@@ -26,6 +26,7 @@ capi = []
 parallel = ["dep:rayon"]
 
 [dependencies]
+minimage = { version = "0.1.1", git = "https://github.com/lode-org/minimage", tag = "v0.1.1" }
 rayon = { version = "1.10", optional = true }
 
 [[test]]

@@ -36,3 +36,13 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<minimage::Error> for Error {
+    fn from(err: minimage::Error) -> Self {
+        match err {
+            minimage::Error::BadBox => Error::BadBox,
+            minimage::Error::BufferSize => Error::BufferSize,
+            minimage::Error::Empty => Error::Empty,
+        }
+    }
+}
