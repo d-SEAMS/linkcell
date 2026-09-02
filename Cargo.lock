@@ -81,12 +81,13 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 name = "linkcell"
 version = "0.3.3"
 dependencies = [
+ "minimage",
  "rayon",
 ]
 
 [[package]]
 name = "linkcell-python"
-version = "0.3.3"
+version = "0.3.1"
 dependencies = [
  "cc",
  "dlpk",
@@ -104,6 +105,11 @@ dependencies = [
  "autocfg",
  "rawpointer",
 ]
+
+[[package]]
+name = "minimage"
+version = "0.1.1"
+source = "git+https://github.com/lode-org/minimage?tag=v0.1.1#0545e172d88a887c6d9d8e3977e5c12fc1ba6f38"
 
 [[package]]
 name = "ndarray"
