@@ -18,6 +18,10 @@ It is a LODE library. The Rust crate is the implementation. The C ABI
 [readcon-core](https://github.com/lode-org/readcon-core). C++ is a RAII
 header over that ABI.
 
+Released versions live in [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog).
+Unreleased notes are files under `changelog.d/`. The cut is
+`towncrier build --version X.Y.Z`.
+
 ## Install
 
 Rust:

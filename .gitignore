@@ -30,6 +30,8 @@ rustc-ice-*.txt
 
 # Prerequisites
 *.d
+!changelog.d/
+!changelog.d/**
 
 # Compiled Object files
 *.slo
