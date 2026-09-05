@@ -79,3 +79,26 @@ def test_knn_sheared_matches_minimage_euclidean():
     got = float(d2[0, 0])
     assert abs(got - float(mi.dist2(xyz[0].tolist(), xyz[1].tolist()))) < 1e-12
     assert abs(got - float(mi.dist2_euclidean(xyz[0].tolist(), xyz[1].tolist()))) < 1e-12
+
+
+def test_knn_hex_body_diagonal_matches_minimage_euclidean():
+    rows = np.ascontiguousarray(
+        [[10.0, 0.0, 0.0], [5.0, 8.660254037844386, 0.0], [0.0, 0.0, 10.0]],
+        dtype=np.float64,
+    )
+    mi = minimage.Cell.from_vesin(rows)
+    origin = [0.0, 0.0, 0.0]
+    body = (
+        0.49 * np.array([10.0, 0.0, 0.0])
+        + 0.49 * np.array([5.0, 8.660254037844386, 0.0])
+        + 0.49 * np.array([0.0, 0.0, 10.0])
+    ).tolist()
+    xyz = np.ascontiguousarray([origin, body], dtype=np.float64)
+    raw = linkcell.knearest(xyz, rows, 1)
+    nn = np.from_dlpack(raw[0])
+    d2 = np.from_dlpack(raw[1])
+    euc = float(mi.dist2_euclidean(origin, body))
+    frac = float(mi.dist2(origin, body))
+    assert int(nn[0, 0]) == 1
+    assert abs(float(d2[0, 0]) - euc) < 1e-12
+    assert euc + 1e-8 < frac
