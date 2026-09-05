@@ -123,6 +123,35 @@ fn hex_body_diagonal_knn_matches_euclidean() {
     assert!(euc + 1e-8 < frac);
 }
 
+fn unreduced_skew() -> Cell {
+    // |xy| = 0.99 Lx: tilt-unreduced. 2a-2b sits outside {-1,0,1}^3.
+    Cell::from_vectors(
+        [1.0, 0.0, 0.0],
+        [0.99, 0.01, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0],
+    )
+    .unwrap()
+}
+
+#[test]
+fn unreduced_skew_knn_beats_unreduced_27_image() {
+    let b = unreduced_skew();
+    let origin = [0.0, 0.0, 0.0];
+    let lattice = [0.02, -0.02, 0.0];
+    let xyz = [origin, lattice];
+    let rows = knearest(&xyz, &b, 1, None, Some(0.2)).unwrap();
+    let brute = knearest_brute(&xyz, &b, 1, None).unwrap();
+    let euc = b.dist2_euclidean(origin, lattice);
+    let twentyseven = mic_dist2_27(&b, origin, lattice);
+    assert_eq!(rows[0].indices, vec![1]);
+    assert_eq!(rows[0].indices, brute[0].indices);
+    assert!(almost(rows[0].dist2[0], brute[0].dist2[0]));
+    assert!(almost(rows[0].dist2[0], euc));
+    assert!(euc < 1e-24);
+    assert!(euc + 1e-8 < twentyseven);
+}
+
 #[test]
 fn agrees_with_brute_force_on_a_sheared_cell() {
     let b = hex_prism();

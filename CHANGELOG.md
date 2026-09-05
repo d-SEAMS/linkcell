@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `knearest_brute` / `pair_dist2` use `Cell::dist2_euclidean` (Smith
+  half-edge test, then a Minkowski-reduced 27-image). A 27-image of
+  an unreduced H misses lattice points outside `{-1,0,1}^3`. A
+  hex-prism body diagonal is a fractional wrap that is not nearest.
+
 ## 0.3.3
 
 Two wheels: `abi3-py312` (GIL, CPython 3.12+) and `abi3t-py315`
