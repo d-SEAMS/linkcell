@@ -102,3 +102,32 @@ def test_knn_hex_body_diagonal_matches_minimage_euclidean():
     assert int(nn[0, 0]) == 1
     assert abs(float(d2[0, 0]) - euc) < 1e-12
     assert euc + 1e-8 < frac
+
+
+def test_knn_unreduced_skew_beats_unreduced_27_image():
+    rows = np.ascontiguousarray(
+        [[1.0, 0.0, 0.0], [0.99, 0.01, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    mi = minimage.Cell.from_vesin(rows)
+    origin = [0.0, 0.0, 0.0]
+    lattice = [0.02, -0.02, 0.0]
+    xyz = np.ascontiguousarray([origin, lattice], dtype=np.float64)
+    raw = linkcell.knearest(xyz, rows, 1)
+    nn = np.from_dlpack(raw[0])
+    d2 = np.from_dlpack(raw[1])
+    euc = float(mi.dist2_euclidean(origin, lattice))
+    a = np.array(rows[0])
+    b = np.array(rows[1])
+    c = np.array(rows[2])
+    q = np.array(lattice)
+    best27 = min(
+        float((q + na * a + nb * b + nc * c) @ (q + na * a + nb * b + nc * c))
+        for na in (-1, 0, 1)
+        for nb in (-1, 0, 1)
+        for nc in (-1, 0, 1)
+    )
+    assert int(nn[0, 0]) == 1
+    assert abs(float(d2[0, 0]) - euc) < 1e-12
+    assert euc < 1e-24
+    assert euc + 1e-8 < best27
