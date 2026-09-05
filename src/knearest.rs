@@ -473,10 +473,9 @@ fn search(
 
 /// Brute-force k-nearest. Tests and small systems only.
 ///
-/// Orthorhombic boxes use [`Cell::dist2`]. Sheared boxes take the
-/// minimum over the 27 nearest lattice images: the single
-/// parallelepiped wrap is not the Wigner-Seitz cell of a 60-degree
-/// hex prism.
+/// Distances are [`Cell::dist2_euclidean`]: Smith half-edge test, then
+/// a Minkowski-reduced 27-image. A hex-prism body diagonal is a
+/// fractional wrap that is not the nearest image.
 ///
 /// ```
 /// use linkcell::{knearest, knearest_brute, Cell};

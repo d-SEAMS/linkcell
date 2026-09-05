@@ -107,6 +107,23 @@ fn triclinic_image_beats_the_cartesian_far_point() {
 }
 
 #[test]
+fn hex_body_diagonal_knn_matches_euclidean() {
+    let b = hex_prism();
+    let origin = [0.0, 0.0, 0.0];
+    let body = b.cartesian([0.49, 0.49, 0.49]);
+    let xyz = [origin, body];
+    let rows = knearest(&xyz, &b, 1, None, Some(2.0)).unwrap();
+    let brute = knearest_brute(&xyz, &b, 1, None).unwrap();
+    let euc = b.dist2_euclidean(origin, body);
+    let frac = b.dist2(origin, body);
+    assert_eq!(rows[0].indices, vec![1]);
+    assert_eq!(rows[0].indices, brute[0].indices);
+    assert!(almost(rows[0].dist2[0], brute[0].dist2[0]));
+    assert!(almost(rows[0].dist2[0], euc));
+    assert!(euc + 1e-8 < frac);
+}
+
+#[test]
 fn agrees_with_brute_force_on_a_sheared_cell() {
     let b = hex_prism();
     let mut xyz = Vec::new();
