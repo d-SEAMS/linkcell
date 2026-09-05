@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "linkcell-python"
-version = "0.3.1"
+version = "0.3.3"
 dependencies = [
  "cc",
  "dlpk",
@@ -109,7 +109,6 @@ dependencies = [
 [[package]]
 name = "minimage"
 version = "0.1.1"
-source = "git+https://github.com/lode-org/minimage?tag=v0.1.1#0545e172d88a887c6d9d8e3977e5c12fc1ba6f38"
 
 [[package]]
 name = "ndarray"

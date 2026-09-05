@@ -22,21 +22,7 @@ const MAX_CELLS: i64 = 16_777_216;
 type SearchHits = Vec<(usize, Vec<(f64, usize)>)>;
 
 fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
-    if simbox.is_ortho() {
-        return simbox.dist2(p, q);
-    }
-    let mut best = f64::INFINITY;
-    for na in -1..=1 {
-        for nb in -1..=1 {
-            for nc in -1..=1 {
-                let d2 = simbox.dist2_shifted(p, q, simbox.lattice_shift(na, nb, nc));
-                if d2 < best {
-                    best = d2;
-                }
-            }
-        }
-    }
-    best
+    simbox.dist2_euclidean(p, q)
 }
 
 fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
