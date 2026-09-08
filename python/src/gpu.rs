@@ -250,7 +250,7 @@ fn legacy_capsule(py: Python<'_>, owner: Py<PyCapsule>) -> PyResult<Py<PyCapsule
             legacy_tensor_deleter(managed);
             return Err(PyErr::fetch(py));
         }
-        Ok(Py::from_owned_ptr(py, capsule))
+        Ok(Bound::from_owned_ptr(py, capsule).cast_into::<PyCapsule>()?.unbind())
     }
 }
 
