@@ -5,7 +5,7 @@ use std::ptr;
 
 use dlpk::pyo3::PyDLPack;
 use dlpk::sys::{
-    DLDevice, DLDeviceType, DLManagedTensorVersioned, DLTensor, DLPACK_FLAG_BITMASK_IS_COPIED,
+    DLDevice, DLDeviceType, DLManagedTensor, DLManagedTensorVersioned, DLTensor, DLPACK_FLAG_BITMASK_IS_COPIED,
     DLPACK_FLAG_BITMASK_READ_ONLY,
 };
 use dlpk::{DLPackTensor, GetDLPackDataType};
@@ -180,8 +180,19 @@ impl StreamDlpack {
         copy: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Py<PyCapsule>> {
         let _ = stream;
-        self.inner
-            .__dlpack__(py, None, max_version, dl_device, copy)
+        let versioned = max_version
+            .as_ref()
+            .map(|value| value.extract::<(u32, u32)>())
+            .transpose()?
+            .is_some_and(|version| version.0 >= 1);
+        let cap = self.inner.__dlpack__(
+            py, None, if versioned { max_version } else { None }, dl_device, copy,
+        )?;
+        if versioned {
+            Ok(cap)
+        } else {
+            legacy_capsule(py, cap)
+        }
     }
 
     fn __dlpack_device__<'py>(&self, py: Python<'py>) -> PyResult<Py<pyo3::types::PyTuple>> {
@@ -189,10 +200,58 @@ impl StreamDlpack {
     }
 }
 
-fn to_stream_dlpack(py: Python<'_>, tensor: DLPackTensor) -> PyResult<Py<PyAny>> {
+pub(crate) fn to_stream_dlpack(py: Python<'_>, tensor: DLPackTensor) -> PyResult<Py<PyAny>> {
     let inner =
         PyDLPack::try_from(tensor).map_err(|e| PyRuntimeError::new_err(format!("dlpack: {e}")))?;
     Ok(Py::new(py, StreamDlpack { inner })?.into_any())
+}
+
+unsafe extern "C" fn legacy_tensor_deleter(tensor: *mut DLManagedTensor) {
+    unsafe {
+        let managed = Box::from_raw(tensor);
+        drop(Box::from_raw(managed.manager_ctx.cast::<Py<PyCapsule>>()));
+    }
+}
+
+unsafe extern "C" fn legacy_capsule_destructor(capsule: *mut pyo3::ffi::PyObject) {
+    unsafe {
+        // A consumer renames its capsule and owns the managed tensor's deleter.
+        if pyo3::ffi::PyCapsule_IsValid(capsule, crate::DLTENSOR.as_ptr()) == 1 {
+            let tensor = pyo3::ffi::PyCapsule_GetPointer(capsule, crate::DLTENSOR.as_ptr());
+            legacy_tensor_deleter(tensor.cast());
+        }
+    }
+}
+
+fn legacy_capsule(py: Python<'_>, owner: Py<PyCapsule>) -> PyResult<Py<PyCapsule>> {
+    let dl_tensor = crate::with_dltensor(owner.bind(py), |tensor| {
+        Ok(DLTensor {
+            data: tensor.data,
+            device: tensor.device,
+            ndim: tensor.ndim,
+            dtype: tensor.dtype,
+            shape: tensor.shape,
+            strides: tensor.strides,
+            byte_offset: tensor.byte_offset,
+        })
+    })?;
+    let managed = Box::into_raw(Box::new(DLManagedTensor {
+        dl_tensor,
+        manager_ctx: Box::into_raw(Box::new(owner)).cast(),
+        deleter: Some(legacy_tensor_deleter),
+    }));
+    // The legacy manager retains the versioned capsule until its consumer
+    // releases the buffer; each protocol owns exactly one deleter call.
+    unsafe {
+        let capsule = pyo3::ffi::PyCapsule_New(
+            managed.cast(), crate::DLTENSOR.as_ptr(), Some(legacy_capsule_destructor),
+        );
+        if capsule.is_null() {
+            legacy_tensor_deleter(managed);
+            return Err(PyErr::fetch(py));
+        }
+        Ok(Py::from_owned_ptr(py, capsule))
+    }
 }
 
 fn xyz_n(shape: &[i64]) -> PyResult<(usize, usize)> {
