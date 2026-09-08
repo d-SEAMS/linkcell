@@ -6,6 +6,7 @@ use std::ptr;
 use dlpk::pyo3::PyDLPack;
 use dlpk::sys::{
     DLDevice, DLDeviceType, DLManagedTensorVersioned, DLTensor, DLPACK_FLAG_BITMASK_IS_COPIED,
+    DLPACK_FLAG_BITMASK_READ_ONLY,
 };
 use dlpk::{DLPackTensor, GetDLPackDataType};
 use linkcell::lc_cell;
@@ -205,9 +206,42 @@ fn xyz_n(shape: &[i64]) -> PyResult<(usize, usize)> {
     }
 }
 
+unsafe extern "C" fn borrowed_capsule_deleter(tensor: *mut DLManagedTensorVersioned) {
+    unsafe {
+        let managed = Box::from_raw(tensor);
+        drop(Box::from_raw(managed.manager_ctx.cast::<Py<PyCapsule>>()));
+    }
+}
+
 fn take_cuda(obj: &Bound<'_, PyAny>, stream: *mut c_void) -> PyResult<DLPackTensor> {
     let cap = capsule_on_stream(obj, stream)?;
-    DLPackTensor::try_from(&cap).map_err(|e| PyValueError::new_err(format!("dlpack: {e}")))
+    if cap.name()?.map(|name| unsafe { name.as_cstr() }) != Some(crate::DLTENSOR) {
+        return DLPackTensor::try_from(&cap)
+            .map_err(|e| PyValueError::new_err(format!("dlpack: {e}")));
+    }
+    // The legacy capsule owns its buffer and metadata. Retaining it keeps
+    // both alive through the synchronous GPU operation without consuming
+    // its deleter or interpreting the legacy layout as a versioned tensor.
+    let dl_tensor = crate::with_dltensor(&cap, |tensor| {
+        Ok(DLTensor {
+            data: tensor.data,
+            device: tensor.device,
+            ndim: tensor.ndim,
+            dtype: tensor.dtype,
+            shape: tensor.shape,
+            strides: tensor.strides,
+            byte_offset: tensor.byte_offset,
+        })
+    })?;
+    let managed = Box::new(DLManagedTensorVersioned {
+        version: dlpk::sys::DLPackVersion::current(),
+        manager_ctx: Box::into_raw(Box::new(cap.unbind())).cast(),
+        deleter: Some(borrowed_capsule_deleter),
+        flags: DLPACK_FLAG_BITMASK_READ_ONLY,
+        dl_tensor,
+    });
+    // The manager owns the capsule from which all tensor pointers originate.
+    Ok(unsafe { DLPackTensor::from_ptr(Box::into_raw(managed)) })
 }
 
 fn cell_n_from_shape(shape: &[i64]) -> PyResult<i32> {
