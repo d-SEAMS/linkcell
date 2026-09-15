@@ -307,15 +307,14 @@ pub(crate) fn parse_cell(buf: &HostF64) -> PyResult<(Cell, lc_cell)> {
     Ok((cell, raw))
 }
 
-fn to_pydlpack<A>(arr: A) -> PyResult<PyDLPack>
+fn to_pydlpack<A>(py: Python<'_>, arr: A) -> PyResult<Py<PyAny>>
 where
     DLPackTensor: TryFrom<A>,
     <DLPackTensor as TryFrom<A>>::Error: std::fmt::Display,
 {
     let tensor = DLPackTensor::try_from(arr)
         .map_err(|e| PyRuntimeError::new_err(format!("ndarray -> dlpack: {e}")))?;
-    PyDLPack::try_from(tensor)
-        .map_err(|e| PyRuntimeError::new_err(format!("dlpack -> PyDLPack: {e}")))
+    gpu::to_stream_dlpack(py, tensor)
 }
 
 /// Periodic linked-cell k-nearest search.
@@ -396,8 +395,8 @@ fn knearest<'py>(
         let d2_a = Array2::from_shape_vec((n, k), d2)
             .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
         Ok((
-            Py::new(py, to_pydlpack(nn_a)?)?.into_any(),
-            Py::new(py, to_pydlpack(d2_a)?)?.into_any(),
+            to_pydlpack(py, nn_a)?,
+            to_pydlpack(py, d2_a)?,
         ))
     } else {
         let nn_a = Array3::from_shape_vec((n_frames, n, k), nn)
@@ -405,8 +404,8 @@ fn knearest<'py>(
         let d2_a = Array3::from_shape_vec((n_frames, n, k), d2)
             .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
         Ok((
-            Py::new(py, to_pydlpack(nn_a)?)?.into_any(),
-            Py::new(py, to_pydlpack(d2_a)?)?.into_any(),
+            to_pydlpack(py, nn_a)?,
+            to_pydlpack(py, d2_a)?,
         ))
     }
 }

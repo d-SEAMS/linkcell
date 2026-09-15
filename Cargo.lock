@@ -81,6 +81,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 name = "linkcell"
 version = "0.3.3"
 dependencies = [
+ "minimage",
  "rayon",
 ]
 
@@ -104,6 +105,11 @@ dependencies = [
  "autocfg",
  "rawpointer",
 ]
+
+[[package]]
+name = "minimage"
+version = "0.1.1"
+source = "git+https://github.com/lode-org/minimage.git?rev=624d4395beae609281bb951e66299658bf313fc1#624d4395beae609281bb951e66299658bf313fc1"
 
 [[package]]
 name = "ndarray"

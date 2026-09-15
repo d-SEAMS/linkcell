@@ -71,3 +71,17 @@ def test_torch_cuda_batched():
 
 def test_gpu_available_is_bool():
     assert isinstance(linkcell.gpu_available(), bool)
+
+
+def test_cpu_export_to_torch_retains_buffer():
+    import gc
+
+    xyz = np.array([[0.2, 0.0, 0.0], [9.4, 0.0, 0.0]], dtype=np.float64)
+    cell = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+    nn, d2 = linkcell.knearest(xyz, cell, 1)
+    indices = torch.from_dlpack(nn)
+    distances = torch.from_dlpack(d2)
+    del nn, d2
+    gc.collect()
+    assert indices.tolist() == [[1], [0]]
+    torch.testing.assert_close(distances, torch.full((2, 1), 0.64, dtype=torch.float64))
