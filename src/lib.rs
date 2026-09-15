@@ -4,7 +4,8 @@
 //! without a minimum-image convention. This crate is the missing piece:
 //! Allen and Tildesley's linked cells, a k-heap per source, expanding
 //! Chebyshev shells until the k-th neighbour cannot lie outside the
-//! visited cube.
+//! visited cube. [`pairs_within`] is the cutoff pair list with integer
+//! cell shifts (vesin/tonari `ijS`); [`knearest`] unique-indexes.
 //!
 //! # Algorithm
 //!
@@ -107,12 +108,14 @@
 mod cell;
 mod error;
 mod knearest;
+mod pairs;
 
 pub use cell::Cell;
 pub use error::Error;
 pub use knearest::{
     knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Neighbors,
 };
+pub use pairs::{pairs_within, Pair};
 
 #[cfg(feature = "capi")]
 mod capi;

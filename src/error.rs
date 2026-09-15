@@ -19,6 +19,10 @@ pub enum Error {
     MaskLen,
     /// Linked-cell mesh would overflow or exceed the bin cap.
     TooManyCells,
+    /// `cutoff` is not finite and strictly positive.
+    BadCutoff,
+    /// Periodic image stencil exceeds the 2^24 resource cap.
+    TooManyImages,
 }
 
 impl fmt::Display for Error {
@@ -31,6 +35,8 @@ impl fmt::Display for Error {
             Error::Overflow => write!(f, "n * k overflows"),
             Error::MaskLen => write!(f, "mask length must be n"),
             Error::TooManyCells => write!(f, "linked-cell mesh is too fine"),
+            Error::BadCutoff => write!(f, "cutoff must be finite and positive"),
+            Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
         }
     }
 }
