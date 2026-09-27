@@ -108,8 +108,9 @@ dependencies = [
 
 [[package]]
 name = "minimage"
-version = "0.1.1"
-source = "git+https://github.com/lode-org/minimage.git?rev=624d4395beae609281bb951e66299658bf313fc1#624d4395beae609281bb951e66299658bf313fc1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8f0c3ad52d3a9253be305dfee0ce9412d3f008784a031e346cc9de8700ee0e"
 
 [[package]]
 name = "ndarray"

@@ -19,6 +19,7 @@ by [towncrier](https://towncrier.readthedocs.io/).
 ### Changed
 
 - `knearest_brute` ranks with `Cell::dist2_euclidean` (Smith then Minkowski 27-image).
+- The crate depends on minimage 0.1.2 from crates.io.
 - CHANGELOG.md follows Keep a Changelog. Unreleased notes are changelog.d fragments assembled by towncrier.
 
 ### Fixed
