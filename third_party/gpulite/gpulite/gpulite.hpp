@@ -13,6 +13,8 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cassert>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 
