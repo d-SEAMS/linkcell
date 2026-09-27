@@ -15,6 +15,7 @@ fn main() {
         .cpp(true)
         .std("c++17")
         .define("LINKCELL_HAS_GPULITE", "1")
+        .define("NOMINMAX", None)
         .include(root.join("include"))
         .include(root.join("third_party/gpulite"))
         .file(root.join("src/gpu/knearest.cpp"))
@@ -22,6 +23,9 @@ fn main() {
         .warnings(false);
     if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
         build.flag_if_supported("-fPIC");
+    }
+    if std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "msvc" {
+        build.flag("/Zc:__cplusplus");
     }
     build.compile("linkcell_gpu");
 

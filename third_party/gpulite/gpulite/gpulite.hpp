@@ -21,6 +21,9 @@
 #include <dlfcn.h>
 #include <unistd.h>  // for getcwd
 #elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <libloaderapi.h>
 
@@ -437,7 +440,7 @@ inline std::optional<std::filesystem::path> FindBestCudaDll(const std::wstring& 
             int score = ParseCudartVersionScore(prefix, name);
             // Prefer versioned DLLs; still accept plain "<prefix>.dll" with score 1
             if (name == prefix + L".dll") {
-                score = std::max(score, 1);
+                score = (std::max)(score, 1);
             }
 
             matches.push_back({ e.path(), score });

@@ -738,7 +738,7 @@ void Workspace::knearest_into_many(const double *xyz, std::size_t n,
   if (!(edge > 0.0)) {
     edge = 3.0;
   }
-  edge = std::min(edge, std::min(widths[0], std::min(widths[1], widths[2])));
+  edge = (std::min)(edge, (std::min)(widths[0], (std::min)(widths[1], widths[2])));
   int nx = static_cast<int>(std::floor(widths[0] / edge));
   int ny = static_cast<int>(std::floor(widths[1] / edge));
   int nz = static_cast<int>(std::floor(widths[2] / edge));
@@ -755,11 +755,11 @@ void Workspace::knearest_into_many(const double *xyz, std::size_t n,
   if (nC <= 0 || nC > kMaxCells) {
     throw Error("too many cells");
   }
-  const double cellMin = std::min(
+  const double cellMin = (std::min)(
       widths[0] / static_cast<double>(nx),
-      std::min(widths[1] / static_cast<double>(ny),
-               widths[2] / static_cast<double>(nz)));
-  const int maxReach = std::max(nx, std::max(ny, nz)) / 2 + 1;
+      (std::min)(widths[1] / static_cast<double>(ny),
+                 widths[2] / static_cast<double>(nz)));
+  const int maxReach = (std::max)(nx, (std::max)(ny, nz)) / 2 + 1;
   impl_->ensureStream();
   auto &rt = CUDART::instance();
   const int nF = static_cast<int>(nFrames);
@@ -781,18 +781,18 @@ void Workspace::knearest_into_many(const double *xyz, std::size_t n,
       if (!(flx > 0.0 && fly > 0.0 && flz > 0.0)) {
         throw Error("bad frame box");
       }
-      const int fnx = std::max(1, static_cast<int>(std::floor(flx / edge)));
-      const int fny = std::max(1, static_cast<int>(std::floor(fly / edge)));
-      const int fnz = std::max(1, static_cast<int>(std::floor(flz / edge)));
+      const int fnx = (std::max)(1, static_cast<int>(std::floor(flx / edge)));
+      const int fny = (std::max)(1, static_cast<int>(std::floor(fly / edge)));
+      const int fnz = (std::max)(1, static_cast<int>(std::floor(flz / edge)));
       if (fnx != nx || fny != ny || fnz != nz) {
         throw Error("frame boxes need the same cell grid");
       }
       fillOrthoH(flx, fly, flz,
                  impl_->hH.data() + static_cast<std::size_t>(f) * 9,
                  impl_->hHinv.data() + static_cast<std::size_t>(f) * 9);
-      impl_->hCmin[static_cast<std::size_t>(f)] = std::min(
+      impl_->hCmin[static_cast<std::size_t>(f)] = (std::min)(
           flx / static_cast<double>(nx),
-          std::min(fly / static_cast<double>(ny), flz / static_cast<double>(nz)));
+          (std::min)(fly / static_cast<double>(ny), flz / static_cast<double>(nz)));
     }
   }
   checkCuda(rt.cudaMemcpyAsync(impl_->dH.p, impl_->hH.data(),
@@ -872,7 +872,7 @@ void Workspace::knearest_into_many_dcell(
   const int ny = plan[1];
   const int nz = plan[2];
   const int nC = plan[3];
-  const int maxReach = std::max(nx, std::max(ny, nz)) / 2 + 1;
+  const int maxReach = (std::max)(nx, (std::max)(ny, nz)) / 2 + 1;
   launchWalk(xyz, n, nFrames, k, out, mask, wait, out_d2, nx, ny, nz, nC,
              maxReach);
 }
