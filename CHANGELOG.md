@@ -10,6 +10,21 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.4] - 2026-09-27
+
+### Added
+
+- `pairs_within` returns every atom-image pair inside a cutoff with integer cell shift `S`. `knearest` still unique-indexes. Image stencils above 2^24 fail closed.
+
+### Changed
+
+- `knearest_brute` ranks with `Cell::dist2_euclidean` (Smith then Minkowski 27-image).
+- CHANGELOG.md follows Keep a Changelog. Unreleased notes are changelog.d fragments assembled by towncrier.
+
+### Fixed
+
+- The MSVC build defines `NOMINMAX` before `windows.h` and calls `(std::min)` / `(std::max)`, so those names are not macros. The header includes `<cassert>` and `<optional>` itself. MSVC does not provide those through the other standard headers.
+
 ## [0.3.3] - 2026-08-17
 
 ### Changed
