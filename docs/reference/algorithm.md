@@ -119,17 +119,30 @@ builders take a cutoff, or k neighbours inside a ball.
 ## Parallel
 
 The `parallel` Cargo feature (on by default) maps sources with
-rayon. Each source owns its heap.
+rayon. Each source owns its heap. From 8192 active points upward the
+same feature builds the mesh in parallel: a thread writes each point's
+fractional coordinate once, histograms with atomics, then scatters
+occupants with atomics. Bins are sorted by index afterwards, so the
+occupant order matches the serial build. Below that count the mesh
+stays serial. The cubic hot path is 4096 points and does not take the
+parallel build. `--no-default-features` keeps the whole search serial.
+
+`examples/knn_scale.rs` times one fixed problem. The box grows with
+`n` so the spacing stays 3.125. `RAYON_NUM_THREADS` has to be set
+before the process starts.
 
 ## Device
 
-`linkcell::gpu::Workspace` is the same walk on a CUDA device. Fold,
-bin, then a tiled Hillis-Steele exclusive scan (CUB DeviceScan /
-HOOMD cell offsets). Occupants are stored in cell-major order with
-an O(1) home slot. The stencil is a precomputed Chebyshev shell
-table (LAMMPS `NStencil`, HOOMD `d_cell_adj`), not a nested 3-D
-loop. Eight threads share each source and stride occupants; after
-each shell they merge heaps and apply the host stop. Output is
-Cabana's 2-D packed `n * k` list. `knearest_into_many` covers every
-frame that shares a cell. Fold uses `Hinv`; the pair shift is
-`na a + nb b + nc c`. `k <= 16`.
+`linkcell::gpu::Workspace` is the gpulite CUDA walk. It still stops on
+`reach * cell_min`, which is a lower bound on the host plane, so it
+does not stop earlier than the host. `k <= 16`. That path is separate
+from the Kokkos walk.
+
+`src/kokkos/` is the certified walk on `Kokkos::DefaultExecutionSpace`.
+Fold, bin, exclusive scan, and the per-axis index box run as Kokkos
+parallel loops. The stop is the host plane test, not `reach * cell_min`.
+`k <= 16`. The sources are not in the Cargo or CMake graph, so a
+build without Kokkos stays the same. A Cuda execution space uses this
+source; the timings in the changelog were taken with the OpenMP
+backend, because the machine that measured them has no CUDA device.
+`scripts/bench-kokkos.sh` builds that bench against a Kokkos install.

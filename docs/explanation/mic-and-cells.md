@@ -53,10 +53,11 @@ frontier plane, or until the shell covers a space diagonal.
 vesin answers "who is inside radius r". This crate answers "who are
 the k nearest, with the periodic image". The search takes no
 cutoff. `cell_hint` only sizes the bins. Shells grow until the
-k-th neighbour is certified against the frontier plane. The device
-walk still stops on the looser `reach * cell_min` bound, which is
-that plane distance when the source sits on the outer face of its
-cell.
+k-th neighbour is certified against the frontier plane. The gpulite
+device walk still stops on the looser `reach * cell_min` bound, which
+is that plane distance when the source sits on the outer face of its
+cell. The Kokkos walk in `src/kokkos/` uses the host plane stop on
+whatever execution space Kokkos was built with.
 
 nanoflann answers the same k question in Euclidean space without a
 minimum-image convention. A periodic dump still needs the fold and

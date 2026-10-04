@@ -1,0 +1,92 @@
+//! Strong-scaling probe for one fixed problem.
+//!
+//! The box grows with `n` so the spacing stays 3.125, the cubic hot-path
+//! density. Set `RAYON_NUM_THREADS` before the process starts. Env:
+//! `KNN_SCALE_N` (default 262144), `KNN_SCALE_K` (default 4),
+//! `KNN_SCALE_REPS` (default 6), `KNN_SCALE_SHAPE` (`cubic` or `tilt`).
+
+use std::time::Instant;
+
+use linkcell::{knearest_into, Cell};
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn nside_of(n: usize) -> usize {
+    ((n as f64).cbrt().round() as usize).max(1)
+}
+
+fn cubic(nside: usize) -> (Vec<[f64; 3]>, Cell) {
+    let boxl = nside as f64 * 3.125;
+    let cell = Cell::ortho(boxl, boxl, boxl).expect("box");
+    let mut xyz = Vec::with_capacity(nside * nside * nside);
+    let a = 3.125;
+    for iz in 0..nside {
+        for iy in 0..nside {
+            for ix in 0..nside {
+                xyz.push([ix as f64 * a, iy as f64 * a, iz as f64 * a]);
+            }
+        }
+    }
+    (xyz, cell)
+}
+
+/// Restricted triclinic box, tilt-reduced, scaled so the a edge matches
+/// the cubic spacing times `nside`.
+fn tilt(nside: usize) -> (Vec<[f64; 3]>, Cell) {
+    let lx = nside as f64 * 3.125;
+    let cell = Cell::from_vectors(
+        [lx, 0.0, 0.0],
+        [lx * 0.2, lx * 0.9, 0.0],
+        [lx * 0.05, lx * -0.08, lx * 0.95],
+        [0.0, 0.0, 0.0],
+    )
+    .expect("tilt");
+    let mut xyz = Vec::with_capacity(nside * nside * nside);
+    let nf = nside as f64;
+    for iz in 0..nside {
+        for iy in 0..nside {
+            for ix in 0..nside {
+                let s = [
+                    (ix as f64 + 0.5) / nf,
+                    (iy as f64 + 0.5) / nf,
+                    (iz as f64 + 0.5) / nf,
+                ];
+                xyz.push(cell.cartesian(s));
+            }
+        }
+    }
+    (xyz, cell)
+}
+
+fn main() {
+    let nside = nside_of(env_usize("KNN_SCALE_N", 262_144));
+    let k = env_usize("KNN_SCALE_K", 4);
+    let reps = env_usize("KNN_SCALE_REPS", 6);
+    let shape = std::env::var("KNN_SCALE_SHAPE").unwrap_or_else(|_| "cubic".to_string());
+    let (xyz, cell) = match shape.as_str() {
+        "cubic" => cubic(nside),
+        "tilt" => tilt(nside),
+        other => panic!("unknown KNN_SCALE_SHAPE {other}"),
+    };
+    let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".to_string());
+    let mut out = vec![-1i32; xyz.len() * k];
+    knearest_into(&xyz, &cell, k, None, Some(3.0), &mut out).expect("warmup");
+    let mut acc = 0i32;
+    let started = Instant::now();
+    for _ in 0..reps {
+        knearest_into(&xyz, &cell, k, None, Some(3.0), &mut out).expect("knearest");
+        acc = acc.wrapping_add(out[0]);
+    }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    std::hint::black_box(acc);
+    println!(
+        "shape={shape} threads={threads} n={} k={k} reps={reps} ms={ms:.1} ms_per={:.2}",
+        xyz.len(),
+        ms / reps as f64
+    );
+}

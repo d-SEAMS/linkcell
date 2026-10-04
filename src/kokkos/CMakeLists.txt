@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(linkcell_kokkos LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Kokkos REQUIRED)
+add_executable(lc_kokkos_bench knearest.cpp bench.cpp)
+target_link_libraries(lc_kokkos_bench PRIVATE Kokkos::kokkos)
+target_compile_options(lc_kokkos_bench PRIVATE -O3)

@@ -1,0 +1,1 @@
+The mesh build is parallel from 8192 active points, and `src/kokkos` runs the certified walk on a Kokkos execution space. On this 8-core host a cubic 262144-point, k=4 search went from 14.8 ms to 11.9 ms at 8 threads; the Kokkos OpenMP backend went from 68.7 ms at 1 thread to 19.6 ms at 8. There is no CUDA device here, so that backend was not timed.

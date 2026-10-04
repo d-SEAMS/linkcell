@@ -14,8 +14,9 @@
 //! writes packed `n * k` indices (`-1` unused). [`knearest_into_d2`]
 //! also writes the matching squared distances (`NaN` unused). Sources run under
 //! rayon when the `parallel` feature is on (the default); build with
-//! `--no-default-features` to serialize. The per-source `KHeap` stays on
-//! the stack for `k <= 16`.
+//! `--no-default-features` to serialize. At 8192 active points and above,
+//! that feature also builds the mesh in parallel. The per-source `KHeap` stays
+//! on the stack for `k <= 16`.
 
 use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
 use crate::cell::Cell;
@@ -758,4 +759,83 @@ pub fn knearest_brute(
         out[i].indices = pairs.iter().map(|p| p.1).collect();
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod scale_mesh_tests {
+    use super::*;
+
+    fn ortho_lattice(nside: usize) -> (Vec<[f64; 3]>, Cell) {
+        let a = 3.125;
+        let boxl = nside as f64 * a;
+        let cell = Cell::ortho(boxl, boxl, boxl).unwrap();
+        let mut xyz = Vec::with_capacity(nside * nside * nside);
+        for iz in 0..nside {
+            for iy in 0..nside {
+                for ix in 0..nside {
+                    xyz.push([ix as f64 * a, iy as f64 * a, iz as f64 * a]);
+                }
+            }
+        }
+        (xyz, cell)
+    }
+
+    fn assert_certified(
+        cell: &Cell,
+        xyz: &[[f64; 3]],
+        active: &[usize],
+        i: usize,
+        row: &Neighbors,
+    ) {
+        let k = 4;
+        let mut best: Vec<(f64, usize)> = active
+            .iter()
+            .copied()
+            .filter(|&j| j != i)
+            .map(|j| (cell.dist2_euclidean(xyz[i], xyz[j]), j))
+            .collect();
+        best.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.1.cmp(&q.1)));
+        let kth = best[k - 1].0;
+        assert_eq!(row.indices.len(), k);
+        for (&d, &j) in row.dist2.iter().zip(&row.indices) {
+            let true_d = cell.dist2_euclidean(xyz[i], xyz[j]);
+            assert!((d - true_d).abs() <= 1e-8 * true_d.max(1.0));
+            assert!(
+                d <= kth * (1.0 + 1e-8) + 1e-9,
+                "i={i} j={j} d={d} kth={kth}"
+            );
+        }
+        for (d, j) in &best {
+            if *d + 1e-8 < kth {
+                assert!(
+                    row.indices.contains(j),
+                    "i={i} missed closer {j} d={d} kth={kth}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_mesh_matches_euclidean_on_a_large_lattice() {
+        // 22^3 = 10648 active points, above the parallel-mesh threshold.
+        let (xyz, cell) = ortho_lattice(22);
+        let rows = knearest(&xyz, &cell, 4, None, Some(3.0)).unwrap();
+        let active: Vec<usize> = (0..xyz.len()).collect();
+        for i in (0..xyz.len()).step_by(700) {
+            assert_certified(&cell, &xyz, &active, i, &rows[i]);
+        }
+    }
+
+    #[test]
+    fn parallel_mesh_respects_a_mask() {
+        let (xyz, cell) = ortho_lattice(26);
+        let mask: Vec<bool> = (0..xyz.len()).map(|i| i % 2 == 0).collect();
+        let rows = knearest(&xyz, &cell, 4, Some(&mask), Some(3.0)).unwrap();
+        let active: Vec<usize> = (0..xyz.len()).filter(|&i| mask[i]).collect();
+        assert!(active.len() >= 8_192);
+        for &i in active.iter().step_by(900) {
+            assert_certified(&cell, &xyz, &active, i, &rows[i]);
+            assert!(rows[i + 1].indices.is_empty());
+        }
+    }
 }
