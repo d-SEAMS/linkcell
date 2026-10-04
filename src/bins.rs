@@ -218,12 +218,6 @@ impl Mesh {
         cell_index(ix, iy, iz, self.nx, self.ny, self.nz)
     }
 
-    pub(crate) fn slots(&self, cell: usize) -> &[usize] {
-        let lo = self.offsets[cell];
-        let hi = self.offsets[cell + 1];
-        &self.occupants[lo..hi]
-    }
-
     /// Half-box of bins. The search cap is at least this, and at least
     /// the space diagonal in cell heights.
     pub(crate) fn image_reach(&self) -> i32 {

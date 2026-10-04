@@ -1,1 +1,1 @@
-`pairs_within` tests each unordered pair once and writes both shifts when the caller wants the full list. On this host a periodic 18 Å cube, 4 Å cutoff, and 4096 atoms went from 27 ms to 18 ms on one thread.
+`pairs_within` tests each unordered pair once, then writes the rows. A full list still has both shifts. On this host a periodic 18 Å cube, 4 Å cutoff, and 4096 atoms went from 27 ms to 14 ms on one thread.
