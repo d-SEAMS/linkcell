@@ -15,11 +15,9 @@
 //! `--no-default-features` to serialize. The per-source `KHeap` stays on
 //! the stack for `k <= 16`.
 
-use crate::bins::{self, for_shell, frontier_dist2, slab_dist2, Mesh};
+use crate::bins::{self, frontier_dist2, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::Error;
-
-type SearchHits = Vec<(usize, Vec<(f64, usize)>)>;
 
 fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
     simbox.dist2_euclidean(p, q)
@@ -161,18 +159,41 @@ impl KHeap {
         self.d2_at(self.worst_at)
     }
 
-    fn finish(self) -> Vec<(f64, usize)> {
-        let mut pairs = Vec::with_capacity(self.n);
-        for t in 0..self.n {
-            let j = if self.k <= 16 {
-                self.idx[t]
-            } else {
-                self.extra_idx[t]
-            };
-            pairs.push((self.d2_at(t), j));
+    /// Write nearest-first into caller slots. Unused tail stays as the caller left it.
+    fn write_sorted(&self, nn: &mut [i32], mut d2: Option<&mut [f64]>) {
+        if self.k <= 16 {
+            let n = self.n;
+            let mut order = [0u8; 16];
+            for (t, slot) in order.iter_mut().enumerate().take(n) {
+                *slot = t as u8;
+            }
+            order[..n].sort_by(|&a, &b| {
+                let (a, b) = (a as usize, b as usize);
+                self.d2[a]
+                    .total_cmp(&self.d2[b])
+                    .then(self.idx[a].cmp(&self.idx[b]))
+            });
+            for (t, &slot) in order[..n].iter().enumerate() {
+                let s = slot as usize;
+                nn[t] = self.idx[s] as i32;
+                if let Some(buf) = d2.as_mut() {
+                    buf[t] = self.d2[s];
+                }
+            }
+        } else {
+            let mut order: Vec<usize> = (0..self.n).collect();
+            order.sort_by(|&a, &b| {
+                self.extra_d2[a]
+                    .total_cmp(&self.extra_d2[b])
+                    .then(self.extra_idx[a].cmp(&self.extra_idx[b]))
+            });
+            for (t, &s) in order.iter().enumerate() {
+                nn[t] = self.extra_idx[s] as i32;
+                if let Some(buf) = d2.as_mut() {
+                    buf[t] = self.extra_d2[s];
+                }
+            }
         }
-        pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        pairs
     }
 }
 
@@ -312,16 +333,7 @@ fn write_one(
     if let Some(d2) = out_d2.as_mut() {
         d2.fill(f64::NAN);
     }
-    let rows = search(xyz, simbox, k, mask, cell_hint)?;
-    for (i, pairs) in rows {
-        for (t, &(d2, j)) in pairs.iter().enumerate() {
-            out_nn[i * k + t] = j as i32;
-            if let Some(buf) = out_d2.as_mut() {
-                buf[i * k + t] = d2;
-            }
-        }
-    }
-    Ok(())
+    execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
@@ -335,7 +347,7 @@ fn write_one(
 /// basis. Distances are [`Cell::dist2_shifted`] plus
 /// [`Cell::lattice_shift`]. The walk does not stamp unique cells:
 /// occupants of one bin can need different images. A full heap stops
-/// when its worst distance is inside the frontier plane bound.
+/// when its worst distance is at most the frontier plane bound.
 ///
 /// ```
 /// use linkcell::{knearest, Cell};
@@ -359,21 +371,39 @@ pub fn knearest(
     cell_hint: Option<f64>,
 ) -> Result<Vec<Neighbors>, Error> {
     let n = xyz.len();
+    let Some(nk) = n.checked_mul(k) else {
+        return Err(Error::Overflow);
+    };
+    let mut nn = vec![-1i32; nk];
+    let mut d2 = vec![f64::NAN; nk];
+    write_one(xyz, simbox, k, mask, cell_hint, &mut nn, Some(&mut d2))?;
     let mut out = vec![Neighbors::default(); n];
-    for (i, pairs) in search(xyz, simbox, k, mask, cell_hint)? {
-        out[i].dist2 = pairs.iter().map(|p| p.0).collect();
-        out[i].indices = pairs.iter().map(|p| p.1).collect();
+    for i in 0..n {
+        let row_nn = &nn[i * k..(i + 1) * k];
+        let row_d2 = &d2[i * k..(i + 1) * k];
+        let m = row_nn.iter().take_while(|j| **j >= 0).count();
+        out[i].indices = row_nn[..m].iter().map(|&j| j as usize).collect();
+        out[i].dist2 = row_d2[..m].to_vec();
     }
     Ok(out)
 }
 
-fn search(
+struct Geom {
+    cols: [[f64; 3]; 3],
+    lengths: [f64; 3],
+    nbin: [i32; 3],
+    widths: [f64; 3],
+}
+
+fn execute(
     xyz: &[[f64; 3]],
     simbox: &Cell,
     k: usize,
     mask: Option<&[bool]>,
     cell_hint: Option<f64>,
-) -> Result<SearchHits, Error> {
+    out_nn: &mut [i32],
+    out_d2: Option<&mut [f64]>,
+) -> Result<(), Error> {
     if k == 0 {
         return Err(Error::ZeroK);
     }
@@ -386,85 +416,262 @@ fn search(
             return Err(Error::MaskLen);
         }
     }
-    let active: Vec<usize> = (0..n)
-        .filter(|&i| mask.map(|m| m[i]).unwrap_or(true))
-        .collect();
-    if active.is_empty() {
-        return Ok(Vec::new());
-    }
-    if active.len() == 1 {
-        return Ok(vec![(active[0], Vec::new())]);
+    let n_active = match mask {
+        Some(m) => m.iter().filter(|&&on| on).count(),
+        None => n,
+    };
+    if n_active <= 1 {
+        return Ok(());
     }
 
-    // Same Cartesian lattice, with the short vectors as edges so the
-    // Euclidean image sits in a nearby shell. The caller's H is unchanged.
-    let walk = match minimage::minkowski_reduce(simbox) {
-        Ok(cell) => cell,
-        Err(_) => *simbox,
+    // Orthorhombic MIC is the per-axis wrap, so the original basis is
+    // already the one the shells should walk. A skewed cell is rewritten
+    // so the short lattice vectors are the edges.
+    let walk = if simbox.is_ortho() {
+        *simbox
+    } else {
+        match minimage::minkowski_reduce(simbox) {
+            Ok(cell) => cell,
+            Err(_) => *simbox,
+        }
     };
     let edge = bins::target_edge(&walk, cell_hint, 3.0);
-    let mesh = Mesh::build(xyz, &walk, &active, edge)?;
+    let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
+    let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
     let nbin = [mesh.nx, mesh.ny, mesh.nz];
     let widths = mesh.widths;
     let cell_min = (widths[0] / f64::from(mesh.nx))
         .min(widths[1] / f64::from(mesh.ny))
         .min(widths[2] / f64::from(mesh.nz));
-    // Any two points in the cell are at most one space diagonal apart, and
-    // the nearest image is no longer than that. Cover that ball in bins.
     let need = (box_diameter(&walk) / cell_min).ceil();
     let max_reach = if need.is_finite() && need < 1.0e7 {
         (need as i32).saturating_add(3).max(mesh.image_reach())
     } else {
         mesh.image_reach()
     };
-
-    let one = |i: usize| -> (usize, Vec<(f64, usize)>) {
-        let mut heap = KHeap::new(k);
-        let [ix, iy, iz] = mesh.bin[i];
-        let origin = mesh.frac[i];
-        let pi = mesh.folded[i];
-        let mut reach = 1i32;
-        while reach <= max_reach {
-            for_shell(reach, |dx, dy, dz| {
-                let jx = ix + dx;
-                let jy = iy + dy;
-                let jz = iz + dz;
-                if heap.full() {
-                    let lb = slab_dist2(origin, [jx, jy, jz], nbin, widths);
-                    if heap.worst() <= lb {
-                        return;
-                    }
-                }
-                let shift = walk.lattice_shift(
-                    jx.div_euclid(mesh.nx),
-                    jy.div_euclid(mesh.ny),
-                    jz.div_euclid(mesh.nz),
-                );
-                for &ju in mesh.slots(mesh.cell_of(jx, jy, jz)) {
-                    if ju != i {
-                        heap.push(walk.dist2_shifted(pi, mesh.folded[ju], shift), ju);
-                    }
-                }
-            });
-            if heap.full() {
-                let bound = frontier_dist2(origin, [ix, iy, iz], reach, nbin, widths);
-                if heap.worst() <= bound {
-                    break;
-                }
-            }
-            reach += 1;
-        }
-        (i, heap.finish())
+    let geom = Geom {
+        cols: [walk.a(), walk.b(), walk.c()],
+        lengths: walk.widths(),
+        nbin,
+        widths,
     };
+    if walk.is_ortho() {
+        dispatch::<true>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+    } else {
+        dispatch::<false>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+    }
+    Ok(())
+}
 
+fn dispatch<const ORTHO: bool>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    mask: Option<&[bool]>,
+    out_nn: &mut [i32],
+    out_d2: Option<&mut [f64]>,
+) {
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        Ok(active.par_iter().copied().map(one).collect())
+        match (mask, out_d2) {
+            (None, None) => {
+                out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
+                    walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                });
+            }
+            (None, Some(d2)) => {
+                out_nn
+                    .par_chunks_mut(k)
+                    .zip(d2.par_chunks_mut(k))
+                    .enumerate()
+                    .for_each(|(i, (nn, dd))| {
+                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                    });
+            }
+            (Some(mask), None) => {
+                out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
+                    if mask[i] {
+                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                    }
+                });
+            }
+            (Some(mask), Some(d2)) => {
+                out_nn
+                    .par_chunks_mut(k)
+                    .zip(d2.par_chunks_mut(k))
+                    .enumerate()
+                    .for_each(|(i, (nn, dd))| {
+                        if mask[i] {
+                            walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                        }
+                    });
+            }
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {
-        Ok(active.iter().copied().map(one).collect())
+        match (mask, out_d2) {
+            (None, None) => {
+                for (i, nn) in out_nn.chunks_mut(k).enumerate() {
+                    walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                }
+            }
+            (None, Some(d2)) => {
+                for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
+                    walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                }
+            }
+            (Some(mask), None) => {
+                for (i, nn) in out_nn.chunks_mut(k).enumerate() {
+                    if mask[i] {
+                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                    }
+                }
+            }
+            (Some(mask), Some(d2)) => {
+                for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
+                    if mask[i] {
+                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn walk_source<const ORTHO: bool>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    i: usize,
+    nn: &mut [i32],
+    d2: Option<&mut [f64]>,
+) {
+    let mut heap = KHeap::new(k);
+    let [ix, iy, iz] = mesh.bin[i];
+    let origin = mesh.frac[i];
+    let pi = mesh.folded[i];
+    let mut reach = 1i32;
+    while reach <= max_reach {
+        let mut query = CellQuery {
+            heap: &mut heap,
+            mesh,
+            geom,
+            i,
+            pi,
+            origin,
+        };
+        if reach == 1 {
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, false);
+                    }
+                }
+            }
+        } else {
+            let r = reach;
+            for dz in [-r, r] {
+                for dx in -r..=r {
+                    for dy in -r..=r {
+                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, true);
+                    }
+                }
+            }
+            for dy in [-r, r] {
+                for dx in -r..=r {
+                    for dz in (1 - r)..r {
+                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, true);
+                    }
+                }
+            }
+            for dx in [-r, r] {
+                for dy in (1 - r)..r {
+                    for dz in (1 - r)..r {
+                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, true);
+                    }
+                }
+            }
+        }
+        if heap.full() {
+            let bound = frontier_dist2(origin, [ix, iy, iz], reach, geom.nbin, geom.widths, false);
+            if heap.worst() <= bound {
+                break;
+            }
+        }
+        reach += 1;
+    }
+    heap.write_sorted(nn, d2);
+}
+
+struct CellQuery<'a> {
+    heap: &'a mut KHeap,
+    mesh: &'a Mesh,
+    geom: &'a Geom,
+    i: usize,
+    pi: [f64; 3],
+    origin: [f64; 3],
+}
+
+#[inline(always)]
+fn visit_cell<const ORTHO: bool>(
+    q: &mut CellQuery<'_>,
+    jx: i32,
+    jy: i32,
+    jz: i32,
+    allow_slab: bool,
+) {
+    let (cell, na, nb, nc) = q.mesh.locate(jx, jy, jz);
+    let lo = q.mesh.offsets[cell];
+    let hi = q.mesh.offsets[cell + 1];
+    let count = hi - lo;
+    if count == 0 {
+        return;
+    }
+    // One orthorhombic occupant is a subtract and three multiplies.
+    // The slab test is three divisions, so it only pays for a crowded bin.
+    if allow_slab && !(ORTHO && count == 1) && q.heap.full() {
+        let lb = slab_dist2(q.origin, [jx, jy, jz], q.geom.nbin, q.geom.widths);
+        if q.heap.worst() <= lb {
+            return;
+        }
+    }
+    let shift = if ORTHO {
+        if (na | nb | nc) == 0 {
+            [0.0; 3]
+        } else {
+            [
+                f64::from(na) * q.geom.lengths[0],
+                f64::from(nb) * q.geom.lengths[1],
+                f64::from(nc) * q.geom.lengths[2],
+            ]
+        }
+    } else {
+        let fa = f64::from(na);
+        let fb = f64::from(nb);
+        let fc = f64::from(nc);
+        let a = q.geom.cols[0];
+        let b = q.geom.cols[1];
+        let c = q.geom.cols[2];
+        [
+            fa * a[0] + fb * b[0] + fc * c[0],
+            fa * a[1] + fb * b[1] + fc * c[1],
+            fa * a[2] + fb * b[2] + fc * c[2],
+        ]
+    };
+    let pi = q.pi;
+    for &ju in &q.mesh.occupants[lo..hi] {
+        if ju != q.i {
+            let p = q.mesh.folded[ju];
+            let dx = p[0] + shift[0] - pi[0];
+            let dy = p[1] + shift[1] - pi[1];
+            let dz = p[2] + shift[2] - pi[2];
+            q.heap.push(dx * dx + dy * dy + dz * dz, ju);
+        }
     }
 }
 

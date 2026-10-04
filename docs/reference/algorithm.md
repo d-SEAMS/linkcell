@@ -75,11 +75,13 @@ source to that image's slab is already at least the worst heap entry.
 
 After each shell, if the heap is full and the worst `dist2` is at
 most the squared perpendicular distance to the nearest unvisited
-lattice plane, no unvisited point can beat the k-th neighbour, and
-the walk stops. The older `reach * cell_min` bound is that distance
-when the source sits on the outer face of its cell; a source in the
-interior stops sooner. The device walk still uses `reach * cell_min`,
-which is a lower bound on the same plane, so it does not stop earlier.
+lattice plane, the walk stops. Bins are half-open, so every unvisited
+point lies strictly past that plane: a neighbour that sits on the
+plane is still the nearest, and shrinking the plane would walk another
+shell. The older `reach * cell_min` bound is that distance when the
+source sits on the outer face of its cell; a source in the interior
+stops sooner. The device walk still uses `reach * cell_min`, which is
+a lower bound on the same plane, so it does not stop earlier.
 
 `knearest` returns `Neighbors` rows (`indices`, `dist2`), nearest
 first. `knearest_into` / `lc_knearest` write packed indices.

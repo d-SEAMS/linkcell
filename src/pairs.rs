@@ -86,7 +86,7 @@ pub fn pairs_within(
     }
 
     let edge = bins::target_edge(simbox, cell_hint, cutoff);
-    let mesh = Mesh::build(xyz, simbox, &active, edge)?;
+    let mesh = Mesh::build(xyz, simbox, Some(&active), edge)?;
     let cell_min = (mesh.widths[0] / f64::from(mesh.nx))
         .min(mesh.widths[1] / f64::from(mesh.ny))
         .min(mesh.widths[2] / f64::from(mesh.nz));
@@ -139,7 +139,7 @@ pub fn pairs_within(
                     }
                 }
             });
-            let bound = frontier_dist2(origin, [ix, iy, iz], reach, nbin, widths);
+            let bound = frontier_dist2(origin, [ix, iy, iz], reach, nbin, widths, true);
             if bound >= cut2 {
                 break;
             }

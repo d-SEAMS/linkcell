@@ -17,7 +17,7 @@
 //! 3. **Expand Chebyshev shells** of linked cells (`reach = 1, 2, ...`)
 //!    on a Minkowski-reduced basis of the same lattice. Occupants are
 //!    stored in cell order. The walk stops when the k-heap is full and
-//!    the k-th squared distance is inside the perpendicular distance to
+//!    the k-th squared distance is at most the perpendicular distance to
 //!    the unvisited frontier. A neighbour cell whose slab cannot beat
 //!    that distance is skipped. The shell cap is the space diagonal
 //!    over the minimum cell height, so a shift outside `{-1,0,1}` is

@@ -203,7 +203,7 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
 - The search does not take a cutoff. A cell-size hint only sets the bin
   width. `knearest` bins in a Minkowski-reduced basis and stores each
   bin as a contiguous slice. Shells grow until the k-th neighbour is
-  inside the perpendicular distance to the unvisited frontier.
+  no farther than the unvisited frontier.
 - vesin remains the right library for a *cutoff* pair list.
 
 ## License

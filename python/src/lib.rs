@@ -394,19 +394,13 @@ fn knearest<'py>(
             .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
         let d2_a = Array2::from_shape_vec((n, k), d2)
             .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
-        Ok((
-            to_pydlpack(py, nn_a)?,
-            to_pydlpack(py, d2_a)?,
-        ))
+        Ok((to_pydlpack(py, nn_a)?, to_pydlpack(py, d2_a)?))
     } else {
         let nn_a = Array3::from_shape_vec((n_frames, n, k), nn)
             .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
         let d2_a = Array3::from_shape_vec((n_frames, n, k), d2)
             .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
-        Ok((
-            to_pydlpack(py, nn_a)?,
-            to_pydlpack(py, d2_a)?,
-        ))
+        Ok((to_pydlpack(py, nn_a)?, to_pydlpack(py, d2_a)?))
     }
 }
 
