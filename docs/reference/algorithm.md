@@ -91,13 +91,13 @@ walk evaluates `(ρ − 1) / 2 + 13 ρ`, which is exactly half:
 shift once per cell pair. The extra traffic is the hit buffer and the
 40-byte row.
 
-Each bin is then Morton-ordered so a run of four or eight occupants is
-a compact cluster, as in GROMACS nbnxn. The 4×8 distance tile is
-skipped when the certified Euclidean gap between the shifted source
-box and the target box is already at least the cutoff. A tile that
-might contain a neighbour still computes every squared distance,
-because the row stores `dist2`. The returned list stays one atom-image
-per hit: a cluster bitmask would expand into that same row.
+GROMACS nbnxn stores a cluster-pair list and an interaction bitmask,
+and the force kernel reads that list. This call returns one atom-image
+row. Morton-ordering each bin and skipping a 4×8 tile whose certified
+box misses the cutoff was timed on this host for the 4096-atom cube at
+a 4 Å cutoff: about 2.8 ms on one thread and 0.98 ms on eight, against
+2.68 ms and 0.87 ms for the distance tile alone. The walk keeps the
+distance tile. A cluster bitmask would still expand into the same row.
 
 ## Heap and stop
 

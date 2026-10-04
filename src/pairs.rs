@@ -10,11 +10,6 @@
 //! not [`dist2_ortho_diffs`](crate::dist2_ortho_diffs): that Highway
 //! kernel wraps a raw difference into the central cell, and a second
 //! wrap on an already shifted delta changes which rows survive.
-//!
-//! Occupants of a bin are Morton-ordered into spatial clusters, the
-//! same idea as GROMACS nbnxn. A 4×8 tile is skipped when the certified
-//! gap between those boxes is already at least the cutoff. The public
-//! row stays one atom-image: the caller reads [`Pair`].
 
 use crate::bins::{self, axis_gap, Mesh};
 use crate::cell::Cell;
@@ -121,7 +116,7 @@ pub fn pairs_within(
     }
 
     let edge = bins::target_edge(simbox, cell_hint, cutoff);
-    let mut mesh = Mesh::build(xyz, simbox, Some(&active), edge)?;
+    let mesh = Mesh::build(xyz, simbox, Some(&active), edge)?;
     let cell_min = (mesh.widths[0] / f64::from(mesh.nx))
         .min(mesh.widths[1] / f64::from(mesh.ny))
         .min(mesh.widths[2] / f64::from(mesh.nz));
@@ -151,16 +146,10 @@ pub fn pairs_within(
         coords.y[slot] = p[1];
         coords.z[slot] = p[2];
     }
-    // Compact clusters: a run of 4 or 8 slots is a small box, so the
-    // tile test below can reject it. Pair identity does not depend on
-    // this order.
-    pack_clusters(&mesh.offsets, &mut mesh.occupants, &mut coords);
-    let boxes = cluster_boxes(&mesh.offsets, &coords);
     let partners = build_partners(&mesh, simbox, reach, cut2);
     let walk = Walk {
         mesh: &mesh,
         coords: &coords,
-        boxes: &boxes,
         cut2,
         half,
         partners: &partners,
@@ -365,166 +354,11 @@ fn uniform_reach(nbin: [i32; 3], widths: [f64; 3], cut2: f64, max_reach: i32) ->
 struct Walk<'a> {
     mesh: &'a Mesh,
     coords: &'a Coords,
-    boxes: &'a ClusterBoxes,
     cut2: f64,
     half: bool,
     partners: &'a PartnerList,
     /// 2 = AVX-512, 1 = AVX, 0 = scalar.
     simd: u8,
-}
-
-/// Axis-aligned bounds of every 4-atom run that starts on a bin boundary.
-struct ClusterBoxes {
-    lo: Vec<[f64; 3]>,
-    hi: Vec<[f64; 3]>,
-}
-
-fn pack_clusters(offsets: &[usize], occupants: &mut [usize], coords: &mut Coords) {
-    let mut perm = Vec::new();
-    let mut tmp_id = Vec::new();
-    let mut tmp_x = Vec::new();
-    let mut tmp_y = Vec::new();
-    let mut tmp_z = Vec::new();
-    for cell in 0..offsets.len() - 1 {
-        let lo = offsets[cell];
-        let hi = offsets[cell + 1];
-        let n = hi - lo;
-        if n < 4 {
-            continue;
-        }
-        let mut min = [f64::INFINITY; 3];
-        let mut max = [f64::NEG_INFINITY; 3];
-        for s in lo..hi {
-            min[0] = min[0].min(coords.x[s]);
-            max[0] = max[0].max(coords.x[s]);
-            min[1] = min[1].min(coords.y[s]);
-            max[1] = max[1].max(coords.y[s]);
-            min[2] = min[2].min(coords.z[s]);
-            max[2] = max[2].max(coords.z[s]);
-        }
-        let side = (n as f64).cbrt().ceil().clamp(1.0, 1024.0);
-        perm.clear();
-        perm.extend(0..n);
-        perm.sort_by_key(|&k| {
-            let s = lo + k;
-            morton3(
-                quant(coords.x[s], min[0], max[0], side),
-                quant(coords.y[s], min[1], max[1], side),
-                quant(coords.z[s], min[2], max[2], side),
-            )
-        });
-        tmp_id.clear();
-        tmp_x.clear();
-        tmp_y.clear();
-        tmp_z.clear();
-        for &k in &perm {
-            let s = lo + k;
-            tmp_id.push(occupants[s]);
-            tmp_x.push(coords.x[s]);
-            tmp_y.push(coords.y[s]);
-            tmp_z.push(coords.z[s]);
-        }
-        occupants[lo..hi].copy_from_slice(&tmp_id);
-        coords.x[lo..hi].copy_from_slice(&tmp_x);
-        coords.y[lo..hi].copy_from_slice(&tmp_y);
-        coords.z[lo..hi].copy_from_slice(&tmp_z);
-    }
-}
-
-fn quant(v: f64, min: f64, max: f64, side: f64) -> u32 {
-    let span = (max - min).max(1.0e-30);
-    let mut q = ((v - min) / span * side).floor();
-    if q < 0.0 || !q.is_finite() {
-        q = 0.0;
-    }
-    if q >= side {
-        q = side - 1.0;
-    }
-    q as u32
-}
-
-fn part1by2(mut n: u32) -> u32 {
-    n &= 0x0000_03ff;
-    n = (n ^ (n << 16)) & 0x0300_00ff;
-    n = (n ^ (n << 8)) & 0x0300_f00f;
-    n = (n ^ (n << 4)) & 0x030c_30c3;
-    n = (n ^ (n << 2)) & 0x0924_9249;
-    n
-}
-
-fn morton3(x: u32, y: u32, z: u32) -> u32 {
-    part1by2(x) | (part1by2(y) << 1) | (part1by2(z) << 2)
-}
-
-fn cluster_boxes(offsets: &[usize], coords: &Coords) -> ClusterBoxes {
-    let n = coords.x.len();
-    let mut lo = vec![[0.0; 3]; n];
-    let mut hi = vec![[0.0; 3]; n];
-    for cell in 0..offsets.len() - 1 {
-        let start = offsets[cell];
-        let end = offsets[cell + 1];
-        let mut s = start;
-        while s + 4 <= end {
-            let mut lx = coords.x[s];
-            let mut hx = lx;
-            let mut ly = coords.y[s];
-            let mut hy = ly;
-            let mut lz = coords.z[s];
-            let mut hz = lz;
-            for t in 1..4 {
-                let x = coords.x[s + t];
-                let y = coords.y[s + t];
-                let z = coords.z[s + t];
-                lx = lx.min(x);
-                hx = hx.max(x);
-                ly = ly.min(y);
-                hy = hy.max(y);
-                lz = lz.min(z);
-                hz = hz.max(z);
-            }
-            lo[s] = [lx, ly, lz];
-            hi[s] = [hx, hy, hz];
-            s += 4;
-        }
-    }
-    ClusterBoxes { lo, hi }
-}
-
-#[inline(always)]
-fn axis_sep(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
-    if a1 < b0 {
-        b0 - a1
-    } else if b1 < a0 {
-        a0 - b1
-    } else {
-        0.0
-    }
-}
-
-/// `true` when every point of the two boxes is at least `cutoff` apart.
-/// The gap is shrunk by [`bins::certify`] so a real neighbour stays.
-#[inline(always)]
-fn cluster_apart(ilo: [f64; 3], ihi: [f64; 3], jlo: [f64; 3], jhi: [f64; 3], cut2: f64) -> bool {
-    let gx = axis_sep(ilo[0], ihi[0], jlo[0], jhi[0]);
-    let gy = axis_sep(ilo[1], ihi[1], jlo[1], jhi[1]);
-    let gz = axis_sep(ilo[2], ihi[2], jlo[2], jhi[2]);
-    if gx <= 0.0 && gy <= 0.0 && gz <= 0.0 {
-        return false;
-    }
-    let raw = gx * gx + gy * gy + gz * gz;
-    if !raw.is_finite() {
-        return false;
-    }
-    let d = bins::certify(raw.sqrt());
-    d * d >= cut2
-}
-
-#[inline(always)]
-fn union_box(a0: [f64; 3], a1: [f64; 3], b0: [f64; 3], b1: [f64; 3]) -> ([f64; 3], [f64; 3]) {
-    (
-        [a0[0].min(b0[0]), a0[1].min(b0[1]), a0[2].min(b0[2])],
-        [a1[0].max(b1[0]), a1[1].max(b1[1]), a1[2].max(b1[2])],
-    )
 }
 
 #[derive(Clone, Copy)]
@@ -763,8 +597,6 @@ impl Walk<'_> {
                         &self.coords.y,
                         &self.coords.z,
                         &self.mesh.occupants,
-                        &self.boxes.lo,
-                        &self.boxes.hi,
                         self.cut2,
                         block,
                         scratch,
@@ -780,8 +612,6 @@ impl Walk<'_> {
                         &self.coords.y,
                         &self.coords.z,
                         &self.mesh.occupants,
-                        &self.boxes.lo,
-                        &self.boxes.hi,
                         self.cut2,
                         block,
                         scratch,
@@ -807,20 +637,7 @@ impl Walk<'_> {
             let px = self.coords.x[s] - sx;
             let py = self.coords.y[s] - sy;
             let pz = self.coords.z[s] - sz;
-            let mut slot = j_lo;
-            while slot < block.j_hi {
-                if !block.tri && slot + 8 <= block.j_hi && (slot - block.j_lo) % 8 == 0 {
-                    let (jlo, jhi) = union_box(
-                        self.boxes.lo[slot],
-                        self.boxes.hi[slot],
-                        self.boxes.lo[slot + 4],
-                        self.boxes.hi[slot + 4],
-                    );
-                    if cluster_apart([px, py, pz], [px, py, pz], jlo, jhi, self.cut2) {
-                        slot += 8;
-                        continue;
-                    }
-                }
+            for slot in j_lo..block.j_hi {
                 let dx = self.coords.x[slot] - px;
                 let dy = self.coords.y[slot] - py;
                 let dz = self.coords.z[slot] - pz;
@@ -828,12 +645,10 @@ impl Walk<'_> {
                 if d2 < self.cut2 {
                     let j = self.mesh.occupants[slot];
                     if j == i && block.shift_s == [0, 0, 0] {
-                        slot += 1;
                         continue;
                     }
                     self.record(found, i, j, block.shift_s, d2);
                 }
-                slot += 1;
             }
         }
     }
@@ -1088,10 +903,8 @@ fn cell_ranges(offsets: &[usize], threads: usize) -> Vec<(usize, usize)> {
 }
 
 /// # Safety
-/// `block` indexes `xs`, `ys`, `zs`, and `ids`. `lo4` and `hi4` have that
-/// same length, and every 4-atom run this function reads was filled.
-/// `scratch` holds every pair in the block.
-#[allow(clippy::incompatible_msrv, clippy::too_many_arguments)]
+/// `block` indexes `xs`, `ys`, `zs`, and `ids`. `scratch` holds every pair in the block.
+#[allow(clippy::incompatible_msrv)]
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 #[target_feature(enable = "avx512f")]
 #[inline(never)]
@@ -1100,8 +913,6 @@ unsafe fn avx512_scan(
     ys: &[f64],
     zs: &[f64],
     ids: &[usize],
-    lo4: &[[f64; 3]],
-    hi4: &[[f64; 3]],
     cut2: f64,
     block: &Block,
     scratch: &mut Scratch,
@@ -1116,8 +927,6 @@ unsafe fn avx512_scan(
     let yp = ys.as_ptr();
     let zp = zs.as_ptr();
     let idp = ids.as_ptr();
-    let lop = lo4.as_ptr();
-    let hip = hi4.as_ptr();
     let atom_p = scratch.atom.as_mut_ptr();
     let js_p = scratch.js.as_mut_ptr();
     let d2_p = scratch.d2.as_mut_ptr();
@@ -1250,29 +1059,8 @@ unsafe fn avx512_scan(
             let b3x = _mm512_set1_pd(p3x);
             let b3y = _mm512_set1_pd(p3y);
             let b3z = _mm512_set1_pd(p3z);
-            let ilo = [
-                p0x.min(p1x).min(p2x).min(p3x),
-                p0y.min(p1y).min(p2y).min(p3y),
-                p0z.min(p1z).min(p2z).min(p3z),
-            ];
-            let ihi = [
-                p0x.max(p1x).max(p2x).max(p3x),
-                p0y.max(p1y).max(p2y).max(p3y),
-                p0z.max(p1z).max(p2z).max(p3z),
-            ];
             let mut slot = j_lo;
             while slot < end {
-                // Safety: `slot + 8 <= j_hi` and both 4-atom runs were filled.
-                let a = *lop.add(slot);
-                let b = *hip.add(slot);
-                let c = *lop.add(slot + 4);
-                let d = *hip.add(slot + 4);
-                let jlo = [a[0].min(c[0]), a[1].min(c[1]), a[2].min(c[2])];
-                let jhi = [b[0].max(d[0]), b[1].max(d[1]), b[2].max(d[2])];
-                if cluster_apart(ilo, ihi, jlo, jhi, cut2) {
-                    slot += 8;
-                    continue;
-                }
                 let jx = _mm512_loadu_pd(xp.add(slot));
                 let jy = _mm512_loadu_pd(yp.add(slot));
                 let jz = _mm512_loadu_pd(zp.add(slot));
@@ -1312,10 +1100,7 @@ unsafe fn avx512_scan(
 }
 
 /// # Safety
-/// `block` indexes `xs`, `ys`, `zs`, and `ids`. `lo4` and `hi4` have that
-/// same length, and every 4-atom run this function reads was filled.
-/// `scratch` holds every pair in the block.
-#[allow(clippy::too_many_arguments)]
+/// `block` indexes `xs`, `ys`, `zs`, and `ids`. `scratch` holds every pair in the block.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 #[inline(never)]
@@ -1324,8 +1109,6 @@ unsafe fn avx_scan(
     ys: &[f64],
     zs: &[f64],
     ids: &[usize],
-    lo4: &[[f64; 3]],
-    hi4: &[[f64; 3]],
     cut2: f64,
     block: &Block,
     scratch: &mut Scratch,
@@ -1338,8 +1121,6 @@ unsafe fn avx_scan(
     let yp = ys.as_ptr();
     let zp = zs.as_ptr();
     let idp = ids.as_ptr();
-    let lop = lo4.as_ptr();
-    let hip = hi4.as_ptr();
     let atom_p = scratch.atom.as_mut_ptr();
     let js_p = scratch.js.as_mut_ptr();
     let d2_p = scratch.d2.as_mut_ptr();
@@ -1473,17 +1254,8 @@ unsafe fn avx_scan(
             let b1x = _mm256_set1_pd(p1x);
             let b1y = _mm256_set1_pd(p1y);
             let b1z = _mm256_set1_pd(p1z);
-            let ilo = [p0x.min(p1x), p0y.min(p1y), p0z.min(p1z)];
-            let ihi = [p0x.max(p1x), p0y.max(p1y), p0z.max(p1z)];
             let mut slot = j_lo;
             while slot < end {
-                // Safety: `slot + 4 <= j_hi` and that 4-atom run was filled.
-                let jlo = *lop.add(slot);
-                let jhi = *hip.add(slot);
-                if cluster_apart(ilo, ihi, jlo, jhi, cut2) {
-                    slot += 4;
-                    continue;
-                }
                 let jx = _mm256_loadu_pd(xp.add(slot));
                 let jy = _mm256_loadu_pd(yp.add(slot));
                 let jz = _mm256_loadu_pd(zp.add(slot));
