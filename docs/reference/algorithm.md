@@ -91,6 +91,14 @@ walk evaluates `(ρ − 1) / 2 + 13 ρ`, which is exactly half:
 shift once per cell pair. The extra traffic is the hit buffer and the
 40-byte row.
 
+Each bin is then Morton-ordered so a run of four or eight occupants is
+a compact cluster, as in GROMACS nbnxn. The 4×8 distance tile is
+skipped when the certified Euclidean gap between the shifted source
+box and the target box is already at least the cutoff. A tile that
+might contain a neighbour still computes every squared distance,
+because the row stores `dist2`. The returned list stays one atom-image
+per hit: a cluster bitmask would expand into that same row.
+
 ## Heap and stop
 
 A max-heap of size `k` stores `(dist2, index)`, ordered
