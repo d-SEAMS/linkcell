@@ -1,1 +1,0 @@
-k-nearest and cutoff walks grow one axis of the index box at a time, and a restricted triclinic cell is tilt-reduced before the walk. Orthorhombic films and LAMMPS tilts no longer take the cubic shell.

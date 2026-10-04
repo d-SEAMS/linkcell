@@ -10,6 +10,18 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.5] - 2026-10-04
+
+### Changed
+
+- The cutoff list is on the C, C++, and Python APIs as `lc_pairs_within`, `linkcell::pairs_within`, and `linkcell.pairs_within`. Each row is an atom-image with the caller's shift `S`.
+- The minimum-image note now covers closest-vector search, periodic Delaunay triangulations, the robotics kd-tree on a product of circles, tensor sketches, and crystal-graph construction. None of those replaces the cell walk on a filled cubic lattice.
+- The minimum-image note now places the walk against Quentrec-Brot, Rapaport's cell shift, the Bentley-Weide-Yao cell technique, and the cutoff lists in LAMMPS, GROMACS, HOOMD, vesin, and freud. The host stop described there is the frontier plane.
+- `knearest_into` stops when the k-th neighbour reaches the unvisited plane, including a neighbour that sits on that plane, and writes each packed row from the stack heap.
+- `knearest` bins in a Minkowski-reduced basis and stores occupants in cell order. Shells stop on the perpendicular distance to the unvisited frontier, and a cell is skipped when its slab cannot beat the k-th neighbour. `pairs_within` uses the same bins and frontier, and still reports shifts in the caller's basis.
+- k-nearest and cutoff walks grow one axis of the index box at a time, and a restricted triclinic cell is tilt-reduced before the walk. Orthorhombic films and LAMMPS tilts no longer take the cubic shell.
+
+
 ## [0.3.4] - 2026-09-27
 
 ### Added

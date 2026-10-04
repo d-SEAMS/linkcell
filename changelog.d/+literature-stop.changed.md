@@ -1,1 +1,0 @@
-The minimum-image note now places the walk against Quentrec–Brot, Rapaport's cell shift, the Bentley–Weide–Yao cell technique, and the cutoff lists in LAMMPS, GROMACS, HOOMD, vesin, and freud. The host stop described there is the frontier plane.

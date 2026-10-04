@@ -4,14 +4,16 @@
   <img src="assets/branding/linkcell-logo-light.svg" width="360" alt="linkcell">
 </p>
 
-Periodic **linked-cell k-nearest** neighbour search for molecular simulations.
+Periodic linked-cell neighbour lists for molecular simulations.
 
-vesin builds cutoff pair lists. nanoflann builds Euclidean KD-trees without a
-minimum-image convention. This crate is the piece those two leave open: the
-linked-cell walk of Allen and Tildesley (*Computer Simulation of Liquids*),
-a k-heap per source, shells expanded until the k-th neighbour cannot sit
-outside the visited cube. The optional gpulite path runs that walk on a
-CUDA device (`linkcell::gpu::Workspace`); pair lists stay on the device.
+`pairs_within` is the cutoff list: one row per atom-image, the caller's
+shift `S`, and a squared distance strictly below the cutoff squared.
+`knearest` is the k-nearest list. nanoflann builds Euclidean KD-trees
+without a minimum-image convention. The walk is the linked-cell method
+of Allen and Tildesley (*Computer Simulation of Liquids*). k-nearest
+shells stop when the k-th neighbour reaches the unvisited plane. The
+optional gpulite path runs that k-nearest walk on a CUDA device
+(`linkcell::gpu::Workspace`).
 
 It is a LODE library. The Rust crate is the implementation. The C ABI
 (`lc_*`) is the hourglass waist, the same shape as
@@ -70,7 +72,7 @@ As a wrap, Meson exposes `linkcell_dep`:
 ```
 [wrap-git]
 url = https://github.com/d-SEAMS/linkcell.git
-revision = v0.3.4
+revision = v0.3.5
 depth = 1
 
 [provide]
@@ -202,7 +204,7 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
 - One lattice shift per unique cell is wrong unless every wrap of that
   cell is visited. The walk visits integer cell offsets, so each wrap
   of a bin is a separate visit.
-- The search does not take a cutoff. A cell-size hint only sets the bin
+- `knearest` does not take a cutoff. A cell-size hint only sets the bin
   width. `knearest` stores each bin as a contiguous slice. An
   orthorhombic cell is binned as stored, a restricted triclinic cell
   is tilt-reduced, and a general orientation is Minkowski-reduced.
