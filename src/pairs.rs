@@ -5,7 +5,11 @@
 //! squared distance is strictly below `cutoff²`, including periodic
 //! self-images. Each unordered pair is tested once. Hits from a bin
 //! are buffered, then the rows are written. A full list writes both
-//! `(i, j, S)` and `(j, i, -S)`. Displacement is `q - p + lattice_shift(S)`.
+//! `(i, j, S)` and `(j, i, -S)`. Displacement is `q - p + lattice_shift(S)`,
+//! which is [`Cell::dist2_shifted`](crate::Cell::dist2_shifted). This is
+//! not [`dist2_ortho_diffs`](crate::dist2_ortho_diffs): that Highway
+//! kernel wraps a raw difference into the central cell, and a second
+//! wrap on an already shifted delta changes which rows survive.
 
 use crate::bins::{self, axis_gap, Mesh};
 use crate::cell::Cell;
@@ -1319,6 +1323,38 @@ unsafe fn avx_scan(
 mod tests {
     use super::*;
     use crate::Cell;
+
+    #[test]
+    fn far_image_is_not_rewrapped() {
+        let sim = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let xyz = [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]];
+        let pairs = pairs_within(&xyz, &sim, 3.0, None, Some(10.0), false).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|p| p.shift == [0, 0, 0]));
+        assert!(pairs.iter().all(|p| (p.dist2 - 0.01).abs() < 1e-12));
+    }
+
+    #[test]
+    fn highway_mic_matches_wrap_pair_distance() {
+        let sim = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let xyz = [[0.2, 0.0, 0.0], [9.4, 0.0, 0.0]];
+        let pairs = pairs_within(&xyz, &sim, 1.0, None, None, true).unwrap();
+        let mut mic = [0.0];
+        crate::dist2_ortho_diffs(
+            &[xyz[1][0] - xyz[0][0]],
+            &[xyz[1][1] - xyz[0][1]],
+            &[xyz[1][2] - xyz[0][2]],
+            10.0,
+            10.0,
+            10.0,
+            &mut mic,
+        )
+        .unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].shift, [-1, 0, 0]);
+        assert!((pairs[0].dist2 - mic[0]).abs() < 1e-12);
+        assert!((mic[0] - 0.64).abs() < 1e-12);
+    }
 
     #[test]
     fn wrap_pair_keeps_shift() {

@@ -22,6 +22,20 @@ Orthorhombic boxes skip the two 3x3 matvecs everywhere they can:
 `fractional` divides by the three widths, `lattice_shift` multiplies
 those widths, and brute `dist2` is three independent wraps.
 
+## Highway batch
+
+`dist2_ortho_diffs` is minimage's orthorhombic minimum-image kernel,
+the same arithmetic as Highway `BatchPeriodicDistSq`. Differences
+are packed `dx, dy, dz`. One reciprocal per axis is hoisted, then
+`dr = abs(dr)` and `dr -= L * round(dr / L)`. `knearest_brute` calls
+that on a rectangular box. `pairs_within` does not. Its rows are one
+chosen image `S`, and the distance is `dist2_shifted`. Feeding that
+shifted delta through the round pulls a far image back inside the
+cutoff and stores it under the stencil's `S`, which is a different
+image. `reduce_pairs` is the other minimage helper: it collapses a
+vesin list to one pair and drops the self image. The cutoff list
+keeps every in-range image, so it does not call that reduction.
+
 ## One shift per cell is wrong
 
 The bins live in the primary cell. Cell `(ix + nx, iy, iz)` is the

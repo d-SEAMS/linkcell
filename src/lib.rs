@@ -38,7 +38,10 @@
 //! subtract plus one lattice vector (the vesin / LAMMPS ghost trick).
 //! Orthorhombic boxes set the [`Cell::is_ortho`] flag and skip the two
 //! 3x3 matvecs: three independent wraps, and the shift is a scaled
-//! diagonal.
+//! diagonal. The Highway batch ([`dist2_ortho_diffs`]) is that wrap
+//! for a raw difference. [`knearest_brute`] uses it on an orthorhombic
+//! box. [`pairs_within`] keeps the stencil image and does not wrap
+//! the shifted difference again.
 //!
 //! # Why a unique-cell stamp is wrong
 //!
@@ -127,7 +130,9 @@ mod knearest;
 mod pairs;
 mod pop;
 
-pub use cell::Cell;
+pub use cell::{
+    dist2_many, dist2_ortho_diffs, dist2_pairs, reduce_pairs, reduce_pairs_packed, wrap_many, Cell,
+};
 pub use error::Error;
 pub use knearest::{
     knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Neighbors,

@@ -26,6 +26,28 @@ fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
     simbox.dist2_euclidean(p, q)
 }
 
+/// Orthorhombic MIC for every candidate, via minimage's Highway kernel.
+fn ortho_highway_dist2(
+    p: [f64; 3],
+    others: &[usize],
+    xyz: &[[f64; 3]],
+    widths: [f64; 3],
+) -> Result<Vec<f64>, Error> {
+    let n = others.len();
+    let mut dx = Vec::with_capacity(n);
+    let mut dy = Vec::with_capacity(n);
+    let mut dz = Vec::with_capacity(n);
+    for &j in others {
+        let q = xyz[j];
+        dx.push(q[0] - p[0]);
+        dy.push(q[1] - p[1]);
+        dz.push(q[2] - p[2]);
+    }
+    let mut out = vec![0.0; n];
+    crate::dist2_ortho_diffs(&dx, &dy, &dz, widths[0], widths[1], widths[2], &mut out)?;
+    Ok(out)
+}
+
 fn box_diameter(cell: &Cell) -> f64 {
     let a = cell.a();
     let b = cell.b();
@@ -717,8 +739,12 @@ fn visit_cell<const MODE: u8>(q: &mut CellQuery<'_>, jx: i32, jy: i32, jz: i32, 
 
 /// Brute-force k-nearest. Tests and small systems only.
 ///
-/// Distances are [`Cell::dist2_euclidean`]: Smith half-edge test, then
-/// a Minkowski-reduced 27-image. A hex-prism body diagonal is a
+/// An orthorhombic box calls [`crate::dist2_ortho_diffs`]: SoA
+/// differences, one reciprocal per axis, then the Highway wrap
+/// `dr -= box * round(dr / box)`. On a rectangular box that wrap is
+/// the Euclidean nearest image. Any other box stays on
+/// [`Cell::dist2_euclidean`]: Smith half-edge test, then a
+/// Minkowski-reduced 27-image. A hex-prism body diagonal is a
 /// fractional wrap that is not the nearest image.
 ///
 /// ```
@@ -754,13 +780,19 @@ pub fn knearest_brute(
         })
         .collect();
     let mut out = vec![Neighbors::default(); n];
+    let ortho = simbox.is_ortho();
+    let widths = simbox.widths();
     for &i in &active {
-        let mut pairs: Vec<(f64, usize)> = active
-            .iter()
-            .copied()
-            .filter(|&j| j != i)
-            .map(|j| (pair_dist2(simbox, xyz[i], xyz[j]), j))
-            .collect();
+        let others: Vec<usize> = active.iter().copied().filter(|&j| j != i).collect();
+        let d2 = if ortho {
+            ortho_highway_dist2(xyz[i], &others, xyz, widths)?
+        } else {
+            others
+                .iter()
+                .map(|&j| pair_dist2(simbox, xyz[i], xyz[j]))
+                .collect()
+        };
+        let mut pairs: Vec<(f64, usize)> = d2.into_iter().zip(others).collect();
         pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         pairs.truncate(k);
         out[i].dist2 = pairs.iter().map(|p| p.0).collect();
@@ -772,6 +804,25 @@ pub fn knearest_brute(
 #[cfg(test)]
 mod scale_mesh_tests {
     use super::*;
+
+    #[test]
+    fn brute_ortho_matches_euclidean_mic() {
+        let (xyz, cell) = ortho_lattice(4);
+        let k = 4;
+        let brute = knearest_brute(&xyz, &cell, k, None).unwrap();
+        let mut best: Vec<(f64, usize)> = (1..xyz.len())
+            .map(|j| (cell.dist2_euclidean(xyz[0], xyz[j]), j))
+            .collect();
+        best.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        best.truncate(k);
+        assert_eq!(
+            brute[0].indices,
+            best.iter().map(|p| p.1).collect::<Vec<_>>()
+        );
+        for (t, (d, _)) in best.iter().enumerate() {
+            assert!((brute[0].dist2[t] - d).abs() < 1e-12);
+        }
+    }
 
     fn ortho_lattice(nside: usize) -> (Vec<[f64; 3]>, Cell) {
         let a = 3.125;

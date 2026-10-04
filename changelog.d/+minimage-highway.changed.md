@@ -1,0 +1,1 @@
+Orthorhombic brute-force neighbours call minimage's Highway kernel (`dist2_ortho_diffs`). `pairs_within` still records the stencil shift and does not wrap that difference a second time. The batch helpers are re-exported.

@@ -115,8 +115,10 @@ first. `knearest_into` / `lc_knearest` write packed indices.
 `knearest_into_many` / `lc_knearest_many` cover a frame-major batch.
 
 `knearest_brute` is the all-pairs check used by tests and small
-systems. It calls `Cell::dist2_euclidean` per pair: Smith half-edge
-test, then a Minkowski-reduced 27-image. The 27-image of an
+systems. An orthorhombic box calls `dist2_ortho_diffs` (the Highway
+batch: SoA differences, one reciprocal per axis, then the per-axis
+round). Any other box calls `Cell::dist2_euclidean` per pair: Smith
+half-edge test, then a Minkowski-reduced 27-image. The 27-image of an
 unreduced H misses lattice points such as `2(a-b)`. The fractional
 wrap of a hex-prism body diagonal is not nearest. It is not the
 production walk.

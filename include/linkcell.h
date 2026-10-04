@@ -193,6 +193,8 @@ const char *lc_last_error(void);
  * Each row is one atom-image: `out_i[t]`, `out_j[t]`,
  * `out_shift[3*t + 0..3]` = `(na, nb, nc)`, and `out_d2[t]`.
  * Displacement is `r_j - r_i + S H` in the caller's basis.
+ * That is the stencil image, not a second minimum-image wrap of
+ * the raw difference.
  * `dist2` is strictly below `cutoff` squared. `half` nonzero keeps
  * the canonical side of `(i, j, S)` versus `(j, i, -S)`.
  *

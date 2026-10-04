@@ -199,7 +199,11 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   distances are a Cartesian subtract plus that cell's lattice
   translation (`dist2_shifted` and `lattice_shift`), the vesin /
   LAMMPS ghost construction. Orthorhombic boxes use three independent
-  wraps and skip the two Hinv matvecs. A restricted triclinic box is
+  wraps and skip the two Hinv matvecs. The batched form of that wrap
+  is minimage's Highway kernel, `dist2_ortho_diffs`, re-exported here
+  and used by the orthorhombic brute-force check. A cutoff row keeps
+  the stencil image, so `pairs_within` does not run that round on an
+  already shifted difference. A restricted triclinic box is
   tilt-reduced and uses a triangular shift.
 - One lattice shift per unique cell is wrong unless every wrap of that
   cell is visited. The walk visits integer cell offsets, so each wrap
