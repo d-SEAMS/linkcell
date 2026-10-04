@@ -123,7 +123,99 @@ A bounding-volume hierarchy (Howard, Anderson, Nikoubashman, Glotzer,
 and Panagiotopoulos, *Comput. Phys. Commun.* **203**, 45, 2016) wins
 for a cutoff when particle sizes differ. HOOMD's own comparison is
 that the cell list wins when every particle has essentially the same
-range. A kd-tree has the same split: it is the structure for a
-general distribution, not for a filled periodic lattice in three
-dimensions. Verlet skins reuse a cutoff list across timesteps. This
+range. Verlet skins reuse a cutoff list across timesteps. This
 search is one configuration and has no radius it may legally freeze.
+
+## Geometry, algebra, robotics, tensors, graphs
+
+These are the places a molecular-dynamics reading does not look.
+None of them replaces the cell walk on a filled cubic lattice. Two
+of them are the exact certificates for the skewed cell, and they
+answer a different query than "the k nearest sites."
+
+**Closest lattice vector.** Agrell, Eriksson, Vardy, and Zeger,
+*IEEE Trans. Inf. Theory* **48**, 2201 (2002), survey closest-point
+search. Schnorr–Euchner enumeration walks lattice layers in order of
+orthogonal distance and stops when the next layer is farther than the
+best point already found. The layer index is not confined to
+`{-1,0,1}`. Babai's nearest plane (*Combinatorica* **6**, 1, 1986)
+keeps only one layer per dimension and can miss the same image a
+27-image loop misses. McKilliam, Grant, and Clarkson, *SIAM J.
+Discrete Math.* **28**, 1405 (2014), start from the component-wise
+floor in an obtuse superbasis and add a series of relevant vectors.
+Every lattice of dimension less than 4 has such a superbasis, and
+the series reaches a closest lattice point in at most as many steps
+as the dimension. The vector it returns is the closest lattice point
+to one displacement. It does not say which other site is the k-th
+neighbour.
+On the cubic hot path the closest coefficient is already inside the
+first shell, so the certificate does not change the neighbour list
+and does not remove any bin visits.
+
+**Periodic Delaunay.** Caroli and Teillaud, ESA 2009, compute the
+Delaunay triangulation of the cubic flat torus, keeping one copy of
+each point once the complex is simplicial, and a finite-sheeted cover
+otherwise. CGAL's `Periodic_3_Delaunay_triangulation_3` implements
+that cubic torus and can return the nearest vertex. Osang,
+Rouxel-Labbé, and Teillaud, ESA 2020, extend it to a general lattice
+by reducing to an obtuse superbase and folding each point with a
+closest-vector query. The dual is an exact 1-nearest structure. The
+link of a vertex is not the 4 nearest neighbours: a site's fourth
+neighbour need not be a Delaunay edge. Dickerson and Eppstein,
+*Comput. Geom.* **5**, 277 (1996), recover the k nearest from a
+Delaunay search in `O(k n log n)` in Euclidean space, with no
+periodic quotient. Lee, *IEEE Trans. Comput.* **C-31**, 478 (1982),
+builds the order-k Voronoi diagram in the plane. The proved cost of
+the 3D periodic triangulation is the same `O(n^2)` worst case as a
+Delaunay triangulation in `R^3`. A cell list on this sample is linear.
+Callahan and Kosaraju, *J. ACM* **42**, 67 (1995), get all k-nearest
+neighbours from a well-separated pair decomposition in Euclidean
+space. A decomposition of one fundamental domain misses a pair that
+is close only after a lattice translation. No tensor train, Gröbner
+basis, or cylindrical algebraic decomposition turned up as the
+decision procedure for this query. The identity that decides the
+closest lattice vector in three dimensions is the obtuse superbase
+already cited above.
+
+**Robotics.** Yershova and LaValle, *IEEE Trans. Robot.* **23**, 151
+(2007), extend Arya and Mount's kd-tree to a product of lines,
+circles, and `RP^3`. On `(S^1)^3` the distance is the Euclidean
+minimum image of an orthorhombic box, and a node is discarded only
+when the circular distance to its rectangle is already worse than
+the best point seen. The proof is for one neighbour. The same prune
+is the wrong Euclidean distance on a skewed cell, because the metric
+no longer splits across axes. Ichnowski and Alterovitz, WAFR 2014,
+search `SO(3)` and `SE(3)` with four kd-trees on the quaternion
+3-sphere. That distance is a great-arc plus a translation, not
+`R^3` modulo a lattice. OMPL's torus state space is the embedded
+doughnut surface, and GNAT answers queries in the metric that
+surface supplies. Cover trees and GNAT likewise answer queries in
+the metric they are given. Neither constructs the lattice images of
+a periodic box. Pan,
+Lauterbach, and Manocha, IROS 2010, use locality-sensitive hashing,
+which they state is approximate.
+
+**Tensors.** Jégou, Douze, and Schmid, *IEEE TPAMI* **33**, 117
+(2011), product-quantize a Cartesian product of subspaces. The
+codes are approximate. Pham and Pagh, KDD 2013, sketch a polynomial
+kernel. Novikov, Gneushev, Kadeishvili, and Oseledets, arXiv:2410.04462
+(2024), use a tensor train as an approximate point-cloud index, with
+no periodic cell. The orthorhombic minimum image is a sum of three
+circular distances, which is why the ortho path never multiplies by
+`H`. That is the product metric above, not a tensor decomposition.
+
+**Graph construction.** Crystal networks take a cutoff ball, or k
+neighbours from inside a ball. Xie and Grossman, *Phys. Rev. Lett.*
+**120**, 145301 (2018), keep 12 neighbours inside a fixed radius, so
+the 12th neighbour outside that ball is absent. ALIGNN grows the
+radius until 12 neighbours exist and then keeps the whole shell.
+fairchem's periodic radius graph repeats the lattice out to
+`ceil(radius / face height)` and then caps the list. Park and
+Wolverton, *Phys. Rev. Materials* **4**, 063801 (2020), connect
+Voronoi neighbours instead. A Voronoi face can be longer than a
+non-neighbour, so that graph is not the k nearest sites. Ruff,
+Reiser, Stühmer, and Friederich, *Digital Discovery* **3**, 594
+(2024), compare periodic k-nearest, radius, and Voronoi edges and
+keep k = 24. NequIP, Allegro, and MACE consume a cutoff list. None
+of these is an uncapped Euclidean k-nearest walk, and none of them
+adds a bin test this search does not already apply.
