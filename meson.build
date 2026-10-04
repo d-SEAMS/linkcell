@@ -2,7 +2,7 @@ project(
   'linkcell',
   ['c', 'cpp'],
   # Keep in lockstep with Cargo.toml [package].version (source of truth).
-  version: '0.3.3',
+  version: '0.3.5',
   meson_version: '>=1.2.0',
   license: 'MIT',
   default_options: [
