@@ -81,6 +81,16 @@ The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.
 
+With the bin edge equal to the cutoff the search radius is 1, and the
+gap between any two cells inside that stencil is 0, so the bin test
+does not drop a cell. vesin's cell list then evaluates
+`27 ρ − 1` ordered distances per atom (`ρ` atoms in the cell). This
+walk evaluates `(ρ − 1) / 2 + 13 ρ`, which is exactly half:
+`scripts/cutoff_work.py` simplifies the ratio to 2. vesin also forms
+`S H` with a 3×3 product on every candidate. This walk forms that
+shift once per cell pair. The extra traffic is the hit buffer and the
+40-byte row.
+
 ## Heap and stop
 
 A max-heap of size `k` stores `(dist2, index)`, ordered
