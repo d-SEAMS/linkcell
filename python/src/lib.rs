@@ -10,14 +10,16 @@ use dlpk::sys::{
     DLDataTypeCode, DLDeviceType, DLManagedTensor, DLManagedTensorVersioned, DLTensor,
 };
 use dlpk::DLPackTensor;
-use linkcell::{knearest_into_d2, knearest_into_many, lc_cell, Cell};
-use ndarray::{Array2, Array3};
+use linkcell::{knearest_into_d2, knearest_into_many, lc_cell, pairs_within, Cell};
+use ndarray::{Array1, Array2, Array3};
 
 mod gpu;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyModule};
+
+type PairPack = (Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>);
 
 const DLTENSOR_VERSIONED: &std::ffi::CStr = c_str!("dltensor_versioned");
 const DLTENSOR: &std::ffi::CStr = c_str!("dltensor");
@@ -404,6 +406,75 @@ fn knearest<'py>(
     }
 }
 
+/// Cutoff pairs in the vesin / tonari `ijS` layout.
+///
+/// `xyz` is float64 `(n, 3)`. `cell` is the same shapes as
+/// [`knearest`]. Each row is one atom-image whose squared distance is
+/// strictly below `cutoff` squared. `S` is the integer shift of the
+/// target in the caller's basis. `half` keeps one side of
+/// `(i, j, S)` and `(j, i, -S)`.
+///
+/// Returns `(i, j, S, dist2)`. `i` and `j` are int32 `(n_pairs,)`,
+/// `S` is int32 `(n_pairs, 3)`, `dist2` is float64 `(n_pairs,)`.
+/// A cutoff neighbour list is this function. `knearest` is the
+/// k-nearest list.
+#[pyfunction]
+#[pyo3(name = "pairs_within", signature = (xyz, cell, cutoff, mask=None, cell_hint=None, half=false))]
+fn pairs_within_py<'py>(
+    py: Python<'py>,
+    xyz: &Bound<'py, PyAny>,
+    cell: &Bound<'py, PyAny>,
+    cutoff: f64,
+    mask: Option<&Bound<'py, PyAny>>,
+    cell_hint: Option<f64>,
+    half: bool,
+) -> PyResult<PairPack> {
+    if peek_cuda(xyz)? {
+        return Err(PyValueError::new_err(
+            "pairs_within reads host tensors; move xyz to the CPU",
+        ));
+    }
+    let cell_buf = take_f64(cell)?;
+    let (sim, _) = parse_cell(&cell_buf)?;
+    let xyz_buf = take_f64(xyz)?;
+    let (pts, n, n_frames) = parse_xyz(&xyz_buf)?;
+    if n_frames != 1 {
+        return Err(PyValueError::new_err(
+            "pairs_within takes one frame; xyz shape is (n, 3)",
+        ));
+    }
+    let mask_vec = match mask {
+        None => None,
+        Some(m) => Some(take_mask(m, n)?),
+    };
+    let hint = cell_hint.filter(|h| *h > 0.0);
+    let pairs = py
+        .detach(|| pairs_within(&pts, &sim, cutoff, mask_vec.as_deref(), hint, half))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut ii = Vec::with_capacity(pairs.len());
+    let mut jj = Vec::with_capacity(pairs.len());
+    let mut shift = Vec::with_capacity(pairs.len() * 3);
+    let mut d2 = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        ii.push(pair.i as i32);
+        jj.push(pair.j as i32);
+        shift.extend_from_slice(&pair.shift);
+        d2.push(pair.dist2);
+    }
+    let n_pairs = ii.len();
+    let i_a = Array1::from_vec(ii);
+    let j_a = Array1::from_vec(jj);
+    let s_a = Array2::from_shape_vec((n_pairs, 3), shift)
+        .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
+    let d_a = Array1::from_vec(d2);
+    Ok((
+        to_pydlpack(py, i_a)?,
+        to_pydlpack(py, j_a)?,
+        to_pydlpack(py, s_a)?,
+        to_pydlpack(py, d_a)?,
+    ))
+}
+
 #[pyfunction]
 fn gpu_available() -> bool {
     gpu::available()
@@ -412,6 +483,7 @@ fn gpu_available() -> bool {
 #[pymodule]
 fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(knearest, m)?)?;
+    m.add_function(wrap_pyfunction!(pairs_within_py, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
     m.add_class::<PyDLPack>()?;
     m.add_class::<gpu::StreamDlpack>()?;

@@ -257,3 +257,119 @@ pub unsafe extern "C" fn lc_knearest_many(
     clear_error();
     0
 }
+
+/// Cutoff pairs with the vesin / tonari shift `S`.
+///
+/// Each row is one atom-image: `out_i[t]`, `out_j[t]`,
+/// `out_shift[3*t + 0..3]` = `(na, nb, nc)`, and `out_d2[t]`.
+/// Displacement is `r_j - r_i + S H` in the caller's basis.
+/// `dist2` is strictly below `cutoff` squared. `half` nonzero keeps
+/// the canonical side of `(i, j, S)` versus `(j, i, -S)`.
+///
+/// Pass null `out_i`, `out_j`, `out_shift`, and `out_d2` to query.
+/// `*out_count` receives the row count and the return is 0.
+/// Otherwise all four buffers are required and `cap` is their row
+/// capacity. A short buffer sets `*out_count` to the needed row count
+/// and returns nonzero without writing.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `simbox` points at one
+/// `lc_cell`. `mask`, if non-null, is readable for `n` ints.
+/// `out_count` is writable. On a fill, `out_i` and `out_j` are
+/// writable for `cap` ints, `out_shift` for `cap * 3` ints, and
+/// `out_d2` for `cap` doubles.
+#[no_mangle]
+pub unsafe extern "C" fn lc_pairs_within(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    half: c_int,
+    out_i: *mut c_int,
+    out_j: *mut c_int,
+    out_shift: *mut c_int,
+    out_d2: *mut f64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if out_count.is_null() {
+        return fail_msg("null pointer");
+    }
+    if n == 0 {
+        return fail(Error::Empty);
+    }
+    if xyz.is_null() || simbox.is_null() {
+        return fail_msg("null pointer");
+    }
+    if n > c_int::MAX as usize {
+        return fail(Error::Overflow);
+    }
+    let max_xyz = (isize::MAX as usize) / 3;
+    if n > max_xyz {
+        return fail(Error::Overflow);
+    }
+    let box_c = unsafe { *simbox };
+    let sim = match Cell::from_vectors(
+        [box_c.ax, box_c.ay, box_c.az],
+        [box_c.bx, box_c.by, box_c.bz],
+        [box_c.cx, box_c.cy, box_c.cz],
+        [box_c.ox, box_c.oy, box_c.oz],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            set_error(&e.to_string());
+            return 1;
+        }
+    };
+    let pts: &[[f64; 3]] = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_vec: Option<Vec<bool>> = if mask.is_null() {
+        None
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(mask, n) };
+        Some(raw.iter().map(|&v| v != 0).collect())
+    };
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
+    let pairs = match crate::pairs_within(pts, &sim, cutoff, mask_vec.as_deref(), hint, half != 0) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    unsafe {
+        *out_count = pairs.len();
+    }
+    let query = out_i.is_null() && out_j.is_null() && out_shift.is_null() && out_d2.is_null();
+    if query {
+        clear_error();
+        return 0;
+    }
+    if out_i.is_null() || out_j.is_null() || out_shift.is_null() || out_d2.is_null() {
+        return fail_msg("null pointer");
+    }
+    if cap < pairs.len() {
+        return fail_msg("pair buffer is shorter than the pair count");
+    }
+    let shift_len = match pairs.len().checked_mul(3) {
+        Some(v) if v <= isize::MAX as usize => v,
+        _ => return fail(Error::Overflow),
+    };
+    let ii = unsafe { std::slice::from_raw_parts_mut(out_i, pairs.len()) };
+    let jj = unsafe { std::slice::from_raw_parts_mut(out_j, pairs.len()) };
+    let ss = unsafe { std::slice::from_raw_parts_mut(out_shift, shift_len) };
+    let dd = unsafe { std::slice::from_raw_parts_mut(out_d2, pairs.len()) };
+    for (t, pair) in pairs.iter().enumerate() {
+        ii[t] = pair.i as c_int;
+        jj[t] = pair.j as c_int;
+        ss[3 * t] = pair.shift[0];
+        ss[3 * t + 1] = pair.shift[1];
+        ss[3 * t + 2] = pair.shift[2];
+        dd[t] = pair.dist2;
+    }
+    clear_error();
+    0
+}

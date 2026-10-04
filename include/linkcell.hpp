@@ -241,6 +241,63 @@ knearest(const std::vector<std::array<double, 3>> &xyz, const Cell &cell,
   return knearest(ptr, xyz.size(), cell, k, mask, cell_hint);
 }
 
+/// One atom-image inside a cutoff. `shift` is vesin / tonari `S`.
+/// Displacement is `r_j - r_i + S H` in the caller's basis.
+struct ShiftedPair {
+  int i = 0;
+  int j = 0;
+  std::array<int, 3> shift{{0, 0, 0}};
+  double dist2 = 0.0;
+};
+
+/// Pairs with squared distance strictly below `cutoff * cutoff`.
+///
+/// `half` keeps one side of `(i, j, S)` and `(j, i, -S)`. This is the
+/// cutoff list. k-nearest is [`knearest`].
+[[nodiscard]] inline std::vector<ShiftedPair>
+pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
+             const int *mask = nullptr, double cell_hint = 0.0,
+             bool half = false) {
+  if (n == 0 || xyz == nullptr) {
+    throw Error("no points");
+  }
+  const lc_cell raw = cell.raw();
+  std::size_t count = 0;
+  const int status = lc_pairs_within(
+      xyz, detail::to_c_count(n, "n"), &raw, cutoff, mask, cell_hint,
+      half ? 1 : 0, nullptr, nullptr, nullptr, nullptr, 0, &count);
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg)
+                            : std::string("linkcell: pairs_within failed"));
+  }
+  if (count == 0) {
+    return {};
+  }
+  std::vector<int> ii(count);
+  std::vector<int> jj(count);
+  std::vector<int> shift(count * 3);
+  std::vector<double> d2(count);
+  std::size_t wrote = 0;
+  const int fill = lc_pairs_within(
+      xyz, detail::to_c_count(n, "n"), &raw, cutoff, mask, cell_hint,
+      half ? 1 : 0, ii.data(), jj.data(), shift.data(), d2.data(), count,
+      &wrote);
+  if (fill != 0) {
+    const char *msg = lc_last_error();
+    throw Error(fill, msg ? std::string(msg)
+                          : std::string("linkcell: pairs_within failed"));
+  }
+  std::vector<ShiftedPair> out(wrote);
+  for (std::size_t t = 0; t < wrote; ++t) {
+    out[t].i = ii[t];
+    out[t].j = jj[t];
+    out[t].shift = {shift[3 * t], shift[3 * t + 1], shift[3 * t + 2]};
+    out[t].dist2 = d2[t];
+  }
+  return out;
+}
+
 [[nodiscard]] inline const char *version() noexcept { return lc_version(); }
 
 } // namespace linkcell

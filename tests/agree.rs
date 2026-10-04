@@ -1,6 +1,6 @@
 use linkcell::{
-    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Cell, Error,
-    Neighbors,
+    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, pairs_within,
+    Cell, Error, Neighbors,
 };
 
 fn almost(a: f64, b: f64) -> bool {
@@ -665,6 +665,106 @@ fn film_with_vacuum_matches_brute() {
     let got = knearest(&xyz, &b, 4, None, Some(3.0)).unwrap();
     let brute = knearest_brute(&xyz, &b, 4, None).unwrap();
     assert_rows_match("film", &got, &brute);
+}
+
+fn cutoff_keys(
+    cell: &Cell,
+    xyz: &[[f64; 3]],
+    cutoff: f64,
+    half: bool,
+) -> Vec<(usize, usize, [i32; 3])> {
+    let w = cell.widths();
+    let repeats = [
+        (cutoff / w[0]).ceil() as i32,
+        (cutoff / w[1]).ceil() as i32,
+        (cutoff / w[2]).ceil() as i32,
+    ];
+    let cut2 = cutoff * cutoff;
+    let mut want = Vec::new();
+    for (i, pi_raw) in xyz.iter().enumerate() {
+        let pi = cell.cartesian(cell.fractional(*pi_raw));
+        for (j, pj_raw) in xyz.iter().enumerate() {
+            let pj = cell.cartesian(cell.fractional(*pj_raw));
+            for na in -repeats[0]..=repeats[0] {
+                for nb in -repeats[1]..=repeats[1] {
+                    for nc in -repeats[2]..=repeats[2] {
+                        if i == j && na == 0 && nb == 0 && nc == 0 {
+                            continue;
+                        }
+                        let shift = [na, nb, nc];
+                        let d2 = cell.dist2_shifted(pi, pj, cell.lattice_shift(na, nb, nc));
+                        if d2 < cut2 && (!half || keep_half_key(i, j, shift)) {
+                            want.push((i, j, shift));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    want.sort();
+    want
+}
+
+fn keep_half_key(i: usize, j: usize, shift: [i32; 3]) -> bool {
+    if i != j {
+        return i < j;
+    }
+    for s in shift {
+        if s != 0 {
+            return s < 0;
+        }
+    }
+    true
+}
+
+fn assert_cutoff(label: &str, cell: &Cell, xyz: &[[f64; 3]], cutoff: f64) {
+    for half in [false, true] {
+        let got = pairs_within(xyz, cell, cutoff, None, Some(3.0), half).unwrap();
+        let mut keys: Vec<_> = got.iter().map(|p| (p.i, p.j, p.shift)).collect();
+        keys.sort();
+        let want = cutoff_keys(cell, xyz, cutoff, half);
+        assert_eq!(keys, want, "{label} half={half}");
+        for pair in &got {
+            let pi = cell.cartesian(cell.fractional(xyz[pair.i]));
+            let pj = cell.cartesian(cell.fractional(xyz[pair.j]));
+            let d2 = cell.dist2_shifted(
+                pi,
+                pj,
+                cell.lattice_shift(pair.shift[0], pair.shift[1], pair.shift[2]),
+            );
+            assert!((pair.dist2 - d2).abs() < 1e-9, "{label}");
+        }
+    }
+}
+
+#[test]
+fn cutoff_list_matches_shift_scan_on_consumer_cells() {
+    let film = Cell::ortho(20.0, 20.0, 40.0).unwrap();
+    let mut film_xyz = Vec::new();
+    for iz in 0..2 {
+        for iy in 0..4 {
+            for ix in 0..4 {
+                film_xyz.push([
+                    (ix as f64 + 0.5) * 5.0,
+                    (iy as f64 + 0.5) * 5.0,
+                    (iz as f64 + 0.5) * 5.0,
+                ]);
+            }
+        }
+    }
+    assert_cutoff("film", &film, &film_xyz, 6.0);
+
+    let hex = Cell::from_vectors(
+        [10.0, 0.0, 0.0],
+        [5.0, 8.660254037844386, 0.0],
+        [0.0, 0.0, 12.0],
+        [0.0, 0.0, 0.0],
+    )
+    .unwrap();
+    assert_cutoff("hex", &hex, &points_in_cell(&hex, 12, 3), 4.0);
+
+    let tilt = Cell::from_lammps(-2.0, 8.0, 0.0, 4.0, 0.0, 7.0, -2.0, 0.0, 0.0).unwrap();
+    assert_cutoff("tilt", &tilt, &points_in_cell(&tilt, 12, 7), 2.2);
 }
 
 #[test]

@@ -52,6 +52,21 @@ extern "C" {
         out_nn: *mut c_int,
         out_d2: *mut f64,
     ) -> c_int;
+    fn lc_pairs_within(
+        xyz: *const f64,
+        n: usize,
+        simbox: *const LcCell,
+        cutoff: f64,
+        mask: *const c_int,
+        cell_hint: f64,
+        half: c_int,
+        out_i: *mut c_int,
+        out_j: *mut c_int,
+        out_shift: *mut c_int,
+        out_d2: *mut f64,
+        cap: usize,
+        out_count: *mut usize,
+    ) -> c_int;
 }
 
 fn ortho_c(lx: f64, ly: f64, lz: f64) -> LcCell {
@@ -364,4 +379,85 @@ fn lc_knearest_many_two_frames() {
     assert_eq!(rc, 0);
     assert_eq!(nn, [1, 0, 1, 0]);
     assert!((d2[3] - 0.64).abs() < 1e-12);
+}
+
+#[test]
+fn lc_pairs_within_queries_then_writes_the_shift() {
+    let packed = [0.2, 0.0, 0.0, 9.4, 0.0, 0.0];
+    let box_c = ortho_c(10.0, 10.0, 10.0);
+    let mut count = 0usize;
+    let rc = unsafe {
+        lc_pairs_within(
+            packed.as_ptr(),
+            2,
+            &box_c,
+            1.0,
+            std::ptr::null(),
+            0.0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(count, 2);
+    let mut ii = [0i32; 1];
+    let mut jj = [0i32; 1];
+    let mut shift = [0i32; 3];
+    let mut d2 = [0.0f64; 1];
+    let short = unsafe {
+        lc_pairs_within(
+            packed.as_ptr(),
+            2,
+            &box_c,
+            1.0,
+            std::ptr::null(),
+            0.0,
+            0,
+            ii.as_mut_ptr(),
+            jj.as_mut_ptr(),
+            shift.as_mut_ptr(),
+            d2.as_mut_ptr(),
+            1,
+            &mut count,
+        )
+    };
+    assert_ne!(short, 0);
+    assert_eq!(count, 2);
+    let msg = unsafe { std::ffi::CStr::from_ptr(linkcell::lc_last_error()) };
+    assert_eq!(
+        msg.to_str().unwrap(),
+        "pair buffer is shorter than the pair count"
+    );
+    let mut ii = [0i32; 2];
+    let mut jj = [0i32; 2];
+    let mut shift = [0i32; 6];
+    let mut d2 = [0.0f64; 2];
+    let rc = unsafe {
+        lc_pairs_within(
+            packed.as_ptr(),
+            2,
+            &box_c,
+            1.0,
+            std::ptr::null(),
+            0.0,
+            0,
+            ii.as_mut_ptr(),
+            jj.as_mut_ptr(),
+            shift.as_mut_ptr(),
+            d2.as_mut_ptr(),
+            2,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(count, 2);
+    let row = ii.iter().position(|&i| i == 0).unwrap();
+    assert_eq!(jj[row], 1);
+    assert_eq!(&shift[3 * row..3 * row + 3], &[-1, 0, 0]);
+    assert!((d2[row] - 0.64).abs() < 1e-12);
 }

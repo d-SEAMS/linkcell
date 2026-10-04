@@ -113,8 +113,9 @@
 //! # }
 //! ```
 //!
-//! The C ABI (`lc_*`) is the hourglass waist: packed `n * k` indices
-//! and matching squared distances. C++ lives in `include/linkcell.hpp`
+//! The C ABI (`lc_*`) is the hourglass waist: packed `n * k` indices,
+//! matching squared distances, and `lc_pairs_within` for a cutoff
+//! list with the caller's shift. C++ lives in `include/linkcell.hpp`
 //! as a RAII header over that ABI.
 
 #![deny(missing_docs)]

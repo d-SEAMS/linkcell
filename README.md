@@ -208,7 +208,9 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   is tilt-reduced, and a general orientation is Minkowski-reduced.
   The box grows until the k-th neighbour is no farther than the
   nearest unvisited face.
-- vesin remains the right library for a *cutoff* pair list.
+- A cutoff pair list is `pairs_within` / `lc_pairs_within` /
+  `linkcell.pairs_within`: atom-image rows with the caller's shift
+  `S`. `knearest` is the k-nearest list.
 
 ## License
 
