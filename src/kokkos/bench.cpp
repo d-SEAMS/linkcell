@@ -224,9 +224,7 @@ int main(int argc, char** argv) {
             std::vector<int> nn(static_cast<size_t>(n) * 4, -1);
             lc_kokkos_knearest(timed.data(), n, run, 4, 3.0, nn.data(), nullptr);
             uint64_t useful[64] = {};
-            if (std::getenv("LC_KOKKOS_POP") != nullptr) {
-                lc_kokkos_pop_bind(useful);
-            }
+            lc_kokkos_pop_bind(useful);
             int acc = nn[0];
             auto t0 = std::chrono::steady_clock::now();
             for (int r = 0; r < reps; ++r) {
@@ -239,31 +237,29 @@ int main(int argc, char** argv) {
             std::cout << "backend=" << Kokkos::DefaultExecutionSpace::name()
                       << " threads=" << nt << " n=" << n << " k=4 reps=" << reps << " ms=" << ms
                       << " ms_per=" << (ms / reps) << " acc=" << acc << "\n";
-            if (std::getenv("LC_KOKKOS_POP") != nullptr) {
-                uint64_t sum = 0;
-                uint64_t mx = 0;
-                int nslot = nt < 64 ? nt : 64;
-                for (int t = 0; t < nslot; ++t) {
-                    sum += useful[t];
-                    if (useful[t] > mx) {
-                        mx = useful[t];
-                    }
+            uint64_t sum = 0;
+            uint64_t mx = 0;
+            int nslot = nt < 64 ? nt : 64;
+            for (int t = 0; t < nslot; ++t) {
+                sum += useful[t];
+                if (useful[t] > mx) {
+                    mx = useful[t];
                 }
-                double avg = nslot > 0 ? static_cast<double>(sum) / nslot : 0;
-                double lb = mx > 0 ? avg / static_cast<double>(mx) : 0;
-                uint64_t wall_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-                double ce = wall_ns > 0 ? static_cast<double>(mx) / static_cast<double>(wall_ns) : 0;
-                std::cout << "pop backend=OpenMP threads=" << nt << " n=" << n << " reps=" << reps
-                          << " wall_ns=" << wall_ns << " useful_ns=";
-                for (int t = 0; t < nslot; ++t) {
-                    if (t) {
-                        std::cout << ",";
-                    }
-                    std::cout << useful[t];
-                }
-                std::cout << " lb=" << lb << " ce=" << ce << " pe=" << (lb * ce) << "\n";
             }
+            double avg = nslot > 0 ? static_cast<double>(sum) / nslot : 0;
+            double lb = mx > 0 ? avg / static_cast<double>(mx) : 0;
+            uint64_t wall_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            double ce = wall_ns > 0 ? static_cast<double>(mx) / static_cast<double>(wall_ns) : 0;
+            std::cout << "pop backend=OpenMP threads=" << nt << " n=" << n << " reps=" << reps
+                      << " wall_ns=" << wall_ns << " useful_ns=";
+            for (int t = 0; t < nslot; ++t) {
+                if (t) {
+                    std::cout << ",";
+                }
+                std::cout << useful[t];
+            }
+            std::cout << " lb=" << lb << " ce=" << ce << " pe=" << (lb * ce) << "\n";
         }
     }
     Kokkos::finalize();

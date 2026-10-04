@@ -801,6 +801,7 @@ impl Walk<'_> {
             .par_iter()
             .enumerate()
             .for_each(|(t, (scratch, extra))| {
+                let _timer = crate::pop::JobTimer::new();
                 let mut at = off[t];
                 let hit_rows = if half {
                     scratch.js.len()

@@ -1,11 +1,17 @@
-//! POP timing for a scaling run.
+//! POP3 timing for a scaling run.
 //!
-//! Set `LINKCELL_POP` and the mesh build and the walk record useful
-//! time on each rayon worker. Useful time is time inside the user
-//! loops, not time spent waiting on other workers. The formulas are
-//! the POP single-level hierarchy: load balance is the average useful
-//! time over the maximum, communication efficiency is that maximum
-//! over the wall time, and parallel efficiency is their product.
+//! [POP3](https://pop-coe.eu/) is the multiplicative hierarchy. Useful
+//! time is time inside the user loops, not time spent waiting on other
+//! workers. Load balance is the average useful time over the maximum.
+//! Communication efficiency is that maximum over the wall time.
+//! Parallel efficiency is their product. Computation scaling and
+//! global efficiency need a 1-thread reference, which
+//! `scripts/pop-report.py` applies. Instruction, IPC, and frequency
+//! scaling need a PMU, and this host has none.
+//!
+//! Set `LINKCELL_POP`, or call [`engage`], and the mesh build and the
+//! walk record useful time on each rayon worker. The scale probes call
+//! [`engage`] so a profile always uses this hierarchy.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -26,17 +32,53 @@ thread_local! {
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static NTHREADS: AtomicUsize = AtomicUsize::new(1);
 
+static FLAG: AtomicU8 = AtomicU8::new(0);
+
 pub(crate) fn enabled() -> bool {
-    static FLAG: AtomicU8 = AtomicU8::new(0);
     match FLAG.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
         _ => {
             let on = std::env::var_os("LINKCELL_POP").is_some();
-            FLAG.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
+            let _ = FLAG.compare_exchange(
+                0,
+                if on { 2 } else { 1 },
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            FLAG.load(Ordering::Relaxed) == 2
         }
     }
+}
+
+/// Turn POP3 counters on for this process.
+///
+/// Scale probes call this before [`prepare`] so the run records useful
+/// time even when `LINKCELL_POP` is unset. A later call wins over an
+/// earlier read of the environment.
+pub fn engage() {
+    FLAG.store(2, Ordering::Relaxed);
+}
+
+/// POP3 factors for one run: load balance, communication efficiency,
+/// parallel efficiency.
+///
+/// `useful` is one nanosecond total per worker. `wall_ns` is the
+/// elapsed time of the same repetitions.
+pub fn efficiencies(useful: &[u64], wall_ns: u64) -> (f64, f64, f64) {
+    if useful.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let sum: u64 = useful.iter().copied().sum();
+    let max = useful.iter().copied().max().unwrap_or(0);
+    let avg = sum as f64 / useful.len() as f64;
+    let lb = if max == 0 { 0.0 } else { avg / max as f64 };
+    let ce = if wall_ns == 0 {
+        0.0
+    } else {
+        max as f64 / wall_ns as f64
+    };
+    (lb, ce, lb * ce)
 }
 
 fn slot() -> usize {
@@ -64,7 +106,7 @@ fn worker_slot() -> usize {
 
 /// Give every worker a slot. Call once before the timed repetitions.
 ///
-/// Does nothing unless `LINKCELL_POP` is set.
+/// Does nothing until [`engage`] or `LINKCELL_POP`.
 pub fn prepare() {
     if !enabled() {
         return;
@@ -86,7 +128,7 @@ pub fn prepare() {
 
 /// Zero the useful-time counters. Slot assignment stays.
 ///
-/// Does nothing unless `LINKCELL_POP` is set.
+/// Does nothing until [`engage`] or `LINKCELL_POP`.
 pub fn reset() {
     if !enabled() {
         return;
@@ -104,7 +146,7 @@ fn add_slot(slot_id: usize, ns: u64) {
 
 /// Useful nanoseconds on each worker, in slot order.
 ///
-/// Empty when `LINKCELL_POP` is unset.
+/// Empty until [`engage`] or `LINKCELL_POP`.
 pub fn snapshot() -> Vec<u64> {
     if !enabled() {
         return Vec::new();
@@ -139,5 +181,18 @@ impl Drop for JobTimer {
         if let Some(start) = self.start.take() {
             add_slot(self.slot, start.elapsed().as_nanos() as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn efficiencies_match_pop3() {
+        let (lb, ce, pe) = efficiencies(&[2, 4], 8);
+        assert!((lb - 0.75).abs() < 1e-12);
+        assert!((ce - 0.5).abs() < 1e-12);
+        assert!((pe - 0.375).abs() < 1e-12);
     }
 }

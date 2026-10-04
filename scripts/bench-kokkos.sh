@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build and time the Kokkos certified walk. OpenMP is the backend this
-# script expects. A Cuda Kokkos install uses the same sources.
+# Build and time the Kokkos certified walk with the POP3 hierarchy.
+# OpenMP is the backend this script expects. A Cuda Kokkos install
+# uses the same sources. The bench always records useful time.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 PREFIX=${KOKKOS_ROOT:-/tmp/kokkos-install}

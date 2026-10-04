@@ -3,7 +3,8 @@
 //! Env: `PAIRS_N` (default 4096), `PAIRS_REPS` (default 5),
 //! `PAIRS_HALF` (default 0), `PAIRS_HINT` (bin edge, or the cutoff).
 //! `RAYON_NUM_THREADS` is read at startup. The line reports the first
-//! three calls, then the mean of the timed reps after that.
+//! three calls, then the mean of the timed reps after that. Those
+//! timed reps always record the POP3 hierarchy.
 
 use std::time::Instant;
 
@@ -46,8 +47,11 @@ fn main() {
     let hint = std::env::var("PAIRS_HINT")
         .ok()
         .and_then(|s| s.parse().ok());
+    let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".to_string());
     let xyz = fill(n);
     let cell = Cell::ortho(18.0, 18.0, 18.0).expect("box");
+    linkcell::pop_engage();
+    linkcell::pop_prepare();
     let mut pairs = Vec::new();
     let mut early = Vec::new();
     for _ in 0..3 {
@@ -55,13 +59,15 @@ fn main() {
         pairs = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
         early.push(t.elapsed().as_secs_f64() * 1e3);
     }
+    linkcell::pop_reset();
     let t0 = Instant::now();
     let mut acc = 0usize;
     for _ in 0..reps {
         let got = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
         acc += got.len();
     }
-    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let wall_ns = t0.elapsed().as_nanos() as u64;
+    let ms = wall_ns as f64 / 1e6;
     println!(
         "n={} half={} hint={:?} pairs={} cold={:.3} call2={:.3} call3={:.3} reps={} ms_per={:.4} acc={}",
         xyz.len(),
@@ -74,5 +80,16 @@ fn main() {
         reps,
         ms / reps as f64,
         acc
+    );
+    let useful = linkcell::pop_snapshot();
+    let (lb, ce, pe) = linkcell::pop_efficiencies(&useful, wall_ns);
+    let list = useful
+        .iter()
+        .map(|ns| ns.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "pop shape=pairs-{n}-h{} threads={threads} n={n} reps={reps} wall_ns={wall_ns} useful_ns={list} lb={lb:.4} ce={ce:.4} pe={pe:.4}",
+        half as u8
     );
 }

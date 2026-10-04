@@ -1,7 +1,7 @@
 #!/bin/sh
-# Strong-scaling sweep with POP metrics.
+# Strong-scaling sweep with the POP3 hierarchy.
 # Build first: cargo build --release --example knn_scale
-# LINKCELL_POP records useful time per worker. The hierarchy is
+# The probe always records useful time per worker. The hierarchy is
 # load balance, communication efficiency, parallel efficiency,
 # computation scaling against 1 thread, and global efficiency.
 set -eu

@@ -138,7 +138,10 @@ pub use knearest::{
     knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Neighbors,
 };
 pub use pairs::{pairs_within, Pair};
-pub use pop::{prepare as pop_prepare, reset as pop_reset, snapshot as pop_snapshot};
+pub use pop::{
+    efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
+    reset as pop_reset, snapshot as pop_snapshot,
+};
 
 #[cfg(feature = "capi")]
 mod capi;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn `pop ...` lines into the POP strong-scaling hierarchy.
+"""Turn `pop ...` lines into the POP3 strong-scaling hierarchy.
 
 Reference is the 1-thread row of the same shape. Computation scaling is
 sum(useful at 1 thread) / sum(useful here), per repetition. Global
