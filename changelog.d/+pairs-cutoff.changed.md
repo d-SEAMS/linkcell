@@ -1,1 +1,1 @@
-`pairs_within` tests each unordered pair once, then writes the rows. A full list still has both shifts. On this host a periodic 18 Å cube, 4 Å cutoff, and 4096 atoms went from 27 ms to 14 ms on one thread.
+`pairs_within` buffers cutoff hits and writes the rows in one pass. A full list still has both shifts. On Linux the pair buffer stays on the heap so a repeated call does not fault those pages again. On this host a periodic 18 Å cube, 4 Å cutoff, and 4096 atoms is 2.8 ms once that buffer is warm, down from 14 ms.

@@ -3,9 +3,9 @@
 //! [`knearest`](crate::knearest) unique-indexes the neighbour and
 //! drops the image. This walk keeps every atom-image pair whose
 //! squared distance is strictly below `cutoff²`, including periodic
-//! self-images. Each unordered pair is tested once. A full list
-//! writes both `(i, j, S)` and `(j, i, -S)`. Displacement is
-//! `q - p + lattice_shift(S)`.
+//! self-images. Each unordered pair is tested once. Hits from a bin
+//! are buffered, then the rows are written. A full list writes both
+//! `(i, j, S)` and `(j, i, -S)`. Displacement is `q - p + lattice_shift(S)`.
 
 use crate::bins::{self, axis_gap, Mesh};
 use crate::cell::Cell;
@@ -72,8 +72,34 @@ pub fn pairs_within(
     if active.is_empty() {
         return Ok(Vec::new());
     }
+    retain_pair_pages();
 
     let w = simbox.widths();
+    // Reserve the pair buffer before the mesh. A repeated call can then
+    // reuse that chunk instead of letting smaller allocs split it.
+    let rows = pair_capacity(active.len(), w, cutoff, half);
+    // The 4096-atom list is limited by writing the rows. Extra threads
+    // add a copy and lose. Split only once the atom count is large.
+    let solo = {
+        #[cfg(feature = "parallel")]
+        {
+            rayon::current_num_threads() <= 1 || active.len() < 32_768
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            true
+        }
+    };
+    let found = if solo {
+        Vec::with_capacity(rows)
+    } else {
+        Vec::new()
+    };
+    let mut scratch = Scratch::new();
+    if solo {
+        let hits = if half { rows } else { (rows + 1) / 2 };
+        scratch.reserve_more(hits);
+    }
     let mut image_count: i64 = 1;
     let mut repeats = [0i32; 3];
     for a in 0..3 {
@@ -127,8 +153,38 @@ pub fn pairs_within(
         cut2,
         half,
         partners: &partners,
+        simd: simd_mode(),
     };
-    Ok(walk.collect())
+    Ok(walk.collect(found, scratch))
+}
+
+fn pair_capacity(n_src: usize, widths: [f64; 3], cutoff: f64, half: bool) -> usize {
+    let volume = (widths[0] * widths[1] * widths[2]).max(1.0e-30);
+    let shell = 4.1887902047863905 * cutoff * cutoff * cutoff;
+    let neighbors = ((n_src.max(1) as f64) * shell / volume).ceil().max(1.0);
+    let rows = neighbors * if half { 0.5 } else { 1.0 };
+    ((n_src as f64) * rows * 1.25) as usize + 16
+}
+
+/// glibc drops a large free buffer (`MADV_DONTNEED`) and the next cutoff
+/// list faults every page. Keep those pages on the heap. The knobs are
+/// `M_TRIM_THRESHOLD` and `M_MMAP_THRESHOLD`.
+fn retain_pair_pages() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // Safety: mallopt is process-wide and these two knobs are integers.
+            unsafe {
+                extern "C" {
+                    fn mallopt(param: i32, value: i32) -> i32;
+                }
+                let _ = mallopt(-1, -1);
+                let _ = mallopt(-3, 256 << 20);
+            }
+        });
+    }
 }
 
 struct Partner {
@@ -236,9 +292,20 @@ struct Coords {
     z: Vec<f64>,
 }
 
-#[cfg(target_arch = "x86_64")]
-fn simd_avx() -> bool {
-    std::is_x86_feature_detected!("avx")
+fn simd_mode() -> u8 {
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    {
+        if std::is_x86_feature_detected!("avx512f") {
+            return 2;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx") {
+            return 1;
+        }
+    }
+    0
 }
 
 /// `true` for exactly one of `(d)` and `(-d)`. The zero offset is the home cell.
@@ -290,6 +357,8 @@ struct Walk<'a> {
     cut2: f64,
     half: bool,
     partners: &'a PartnerList,
+    /// 2 = AVX-512, 1 = AVX, 0 = scalar.
+    simd: u8,
 }
 
 struct Block {
@@ -299,14 +368,137 @@ struct Block {
     j_hi: usize,
     shift_s: [i32; 3],
     shift: [f64; 3],
+    /// Home cell: source `s` only sees occupants `s + 1 ..`.
+    tri: bool,
 }
 
-#[derive(Clone, Copy)]
-struct Compact {
-    i: u32,
-    j: u32,
-    shift: [i32; 3],
-    d2: f64,
+/// Hits for the whole chunk. The distance loop appends here, then one
+/// pass writes the rows. Runs share a shift so the inner loop does not.
+struct Scratch {
+    atom: Vec<u32>,
+    js: Vec<u64>,
+    d2: Vec<f64>,
+    run_shift: Vec<[i32; 3]>,
+    run_end: Vec<usize>,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            atom: Vec::new(),
+            js: Vec::new(),
+            d2: Vec::new(),
+            run_shift: Vec::new(),
+            run_end: Vec::new(),
+        }
+    }
+
+    fn reserve_more(&mut self, extra: usize) {
+        let need = self.js.len().saturating_add(extra);
+        if self.js.capacity() < need {
+            self.atom.reserve(extra);
+            self.js.reserve(extra);
+            self.d2.reserve(extra);
+        }
+    }
+
+    fn finish(&mut self, n: usize) {
+        debug_assert!(n <= self.js.capacity());
+        unsafe {
+            self.atom.set_len(n);
+            self.js.set_len(n);
+            self.d2.set_len(n);
+        }
+    }
+
+    fn note(&mut self, before: usize, shift: [i32; 3]) {
+        let after = self.js.len();
+        if after > before {
+            self.run_shift.push(shift);
+            self.run_end.push(after);
+        }
+    }
+}
+
+/// Worst-case hits kept in the scratch buffer. Larger blocks use the scalar walk.
+const MAX_SCRATCH: usize = 1 << 20;
+
+#[inline(never)]
+fn write_full(
+    dst: &mut [std::mem::MaybeUninit<Pair>],
+    atom: &[u32],
+    js: &[u64],
+    d2: &[f64],
+    shifts: &[[i32; 3]],
+    ends: &[usize],
+) {
+    let dp = dst.as_mut_ptr();
+    let ap = atom.as_ptr();
+    let jp = js.as_ptr();
+    let yp = d2.as_ptr();
+    let mut out = 0usize;
+    let mut lo = 0usize;
+    for (r, &hi) in ends.iter().enumerate() {
+        let shift = shifts[r];
+        let neg = [-shift[0], -shift[1], -shift[2]];
+        for k in lo..hi {
+            unsafe {
+                let i = (*ap.add(k)) as usize;
+                let j = (*jp.add(k)) as usize;
+                let dist2 = *yp.add(k);
+                (*dp.add(out)).write(Pair { i, j, shift, dist2 });
+                (*dp.add(out + 1)).write(Pair {
+                    i: j,
+                    j: i,
+                    shift: neg,
+                    dist2,
+                });
+            }
+            out += 2;
+        }
+        lo = hi;
+    }
+}
+
+#[inline(never)]
+fn write_half(
+    dst: &mut [std::mem::MaybeUninit<Pair>],
+    atom: &[u32],
+    js: &[u64],
+    d2: &[f64],
+    shifts: &[[i32; 3]],
+    ends: &[usize],
+) {
+    let dp = dst.as_mut_ptr();
+    let ap = atom.as_ptr();
+    let jp = js.as_ptr();
+    let yp = d2.as_ptr();
+    let mut out = 0usize;
+    let mut lo = 0usize;
+    for (r, &hi) in ends.iter().enumerate() {
+        let shift = shifts[r];
+        let neg = [-shift[0], -shift[1], -shift[2]];
+        for k in lo..hi {
+            unsafe {
+                let i = (*ap.add(k)) as usize;
+                let j = (*jp.add(k)) as usize;
+                let dist2 = *yp.add(k);
+                let pair = if keep_half(i, j, shift) {
+                    Pair { i, j, shift, dist2 }
+                } else {
+                    Pair {
+                        i: j,
+                        j: i,
+                        shift: neg,
+                        dist2,
+                    }
+                };
+                (*dp.add(out)).write(pair);
+            }
+            out += 1;
+        }
+        lo = hi;
+    }
 }
 
 impl Walk<'_> {
@@ -334,193 +526,145 @@ impl Walk<'_> {
         }
     }
 
-    fn scan_block(&self, found: &mut Vec<Pair>, block: &Block) {
+    fn commit(&self, found: &mut Vec<Pair>, scratch: &Scratch) {
+        let n = scratch.js.len();
+        if n == 0 {
+            return;
+        }
+        debug_assert_eq!(scratch.atom.len(), n);
+        debug_assert_eq!(scratch.d2.len(), n);
+        let rows = if self.half { n } else { n * 2 };
+        found.reserve(rows);
+        let len0 = found.len();
+        {
+            let spare = &mut found.spare_capacity_mut()[..rows];
+            if self.half {
+                write_half(
+                    spare,
+                    &scratch.atom,
+                    &scratch.js,
+                    &scratch.d2,
+                    &scratch.run_shift,
+                    &scratch.run_end,
+                );
+            } else {
+                write_full(
+                    spare,
+                    &scratch.atom,
+                    &scratch.js,
+                    &scratch.d2,
+                    &scratch.run_shift,
+                    &scratch.run_end,
+                );
+            }
+        }
+        unsafe {
+            found.set_len(len0 + rows);
+        }
+    }
+
+    fn scan_block(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, block: &Block) {
         if block.i_lo >= block.i_hi || block.j_lo >= block.j_hi {
             return;
         }
-        #[cfg(target_arch = "x86_64")]
-        if block.j_hi - block.j_lo >= 4 && simd_avx() {
-            unsafe {
-                self.scan_block_avx(found, block);
-            }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = scratch;
+            self.scan_scalar(found, block);
             return;
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ns = block.i_hi - block.i_lo;
+            let span = block.j_hi - block.j_lo;
+            if span == 0 || ns > MAX_SCRATCH / span {
+                self.scan_scalar(found, block);
+                return;
+            }
+            let before = scratch.js.len();
+            scratch.reserve_more(ns * span);
+            #[cfg(linkcell_avx512)]
+            if self.simd == 2 {
+                unsafe {
+                    avx512_scan(
+                        &self.coords.x,
+                        &self.coords.y,
+                        &self.coords.z,
+                        &self.mesh.occupants,
+                        self.cut2,
+                        block,
+                        scratch,
+                    );
+                }
+                scratch.note(before, block.shift_s);
+                return;
+            }
+            if self.simd >= 1 {
+                unsafe {
+                    avx_scan(
+                        &self.coords.x,
+                        &self.coords.y,
+                        &self.coords.z,
+                        &self.mesh.occupants,
+                        self.cut2,
+                        block,
+                        scratch,
+                    );
+                }
+                scratch.note(before, block.shift_s);
+                return;
+            }
+            self.scan_scalar(found, block);
+        }
+    }
+
+    fn scan_scalar(&self, found: &mut Vec<Pair>, block: &Block) {
         let sx = block.shift[0];
         let sy = block.shift[1];
         let sz = block.shift[2];
         for s in block.i_lo..block.i_hi {
+            let j_lo = if block.tri { s + 1 } else { block.j_lo };
+            if j_lo >= block.j_hi {
+                continue;
+            }
             let i = self.mesh.occupants[s];
             let px = self.coords.x[s] - sx;
             let py = self.coords.y[s] - sy;
             let pz = self.coords.z[s] - sz;
-            for slot in block.j_lo..block.j_hi {
+            for slot in j_lo..block.j_hi {
                 let dx = self.coords.x[slot] - px;
                 let dy = self.coords.y[slot] - py;
                 let dz = self.coords.z[slot] - pz;
                 let d2 = dx * dx + dy * dy + dz * dz;
                 if d2 < self.cut2 {
-                    let ju = self.mesh.occupants[slot];
-                    if ju == i && block.shift_s == [0, 0, 0] {
+                    let j = self.mesh.occupants[slot];
+                    if j == i && block.shift_s == [0, 0, 0] {
                         continue;
                     }
-                    self.write_staged(
-                        found,
-                        &[Compact {
-                            i: i as u32,
-                            j: ju as u32,
-                            shift: block.shift_s,
-                            d2,
-                        }],
-                    );
+                    self.record(found, i, j, block.shift_s, d2);
                 }
             }
         }
     }
 
-    /// # Safety
-    /// `block` ranges index `coords` and `occupants`.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx")]
-    unsafe fn scan_block_avx(&self, found: &mut Vec<Pair>, block: &Block) {
-        use std::arch::x86_64::{
-            _mm256_add_pd, _mm256_cmp_pd, _mm256_loadu_pd, _mm256_movemask_pd, _mm256_mul_pd,
-            _mm256_set1_pd, _mm256_storeu_pd, _mm256_sub_pd, _CMP_LT_OQ,
-        };
-        let sx = block.shift[0];
-        let sy = block.shift[1];
-        let sz = block.shift[2];
-        let cut = _mm256_set1_pd(self.cut2);
-        let xs = self.coords.x.as_ptr();
-        let ys = self.coords.y.as_ptr();
-        let zs = self.coords.z.as_ptr();
-        let ids = self.mesh.occupants.as_ptr();
-        let end = block.j_lo + ((block.j_hi - block.j_lo) & !3);
-        let shift_s = block.shift_s;
-        let skip_self = shift_s == [0, 0, 0];
-        let mut staged = [Compact {
-            i: 0,
-            j: 0,
-            shift: [0, 0, 0],
-            d2: 0.0,
-        }; 64];
-        for s in block.i_lo..block.i_hi {
-            let i = *ids.add(s);
-            let iu = i as u32;
-            let bx = _mm256_set1_pd(*xs.add(s) - sx);
-            let by = _mm256_set1_pd(*ys.add(s) - sy);
-            let bz = _mm256_set1_pd(*zs.add(s) - sz);
-            let mut n = 0usize;
-            let mut slot = block.j_lo;
-            while slot < end {
-                let dx = _mm256_sub_pd(_mm256_loadu_pd(xs.add(slot)), bx);
-                let dy = _mm256_sub_pd(_mm256_loadu_pd(ys.add(slot)), by);
-                let dz = _mm256_sub_pd(_mm256_loadu_pd(zs.add(slot)), bz);
-                let d2v = _mm256_add_pd(
-                    _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
-                    _mm256_mul_pd(dz, dz),
-                );
-                let bits = _mm256_movemask_pd(_mm256_cmp_pd(d2v, cut, _CMP_LT_OQ));
-                if bits != 0 {
-                    let mut lane = [0.0f64; 4];
-                    _mm256_storeu_pd(lane.as_mut_ptr(), d2v);
-                    if bits & 1 != 0 {
-                        let j = *ids.add(slot);
-                        if !(skip_self && j == i) {
-                            staged[n] = Compact {
-                                i: iu,
-                                j: j as u32,
-                                shift: shift_s,
-                                d2: lane[0],
-                            };
-                            n += 1;
-                        }
-                    }
-                    if bits & 2 != 0 {
-                        let j = *ids.add(slot + 1);
-                        if !(skip_self && j == i) {
-                            staged[n] = Compact {
-                                i: iu,
-                                j: j as u32,
-                                shift: shift_s,
-                                d2: lane[1],
-                            };
-                            n += 1;
-                        }
-                    }
-                    if bits & 4 != 0 {
-                        let j = *ids.add(slot + 2);
-                        if !(skip_self && j == i) {
-                            staged[n] = Compact {
-                                i: iu,
-                                j: j as u32,
-                                shift: shift_s,
-                                d2: lane[2],
-                            };
-                            n += 1;
-                        }
-                    }
-                    if bits & 8 != 0 {
-                        let j = *ids.add(slot + 3);
-                        if !(skip_self && j == i) {
-                            staged[n] = Compact {
-                                i: iu,
-                                j: j as u32,
-                                shift: shift_s,
-                                d2: lane[3],
-                            };
-                            n += 1;
-                        }
-                    }
-                    if n > staged.len() - 4 {
-                        self.write_staged(found, &staged[..n]);
-                        n = 0;
-                    }
-                }
-                slot += 4;
-            }
-            for slot in end..block.j_hi {
-                let dx = *xs.add(slot) - (*xs.add(s) - sx);
-                let dy = *ys.add(slot) - (*ys.add(s) - sy);
-                let dz = *zs.add(slot) - (*zs.add(s) - sz);
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < self.cut2 {
-                    let j = *ids.add(slot);
-                    if !(skip_self && j == i) && n < staged.len() {
-                        staged[n] = Compact {
-                            i: iu,
-                            j: j as u32,
-                            shift: shift_s,
-                            d2,
-                        };
-                        n += 1;
-                    }
-                }
-            }
-            if n > 0 {
-                self.write_staged(found, &staged[..n]);
-            }
-        }
-    }
-
-    fn append_cell(&self, found: &mut Vec<Pair>, cell: usize) {
+    fn append_cell(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, cell: usize) {
         let lo = self.mesh.offsets[cell];
         let hi = self.mesh.offsets[cell + 1];
         if lo == hi {
             return;
         }
-        for s in lo..hi {
-            if s + 1 >= hi {
-                break;
-            }
+        if hi - lo >= 2 {
             self.scan_block(
                 found,
+                scratch,
                 &Block {
-                    i_lo: s,
-                    i_hi: s + 1,
-                    j_lo: s + 1,
+                    i_lo: lo,
+                    i_hi: hi,
+                    j_lo: lo,
                     j_hi: hi,
                     shift_s: [0, 0, 0],
                     shift: [0.0; 3],
+                    tri: true,
                 },
             );
         }
@@ -529,6 +673,7 @@ impl Walk<'_> {
         for partner in &self.partners.items[p0..p1] {
             self.scan_block(
                 found,
+                scratch,
                 &Block {
                     i_lo: lo,
                     i_hi: hi,
@@ -536,6 +681,7 @@ impl Walk<'_> {
                     j_hi: partner.hi,
                     shift_s: partner.shift_s,
                     shift: partner.shift,
+                    tri: false,
                 },
             );
         }
@@ -552,52 +698,40 @@ impl Walk<'_> {
         ((n_src as f64) * rows * 1.25) as usize
     }
 
-    fn write_staged(&self, found: &mut Vec<Pair>, hits: &[Compact]) {
-        if hits.is_empty() {
-            return;
+    fn gather_into(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, start: usize, end: usize) {
+        let n_src = self.mesh.offsets[end] - self.mesh.offsets[start];
+        let rows = self.guess_rows(n_src);
+        if found.capacity() < rows {
+            found.reserve(rows - found.capacity());
         }
-        if !self.half {
-            found.reserve(hits.len() * 2);
-            let mut len = found.len();
-            let ptr: *mut Pair = found.as_mut_ptr();
-            for hit in hits {
-                let i = hit.i as usize;
-                let j = hit.j as usize;
-                let neg = [-hit.shift[0], -hit.shift[1], -hit.shift[2]];
-                unsafe {
-                    ptr.add(len).write(Pair {
-                        i,
-                        j,
-                        shift: hit.shift,
-                        dist2: hit.d2,
-                    });
-                    ptr.add(len + 1).write(Pair {
-                        i: j,
-                        j: i,
-                        shift: neg,
-                        dist2: hit.d2,
-                    });
-                }
-                len += 2;
-            }
-            unsafe {
-                found.set_len(len);
-            }
-            return;
+        let hits = if self.half { rows } else { (rows + 1) / 2 };
+        scratch.reserve_more(hits);
+        for cell in start..end {
+            self.append_cell(found, scratch, cell);
         }
-        for hit in hits {
-            self.record(found, hit.i as usize, hit.j as usize, hit.shift, hit.d2);
-        }
+        self.commit(found, scratch);
     }
 
-    fn collect(&self) -> Vec<Pair> {
+    #[cfg(feature = "parallel")]
+    fn gather(&self, start: usize, end: usize) -> Vec<Pair> {
+        let mut found = Vec::new();
+        let mut scratch = Scratch::new();
+        self.gather_into(&mut found, &mut scratch, start, end);
+        found
+    }
+
+    fn collect(&self, found: Vec<Pair>, mut scratch: Scratch) -> Vec<Pair> {
         let ncell = self.mesh.offsets.len() - 1;
-        #[cfg(feature = "parallel")]
-        let offsets = &self.mesh.offsets;
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
             let threads = rayon::current_num_threads().max(1);
+            if threads == 1 || ncell <= 1 {
+                let _timer = crate::pop::JobTimer::new();
+                let mut found = found;
+                self.gather_into(&mut found, &mut scratch, 0, ncell);
+                return found;
+            }
             let chunk = (ncell / threads).max(1);
             let parts: Vec<Vec<Pair>> = (0..ncell)
                 .step_by(chunk)
@@ -606,15 +740,16 @@ impl Walk<'_> {
                 .map(|start| {
                     let _timer = crate::pop::JobTimer::new();
                     let end = (start + chunk).min(ncell);
-                    let n_src = offsets[end] - offsets[start];
-                    let mut found = Vec::with_capacity(self.guess_rows(n_src));
-                    for cell in start..end {
-                        self.append_cell(&mut found, cell);
-                    }
-                    found
+                    self.gather(start, end)
                 })
                 .collect();
-            let mut pairs = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            if parts.len() == 1 {
+                return parts.into_iter().next().unwrap();
+            }
+            let mut pairs = found;
+            if pairs.capacity() < parts.iter().map(Vec::len).sum() {
+                pairs.reserve(parts.iter().map(Vec::len).sum());
+            }
             for part in parts {
                 pairs.extend(part);
             }
@@ -623,13 +758,439 @@ impl Walk<'_> {
         #[cfg(not(feature = "parallel"))]
         {
             let _timer = crate::pop::JobTimer::new();
-            let mut found = Vec::with_capacity(self.guess_rows(self.mesh.occupants.len()));
-            for cell in 0..ncell {
-                self.append_cell(&mut found, cell);
-            }
+            let mut found = found;
+            self.gather_into(&mut found, &mut scratch, 0, ncell);
             found
         }
     }
+}
+
+/// # Safety
+/// `block` indexes `xs`, `ys`, `zs`, and `ids`. `scratch` holds every pair in the block.
+#[allow(clippy::incompatible_msrv)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f")]
+#[inline(never)]
+unsafe fn avx512_scan(
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    ids: &[usize],
+    cut2: f64,
+    block: &Block,
+    scratch: &mut Scratch,
+) {
+    use std::arch::x86_64::_mm512_mask_compressstoreu_epi64;
+    use std::arch::x86_64::_mm512_mask_compressstoreu_pd;
+    use std::arch::x86_64::{
+        __m512i, _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_loadu_pd, _mm512_loadu_si512,
+        _mm512_mul_pd, _mm512_set1_pd, _mm512_sub_pd, _CMP_LT_OQ,
+    };
+    let xp = xs.as_ptr();
+    let yp = ys.as_ptr();
+    let zp = zs.as_ptr();
+    let idp = ids.as_ptr();
+    let atom_p = scratch.atom.as_mut_ptr();
+    let js_p = scratch.js.as_mut_ptr();
+    let d2_p = scratch.d2.as_mut_ptr();
+    let mut n = scratch.js.len();
+    let sx = block.shift[0];
+    let sy = block.shift[1];
+    let sz = block.shift[2];
+    let skip_self = block.shift_s == [0, 0, 0];
+    let cutv = _mm512_set1_pd(cut2);
+
+    macro_rules! take8 {
+        ($mask:expr, $d2v:expr, $jids:expr, $iu:expr, $iatom:expr) => {{
+            if $mask != 0 {
+                let mut td = [0.0f64; 8];
+                let mut tj = [0u64; 8];
+                _mm512_mask_compressstoreu_pd(td.as_mut_ptr(), $mask, $d2v);
+                _mm512_mask_compressstoreu_epi64(tj.as_mut_ptr() as *mut i64, $mask, $jids);
+                let c = $mask.count_ones() as usize;
+                let iatom = $iatom as u64;
+                for k in 0..c {
+                    let j = tj[k];
+                    if skip_self && j == iatom {
+                        continue;
+                    }
+                    atom_p.add(n).write($iu);
+                    js_p.add(n).write(j);
+                    d2_p.add(n).write(td[k]);
+                    n += 1;
+                }
+            }
+        }};
+    }
+    macro_rules! dist8 {
+        ($jx:expr, $jy:expr, $jz:expr, $bx:expr, $by:expr, $bz:expr) => {{
+            let dx = _mm512_sub_pd($jx, $bx);
+            let dy = _mm512_sub_pd($jy, $by);
+            let dz = _mm512_sub_pd($jz, $bz);
+            _mm512_add_pd(
+                _mm512_add_pd(_mm512_mul_pd(dx, dx), _mm512_mul_pd(dy, dy)),
+                _mm512_mul_pd(dz, dz),
+            )
+        }};
+    }
+    macro_rules! keep_one {
+        ($i:expr, $iu:expr, $px:expr, $py:expr, $pz:expr, $j:expr, $jx:expr, $jy:expr, $jz:expr) => {{
+            let i = $i;
+            let j = $j;
+            if !(skip_self && j == i) {
+                let dx = $jx - $px;
+                let dy = $jy - $py;
+                let dz = $jz - $pz;
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 < cut2 {
+                    atom_p.add(n).write($iu);
+                    js_p.add(n).write(j as u64);
+                    d2_p.add(n).write(d2);
+                    n += 1;
+                }
+            }
+        }};
+    }
+    macro_rules! one_src {
+        ($s:expr, $j_lo:expr) => {{
+            let s = $s;
+            let j_lo = $j_lo;
+            if j_lo < block.j_hi {
+                let i = *idp.add(s);
+                let iu = i as u32;
+                let px = *xp.add(s) - sx;
+                let py = *yp.add(s) - sy;
+                let pz = *zp.add(s) - sz;
+                let bx = _mm512_set1_pd(px);
+                let by = _mm512_set1_pd(py);
+                let bz = _mm512_set1_pd(pz);
+                let span = block.j_hi - j_lo;
+                let end = j_lo + (span & !7);
+                let mut slot = j_lo;
+                while slot < end {
+                    let jx = _mm512_loadu_pd(xp.add(slot));
+                    let jy = _mm512_loadu_pd(yp.add(slot));
+                    let jz = _mm512_loadu_pd(zp.add(slot));
+                    let jids = _mm512_loadu_si512(idp.add(slot) as *const __m512i);
+                    let d2v = dist8!(jx, jy, jz, bx, by, bz);
+                    let mask = _mm512_cmp_pd_mask(d2v, cutv, _CMP_LT_OQ);
+                    take8!(mask, d2v, jids, iu, i);
+                    slot += 8;
+                }
+                for slot in end..block.j_hi {
+                    let j = *idp.add(slot);
+                    let jx = *xp.add(slot);
+                    let jy = *yp.add(slot);
+                    let jz = *zp.add(slot);
+                    keep_one!(i, iu, px, py, pz, j, jx, jy, jz);
+                }
+            }
+        }};
+    }
+
+    if !block.tri {
+        let j_lo = block.j_lo;
+        let j_hi = block.j_hi;
+        let end = j_lo + ((j_hi - j_lo) & !7);
+        let mut s = block.i_lo;
+        while s + 4 <= block.i_hi {
+            let i0 = *idp.add(s);
+            let i1 = *idp.add(s + 1);
+            let i2 = *idp.add(s + 2);
+            let i3 = *idp.add(s + 3);
+            let iu0 = i0 as u32;
+            let iu1 = i1 as u32;
+            let iu2 = i2 as u32;
+            let iu3 = i3 as u32;
+            let p0x = *xp.add(s) - sx;
+            let p0y = *yp.add(s) - sy;
+            let p0z = *zp.add(s) - sz;
+            let p1x = *xp.add(s + 1) - sx;
+            let p1y = *yp.add(s + 1) - sy;
+            let p1z = *zp.add(s + 1) - sz;
+            let p2x = *xp.add(s + 2) - sx;
+            let p2y = *yp.add(s + 2) - sy;
+            let p2z = *zp.add(s + 2) - sz;
+            let p3x = *xp.add(s + 3) - sx;
+            let p3y = *yp.add(s + 3) - sy;
+            let p3z = *zp.add(s + 3) - sz;
+            let b0x = _mm512_set1_pd(p0x);
+            let b0y = _mm512_set1_pd(p0y);
+            let b0z = _mm512_set1_pd(p0z);
+            let b1x = _mm512_set1_pd(p1x);
+            let b1y = _mm512_set1_pd(p1y);
+            let b1z = _mm512_set1_pd(p1z);
+            let b2x = _mm512_set1_pd(p2x);
+            let b2y = _mm512_set1_pd(p2y);
+            let b2z = _mm512_set1_pd(p2z);
+            let b3x = _mm512_set1_pd(p3x);
+            let b3y = _mm512_set1_pd(p3y);
+            let b3z = _mm512_set1_pd(p3z);
+            let mut slot = j_lo;
+            while slot < end {
+                let jx = _mm512_loadu_pd(xp.add(slot));
+                let jy = _mm512_loadu_pd(yp.add(slot));
+                let jz = _mm512_loadu_pd(zp.add(slot));
+                let jids = _mm512_loadu_si512(idp.add(slot) as *const __m512i);
+                let d0 = dist8!(jx, jy, jz, b0x, b0y, b0z);
+                let d1 = dist8!(jx, jy, jz, b1x, b1y, b1z);
+                let d2v = dist8!(jx, jy, jz, b2x, b2y, b2z);
+                let d3 = dist8!(jx, jy, jz, b3x, b3y, b3z);
+                take8!(_mm512_cmp_pd_mask(d0, cutv, _CMP_LT_OQ), d0, jids, iu0, i0);
+                take8!(_mm512_cmp_pd_mask(d1, cutv, _CMP_LT_OQ), d1, jids, iu1, i1);
+                take8!(
+                    _mm512_cmp_pd_mask(d2v, cutv, _CMP_LT_OQ),
+                    d2v,
+                    jids,
+                    iu2,
+                    i2
+                );
+                take8!(_mm512_cmp_pd_mask(d3, cutv, _CMP_LT_OQ), d3, jids, iu3, i3);
+                slot += 8;
+            }
+            for slot in end..j_hi {
+                let j = *idp.add(slot);
+                let jx = *xp.add(slot);
+                let jy = *yp.add(slot);
+                let jz = *zp.add(slot);
+                keep_one!(i0, iu0, p0x, p0y, p0z, j, jx, jy, jz);
+                keep_one!(i1, iu1, p1x, p1y, p1z, j, jx, jy, jz);
+                keep_one!(i2, iu2, p2x, p2y, p2z, j, jx, jy, jz);
+                keep_one!(i3, iu3, p3x, p3y, p3z, j, jx, jy, jz);
+            }
+            s += 4;
+        }
+        while s < block.i_hi {
+            one_src!(s, j_lo);
+            s += 1;
+        }
+    } else {
+        for s in block.i_lo..block.i_hi {
+            one_src!(s, s + 1);
+        }
+    }
+    scratch.finish(n);
+}
+
+/// # Safety
+/// `block` indexes `xs`, `ys`, `zs`, and `ids`. `scratch` holds every pair in the block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[inline(never)]
+unsafe fn avx_scan(
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    ids: &[usize],
+    cut2: f64,
+    block: &Block,
+    scratch: &mut Scratch,
+) {
+    use std::arch::x86_64::{
+        _mm256_add_pd, _mm256_cmp_pd, _mm256_loadu_pd, _mm256_movemask_pd, _mm256_mul_pd,
+        _mm256_set1_pd, _mm256_storeu_pd, _mm256_sub_pd, _CMP_LT_OQ,
+    };
+    let xp = xs.as_ptr();
+    let yp = ys.as_ptr();
+    let zp = zs.as_ptr();
+    let idp = ids.as_ptr();
+    let atom_p = scratch.atom.as_mut_ptr();
+    let js_p = scratch.js.as_mut_ptr();
+    let d2_p = scratch.d2.as_mut_ptr();
+    let mut n = scratch.js.len();
+    let sx = block.shift[0];
+    let sy = block.shift[1];
+    let sz = block.shift[2];
+    let skip_self = block.shift_s == [0, 0, 0];
+    let cutv = _mm256_set1_pd(cut2);
+
+    macro_rules! take4 {
+        ($bits:expr, $d2v:expr, $slot:expr, $iu:expr, $iatom:expr) => {{
+            if $bits != 0 {
+                let mut lane = [0.0f64; 4];
+                _mm256_storeu_pd(lane.as_mut_ptr(), $d2v);
+                let iatom = $iatom;
+                if $bits & 1 != 0 {
+                    let j = *idp.add($slot);
+                    if !(skip_self && j == iatom) {
+                        atom_p.add(n).write($iu);
+                        js_p.add(n).write(j as u64);
+                        d2_p.add(n).write(lane[0]);
+                        n += 1;
+                    }
+                }
+                if $bits & 2 != 0 {
+                    let j = *idp.add($slot + 1);
+                    if !(skip_self && j == iatom) {
+                        atom_p.add(n).write($iu);
+                        js_p.add(n).write(j as u64);
+                        d2_p.add(n).write(lane[1]);
+                        n += 1;
+                    }
+                }
+                if $bits & 4 != 0 {
+                    let j = *idp.add($slot + 2);
+                    if !(skip_self && j == iatom) {
+                        atom_p.add(n).write($iu);
+                        js_p.add(n).write(j as u64);
+                        d2_p.add(n).write(lane[2]);
+                        n += 1;
+                    }
+                }
+                if $bits & 8 != 0 {
+                    let j = *idp.add($slot + 3);
+                    if !(skip_self && j == iatom) {
+                        atom_p.add(n).write($iu);
+                        js_p.add(n).write(j as u64);
+                        d2_p.add(n).write(lane[3]);
+                        n += 1;
+                    }
+                }
+            }
+        }};
+    }
+    macro_rules! dist4 {
+        ($jx:expr, $jy:expr, $jz:expr, $bx:expr, $by:expr, $bz:expr) => {{
+            let dx = _mm256_sub_pd($jx, $bx);
+            let dy = _mm256_sub_pd($jy, $by);
+            let dz = _mm256_sub_pd($jz, $bz);
+            _mm256_add_pd(
+                _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
+                _mm256_mul_pd(dz, dz),
+            )
+        }};
+    }
+    macro_rules! one_src {
+        ($s:expr, $j_lo:expr) => {{
+            let s = $s;
+            let j_lo = $j_lo;
+            if j_lo < block.j_hi {
+                let i = *idp.add(s);
+                let iu = i as u32;
+                let px = *xp.add(s) - sx;
+                let py = *yp.add(s) - sy;
+                let pz = *zp.add(s) - sz;
+                let bx = _mm256_set1_pd(px);
+                let by = _mm256_set1_pd(py);
+                let bz = _mm256_set1_pd(pz);
+                let span = block.j_hi - j_lo;
+                let end = j_lo + (span & !3);
+                let mut slot = j_lo;
+                while slot < end {
+                    let jx = _mm256_loadu_pd(xp.add(slot));
+                    let jy = _mm256_loadu_pd(yp.add(slot));
+                    let jz = _mm256_loadu_pd(zp.add(slot));
+                    let d2v = dist4!(jx, jy, jz, bx, by, bz);
+                    let bits = _mm256_movemask_pd(_mm256_cmp_pd(d2v, cutv, _CMP_LT_OQ));
+                    take4!(bits, d2v, slot, iu, i);
+                    slot += 4;
+                }
+                for slot in end..block.j_hi {
+                    let j = *idp.add(slot);
+                    if skip_self && j == i {
+                        continue;
+                    }
+                    let dx = *xp.add(slot) - px;
+                    let dy = *yp.add(slot) - py;
+                    let dz = *zp.add(slot) - pz;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < cut2 {
+                        atom_p.add(n).write(iu);
+                        js_p.add(n).write(j as u64);
+                        d2_p.add(n).write(d2);
+                        n += 1;
+                    }
+                }
+            }
+        }};
+    }
+
+    if !block.tri {
+        let j_lo = block.j_lo;
+        let j_hi = block.j_hi;
+        let end = j_lo + ((j_hi - j_lo) & !3);
+        let mut s = block.i_lo;
+        while s + 2 <= block.i_hi {
+            let i0 = *idp.add(s);
+            let i1 = *idp.add(s + 1);
+            let iu0 = i0 as u32;
+            let iu1 = i1 as u32;
+            let p0x = *xp.add(s) - sx;
+            let p0y = *yp.add(s) - sy;
+            let p0z = *zp.add(s) - sz;
+            let p1x = *xp.add(s + 1) - sx;
+            let p1y = *yp.add(s + 1) - sy;
+            let p1z = *zp.add(s + 1) - sz;
+            let b0x = _mm256_set1_pd(p0x);
+            let b0y = _mm256_set1_pd(p0y);
+            let b0z = _mm256_set1_pd(p0z);
+            let b1x = _mm256_set1_pd(p1x);
+            let b1y = _mm256_set1_pd(p1y);
+            let b1z = _mm256_set1_pd(p1z);
+            let mut slot = j_lo;
+            while slot < end {
+                let jx = _mm256_loadu_pd(xp.add(slot));
+                let jy = _mm256_loadu_pd(yp.add(slot));
+                let jz = _mm256_loadu_pd(zp.add(slot));
+                let d0 = dist4!(jx, jy, jz, b0x, b0y, b0z);
+                let d1 = dist4!(jx, jy, jz, b1x, b1y, b1z);
+                take4!(
+                    _mm256_movemask_pd(_mm256_cmp_pd(d0, cutv, _CMP_LT_OQ)),
+                    d0,
+                    slot,
+                    iu0,
+                    i0
+                );
+                take4!(
+                    _mm256_movemask_pd(_mm256_cmp_pd(d1, cutv, _CMP_LT_OQ)),
+                    d1,
+                    slot,
+                    iu1,
+                    i1
+                );
+                slot += 4;
+            }
+            for slot in end..j_hi {
+                let j = *idp.add(slot);
+                let jx = *xp.add(slot);
+                let jy = *yp.add(slot);
+                let jz = *zp.add(slot);
+                if !(skip_self && j == i0) {
+                    let dx = jx - p0x;
+                    let dy = jy - p0y;
+                    let dz = jz - p0z;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < cut2 {
+                        atom_p.add(n).write(iu0);
+                        js_p.add(n).write(j as u64);
+                        d2_p.add(n).write(d2);
+                        n += 1;
+                    }
+                }
+                if !(skip_self && j == i1) {
+                    let dx = jx - p1x;
+                    let dy = jy - p1y;
+                    let dz = jz - p1z;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < cut2 {
+                        atom_p.add(n).write(iu1);
+                        js_p.add(n).write(j as u64);
+                        d2_p.add(n).write(d2);
+                        n += 1;
+                    }
+                }
+            }
+            s += 2;
+        }
+        if s < block.i_hi {
+            one_src!(s, j_lo);
+        }
+    } else {
+        for s in block.i_lo..block.i_hi {
+            one_src!(s, s + 1);
+        }
+    }
+    scratch.finish(n);
 }
 
 #[cfg(test)]

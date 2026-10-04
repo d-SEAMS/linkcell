@@ -71,8 +71,10 @@ diagonal divided by the minimum cell height, and the frontier test
 stops the walk once the k-th neighbour is certified.
 `pairs_within` keeps the caller's basis, because the returned shift
 `S` is an integer combination of that H. Each unordered pair is
-tested once, and the rows are written after that test. A full list
-writes both `(i, j, S)` and `(j, i, -S)`.
+tested once. Hits from that walk are buffered, then the rows are
+written in one pass. A full list writes both `(i, j, S)` and
+`(j, i, -S)`. On Linux the pair buffer stays on the heap, so a
+repeated call does not fault those pages in again.
 The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.

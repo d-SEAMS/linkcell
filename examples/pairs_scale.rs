@@ -46,7 +46,11 @@ fn main() {
         .and_then(|s| s.parse().ok());
     let xyz = fill(n);
     let cell = Cell::ortho(18.0, 18.0, 18.0).expect("box");
-    let warmup = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
+    // The first calls fault the pair buffer. Time the calls after that.
+    let mut warmup = Vec::new();
+    for _ in 0..3 {
+        warmup = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
+    }
     let t0 = Instant::now();
     let mut acc = 0usize;
     for _ in 0..reps {
