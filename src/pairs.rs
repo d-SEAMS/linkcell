@@ -78,25 +78,21 @@ pub fn pairs_within(
     // Reserve the pair buffer before the mesh. A repeated call can then
     // reuse that chunk instead of letting smaller allocs split it.
     let rows = pair_capacity(active.len(), w, cutoff, half);
-    // The 4096-atom list is limited by writing the rows. Extra threads
-    // add a copy and lose. Split only once the atom count is large.
-    let solo = {
+    // Reserve the pair buffer before the mesh so a repeated call reuses
+    // that chunk. Several threads later write disjoint ranges of it.
+    let found = Vec::with_capacity(rows);
+    let mut scratch = Scratch::new();
+    let parallel_walk = {
         #[cfg(feature = "parallel")]
         {
-            rayon::current_num_threads() <= 1 || active.len() < 32_768
+            rayon::current_num_threads() > 1 && active.len() >= PARALLEL_PAIRS
         }
         #[cfg(not(feature = "parallel"))]
         {
-            true
+            false
         }
     };
-    let found = if solo {
-        Vec::with_capacity(rows)
-    } else {
-        Vec::new()
-    };
-    let mut scratch = Scratch::new();
-    if solo {
+    if !parallel_walk {
         let hits = if half { rows } else { (rows + 1) / 2 };
         scratch.reserve_more(hits);
     }
@@ -361,6 +357,7 @@ struct Walk<'a> {
     simd: u8,
 }
 
+#[derive(Clone, Copy)]
 struct Block {
     i_lo: usize,
     i_hi: usize,
@@ -371,6 +368,11 @@ struct Block {
     /// Home cell: source `s` only sees occupants `s + 1 ..`.
     tri: bool,
 }
+
+/// Atom count where row ranges split across threads. Below this the
+/// pair buffer is smaller than the spawn, so the walk stays on one thread.
+#[cfg(feature = "parallel")]
+const PARALLEL_PAIRS: usize = 512;
 
 /// Hits for the whole chunk. The distance loop appends here, then one
 /// pass writes the rows. Runs share a shift so the inner loop does not.
@@ -698,26 +700,34 @@ impl Walk<'_> {
         ((n_src as f64) * rows * 1.25) as usize
     }
 
+    #[cfg(feature = "parallel")]
+    fn row_count(&self, scratch: &Scratch) -> usize {
+        let n = scratch.js.len();
+        if self.half {
+            n
+        } else {
+            n * 2
+        }
+    }
+
+    fn fill_only(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, start: usize, end: usize) {
+        let n_src = self.mesh.offsets[end] - self.mesh.offsets[start];
+        let rows = self.guess_rows(n_src);
+        let hits = if self.half { rows } else { (rows + 1) / 2 };
+        scratch.reserve_more(hits);
+        for cell in start..end {
+            self.append_cell(found, scratch, cell);
+        }
+    }
+
     fn gather_into(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, start: usize, end: usize) {
         let n_src = self.mesh.offsets[end] - self.mesh.offsets[start];
         let rows = self.guess_rows(n_src);
         if found.capacity() < rows {
             found.reserve(rows - found.capacity());
         }
-        let hits = if self.half { rows } else { (rows + 1) / 2 };
-        scratch.reserve_more(hits);
-        for cell in start..end {
-            self.append_cell(found, scratch, cell);
-        }
+        self.fill_only(found, scratch, start, end);
         self.commit(found, scratch);
-    }
-
-    #[cfg(feature = "parallel")]
-    fn gather(&self, start: usize, end: usize) -> Vec<Pair> {
-        let mut found = Vec::new();
-        let mut scratch = Scratch::new();
-        self.gather_into(&mut found, &mut scratch, start, end);
-        found
     }
 
     fn collect(&self, found: Vec<Pair>, mut scratch: Scratch) -> Vec<Pair> {
@@ -726,34 +736,30 @@ impl Walk<'_> {
         {
             use rayon::prelude::*;
             let threads = rayon::current_num_threads().max(1);
-            if threads == 1 || ncell <= 1 {
+            if threads == 1 || ncell <= 1 || self.mesh.occupants.len() < PARALLEL_PAIRS {
                 let _timer = crate::pop::JobTimer::new();
                 let mut found = found;
                 self.gather_into(&mut found, &mut scratch, 0, ncell);
                 return found;
             }
-            let chunk = (ncell / threads).max(1);
-            let parts: Vec<Vec<Pair>> = (0..ncell)
-                .step_by(chunk)
-                .collect::<Vec<_>>()
+            let ranges = cell_ranges(&self.mesh.offsets, threads);
+            if ranges.len() <= 1 {
+                let _timer = crate::pop::JobTimer::new();
+                let mut found = found;
+                self.gather_into(&mut found, &mut scratch, 0, ncell);
+                return found;
+            }
+            let chunks: Vec<(Scratch, Vec<Pair>)> = ranges
                 .into_par_iter()
-                .map(|start| {
+                .map(|(start, end)| {
                     let _timer = crate::pop::JobTimer::new();
-                    let end = (start + chunk).min(ncell);
-                    self.gather(start, end)
+                    let mut scratch = Scratch::new();
+                    let mut extra = Vec::new();
+                    self.fill_only(&mut extra, &mut scratch, start, end);
+                    (scratch, extra)
                 })
                 .collect();
-            if parts.len() == 1 {
-                return parts.into_iter().next().unwrap();
-            }
-            let mut pairs = found;
-            if pairs.capacity() < parts.iter().map(Vec::len).sum() {
-                pairs.reserve(parts.iter().map(Vec::len).sum());
-            }
-            for part in parts {
-                pairs.extend(part);
-            }
-            pairs
+            self.place_chunks(found, &chunks)
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -763,6 +769,132 @@ impl Walk<'_> {
             found
         }
     }
+
+    #[cfg(feature = "parallel")]
+    fn place_chunks(&self, mut found: Vec<Pair>, chunks: &[(Scratch, Vec<Pair>)]) -> Vec<Pair> {
+        use rayon::prelude::*;
+        let mut rows = Vec::with_capacity(chunks.len());
+        let mut total = 0usize;
+        for (scratch, extra) in chunks {
+            let n = self.row_count(scratch) + extra.len();
+            rows.push(n);
+            total += n;
+        }
+        if found.capacity() < total {
+            found.reserve(total - found.capacity());
+        }
+        let mut off = Vec::with_capacity(chunks.len() + 1);
+        off.push(0usize);
+        for n in &rows {
+            off.push(off.last().copied().unwrap() + n);
+        }
+        let base = SharePtr(found.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
+        let half = self.half;
+        // Safety: each job writes `rows[t]` slots starting at `off[t]`.
+        // Those ranges partition `0..total` and nothing reads them until
+        // every job has joined. `found.len()` stays 0 until then.
+        chunks
+            .par_iter()
+            .enumerate()
+            .for_each(|(t, (scratch, extra))| {
+                let mut at = off[t];
+                let hit_rows = if half {
+                    scratch.js.len()
+                } else {
+                    scratch.js.len() * 2
+                };
+                if hit_rows > 0 {
+                    let dst = unsafe { std::slice::from_raw_parts_mut(base.slot(at), hit_rows) };
+                    if half {
+                        write_half(
+                            dst,
+                            &scratch.atom,
+                            &scratch.js,
+                            &scratch.d2,
+                            &scratch.run_shift,
+                            &scratch.run_end,
+                        );
+                    } else {
+                        write_full(
+                            dst,
+                            &scratch.atom,
+                            &scratch.js,
+                            &scratch.d2,
+                            &scratch.run_shift,
+                            &scratch.run_end,
+                        );
+                    }
+                    at += hit_rows;
+                }
+                if !extra.is_empty() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            extra.as_ptr(),
+                            base.slot(at) as *mut Pair,
+                            extra.len(),
+                        );
+                    }
+                }
+            });
+        unsafe {
+            found.set_len(total);
+        }
+        found
+    }
+}
+
+/// Shared destination for disjoint pair-row ranges.
+///
+/// Safety: jobs write distinct slots and do not read a slot another job writes.
+#[cfg(feature = "parallel")]
+#[derive(Clone, Copy)]
+struct SharePtr(*mut std::mem::MaybeUninit<Pair>);
+#[cfg(feature = "parallel")]
+unsafe impl Send for SharePtr {}
+#[cfg(feature = "parallel")]
+unsafe impl Sync for SharePtr {}
+#[cfg(feature = "parallel")]
+impl SharePtr {
+    unsafe fn slot(self, index: usize) -> *mut std::mem::MaybeUninit<Pair> {
+        self.0.add(index)
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn cell_ranges(offsets: &[usize], threads: usize) -> Vec<(usize, usize)> {
+    let ncell = offsets.len() - 1;
+    if ncell == 0 {
+        return Vec::new();
+    }
+    let threads = threads.max(1).min(ncell);
+    if threads == 1 {
+        return vec![(0, ncell)];
+    }
+    let total = offsets[ncell];
+    if total == 0 {
+        return vec![(0, ncell)];
+    }
+    let mut ranges = Vec::with_capacity(threads);
+    let mut start = 0usize;
+    for t in 1..threads {
+        let target = total * t / threads;
+        let mut end = start;
+        while end < ncell && offsets[end] < target {
+            end += 1;
+        }
+        if end == start {
+            end = (start + 1).min(ncell);
+        }
+        if end <= start {
+            break;
+        }
+        ranges.push((start, end));
+        start = end;
+    }
+    if start < ncell {
+        ranges.push((start, ncell));
+    }
+    ranges
 }
 
 /// # Safety
@@ -801,24 +933,20 @@ unsafe fn avx512_scan(
     let cutv = _mm512_set1_pd(cut2);
 
     macro_rules! take8 {
-        ($mask:expr, $d2v:expr, $jids:expr, $iu:expr, $iatom:expr) => {{
-            if $mask != 0 {
-                let mut td = [0.0f64; 8];
-                let mut tj = [0u64; 8];
-                _mm512_mask_compressstoreu_pd(td.as_mut_ptr(), $mask, $d2v);
-                _mm512_mask_compressstoreu_epi64(tj.as_mut_ptr() as *mut i64, $mask, $jids);
-                let c = $mask.count_ones() as usize;
-                let iatom = $iatom as u64;
-                for k in 0..c {
-                    let j = tj[k];
-                    if skip_self && j == iatom {
-                        continue;
-                    }
-                    atom_p.add(n).write($iu);
-                    js_p.add(n).write(j);
-                    d2_p.add(n).write(td[k]);
-                    n += 1;
+        ($mask:expr, $d2v:expr, $jids:expr, $iu:expr) => {{
+            let mask = $mask;
+            if mask != 0 {
+                let c = mask.count_ones() as usize;
+                _mm512_mask_compressstoreu_pd(d2_p.add(n), mask, $d2v);
+                _mm512_mask_compressstoreu_epi64(js_p.add(n) as *mut i64, mask, $jids);
+                let iu = $iu;
+                let end = n + c;
+                let mut k = n;
+                while k < end {
+                    atom_p.add(k).write(iu);
+                    k += 1;
                 }
+                n = end;
             }
         }};
     }
@@ -874,7 +1002,7 @@ unsafe fn avx512_scan(
                     let jids = _mm512_loadu_si512(idp.add(slot) as *const __m512i);
                     let d2v = dist8!(jx, jy, jz, bx, by, bz);
                     let mask = _mm512_cmp_pd_mask(d2v, cutv, _CMP_LT_OQ);
-                    take8!(mask, d2v, jids, iu, i);
+                    take8!(mask, d2v, jids, iu);
                     slot += 8;
                 }
                 for slot in end..block.j_hi {
@@ -936,16 +1064,10 @@ unsafe fn avx512_scan(
                 let d1 = dist8!(jx, jy, jz, b1x, b1y, b1z);
                 let d2v = dist8!(jx, jy, jz, b2x, b2y, b2z);
                 let d3 = dist8!(jx, jy, jz, b3x, b3y, b3z);
-                take8!(_mm512_cmp_pd_mask(d0, cutv, _CMP_LT_OQ), d0, jids, iu0, i0);
-                take8!(_mm512_cmp_pd_mask(d1, cutv, _CMP_LT_OQ), d1, jids, iu1, i1);
-                take8!(
-                    _mm512_cmp_pd_mask(d2v, cutv, _CMP_LT_OQ),
-                    d2v,
-                    jids,
-                    iu2,
-                    i2
-                );
-                take8!(_mm512_cmp_pd_mask(d3, cutv, _CMP_LT_OQ), d3, jids, iu3, i3);
+                take8!(_mm512_cmp_pd_mask(d0, cutv, _CMP_LT_OQ), d0, jids, iu0);
+                take8!(_mm512_cmp_pd_mask(d1, cutv, _CMP_LT_OQ), d1, jids, iu1);
+                take8!(_mm512_cmp_pd_mask(d2v, cutv, _CMP_LT_OQ), d2v, jids, iu2);
+                take8!(_mm512_cmp_pd_mask(d3, cutv, _CMP_LT_OQ), d3, jids, iu3);
                 slot += 8;
             }
             for slot in end..j_hi {
@@ -1262,6 +1384,55 @@ mod tests {
         got_key.sort();
         want.sort();
         assert_eq!(got_key, want);
+    }
+
+    #[test]
+    fn wide_cube_matches_shift_scan() {
+        let sim = Cell::ortho(18.0, 18.0, 18.0).unwrap();
+        let mut xyz = Vec::new();
+        for iz in 0..8 {
+            for iy in 0..8 {
+                for ix in 0..8 {
+                    xyz.push([
+                        (ix as f64 + 0.5) * 18.0 / 8.0,
+                        (iy as f64 + 0.5) * 18.0 / 8.0,
+                        (iz as f64 + 0.5) * 18.0 / 8.0,
+                    ]);
+                }
+            }
+        }
+        let cutoff = 4.0;
+        let cut2 = cutoff * cutoff;
+        for half in [false, true] {
+            let got = pairs_within(&xyz, &sim, cutoff, None, None, half).unwrap();
+            let mut want = Vec::new();
+            for i in 0..xyz.len() {
+                for j in 0..xyz.len() {
+                    for na in -1..=1 {
+                        for nb in -1..=1 {
+                            for nc in -1..=1 {
+                                if i == j && na == 0 && nb == 0 && nc == 0 {
+                                    continue;
+                                }
+                                let shift = [na, nb, nc];
+                                let d2 = sim.dist2_shifted(
+                                    xyz[i],
+                                    xyz[j],
+                                    sim.lattice_shift(na, nb, nc),
+                                );
+                                if d2 < cut2 && (!half || keep_half(i, j, shift)) {
+                                    want.push((i, j, shift));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut got_key: Vec<_> = got.iter().map(|p| (p.i, p.j, p.shift)).collect();
+            got_key.sort();
+            want.sort();
+            assert_eq!(got_key, want);
+        }
     }
 
     #[test]

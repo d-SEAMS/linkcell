@@ -1,7 +1,9 @@
 //! Cutoff-list probe for the periodic 18 Å cube at a 4 Å cutoff.
 //!
 //! Env: `PAIRS_N` (default 4096), `PAIRS_REPS` (default 5),
-//! `PAIRS_HALF` (default 0). `RAYON_NUM_THREADS` is read at startup.
+//! `PAIRS_HALF` (default 0), `PAIRS_HINT` (bin edge, or the cutoff).
+//! `RAYON_NUM_THREADS` is read at startup. The line reports the first
+//! three calls, then the mean of the timed reps after that.
 
 use std::time::Instant;
 
@@ -46,24 +48,29 @@ fn main() {
         .and_then(|s| s.parse().ok());
     let xyz = fill(n);
     let cell = Cell::ortho(18.0, 18.0, 18.0).expect("box");
-    // The first calls fault the pair buffer. Time the calls after that.
-    let mut warmup = Vec::new();
+    let mut pairs = Vec::new();
+    let mut early = Vec::new();
     for _ in 0..3 {
-        warmup = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
+        let t = Instant::now();
+        pairs = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
+        early.push(t.elapsed().as_secs_f64() * 1e3);
     }
     let t0 = Instant::now();
     let mut acc = 0usize;
     for _ in 0..reps {
-        let pairs = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
-        acc += pairs.len();
+        let got = pairs_within(&xyz, &cell, 4.0, None, hint, half).expect("pairs");
+        acc += got.len();
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     println!(
-        "n={} half={} hint={:?} pairs={} reps={} ms_per={:.4} acc={}",
+        "n={} half={} hint={:?} pairs={} cold={:.3} call2={:.3} call3={:.3} reps={} ms_per={:.4} acc={}",
         xyz.len(),
         half as u8,
         hint,
-        warmup.len(),
+        pairs.len(),
+        early[0],
+        early[1],
+        early[2],
         reps,
         ms / reps as f64,
         acc
