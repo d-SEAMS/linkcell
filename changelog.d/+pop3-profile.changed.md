@@ -1,1 +1,0 @@
-Scale probes always record the POP3 hierarchy: load balance, communication efficiency, parallel efficiency, then computation scaling and global efficiency against the 1-thread run. `scripts/bench-pairs.sh` prints that table for the cutoff list.

@@ -79,7 +79,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "linkcell"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "minimage",
  "rayon",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "linkcell-python"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "cc",
  "dlpk",
@@ -108,9 +108,9 @@ dependencies = [
 
 [[package]]
 name = "minimage"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad8f0c3ad52d3a9253be305dfee0ce9412d3f008784a031e346cc9de8700ee0e"
+checksum = "5b5871b19bca370f68bde5836914dcb7ca0aeca856eb8333233436841db1fbe7"
 
 [[package]]
 name = "ndarray"

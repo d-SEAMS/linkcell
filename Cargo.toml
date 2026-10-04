@@ -1,6 +1,6 @@
 [package]
 name = "linkcell"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 rust-version = "1.70"
 description = "Periodic linked-cell cutoff pairs and k-nearest neighbour search"
@@ -26,7 +26,7 @@ capi = []
 parallel = ["dep:rayon"]
 
 [dependencies]
-minimage = "0.1.2"
+minimage = "0.1.3"
 rayon = { version = "1.10", optional = true }
 
 [[test]]
