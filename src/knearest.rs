@@ -1,9 +1,11 @@
 //! Linked-cell k-nearest search (Allen and Tildesley).
 //!
-//! Fold into the primary cell of a Minkowski-reduced basis, bin on the
-//! fractional mesh in cell-major order, then expand Chebyshev shells
-//! until the k-th neighbour lies inside the perpendicular distance to
-//! the unvisited frontier. Distances are [`crate::Cell::dist2_shifted`]
+//! Fold into the primary cell, bin on the fractional mesh in cell-major
+//! order, then grow the index box until the k-th neighbour lies inside
+//! the perpendicular distance to the unvisited frontier. An orthorhombic
+//! box is walked as stored. A restricted triclinic box is tilt-reduced
+//! first. A general orientation is Minkowski-reduced. Distances are
+//! [`crate::Cell::dist2_shifted`]
 //! plus [`crate::Cell::lattice_shift`]. The walk keys on the integer
 //! stencil, not a unique-cell stamp: occupants of one bin can need
 //! different lattice images of the same source.
@@ -15,7 +17,7 @@
 //! `--no-default-features` to serialize. The per-source `KHeap` stays on
 //! the stack for `k <= 16`.
 
-use crate::bins::{self, frontier_dist2, slab_dist2, Mesh};
+use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::Error;
 
@@ -343,11 +345,13 @@ fn write_one(
 /// `cell_hint` is the target cell edge; `None` uses 3.0 in the same units
 /// as the box. Each row has `min(k, n_active - 1)` entries.
 ///
-/// Fold, bin, then expand Chebyshev shells in the Minkowski-reduced
-/// basis. Distances are [`Cell::dist2_shifted`] plus
-/// [`Cell::lattice_shift`]. The walk does not stamp unique cells:
-/// occupants of one bin can need different images. A full heap stops
-/// when its worst distance is at most the frontier plane bound.
+/// Fold, bin, then grow a rectangular index box. An orthorhombic cell
+/// is used as stored. A restricted triclinic cell is tilt-reduced
+/// first. A general orientation is Minkowski-reduced. Distances are
+/// [`Cell::dist2_shifted`] plus [`Cell::lattice_shift`]. The walk does
+/// not stamp unique cells: occupants of one bin can need different
+/// images. A full heap stops when its worst distance is at most the
+/// nearest unvisited face.
 ///
 /// ```
 /// use linkcell::{knearest, Cell};
@@ -424,11 +428,13 @@ fn execute(
         return Ok(());
     }
 
-    // Orthorhombic MIC is the per-axis wrap, so the original basis is
-    // already the one the shells should walk. A skewed cell is rewritten
-    // so the short lattice vectors are the edges.
+    // Orthorhombic MIC is the per-axis wrap. A LAMMPS / GROMACS
+    // restricted cell is tilt-reduced in place (same Cartesian frame).
+    // Anything else is Minkowski-reduced so the short vectors are the edges.
     let walk = if simbox.is_ortho() {
         *simbox
+    } else if simbox.is_restricted() {
+        simbox.reduce_tilts().unwrap_or(*simbox)
     } else {
         match minimage::minkowski_reduce(simbox) {
             Ok(cell) => cell,
@@ -456,14 +462,16 @@ fn execute(
         widths,
     };
     if walk.is_ortho() {
-        dispatch::<true>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+        dispatch::<0>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+    } else if walk.is_restricted() {
+        dispatch::<1>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
     } else {
-        dispatch::<false>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+        dispatch::<2>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
     }
     Ok(())
 }
 
-fn dispatch<const ORTHO: bool>(
+fn dispatch<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
     k: usize,
@@ -478,7 +486,7 @@ fn dispatch<const ORTHO: bool>(
         match (mask, out_d2) {
             (None, None) => {
                 out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
-                    walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
                 });
             }
             (None, Some(d2)) => {
@@ -487,13 +495,13 @@ fn dispatch<const ORTHO: bool>(
                     .zip(d2.par_chunks_mut(k))
                     .enumerate()
                     .for_each(|(i, (nn, dd))| {
-                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
                     });
             }
             (Some(mask), None) => {
                 out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
                     if mask[i] {
-                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
                     }
                 });
             }
@@ -504,7 +512,7 @@ fn dispatch<const ORTHO: bool>(
                     .enumerate()
                     .for_each(|(i, (nn, dd))| {
                         if mask[i] {
-                            walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                            walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
                         }
                     });
             }
@@ -515,25 +523,25 @@ fn dispatch<const ORTHO: bool>(
         match (mask, out_d2) {
             (None, None) => {
                 for (i, nn) in out_nn.chunks_mut(k).enumerate() {
-                    walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
                 }
             }
             (None, Some(d2)) => {
                 for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
-                    walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
                 }
             }
             (Some(mask), None) => {
                 for (i, nn) in out_nn.chunks_mut(k).enumerate() {
                     if mask[i] {
-                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, None);
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
                     }
                 }
             }
             (Some(mask), Some(d2)) => {
                 for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
                     if mask[i] {
-                        walk_source::<ORTHO>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
                     }
                 }
             }
@@ -542,7 +550,7 @@ fn dispatch<const ORTHO: bool>(
 }
 
 #[inline(always)]
-fn walk_source<const ORTHO: bool>(
+fn walk_source<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
     k: usize,
@@ -555,8 +563,10 @@ fn walk_source<const ORTHO: bool>(
     let [ix, iy, iz] = mesh.bin[i];
     let origin = mesh.frac[i];
     let pi = mesh.folded[i];
-    let mut reach = 1i32;
-    while reach <= max_reach {
+    // Nothing visited yet. The first layer is the 3x3x3 around the source.
+    let mut prev = [-1i32; 3];
+    let mut reach = [1i32; 3];
+    loop {
         let mut query = CellQuery {
             heap: &mut heap,
             mesh,
@@ -565,45 +575,56 @@ fn walk_source<const ORTHO: bool>(
             pi,
             origin,
         };
-        if reach == 1 {
-            for dz in -1..=1 {
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, false);
-                    }
-                }
-            }
-        } else {
-            let r = reach;
-            for dz in [-r, r] {
-                for dx in -r..=r {
-                    for dy in -r..=r {
-                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, true);
-                    }
-                }
-            }
-            for dy in [-r, r] {
-                for dx in -r..=r {
-                    for dz in (1 - r)..r {
-                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, true);
-                    }
-                }
-            }
-            for dx in [-r, r] {
-                for dy in (1 - r)..r {
-                    for dz in (1 - r)..r {
-                        visit_cell::<ORTHO>(&mut query, ix + dx, iy + dy, iz + dz, true);
-                    }
-                }
-            }
-        }
+        let allow_slab = prev[0] >= 0;
+        for_new_layer(prev, reach, |dx, dy, dz| {
+            visit_cell::<MODE>(&mut query, ix + dx, iy + dy, iz + dz, allow_slab);
+        });
+        let gaps = [
+            axis_gap(origin[0], ix, reach[0], geom.nbin[0], geom.widths[0]),
+            axis_gap(origin[1], iy, reach[1], geom.nbin[1], geom.widths[1]),
+            axis_gap(origin[2], iz, reach[2], geom.nbin[2], geom.widths[2]),
+        ];
         if heap.full() {
-            let bound = frontier_dist2(origin, [ix, iy, iz], reach, geom.nbin, geom.widths, false);
+            let bound = gaps
+                .into_iter()
+                .map(|gap| {
+                    if gap > 0.0 && gap.is_finite() {
+                        gap * gap
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(f64::INFINITY, f64::min);
             if heap.worst() <= bound {
                 break;
             }
         }
-        reach += 1;
+        prev = reach;
+        let mut grew = false;
+        if heap.full() {
+            let worst = heap.worst();
+            for a in 0..3 {
+                let gap2 = if gaps[a] > 0.0 && gaps[a].is_finite() {
+                    gaps[a] * gaps[a]
+                } else {
+                    0.0
+                };
+                if worst > gap2 && reach[a] < max_reach {
+                    reach[a] += 1;
+                    grew = true;
+                }
+            }
+        } else {
+            for slot in &mut reach {
+                if *slot < max_reach {
+                    *slot += 1;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
     }
     heap.write_sorted(nn, d2);
 }
@@ -618,13 +639,7 @@ struct CellQuery<'a> {
 }
 
 #[inline(always)]
-fn visit_cell<const ORTHO: bool>(
-    q: &mut CellQuery<'_>,
-    jx: i32,
-    jy: i32,
-    jz: i32,
-    allow_slab: bool,
-) {
+fn visit_cell<const MODE: u8>(q: &mut CellQuery<'_>, jx: i32, jy: i32, jz: i32, allow_slab: bool) {
     let (cell, na, nb, nc) = q.mesh.locate(jx, jy, jz);
     let lo = q.mesh.offsets[cell];
     let hi = q.mesh.offsets[cell + 1];
@@ -634,13 +649,16 @@ fn visit_cell<const ORTHO: bool>(
     }
     // One orthorhombic occupant is a subtract and three multiplies.
     // The slab test is three divisions, so it only pays for a crowded bin.
-    if allow_slab && !(ORTHO && count == 1) && q.heap.full() {
+    // Mode 0 is orthorhombic: one occupant is a subtract, and the slab
+    // test costs more than the distance. Restricted and general cells
+    // keep the slab, because the shift is a matrix product.
+    if allow_slab && !(MODE == 0 && count == 1) && q.heap.full() {
         let lb = slab_dist2(q.origin, [jx, jy, jz], q.geom.nbin, q.geom.widths);
         if q.heap.worst() <= lb {
             return;
         }
     }
-    let shift = if ORTHO {
+    let shift = if MODE == 0 {
         if (na | nb | nc) == 0 {
             [0.0; 3]
         } else {
@@ -650,6 +668,19 @@ fn visit_cell<const ORTHO: bool>(
                 f64::from(nc) * q.geom.lengths[2],
             ]
         }
+    } else if MODE == 1 {
+        // Restricted triclinic: a along x, b in the xy plane.
+        let fa = f64::from(na);
+        let fb = f64::from(nb);
+        let fc = f64::from(nc);
+        let a = q.geom.cols[0];
+        let b = q.geom.cols[1];
+        let c = q.geom.cols[2];
+        [
+            fa * a[0] + fb * b[0] + fc * c[0],
+            fb * b[1] + fc * c[1],
+            fc * c[2],
+        ]
     } else {
         let fa = f64::from(na);
         let fb = f64::from(nb);

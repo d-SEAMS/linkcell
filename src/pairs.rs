@@ -6,7 +6,7 @@
 //! self-images. Displacement is
 //! `q - p + lattice_shift(S)`.
 
-use crate::bins::{self, for_shell, frontier_dist2, slab_dist2, Mesh};
+use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::Error;
 
@@ -108,9 +108,10 @@ pub fn pairs_within(
         let origin = mesh.frac[i];
         let pi = mesh.folded[i];
         let mut found = Vec::new();
-        let mut reach = 1i32;
-        while reach <= max_reach {
-            for_shell(reach, |dx, dy, dz| {
+        let mut prev = [-1i32; 3];
+        let mut reach = [1i32; 3];
+        loop {
+            for_new_layer(prev, reach, |dx, dy, dz| {
                 let jx = ix + dx;
                 let jy = iy + dy;
                 let jz = iz + dz;
@@ -139,11 +140,29 @@ pub fn pairs_within(
                     }
                 }
             });
-            let bound = frontier_dist2(origin, [ix, iy, iz], reach, nbin, widths, true);
-            if bound >= cut2 {
+            let gaps = [
+                axis_gap(origin[0], ix, reach[0], mesh.nx, widths[0]),
+                axis_gap(origin[1], iy, reach[1], mesh.ny, widths[1]),
+                axis_gap(origin[2], iz, reach[2], mesh.nz, widths[2]),
+            ];
+            let mut grew = false;
+            prev = reach;
+            for a in 0..3 {
+                let mut gap = gaps[a];
+                gap = bins::certify(gap);
+                let bound = if gap > 0.0 && gap.is_finite() {
+                    gap * gap
+                } else {
+                    0.0
+                };
+                if bound < cut2 && reach[a] < max_reach {
+                    reach[a] += 1;
+                    grew = true;
+                }
+            }
+            if !grew {
                 break;
             }
-            reach += 1;
         }
         found
     };

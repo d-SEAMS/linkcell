@@ -646,6 +646,40 @@ fn lattice_knearest(
 }
 
 #[test]
+fn film_with_vacuum_matches_brute() {
+    // eOn / readcon orthorhombic film: the points fill a cube and z
+    // continues into vacuum. k = 4 must match the orthorhombic MIC.
+    let b = Cell::ortho(20.0, 20.0, 40.0).unwrap();
+    let mut xyz = Vec::new();
+    for iz in 0..4 {
+        for iy in 0..4 {
+            for ix in 0..4 {
+                xyz.push([
+                    (ix as f64 + 0.5) * 5.0,
+                    (iy as f64 + 0.5) * 5.0,
+                    (iz as f64 + 0.5) * 5.0,
+                ]);
+            }
+        }
+    }
+    let got = knearest(&xyz, &b, 4, None, Some(3.0)).unwrap();
+    let brute = knearest_brute(&xyz, &b, 4, None).unwrap();
+    assert_rows_match("film", &got, &brute);
+}
+
+#[test]
+fn tilted_dump_matches_euclidean() {
+    // seams genice sH: LAMMPS bound with an xy tilt, scaled down.
+    let b = Cell::from_lammps(-2.0, 8.0, 0.0, 4.0, 0.0, 7.0, -2.0, 0.0, 0.0).unwrap();
+    assert!(b.is_restricted());
+    assert!(!b.is_ortho());
+    let xyz = points_in_cell(&b, 24, 7);
+    let got = knearest(&xyz, &b, 4, None, Some(1.5)).unwrap();
+    let brute = knearest_brute(&xyz, &b, 4, None).unwrap();
+    assert_rows_match("tilt", &got, &brute);
+}
+
+#[test]
 fn unreduced_grid_matches_lattice_scan() {
     // Shift (-7, 7, 0) is the Euclidean image here. A 27-image check misses it.
     let b = unreduced_skew();

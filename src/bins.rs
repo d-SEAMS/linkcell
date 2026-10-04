@@ -1,10 +1,11 @@
-//! Cell-major bins and the certified Chebyshev frontier.
+//! Cell-major bins and the certified index-box frontier.
 //!
 //! Occupants of one bin sit in a contiguous slice (HOOMD / vesin), so the
-//! stencil walk is a sequential read. After shell `reach`, every unvisited
-//! image lies beyond one of six lattice planes. The perpendicular distance
-//! to the nearest of those planes is a lower bound on the unvisited
-//! distance, and it is safe to stop once the k-th neighbour is inside it.
+//! stencil walk is a sequential read. The visited set is a rectangular
+//! box in bin index. Every unvisited image lies beyond one of six lattice
+//! planes. The perpendicular distance to the nearest of those planes is a
+//! lower bound on the unvisited distance, and it is safe to stop once the
+//! k-th neighbour is inside it.
 
 use std::cell::RefCell;
 
@@ -202,67 +203,34 @@ pub(crate) fn target_edge(simbox: &Cell, hint: Option<f64>, fallback: f64) -> f6
     edge.min(w[0]).min(w[1]).min(w[2])
 }
 
-/// Visit the Chebyshev shell `max(|dx|,|dy|,|dz|) == reach`.
-///
-/// Reach 1 also visits the home cell. Later shells are the surface only.
-pub(crate) fn for_shell(reach: i32, mut visit: impl FnMut(i32, i32, i32)) {
-    if reach == 1 {
-        visit(0, 0, 0);
-    }
-    let r = reach;
-    for dz in [-r, r] {
-        for dx in -r..=r {
-            for dy in -r..=r {
-                visit(dx, dy, dz);
-            }
-        }
-    }
-    for dy in [-r, r] {
-        for dx in -r..=r {
-            for dz in (1 - r)..r {
-                visit(dx, dy, dz);
-            }
-        }
-    }
-    for dx in [-r, r] {
-        for dy in (1 - r)..r {
-            for dz in (1 - r)..r {
+/// Index box grown from `prev` to `reach`. `prev` of `-1` visits the
+/// whole box, including the home cell. Later calls visit only the new
+/// faces, so a short axis can grow while a long axis stays put.
+pub(crate) fn for_new_layer(prev: [i32; 3], reach: [i32; 3], mut visit: impl FnMut(i32, i32, i32)) {
+    let [px, py, pz] = prev;
+    let [rx, ry, rz] = reach;
+    for dz in -rz..=rz {
+        for dy in -ry..=ry {
+            for dx in -rx..=rx {
+                if dx.abs() <= px && dy.abs() <= py && dz.abs() <= pz {
+                    continue;
+                }
                 visit(dx, dy, dz);
             }
         }
     }
 }
 
-/// Squared lower bound on any point outside the visited Chebyshev cube.
+/// Perpendicular gap from fractional coordinate `s` to the nearest
+/// plane just outside an index interval of radius `reach`.
 ///
-/// Bins are half-open, so an unvisited point lies strictly past this
-/// plane. `conservative` shrinks the plane for a cutoff test, where a
-/// rounded-up gap would drop a pair that is still inside the cutoff.
-/// k-nearest passes `false`: a neighbour sitting on the plane is still
-/// the nearest, and shrinking it forces another shell.
-pub(crate) fn frontier_dist2(
-    s: [f64; 3],
-    bin: [i32; 3],
-    reach: i32,
-    n: [i32; 3],
-    w: [f64; 3],
-    conservative: bool,
-) -> f64 {
-    let mut gap = f64::INFINITY;
-    for a in 0..3 {
-        let inv = 1.0 / f64::from(n[a]);
-        let plus = (f64::from(bin[a] + reach + 1) * inv - s[a]) * w[a];
-        let minus = (s[a] - f64::from(bin[a] - reach) * inv) * w[a];
-        gap = gap.min(plus).min(minus);
-    }
-    if conservative {
-        gap = certify(gap);
-    }
-    if gap > 0.0 && gap.is_finite() {
-        gap * gap
-    } else {
-        0.0
-    }
+/// Bins are half-open, so an unvisited point lies past this plane. A
+/// neighbour sitting on the plane is still inside the visited interval.
+pub(crate) fn axis_gap(s: f64, bin: i32, reach: i32, n: i32, w: f64) -> f64 {
+    let nf = f64::from(n);
+    let plus = (f64::from(bin + reach + 1) / nf - s) * w;
+    let minus = (s - f64::from(bin - reach) / nf) * w;
+    plus.min(minus)
 }
 
 /// Squared lower bound on the distance from `s` to an image bin.
@@ -320,7 +288,7 @@ fn cell_index(ix: i32, iy: i32, iz: i32, nx: i32, ny: i32, nz: i32) -> usize {
     ((cz * ny + cy) * nx + cx) as usize
 }
 
-fn certify(dist: f64) -> f64 {
+pub(crate) fn certify(dist: f64) -> f64 {
     if dist <= 0.0 || !dist.is_finite() {
         return 0.0;
     }
@@ -337,25 +305,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_covers_the_cube_surface_once() {
-        for reach in 1..=4 {
-            let mut seen = Vec::new();
-            for_shell(reach, |dx, dy, dz| seen.push((dx, dy, dz)));
-            seen.sort_unstable();
-            let mut uniq = seen.clone();
-            uniq.dedup();
-            assert_eq!(seen.len(), uniq.len(), "reach {reach} repeats");
-            let side = 2 * reach + 1;
-            let volume = (side * side * side) as usize;
-            let inner = if reach == 1 {
-                0
-            } else {
-                let s = 2 * (reach - 1) + 1;
-                (s * s * s) as usize
-            };
-            assert_eq!(seen.len(), volume - inner);
-            assert_eq!(seen.contains(&(0, 0, 0)), reach == 1);
-        }
+    fn new_layer_is_the_cube_then_one_face() {
+        let mut first = Vec::new();
+        for_new_layer([-1, -1, -1], [1, 1, 1], |dx, dy, dz| {
+            first.push((dx, dy, dz));
+        });
+        assert_eq!(first.len(), 27);
+        let mut grown = Vec::new();
+        for_new_layer([1, 1, 1], [1, 2, 1], |dx, dy, dz| {
+            grown.push((dx, dy, dz));
+        });
+        assert_eq!(grown.len(), 2 * 3 * 3);
+        assert!(grown.iter().all(|(_, y, _)| y.abs() == 2));
     }
 
     #[test]
@@ -367,7 +328,10 @@ mod tests {
         let w = [10.0, 10.0, 10.0];
         let h = w[0] / f64::from(n[0]);
         for reach in 1..=3 {
-            let bound = frontier_dist2(s, bin, reach, n, w, false);
+            let gap = axis_gap(s[0], bin[0], reach, n[0], w[0])
+                .min(axis_gap(s[1], bin[1], reach, n[1], w[1]))
+                .min(axis_gap(s[2], bin[2], reach, n[2], w[2]));
+            let bound = gap * gap;
             let loose = (f64::from(reach) * h) * (f64::from(reach) * h);
             assert!(
                 bound + 1e-9 >= loose * (1.0 - 2.0 * CERT_REL),

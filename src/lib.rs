@@ -2,12 +2,12 @@
 //!
 //! vesin builds cutoff pair lists. nanoflann builds Euclidean KD-trees
 //! without a minimum-image convention. This crate is the missing piece:
-//! Allen and Tildesley's linked cells, a k-heap per source, expanding
-//! Chebyshev shells until the k-th neighbour cannot lie outside the
-//! visited cube. The pair itself is Rapaport's cell shift, not a
-//! per-pair nearest integer. [`pairs_within`] is the cutoff pair list
-//! with integer cell shifts (vesin/tonari `ijS`); [`knearest`]
-//! unique-indexes.
+//! Allen and Tildesley's linked cells, a k-heap per source, and an
+//! index box that grows one axis at a time until the k-th neighbour
+//! cannot lie past an unvisited face. The pair itself is Rapaport's
+//! cell shift, not a per-pair nearest integer. [`pairs_within`] is the
+//! cutoff pair list with integer cell shifts (vesin/tonari `ijS`);
+//! [`knearest`] unique-indexes.
 //!
 //! # Algorithm
 //!
@@ -16,14 +16,21 @@
 //! 2. **Bin** the folded points on a fractional mesh. The bin count
 //!    along each axis uses the perpendicular face width, so a sheared
 //!    dump is not treated as orthogonal.
-//! 3. **Expand Chebyshev shells** of linked cells (`reach = 1, 2, ...`)
-//!    on a Minkowski-reduced basis of the same lattice. Occupants are
-//!    stored in cell order. The walk stops when the k-heap is full and
-//!    the k-th squared distance is at most the perpendicular distance to
-//!    the unvisited frontier. A neighbour cell whose slab cannot beat
-//!    that distance is skipped. The shell cap is the space diagonal
-//!    over the minimum cell height, so a shift outside `{-1,0,1}` is
-//!    still visited when it is the Euclidean image.
+//! 3. **Grow an index box** of linked cells. The first visit is the
+//!    3×3×3 around the home bin. After that, only an axis whose
+//!    unvisited plane is still inside the k-th neighbour grows.
+//!    Occupants are stored in cell order. A neighbour cell whose slab
+//!    cannot beat the worst heap entry is skipped. The cap is the
+//!    space diagonal over the minimum cell height, so a shift outside
+//!    `{-1,0,1}` is still visited when it is the Euclidean image.
+//!
+//! The walk basis depends on the cell. An orthorhombic box, including
+//! a rectangular film, is used as stored. A restricted triclinic box
+//! (LAMMPS dump bounds, a CON angle, a hexagonal prism) is
+//! tilt-reduced in place and the shift is triangular. A general
+//! orientation is Minkowski-reduced. [`pairs_within`] keeps the
+//! caller's basis, because the reported shift is an integer
+//! combination of that H.
 //!
 //! Pair distances in the walk are not a per-pair minimum-image wrap.
 //! After the fold, a neighbour stencil `(jx, jy, jz)` contributes

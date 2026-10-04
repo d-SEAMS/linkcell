@@ -1,9 +1,9 @@
 # Algorithm
 
 Linked-cell k-nearest search in `src/knearest.rs`. Allen and
-Tildesley linked cells, a k-heap per source, Chebyshev shells until
-the k-th neighbour cannot lie outside the visited cube. The search
-takes no cutoff.
+Tildesley linked cells, a k-heap per source, and a rectangular index
+box that grows until the k-th neighbour cannot lie past an unvisited
+face. The search takes no cutoff.
 
 ## Inputs
 
@@ -34,10 +34,14 @@ a sheared box uses `Hinv` only for this fold.
 
 ## Shells
 
-For each source, walk integer cell offsets `(dx, dy, dz)` in
-Chebyshev shells. Shell `reach` is the surface
-`max(|dx|, |dy|, |dz|) == reach` (`reach == 1` also visits the home
-cell). `max_reach` is `max(nx, ny, nz) / 2 + 1`.
+For each source, walk integer cell offsets `(dx, dy, dz)`. The first
+visit is the 3×3×3 around the home bin. After that the index box
+grows one axis at a time: an axis whose unvisited plane is already
+farther than the k-th neighbour stays put, and a short face can take
+another layer while the long faces do not. A cube shell is the case
+where all three planes fail together. `max_reach` is the space
+diagonal of the walk cell, in units of the shortest bin edge, and at
+least half the longest bin count.
 
 Each offset maps to:
 
@@ -56,14 +60,18 @@ in [MIC and cells](../explanation/mic-and-cells.md).
 
 ## Basis
 
-`knearest` bins in a Minkowski-reduced basis (Nguyen–Stehlé). The
-basis spans the same Cartesian lattice, with the short vectors as
-edges, so the Euclidean image is a nearby shell. A 27-image check
-on that basis can still miss a closer shift; the shell cap is the
-space diagonal divided by the minimum cell height, and the frontier
-test stops the walk once the k-th neighbour is certified.
+An orthorhombic box is already the basis the shells walk.
+A restricted triclinic box (LAMMPS dump bounds, a CON file with a
+non-right angle, the cells seams and rgsaddle pass) is tilt-reduced
+in place, GROMACS `correct_box`, and the shift is the triangular
+product. A general orientation is Minkowski-reduced (Nguyen–Stehlé).
+The basis spans the same Cartesian lattice. A 27-image check on that
+basis can still miss a closer shift; the shell cap is the space
+diagonal divided by the minimum cell height, and the frontier test
+stops the walk once the k-th neighbour is certified.
 `pairs_within` keeps the caller's basis, because the returned shift
-`S` is an integer combination of that H.
+`S` is an integer combination of that H. Its index box grows the
+same way, one axis at a time, out to the cutoff.
 
 ## Heap and stop
 

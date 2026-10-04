@@ -94,8 +94,16 @@ that certificate. The walk does not stop at 27 images.
 Welling and Germano, *Comput. Phys. Commun.* **182**, 611 (2011),
 compare the later cell-list variants on the same footing. Gonnet's
 projection sort beats a plain cell list only above roughly 19
-particles per cell. The cubic hot path has one particle per cell, so
-the walk computes the distance instead of projecting.
+particles per cell. A filled cubic lattice has one particle per cell,
+so the walk computes the distance instead of projecting.
+
+The cells this crate is called on are not that cube. eOn and readcon
+store orthorhombic CON frames, often a film plus vacuum. seams walks
+LAMMPS dumps, including restricted triclinic ice (an `xy` tilt).
+rgsaddle's band cell includes a hexagonal prism. Those are
+orthorhombic or tilt-reduced restricted cells. The index box grows
+only on the axis whose plane is still inside the k-th neighbour, so
+a short face does not drag the long faces out to the same shell.
 
 ## Codes that answer a different question
 

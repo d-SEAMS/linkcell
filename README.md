@@ -192,18 +192,22 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   origin. Orthorhombic boxes are `Cell::ortho` / `lc_cell_ortho`.
   Binning is in fractional space, so a sheared dump is not treated as
   orthogonal.
-- Points fold into the primary cell once. Each source then walks
-  Chebyshev shells of neighbour cells. Pair distances are a Cartesian
-  subtract plus that cell's lattice translation (`dist2_shifted` and
-  `lattice_shift`), the vesin / LAMMPS ghost construction. Orthorhombic
-  boxes use three independent wraps and skip the two Hinv matvecs.
+- Points fold into the primary cell once. Each source then grows a
+  rectangular box of neighbour cells, one axis at a time. Pair
+  distances are a Cartesian subtract plus that cell's lattice
+  translation (`dist2_shifted` and `lattice_shift`), the vesin /
+  LAMMPS ghost construction. Orthorhombic boxes use three independent
+  wraps and skip the two Hinv matvecs. A restricted triclinic box is
+  tilt-reduced and uses a triangular shift.
 - One lattice shift per unique cell is wrong unless every wrap of that
   cell is visited. The walk visits integer cell offsets, so each wrap
   of a bin is a separate visit.
 - The search does not take a cutoff. A cell-size hint only sets the bin
-  width. `knearest` bins in a Minkowski-reduced basis and stores each
-  bin as a contiguous slice. Shells grow until the k-th neighbour is
-  no farther than the unvisited frontier.
+  width. `knearest` stores each bin as a contiguous slice. An
+  orthorhombic cell is binned as stored, a restricted triclinic cell
+  is tilt-reduced, and a general orientation is Minkowski-reduced.
+  The box grows until the k-th neighbour is no farther than the
+  nearest unvisited face.
 - vesin remains the right library for a *cutoff* pair list.
 
 ## License
