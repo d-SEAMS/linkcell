@@ -14,9 +14,14 @@
 //! 2. **Bin** the folded points on a fractional mesh. The bin count
 //!    along each axis uses the perpendicular face width, so a sheared
 //!    dump is not treated as orthogonal.
-//! 3. **Expand Chebyshev shells** of linked cells (`reach = 1, 2, ...`).
-//!    The walk stops when the k-heap is full and the k-th squared
-//!    distance cannot hide beyond `(reach * min_subcell_height)^2`.
+//! 3. **Expand Chebyshev shells** of linked cells (`reach = 1, 2, ...`)
+//!    on a Minkowski-reduced basis of the same lattice. Occupants are
+//!    stored in cell order. The walk stops when the k-heap is full and
+//!    the k-th squared distance is inside the perpendicular distance to
+//!    the unvisited frontier. A neighbour cell whose slab cannot beat
+//!    that distance is skipped. The shell cap is the space diagonal
+//!    over the minimum cell height, so a shift outside `{-1,0,1}` is
+//!    still visited when it is the Euclidean image.
 //!
 //! Pair distances in the walk are not a per-pair minimum-image wrap.
 //! After the fold, a neighbour stencil `(jx, jy, jz)` contributes
@@ -105,6 +110,7 @@
 
 #![deny(missing_docs)]
 
+mod bins;
 mod cell;
 mod error;
 mod knearest;

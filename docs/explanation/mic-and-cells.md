@@ -39,6 +39,16 @@ primary bin is visited once per wrap the Chebyshev shell reaches.
 That is the vesin-style construction: every wrap is a visit. One
 shift per cell is correct only when every wrap is visited.
 
+The offsets are taken in a Minkowski-reduced basis of the same
+lattice, so a short vector such as `a - b` is a cell edge. Reduction
+does not change which Cartesian images exist. It does not by itself
+make the nearest image one of the 27 shifts: an unreduced dump can
+need an original shift such as `(-7, 7, 0)`. The walk keeps expanding
+shells until the k-th neighbour is inside the perpendicular distance
+to the unvisited frontier, or until the shell covers a space
+diagonal. `pairs_within` does not reduce: its shift is the caller's
+`S`.
+
 ## Cutoff pair lists
 
 vesin answers "who is inside radius r". This crate answers "who are

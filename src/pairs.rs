@@ -6,10 +6,10 @@
 //! self-images. Displacement is
 //! `q - p + lattice_shift(S)`.
 
+use crate::bins::{self, for_shell, frontier_dist2, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::Error;
 
-const MAX_CELLS: i64 = 16_777_216;
 const MAX_IMAGES: i64 = 1 << 24;
 
 /// One atom-image pair inside the cutoff.
@@ -23,14 +23,6 @@ pub struct Pair {
     pub shift: [i32; 3],
     /// Squared distance after the shift.
     pub dist2: f64,
-}
-
-fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
-    let n = (width / edge).floor().max(1.0);
-    if !n.is_finite() || n > 1_000_000.0 {
-        return Err(Error::TooManyCells);
-    }
-    Ok(n as i32)
 }
 
 fn keep_half(i: usize, j: usize, shift: [i32; 3]) -> bool {
@@ -93,117 +85,87 @@ pub fn pairs_within(
         image_count *= factor;
     }
 
-    let mut edge = cell_hint.unwrap_or(cutoff);
-    if !edge.is_finite() || edge <= 0.0 {
-        edge = cutoff;
-    }
-    edge = edge.min(w[0]).min(w[1]).min(w[2]);
-
-    let nx = bins_1d(w[0], edge)?;
-    let ny = bins_1d(w[1], edge)?;
-    let nz = bins_1d(w[2], edge)?;
-    let ncell = (i64::from(nx))
-        .checked_mul(i64::from(ny))
-        .and_then(|v| v.checked_mul(i64::from(nz)))
-        .filter(|&v| v > 0 && v <= MAX_CELLS)
-        .ok_or(Error::TooManyCells)? as usize;
-    let invx = f64::from(nx);
-    let invy = f64::from(ny);
-    let invz = f64::from(nz);
-    let cell_min = (w[0] / f64::from(nx))
-        .min(w[1] / f64::from(ny))
-        .min(w[2] / f64::from(nz));
-
-    let mut folded = vec![[0.0; 3]; n];
-    let mut bin = vec![(0i32, 0i32, 0i32); n];
-    for &i in &active {
-        let s = simbox.fractional(xyz[i]);
-        folded[i] = simbox.cartesian(s);
-        bin[i] = (
-            ((s[0] * invx) as i32).clamp(0, nx - 1),
-            ((s[1] * invy) as i32).clamp(0, ny - 1),
-            ((s[2] * invz) as i32).clamp(0, nz - 1),
-        );
-    }
-
-    let mut head = vec![-1isize; ncell];
-    let mut next = vec![-1isize; n];
-    let cell_index = |ix: i32, iy: i32, iz: i32| -> usize {
-        let cx = ix.rem_euclid(nx);
-        let cy = iy.rem_euclid(ny);
-        let cz = iz.rem_euclid(nz);
-        ((cz * ny + cy) * nx + cx) as usize
-    };
-    for &i in &active {
-        let (ix, iy, iz) = bin[i];
-        let c = cell_index(ix, iy, iz);
-        next[i] = head[c];
-        head[c] = i as isize;
-    }
-
+    let edge = bins::target_edge(simbox, cell_hint, cutoff);
+    let mesh = Mesh::build(xyz, simbox, &active, edge)?;
+    let cell_min = (mesh.widths[0] / f64::from(mesh.nx))
+        .min(mesh.widths[1] / f64::from(mesh.ny))
+        .min(mesh.widths[2] / f64::from(mesh.nz));
     let reach_cut = (cutoff / cell_min).ceil();
     if !reach_cut.is_finite() || reach_cut > i32::MAX as f64 {
         return Err(Error::TooManyImages);
     }
     let max_reach = (reach_cut as i32)
-        .max(repeats[0] * nx)
-        .max(repeats[1] * ny)
-        .max(repeats[2] * nz)
+        .max(repeats[0] * mesh.nx)
+        .max(repeats[1] * mesh.ny)
+        .max(repeats[2] * mesh.nz)
         .max(1);
     let cut2 = cutoff * cutoff;
-    let mut pairs = Vec::new();
+    let nbin = [mesh.nx, mesh.ny, mesh.nz];
+    let widths = mesh.widths;
 
-    for &i in &active {
-        let (ix, iy, iz) = bin[i];
+    let one = |i: usize| -> Vec<Pair> {
+        let [ix, iy, iz] = mesh.bin[i];
+        let origin = mesh.frac[i];
+        let pi = mesh.folded[i];
+        let mut found = Vec::new();
         let mut reach = 1i32;
         while reach <= max_reach {
-            for dx in -reach..=reach {
-                for dy in -reach..=reach {
-                    for dz in -reach..=reach {
-                        let shell = reach == 1
-                            || dx.abs() == reach
-                            || dy.abs() == reach
-                            || dz.abs() == reach;
-                        if !shell && reach > 1 {
-                            continue;
-                        }
-                        let jx = ix + dx;
-                        let jy = iy + dy;
-                        let jz = iz + dz;
-                        let c = cell_index(jx, jy, jz);
-                        let na = jx.div_euclid(nx);
-                        let nb = jy.div_euclid(ny);
-                        let nc = jz.div_euclid(nz);
-                        let shift_s = [na, nb, nc];
-                        let shift = simbox.lattice_shift(na, nb, nc);
-                        let mut j = head[c];
-                        while j >= 0 {
-                            let ju = j as usize;
-                            let zero_self = ju == i && na == 0 && nb == 0 && nc == 0;
-                            if !zero_self {
-                                let d2 = simbox.dist2_shifted(folded[i], folded[ju], shift);
-                                if d2 < cut2 && (!half || keep_half(i, ju, shift_s)) {
-                                    pairs.push(Pair {
-                                        i,
-                                        j: ju,
-                                        shift: shift_s,
-                                        dist2: d2,
-                                    });
-                                }
-                            }
-                            j = next[ju];
-                        }
+            for_shell(reach, |dx, dy, dz| {
+                let jx = ix + dx;
+                let jy = iy + dy;
+                let jz = iz + dz;
+                let lb = slab_dist2(origin, [jx, jy, jz], nbin, widths);
+                if lb >= cut2 {
+                    return;
+                }
+                let na = jx.div_euclid(mesh.nx);
+                let nb = jy.div_euclid(mesh.ny);
+                let nc = jz.div_euclid(mesh.nz);
+                let shift_s = [na, nb, nc];
+                let shift = simbox.lattice_shift(na, nb, nc);
+                for &ju in mesh.slots(mesh.cell_of(jx, jy, jz)) {
+                    let zero_self = ju == i && na == 0 && nb == 0 && nc == 0;
+                    if zero_self {
+                        continue;
+                    }
+                    let d2 = simbox.dist2_shifted(pi, mesh.folded[ju], shift);
+                    if d2 < cut2 && (!half || keep_half(i, ju, shift_s)) {
+                        found.push(Pair {
+                            i,
+                            j: ju,
+                            shift: shift_s,
+                            dist2: d2,
+                        });
                     }
                 }
-            }
-            let bound = f64::from(reach) * cell_min;
-            if bound * bound >= cut2 {
+            });
+            let bound = frontier_dist2(origin, [ix, iy, iz], reach, nbin, widths);
+            if bound >= cut2 {
                 break;
             }
             reach += 1;
         }
+        found
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let chunks: Vec<Vec<Pair>> = active.par_iter().copied().map(one).collect();
+        let mut pairs = Vec::new();
+        for chunk in chunks {
+            pairs.extend(chunk);
+        }
+        Ok(pairs)
     }
-    Ok(pairs)
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut pairs = Vec::new();
+        for &i in &active {
+            pairs.extend(one(i));
+        }
+        Ok(pairs)
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +192,51 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].i, 0);
         assert_eq!(pairs[0].j, 1);
+    }
+
+    #[test]
+    fn sheared_cutoff_matches_shift_scan() {
+        let sim = Cell::from_vectors(
+            [4.0, 0.0, 0.0],
+            [1.5, 3.0, 0.0],
+            [0.2, -0.4, 3.5],
+            [0.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let xyz = [
+            sim.cartesian([0.05, 0.10, 0.20]),
+            sim.cartesian([0.90, 0.15, 0.80]),
+            sim.cartesian([0.40, 0.70, 0.30]),
+            sim.cartesian([0.12, 0.85, 0.05]),
+        ];
+        let cutoff = 2.5;
+        let got = pairs_within(&xyz, &sim, cutoff, None, Some(1.0), false).unwrap();
+        let mut want = Vec::new();
+        let cut2 = cutoff * cutoff;
+        for i in 0..xyz.len() {
+            for j in 0..xyz.len() {
+                for na in -2..=2 {
+                    for nb in -2..=2 {
+                        for nc in -2..=2 {
+                            if i == j && na == 0 && nb == 0 && nc == 0 {
+                                continue;
+                            }
+                            let shift = sim.lattice_shift(na, nb, nc);
+                            let pi = sim.cartesian(sim.fractional(xyz[i]));
+                            let pj = sim.cartesian(sim.fractional(xyz[j]));
+                            let d2 = sim.dist2_shifted(pi, pj, shift);
+                            if d2 < cut2 {
+                                want.push((i, j, [na, nb, nc]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut got_key: Vec<_> = got.iter().map(|p| (p.i, p.j, p.shift)).collect();
+        got_key.sort();
+        want.sort();
+        assert_eq!(got_key, want);
     }
 
     #[test]

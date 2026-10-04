@@ -1,11 +1,12 @@
 //! Linked-cell k-nearest search (Allen and Tildesley).
 //!
-//! Fold into the primary cell, bin on the fractional mesh, then expand
-//! Chebyshev shells until the k-th neighbour cannot sit outside the
-//! visited cube. Distances are [`crate::Cell::dist2_shifted`] plus
-//! [`crate::Cell::lattice_shift`]. The walk keys on the integer stencil,
-//! not a unique-cell stamp: occupants of one bin can need different
-//! lattice images of the same source.
+//! Fold into the primary cell of a Minkowski-reduced basis, bin on the
+//! fractional mesh in cell-major order, then expand Chebyshev shells
+//! until the k-th neighbour lies inside the perpendicular distance to
+//! the unvisited frontier. Distances are [`crate::Cell::dist2_shifted`]
+//! plus [`crate::Cell::lattice_shift`]. The walk keys on the integer
+//! stencil, not a unique-cell stamp: occupants of one bin can need
+//! different lattice images of the same source.
 //!
 //! [`knearest`] returns one [`Neighbors`] row per point. [`knearest_into`]
 //! writes packed `n * k` indices (`-1` unused). [`knearest_into_d2`]
@@ -14,10 +15,9 @@
 //! `--no-default-features` to serialize. The per-source `KHeap` stays on
 //! the stack for `k <= 16`.
 
+use crate::bins::{self, for_shell, frontier_dist2, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::Error;
-
-const MAX_CELLS: i64 = 16_777_216;
 
 type SearchHits = Vec<(usize, Vec<(f64, usize)>)>;
 
@@ -25,12 +25,22 @@ fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
     simbox.dist2_euclidean(p, q)
 }
 
-fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
-    let n = (width / edge).floor().max(1.0);
-    if !n.is_finite() || n > 1_000_000.0 {
-        return Err(Error::TooManyCells);
+fn box_diameter(cell: &Cell) -> f64 {
+    let a = cell.a();
+    let b = cell.b();
+    let c = cell.c();
+    let mut best = 0.0_f64;
+    for &sa in &[-1.0, 1.0] {
+        for &sb in &[-1.0, 1.0] {
+            for &sc in &[-1.0, 1.0] {
+                let x = sa * a[0] + sb * b[0] + sc * c[0];
+                let y = sa * a[1] + sb * b[1] + sc * c[1];
+                let z = sa * a[2] + sb * b[2] + sc * c[2];
+                best = best.max(x * x + y * y + z * z);
+            }
+        }
     }
-    Ok(n as i32)
+    best.sqrt()
 }
 
 /// Bounded max-heap of `(dist2, index)`. `k <= 16` stays in
@@ -43,6 +53,8 @@ struct KHeap {
     extra_idx: Vec<usize>,
     n: usize,
     k: usize,
+    /// Slot of the lexicographic maximum `(dist2, index)`.
+    worst_at: usize,
 }
 
 impl KHeap {
@@ -60,6 +72,7 @@ impl KHeap {
             extra_idx,
             n: 0,
             k,
+            worst_at: 0,
         }
     }
 
@@ -89,29 +102,55 @@ impl KHeap {
         }
     }
 
+    fn worse_than(&self, d2: f64, j: usize, other: usize) -> bool {
+        let od = self.d2_at(other);
+        let oj = self.idx_at(other);
+        d2 > od || (d2 == od && j > oj)
+    }
+
+    fn recompute_worst(&mut self) {
+        let mut w = 0;
+        for t in 1..self.n {
+            if self.worse_than(self.d2_at(t), self.idx_at(t), w) {
+                w = t;
+            }
+        }
+        self.worst_at = w;
+    }
+
+    /// Insert the nearest image of `j`. Equal distances keep the smaller index.
     fn push(&mut self, d2: f64, j: usize) {
+        if self.n == self.k {
+            let wd = self.d2_at(self.worst_at);
+            let wj = self.idx_at(self.worst_at);
+            // A candidate that does not beat the worst cannot improve any
+            // stored image either: those distances are at most the worst.
+            if d2 > wd || (d2 == wd && j >= wj) {
+                return;
+            }
+        }
         for t in 0..self.n {
             if self.idx_at(t) == j {
                 if d2 < self.d2_at(t) {
                     self.set(t, d2, j);
+                    if t == self.worst_at {
+                        self.recompute_worst();
+                    }
                 }
                 return;
             }
         }
         if self.n < self.k {
-            self.set(self.n, d2, j);
+            let slot = self.n;
+            self.set(slot, d2, j);
+            if slot == 0 || self.worse_than(d2, j, self.worst_at) {
+                self.worst_at = slot;
+            }
             self.n += 1;
             return;
         }
-        let mut worst = 0;
-        for t in 1..self.n {
-            if self.d2_at(t) > self.d2_at(worst) {
-                worst = t;
-            }
-        }
-        if d2 < self.d2_at(worst) {
-            self.set(worst, d2, j);
-        }
+        self.set(self.worst_at, d2, j);
+        self.recompute_worst();
     }
 
     fn full(&self) -> bool {
@@ -119,14 +158,7 @@ impl KHeap {
     }
 
     fn worst(&self) -> f64 {
-        let mut w = self.d2_at(0);
-        for t in 1..self.n {
-            let v = self.d2_at(t);
-            if v > w {
-                w = v;
-            }
-        }
-        w
+        self.d2_at(self.worst_at)
     }
 
     fn finish(self) -> Vec<(f64, usize)> {
@@ -299,10 +331,11 @@ fn write_one(
 /// `cell_hint` is the target cell edge; `None` uses 3.0 in the same units
 /// as the box. Each row has `min(k, n_active - 1)` entries.
 ///
-/// Fold, bin, then expand Chebyshev shells. Distances are
-/// [`Cell::dist2_shifted`] plus [`Cell::lattice_shift`]. The walk does
-/// not stamp unique cells: occupants of one bin can need different
-/// images.
+/// Fold, bin, then expand Chebyshev shells in the Minkowski-reduced
+/// basis. Distances are [`Cell::dist2_shifted`] plus
+/// [`Cell::lattice_shift`]. The walk does not stamp unique cells:
+/// occupants of one bin can need different images. A full heap stops
+/// when its worst distance is inside the frontier plane bound.
 ///
 /// ```
 /// use linkcell::{knearest, Cell};
@@ -359,99 +392,63 @@ fn search(
     if active.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut edge = cell_hint.unwrap_or(3.0);
-    if !edge.is_finite() || edge <= 0.0 {
-        edge = 3.0;
-    }
-    let w = simbox.widths();
-    edge = edge.min(w[0]).min(w[1]).min(w[2]);
-
-    let nx = bins_1d(w[0], edge)?;
-    let ny = bins_1d(w[1], edge)?;
-    let nz = bins_1d(w[2], edge)?;
-    let ncell = (i64::from(nx))
-        .checked_mul(i64::from(ny))
-        .and_then(|v| v.checked_mul(i64::from(nz)))
-        .filter(|&v| v > 0 && v <= MAX_CELLS)
-        .ok_or(Error::TooManyCells)? as usize;
-    let invx = f64::from(nx);
-    let invy = f64::from(ny);
-    let invz = f64::from(nz);
-    let cell_min = (w[0] / f64::from(nx))
-        .min(w[1] / f64::from(ny))
-        .min(w[2] / f64::from(nz));
-
-    // Fold into the primary cell once. Pair distances are then a
-    // Cartesian subtract plus a lattice shift (vesin / LAMMPS ghosts).
-    // The walk keys on the integer stencil, not a unique rem_euclid
-    // cell: occupants of one bin can need different images.
-    let mut folded = vec![[0.0; 3]; n];
-    let mut bin = vec![(0i32, 0i32, 0i32); n];
-    for &i in &active {
-        let s = simbox.fractional(xyz[i]);
-        folded[i] = simbox.cartesian(s);
-        bin[i] = (
-            ((s[0] * invx) as i32).clamp(0, nx - 1),
-            ((s[1] * invy) as i32).clamp(0, ny - 1),
-            ((s[2] * invz) as i32).clamp(0, nz - 1),
-        );
+    if active.len() == 1 {
+        return Ok(vec![(active[0], Vec::new())]);
     }
 
-    let mut head = vec![-1isize; ncell];
-    let mut next = vec![-1isize; n];
-    let cell_index = |ix: i32, iy: i32, iz: i32| -> usize {
-        let cx = ix.rem_euclid(nx);
-        let cy = iy.rem_euclid(ny);
-        let cz = iz.rem_euclid(nz);
-        ((cz * ny + cy) * nx + cx) as usize
+    // Same Cartesian lattice, with the short vectors as edges so the
+    // Euclidean image sits in a nearby shell. The caller's H is unchanged.
+    let walk = match minimage::minkowski_reduce(simbox) {
+        Ok(cell) => cell,
+        Err(_) => *simbox,
     };
-    for &i in &active {
-        let (ix, iy, iz) = bin[i];
-        let c = cell_index(ix, iy, iz);
-        next[i] = head[c];
-        head[c] = i as isize;
-    }
+    let edge = bins::target_edge(&walk, cell_hint, 3.0);
+    let mesh = Mesh::build(xyz, &walk, &active, edge)?;
+    let nbin = [mesh.nx, mesh.ny, mesh.nz];
+    let widths = mesh.widths;
+    let cell_min = (widths[0] / f64::from(mesh.nx))
+        .min(widths[1] / f64::from(mesh.ny))
+        .min(widths[2] / f64::from(mesh.nz));
+    // Any two points in the cell are at most one space diagonal apart, and
+    // the nearest image is no longer than that. Cover that ball in bins.
+    let need = (box_diameter(&walk) / cell_min).ceil();
+    let max_reach = if need.is_finite() && need < 1.0e7 {
+        (need as i32).saturating_add(3).max(mesh.image_reach())
+    } else {
+        mesh.image_reach()
+    };
 
-    let max_reach = nx.max(ny).max(nz) / 2 + 1;
     let one = |i: usize| -> (usize, Vec<(f64, usize)>) {
         let mut heap = KHeap::new(k);
-        let (ix, iy, iz) = bin[i];
+        let [ix, iy, iz] = mesh.bin[i];
+        let origin = mesh.frac[i];
+        let pi = mesh.folded[i];
         let mut reach = 1i32;
         while reach <= max_reach {
-            for dx in -reach..=reach {
-                for dy in -reach..=reach {
-                    for dz in -reach..=reach {
-                        let shell = reach == 1
-                            || dx.abs() == reach
-                            || dy.abs() == reach
-                            || dz.abs() == reach;
-                        if !shell && reach > 1 {
-                            continue;
-                        }
-                        let jx = ix + dx;
-                        let jy = iy + dy;
-                        let jz = iz + dz;
-                        let c = cell_index(jx, jy, jz);
-                        let shift = simbox.lattice_shift(
-                            jx.div_euclid(nx),
-                            jy.div_euclid(ny),
-                            jz.div_euclid(nz),
-                        );
-                        let mut j = head[c];
-                        while j >= 0 {
-                            let ju = j as usize;
-                            if ju != i {
-                                heap.push(simbox.dist2_shifted(folded[i], folded[ju], shift), ju);
-                            }
-                            j = next[ju];
-                        }
+            for_shell(reach, |dx, dy, dz| {
+                let jx = ix + dx;
+                let jy = iy + dy;
+                let jz = iz + dz;
+                if heap.full() {
+                    let lb = slab_dist2(origin, [jx, jy, jz], nbin, widths);
+                    if heap.worst() <= lb {
+                        return;
                     }
                 }
-            }
+                let shift = walk.lattice_shift(
+                    jx.div_euclid(mesh.nx),
+                    jy.div_euclid(mesh.ny),
+                    jz.div_euclid(mesh.nz),
+                );
+                for &ju in mesh.slots(mesh.cell_of(jx, jy, jz)) {
+                    if ju != i {
+                        heap.push(walk.dist2_shifted(pi, mesh.folded[ju], shift), ju);
+                    }
+                }
+            });
             if heap.full() {
-                let bound = f64::from(reach) * cell_min;
-                if heap.worst() <= bound * bound {
+                let bound = frontier_dist2(origin, [ix, iy, iz], reach, nbin, widths);
+                if heap.worst() <= bound {
                     break;
                 }
             }

@@ -24,7 +24,8 @@ fill unused slots with `-1`.
 2. Store the Cartesian image in the primary cell (`Cell::cartesian`).
 3. Bin in fractional space: `floor(s * n*)`, clamped to
    `[0, n* - 1]`.
-4. Chain each active point onto a linked list per bin.
+4. Count occupants per bin, exclusive-scan the counts, and store the
+   active indices in cell order.
 
 `nx, ny, nz` are `floor(width / edge)`, at least 1. `cell_min` is the
 smallest of the three actual cell edges (perpendicular width over
@@ -53,12 +54,32 @@ is a separate visit. Skipping those repeats (one shift per unique
 bin) misses images. That construction, and the ortho cheap path, is
 in [MIC and cells](../explanation/mic-and-cells.md).
 
+## Basis
+
+`knearest` bins in a Minkowski-reduced basis (Nguyen–Stehlé). The
+basis spans the same Cartesian lattice, with the short vectors as
+edges, so the Euclidean image is a nearby shell. A 27-image check
+on that basis can still miss a closer shift; the shell cap is the
+space diagonal divided by the minimum cell height, and the frontier
+test stops the walk once the k-th neighbour is certified.
+`pairs_within` keeps the caller's basis, because the returned shift
+`S` is an integer combination of that H.
+
 ## Heap and stop
 
-A max-heap of size `k` stores `(dist2, index)`. For `k <= 16` it
-lives on the stack. After each shell, if the heap is full and the
-worst `dist2` is at most `(reach * cell_min)^2`, no unvisited point
-can beat the k-th neighbour, and the walk stops.
+A max-heap of size `k` stores `(dist2, index)`, ordered
+lexicographically so an equal distance keeps the smaller index. For
+`k <= 16` it lives on the stack. Occupants of a bin are a contiguous
+slice. A cell is skipped when the perpendicular distance from the
+source to that image's slab is already at least the worst heap entry.
+
+After each shell, if the heap is full and the worst `dist2` is at
+most the squared perpendicular distance to the nearest unvisited
+lattice plane, no unvisited point can beat the k-th neighbour, and
+the walk stops. The older `reach * cell_min` bound is that distance
+when the source sits on the outer face of its cell; a source in the
+interior stops sooner. The device walk still uses `reach * cell_min`,
+which is a lower bound on the same plane, so it does not stop earlier.
 
 `knearest` returns `Neighbors` rows (`indices`, `dist2`), nearest
 first. `knearest_into` / `lc_knearest` write packed indices.

@@ -602,3 +602,75 @@ fn corner_wrap_agrees_with_brute() {
     assert_eq!(cell[1].indices, brute[1].indices);
     assert_eq!(cell[0].indices, vec![1]);
 }
+
+fn lattice_dist2(cell: &Cell, p: [f64; 3], q: [f64; 3], r: i32) -> f64 {
+    let mut best = f64::INFINITY;
+    for na in -r..=r {
+        for nb in -r..=r {
+            for nc in -r..=r {
+                let d2 = cell.dist2_shifted(p, q, cell.lattice_shift(na, nb, nc));
+                if d2 < best {
+                    best = d2;
+                }
+            }
+        }
+    }
+    best
+}
+
+fn lattice_knearest(
+    xyz: &[[f64; 3]],
+    cell: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+    r: i32,
+) -> Vec<Neighbors> {
+    let n = xyz.len();
+    let active: Vec<usize> = (0..n)
+        .filter(|&i| mask.map(|m| m[i]).unwrap_or(true))
+        .collect();
+    let mut out = vec![Neighbors::default(); n];
+    for &i in &active {
+        let mut pairs: Vec<(f64, usize)> = active
+            .iter()
+            .copied()
+            .filter(|&j| j != i)
+            .map(|j| (lattice_dist2(cell, xyz[i], xyz[j], r), j))
+            .collect();
+        pairs.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        pairs.truncate(k);
+        out[i].dist2 = pairs.iter().map(|p| p.0).collect();
+        out[i].indices = pairs.iter().map(|p| p.1).collect();
+    }
+    out
+}
+
+#[test]
+fn unreduced_grid_matches_lattice_scan() {
+    // Shift (-7, 7, 0) is the Euclidean image here. A 27-image check misses it.
+    let b = unreduced_skew();
+    let xyz = points_in_cell(&b, 24, 99);
+    let oracle = lattice_knearest(&xyz, &b, 4, None, 24);
+    for hint in [None, Some(0.05), Some(0.2), Some(3.0)] {
+        let linked = knearest(&xyz, &b, 4, None, hint).unwrap();
+        assert_rows_match(&format!("unreduced hint={hint:?}"), &linked, &oracle);
+    }
+}
+
+#[test]
+fn skewed_triclinic_matches_lattice_scan() {
+    let b = Cell::from_vectors(
+        [4.0, 0.1, 0.0],
+        [3.2, 0.8, 0.05],
+        [0.4, -0.3, 3.5],
+        [1.0, -2.0, 0.5],
+    )
+    .unwrap();
+    let xyz = points_in_cell(&b, 20, 1234);
+    let mask: Vec<bool> = xyz.iter().enumerate().map(|(i, _)| i % 5 != 0).collect();
+    let oracle = lattice_knearest(&xyz, &b, 3, Some(&mask), 4);
+    for hint in [Some(0.4), None, Some(2.5)] {
+        let linked = knearest(&xyz, &b, 3, Some(&mask), hint).unwrap();
+        assert_rows_match(&format!("skew hint={hint:?}"), &linked, &oracle);
+    }
+}
