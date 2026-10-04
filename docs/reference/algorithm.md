@@ -95,6 +95,12 @@ unreduced H misses lattice points such as `2(a-b)`. The fractional
 wrap of a hex-prism body diagonal is not nearest. It is not the
 production walk.
 
+The citations, and the cutoff codes this walk does not copy, are in
+[MIC and cells](../explanation/mic-and-cells.md). The pair kernel is
+Rapaport's cell shift. The expanding shells are Bentley, Weide, and
+Yao's cell technique. A Selling superbase would put the Voronoi
+vectors in `{-1,0,1}`, and this walk does not depend on that.
+
 ## Parallel
 
 The `parallel` Cargo feature (on by default) maps sources with

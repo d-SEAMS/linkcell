@@ -4,8 +4,10 @@
 //! without a minimum-image convention. This crate is the missing piece:
 //! Allen and Tildesley's linked cells, a k-heap per source, expanding
 //! Chebyshev shells until the k-th neighbour cannot lie outside the
-//! visited cube. [`pairs_within`] is the cutoff pair list with integer
-//! cell shifts (vesin/tonari `ijS`); [`knearest`] unique-indexes.
+//! visited cube. The pair itself is Rapaport's cell shift, not a
+//! per-pair nearest integer. [`pairs_within`] is the cutoff pair list
+//! with integer cell shifts (vesin/tonari `ijS`); [`knearest`]
+//! unique-indexes.
 //!
 //! # Algorithm
 //!
