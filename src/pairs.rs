@@ -3,10 +3,11 @@
 //! [`knearest`](crate::knearest) unique-indexes the neighbour and
 //! drops the image. This walk keeps every atom-image pair whose
 //! squared distance is strictly below `cutoff²`, including periodic
-//! self-images. Displacement is
+//! self-images. Each unordered pair is tested once. A full list
+//! writes both `(i, j, S)` and `(j, i, -S)`. Displacement is
 //! `q - p + lattice_shift(S)`.
 
-use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
+use crate::bins::{self, axis_gap, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::Error;
 
@@ -100,90 +101,376 @@ pub fn pairs_within(
         .max(repeats[2] * mesh.nz)
         .max(1);
     let cut2 = cutoff * cutoff;
-    let nbin = [mesh.nx, mesh.ny, mesh.nz];
-    let widths = mesh.widths;
+    // One reach for every atom: the shorter gap at either edge of a bin.
+    // The box is symmetric, so each unordered pair is visited from one
+    // side and written out in both shift directions when `half` is off.
+    let reach = uniform_reach([mesh.nx, mesh.ny, mesh.nz], mesh.widths, cut2, max_reach);
+    let nslot = mesh.occupants.len();
+    let mut coords = Coords {
+        x: vec![0.0; nslot],
+        y: vec![0.0; nslot],
+        z: vec![0.0; nslot],
+    };
+    for (slot, &i) in mesh.occupants.iter().enumerate() {
+        let p = mesh.folded[i];
+        coords.x[slot] = p[0];
+        coords.y[slot] = p[1];
+        coords.z[slot] = p[2];
+    }
+    let walk = Walk {
+        mesh: &mesh,
+        simbox,
+        coords: &coords,
+        cut2,
+        reach,
+        half,
+    };
+    Ok(walk.collect())
+}
 
-    let one = |i: usize| -> Vec<Pair> {
+struct Coords {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z: Vec<f64>,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn simd_avx() -> bool {
+    std::is_x86_feature_detected!("avx")
+}
+
+/// `true` for exactly one of `(d)` and `(-d)`. The zero offset is the home cell.
+fn keep_dir(dx: i32, dy: i32, dz: i32) -> bool {
+    if dx != 0 {
+        return dx > 0;
+    }
+    if dy != 0 {
+        return dy > 0;
+    }
+    if dz != 0 {
+        return dz > 0;
+    }
+    false
+}
+
+fn uniform_reach(nbin: [i32; 3], widths: [f64; 3], cut2: f64, max_reach: i32) -> [i32; 3] {
+    let mut reach = [1i32; 3];
+    loop {
+        let mut grew = false;
+        for a in 0..3 {
+            let n = nbin[a];
+            let w = widths[a];
+            let nf = f64::from(n);
+            let s_hi = (1.0 - 1.0e-12) / nf;
+            let gap = bins::certify(
+                axis_gap(0.0, 0, reach[a], n, w).min(axis_gap(s_hi, 0, reach[a], n, w)),
+            );
+            let bound = if gap > 0.0 && gap.is_finite() {
+                gap * gap
+            } else {
+                0.0
+            };
+            if bound < cut2 && reach[a] < max_reach {
+                reach[a] += 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    reach
+}
+
+struct Walk<'a> {
+    mesh: &'a Mesh,
+    simbox: &'a Cell,
+    coords: &'a Coords,
+    cut2: f64,
+    reach: [i32; 3],
+    half: bool,
+}
+
+struct Src {
+    i: usize,
+    pi: [f64; 3],
+    shift_s: [i32; 3],
+    shift: [f64; 3],
+    home: bool,
+}
+
+impl Walk<'_> {
+    fn record(&self, found: &mut Vec<Pair>, i: usize, j: usize, shift: [i32; 3], dist2: f64) {
+        let neg = [-shift[0], -shift[1], -shift[2]];
+        if !self.half {
+            found.push(Pair { i, j, shift, dist2 });
+            found.push(Pair {
+                i: j,
+                j: i,
+                shift: neg,
+                dist2,
+            });
+            return;
+        }
+        if keep_half(i, j, shift) {
+            found.push(Pair { i, j, shift, dist2 });
+        } else {
+            found.push(Pair {
+                i: j,
+                j: i,
+                shift: neg,
+                dist2,
+            });
+        }
+    }
+
+    #[inline(always)]
+    fn consider(
+        &self,
+        found: &mut Vec<Pair>,
+        i: usize,
+        ju: usize,
+        shift_s: [i32; 3],
+        dist2: f64,
+        home: bool,
+    ) {
+        if home && ju <= i {
+            return;
+        }
+        if !home && ju == i && shift_s == [0, 0, 0] {
+            return;
+        }
+        if dist2 < self.cut2 {
+            self.record(found, i, ju, shift_s, dist2);
+        }
+    }
+
+    fn scan_cell(&self, found: &mut Vec<Pair>, cell: usize, src: &Src) {
+        let lo = self.mesh.offsets[cell];
+        let hi = self.mesh.offsets[cell + 1];
+        if lo == hi {
+            return;
+        }
+        debug_assert_eq!(hi - lo, self.mesh.slots(cell).len());
+        #[cfg(target_arch = "x86_64")]
+        if !src.home && simd_avx() {
+            unsafe {
+                self.scan_avx(found, lo, hi, src);
+            }
+            return;
+        }
+        let sx = src.shift[0];
+        let sy = src.shift[1];
+        let sz = src.shift[2];
+        for (k, &ju) in self.mesh.slots(cell).iter().enumerate() {
+            let slot = lo + k;
+            let dx = self.coords.x[slot] + sx - src.pi[0];
+            let dy = self.coords.y[slot] + sy - src.pi[1];
+            let dz = self.coords.z[slot] + sz - src.pi[2];
+            self.consider(
+                found,
+                src.i,
+                ju,
+                src.shift_s,
+                dx * dx + dy * dy + dz * dz,
+                src.home,
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    unsafe fn scan_avx(&self, found: &mut Vec<Pair>, lo: usize, hi: usize, src: &Src) {
+        use std::arch::x86_64::{
+            _mm256_add_pd, _mm256_cmp_pd, _mm256_loadu_pd, _mm256_movemask_pd, _mm256_mul_pd,
+            _mm256_set1_pd, _mm256_storeu_pd, _mm256_sub_pd, _CMP_LT_OQ,
+        };
+        let bx = _mm256_set1_pd(src.pi[0] - src.shift[0]);
+        let by = _mm256_set1_pd(src.pi[1] - src.shift[1]);
+        let bz = _mm256_set1_pd(src.pi[2] - src.shift[2]);
+        let cut = _mm256_set1_pd(self.cut2);
+        let xs = self.coords.x.as_ptr();
+        let ys = self.coords.y.as_ptr();
+        let zs = self.coords.z.as_ptr();
+        let end = lo + ((hi - lo) & !3);
+        let mut slot = lo;
+        while slot < end {
+            let dx = _mm256_sub_pd(_mm256_loadu_pd(xs.add(slot)), bx);
+            let dy = _mm256_sub_pd(_mm256_loadu_pd(ys.add(slot)), by);
+            let dz = _mm256_sub_pd(_mm256_loadu_pd(zs.add(slot)), bz);
+            let d2 = _mm256_add_pd(
+                _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
+                _mm256_mul_pd(dz, dz),
+            );
+            let bits = _mm256_movemask_pd(_mm256_cmp_pd(d2, cut, _CMP_LT_OQ));
+            if bits != 0 {
+                let mut lane = [0.0f64; 4];
+                _mm256_storeu_pd(lane.as_mut_ptr(), d2);
+                if bits & 1 != 0 {
+                    self.consider(
+                        found,
+                        src.i,
+                        self.mesh.occupants[slot],
+                        src.shift_s,
+                        lane[0],
+                        false,
+                    );
+                }
+                if bits & 2 != 0 {
+                    self.consider(
+                        found,
+                        src.i,
+                        self.mesh.occupants[slot + 1],
+                        src.shift_s,
+                        lane[1],
+                        false,
+                    );
+                }
+                if bits & 4 != 0 {
+                    self.consider(
+                        found,
+                        src.i,
+                        self.mesh.occupants[slot + 2],
+                        src.shift_s,
+                        lane[2],
+                        false,
+                    );
+                }
+                if bits & 8 != 0 {
+                    self.consider(
+                        found,
+                        src.i,
+                        self.mesh.occupants[slot + 3],
+                        src.shift_s,
+                        lane[3],
+                        false,
+                    );
+                }
+            }
+            slot += 4;
+        }
+        let sx = src.shift[0];
+        let sy = src.shift[1];
+        let sz = src.shift[2];
+        for slot in end..hi {
+            let dx = self.coords.x[slot] + sx - src.pi[0];
+            let dy = self.coords.y[slot] + sy - src.pi[1];
+            let dz = self.coords.z[slot] + sz - src.pi[2];
+            self.consider(
+                found,
+                src.i,
+                self.mesh.occupants[slot],
+                src.shift_s,
+                dx * dx + dy * dy + dz * dz,
+                false,
+            );
+        }
+    }
+
+    fn append(&self, found: &mut Vec<Pair>, i: usize) {
+        let mesh = self.mesh;
         let [ix, iy, iz] = mesh.bin[i];
         let origin = mesh.frac[i];
         let pi = mesh.folded[i];
-        let mut found = Vec::new();
-        let mut prev = [-1i32; 3];
-        let mut reach = [1i32; 3];
-        loop {
-            for_new_layer(prev, reach, |dx, dy, dz| {
-                let jx = ix + dx;
-                let jy = iy + dy;
-                let jz = iz + dz;
-                let lb = slab_dist2(origin, [jx, jy, jz], nbin, widths);
-                if lb >= cut2 {
-                    return;
-                }
-                let na = jx.div_euclid(mesh.nx);
-                let nb = jy.div_euclid(mesh.ny);
-                let nc = jz.div_euclid(mesh.nz);
-                let shift_s = [na, nb, nc];
-                let shift = simbox.lattice_shift(na, nb, nc);
-                for &ju in mesh.slots(mesh.cell_of(jx, jy, jz)) {
-                    let zero_self = ju == i && na == 0 && nb == 0 && nc == 0;
-                    if zero_self {
+        let nbin = [mesh.nx, mesh.ny, mesh.nz];
+        let home = Src {
+            i,
+            pi,
+            shift_s: [0, 0, 0],
+            shift: [0.0; 3],
+            home: true,
+        };
+        self.scan_cell(found, mesh.cell_of(ix, iy, iz), &home);
+        let [rx, ry, rz] = self.reach;
+        for dz in -rz..=rz {
+            for dy in -ry..=ry {
+                for dx in -rx..=rx {
+                    if !keep_dir(dx, dy, dz) {
                         continue;
                     }
-                    let d2 = simbox.dist2_shifted(pi, mesh.folded[ju], shift);
-                    if d2 < cut2 && (!half || keep_half(i, ju, shift_s)) {
-                        found.push(Pair {
-                            i,
-                            j: ju,
-                            shift: shift_s,
-                            dist2: d2,
-                        });
+                    let jx = ix + dx;
+                    let jy = iy + dy;
+                    let jz = iz + dz;
+                    if slab_dist2(origin, [jx, jy, jz], nbin, mesh.widths) >= self.cut2 {
+                        continue;
                     }
-                }
-            });
-            let gaps = [
-                axis_gap(origin[0], ix, reach[0], mesh.nx, widths[0]),
-                axis_gap(origin[1], iy, reach[1], mesh.ny, widths[1]),
-                axis_gap(origin[2], iz, reach[2], mesh.nz, widths[2]),
-            ];
-            let mut grew = false;
-            prev = reach;
-            for a in 0..3 {
-                let mut gap = gaps[a];
-                gap = bins::certify(gap);
-                let bound = if gap > 0.0 && gap.is_finite() {
-                    gap * gap
-                } else {
-                    0.0
-                };
-                if bound < cut2 && reach[a] < max_reach {
-                    reach[a] += 1;
-                    grew = true;
+                    let shift_s = [
+                        jx.div_euclid(mesh.nx),
+                        jy.div_euclid(mesh.ny),
+                        jz.div_euclid(mesh.nz),
+                    ];
+                    let shift = self
+                        .simbox
+                        .lattice_shift(shift_s[0], shift_s[1], shift_s[2]);
+                    let src = Src {
+                        i,
+                        pi,
+                        shift_s,
+                        shift,
+                        home: false,
+                    };
+                    self.scan_cell(found, mesh.cell_of(jx, jy, jz), &src);
                 }
             }
-            if !grew {
-                break;
-            }
         }
-        found
-    };
-
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        let chunks: Vec<Vec<Pair>> = active.par_iter().copied().map(one).collect();
-        let mut pairs = Vec::new();
-        for chunk in chunks {
-            pairs.extend(chunk);
-        }
-        Ok(pairs)
     }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let mut pairs = Vec::new();
-        for &i in &active {
-            pairs.extend(one(i));
+
+    fn guess_rows(&self, n_src: usize) -> usize {
+        let w = self.mesh.widths;
+        let volume = (w[0] * w[1] * w[2]).max(1.0e-30);
+        let radius = self.cut2.sqrt();
+        let shell = 4.1887902047863905 * radius * radius * radius;
+        let n = self.mesh.folded.len().max(1) as f64;
+        let neighbors = (n * shell / volume).ceil().max(1.0);
+        let rows = neighbors * if self.half { 0.5 } else { 1.0 };
+        ((n_src as f64) * rows * 1.25) as usize
+    }
+
+    fn collect(&self) -> Vec<Pair> {
+        let ncell = self.mesh.offsets.len() - 1;
+        let occupants = &self.mesh.occupants;
+        let offsets = &self.mesh.offsets;
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            let threads = rayon::current_num_threads().max(1);
+            let chunk = (ncell / threads).max(1);
+            let parts: Vec<Vec<Pair>> = (0..ncell)
+                .step_by(chunk)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|start| {
+                    let _timer = crate::pop::JobTimer::new();
+                    let end = (start + chunk).min(ncell);
+                    let n_src = offsets[end] - offsets[start];
+                    let mut found = Vec::with_capacity(self.guess_rows(n_src));
+                    for cell in start..end {
+                        let rows = &occupants[offsets[cell]..offsets[cell + 1]];
+                        for &src in rows {
+                            self.append(&mut found, src);
+                        }
+                    }
+                    found
+                })
+                .collect();
+            let mut pairs = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for part in parts {
+                pairs.extend(part);
+            }
+            pairs
         }
-        Ok(pairs)
+        #[cfg(not(feature = "parallel"))]
+        {
+            let _timer = crate::pop::JobTimer::new();
+            let mut pairs = Vec::with_capacity(self.guess_rows(occupants.len()));
+            for cell in 0..ncell {
+                let rows = &occupants[offsets[cell]..offsets[cell + 1]];
+                for &src in rows {
+                    self.append(&mut pairs, src);
+                }
+            }
+            pairs
+        }
     }
 }
 

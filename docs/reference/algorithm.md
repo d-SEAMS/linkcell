@@ -70,9 +70,9 @@ basis can still miss a closer shift; the shell cap is the space
 diagonal divided by the minimum cell height, and the frontier test
 stops the walk once the k-th neighbour is certified.
 `pairs_within` keeps the caller's basis, because the returned shift
-`S` is an integer combination of that H. Its index box grows the
-same way, one axis at a time, out to the cutoff. The C, C++, and
-Python entries are that list (`lc_pairs_within`,
+`S` is an integer combination of that H. Each unordered pair is
+tested once. A full list writes both `(i, j, S)` and `(j, i, -S)`.
+The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.
 
