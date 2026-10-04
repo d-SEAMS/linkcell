@@ -118,6 +118,11 @@ builders take a cutoff, or k neighbours inside a ball.
 
 ## Parallel
 
+linkcell is a sub-library. An MPI caller keeps the primary
+communicator and passes a sub-communicator. MPI setup stays in that
+caller. The POP figures below are the threads inside one search: the
+share that sub-communicator already assigned to this call.
+
 The `parallel` Cargo feature (on by default) maps sources with
 rayon. Each source owns its heap. From 8192 active points upward the
 same feature builds the mesh in parallel: a thread writes each point's
@@ -150,8 +155,12 @@ does not stop earlier than the host. `k <= 16`. That path is separate
 from the Kokkos walk.
 
 `src/kokkos/` is the certified walk on `Kokkos::DefaultExecutionSpace`.
-Fold, bin, exclusive scan, and the per-axis index box run as Kokkos
-parallel loops. The stop is the host plane test, not `reach * cell_min`.
+The caller starts Kokkos. The standalone timer calls
+`Kokkos::initialize` because that program is the whole process. A
+caller that already started Kokkos keeps doing so, and an MPI caller
+still passes a sub-communicator. Fold, bin, exclusive scan, and the
+per-axis index box run as Kokkos parallel loops. The stop is the host
+plane test, not `reach * cell_min`.
 `k <= 16`. The sources are not in the Cargo or CMake graph, so a
 build without Kokkos stays the same. A Cuda execution space uses this
 source; the timings in the changelog were taken with the OpenMP

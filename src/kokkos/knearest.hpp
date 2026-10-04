@@ -4,7 +4,9 @@
 
 // Certified linked-cell k-nearest on Kokkos::DefaultExecutionSpace.
 //
-// The caller initializes Kokkos. `box` is the walk cell: orthorhombic
+// The caller initializes Kokkos. linkcell is a sub-library: an MPI
+// caller keeps the primary communicator and passes a sub-communicator.
+// `box` is the walk cell: orthorhombic
 // as stored, restricted triclinic already tilt-reduced, or a general
 // cell already Minkowski-reduced. `mode` is 0, 1, or 2 in that order.
 // `xyz` is row-major `n * 3`. `out_nn` is packed `n * k`, `-1` unused.
