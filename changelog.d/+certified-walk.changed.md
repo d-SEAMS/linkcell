@@ -1,1 +1,0 @@
-`knearest` bins in a Minkowski-reduced basis and stores occupants in cell order. Shells stop on the perpendicular distance to the unvisited frontier, and a cell is skipped when its slab cannot beat the k-th neighbour. `pairs_within` uses the same bins and frontier, and still reports shifts in the caller's basis.

@@ -1,9 +1,9 @@
 [package]
 name = "linkcell"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.70"
-description = "Periodic linked-cell k-nearest neighbour search for molecular simulations"
+description = "Periodic linked-cell cutoff pairs and k-nearest neighbour search"
 license = "MIT"
 repository = "https://github.com/d-SEAMS/linkcell"
 homepage = "https://github.com/d-SEAMS/linkcell"

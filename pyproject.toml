@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "linkcell"
-version = "0.3.4"
-description = "Periodic linked-cell k-nearest neighbour search"
+version = "0.3.5"
+description = "Periodic linked-cell cutoff pairs and k-nearest neighbour search"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
