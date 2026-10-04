@@ -358,6 +358,7 @@ struct Walk<'a> {
     half: bool,
     partners: &'a PartnerList,
     /// 2 = AVX-512, 1 = AVX, 0 = scalar.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     simd: u8,
 }
 
@@ -408,6 +409,7 @@ impl Scratch {
         }
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn finish(&mut self, n: usize) {
         debug_assert!(n <= self.js.capacity());
         unsafe {
@@ -417,6 +419,7 @@ impl Scratch {
         }
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn note(&mut self, before: usize, shift: [i32; 3]) {
         let after = self.js.len();
         if after > before {
@@ -427,6 +430,7 @@ impl Scratch {
 }
 
 /// Worst-case hits kept in the scratch buffer. Larger blocks use the scalar walk.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const MAX_SCRATCH: usize = 1 << 20;
 
 #[inline(never)]
@@ -577,7 +581,6 @@ impl Walk<'_> {
         {
             let _ = scratch;
             self.scan_scalar(found, block);
-            return;
         }
         #[cfg(target_arch = "x86_64")]
         {
