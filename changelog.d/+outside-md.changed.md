@@ -1,0 +1,1 @@
+The minimum-image note now covers closest-vector search, periodic Delaunay triangulations, the robotics kd-tree on a product of circles, tensor sketches, and crystal-graph construction. None of those replaces the cell walk on a filled cubic lattice.

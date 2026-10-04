@@ -1,6 +1,6 @@
 use linkcell::{
-    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Cell, Error,
-    Neighbors,
+    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, pairs_within,
+    Cell, Error, Neighbors,
 };
 
 fn almost(a: f64, b: f64) -> bool {
@@ -601,4 +601,210 @@ fn corner_wrap_agrees_with_brute() {
     assert_eq!(cell[0].indices, brute[0].indices);
     assert_eq!(cell[1].indices, brute[1].indices);
     assert_eq!(cell[0].indices, vec![1]);
+}
+
+fn lattice_dist2(cell: &Cell, p: [f64; 3], q: [f64; 3], r: i32) -> f64 {
+    let mut best = f64::INFINITY;
+    for na in -r..=r {
+        for nb in -r..=r {
+            for nc in -r..=r {
+                let d2 = cell.dist2_shifted(p, q, cell.lattice_shift(na, nb, nc));
+                if d2 < best {
+                    best = d2;
+                }
+            }
+        }
+    }
+    best
+}
+
+fn lattice_knearest(
+    xyz: &[[f64; 3]],
+    cell: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+    r: i32,
+) -> Vec<Neighbors> {
+    let n = xyz.len();
+    let active: Vec<usize> = (0..n)
+        .filter(|&i| mask.map(|m| m[i]).unwrap_or(true))
+        .collect();
+    let mut out = vec![Neighbors::default(); n];
+    for &i in &active {
+        let mut pairs: Vec<(f64, usize)> = active
+            .iter()
+            .copied()
+            .filter(|&j| j != i)
+            .map(|j| (lattice_dist2(cell, xyz[i], xyz[j], r), j))
+            .collect();
+        pairs.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        pairs.truncate(k);
+        out[i].dist2 = pairs.iter().map(|p| p.0).collect();
+        out[i].indices = pairs.iter().map(|p| p.1).collect();
+    }
+    out
+}
+
+#[test]
+fn film_with_vacuum_matches_brute() {
+    // eOn / readcon orthorhombic film: the points fill a cube and z
+    // continues into vacuum. k = 4 must match the orthorhombic MIC.
+    let b = Cell::ortho(20.0, 20.0, 40.0).unwrap();
+    let mut xyz = Vec::new();
+    for iz in 0..4 {
+        for iy in 0..4 {
+            for ix in 0..4 {
+                xyz.push([
+                    (ix as f64 + 0.5) * 5.0,
+                    (iy as f64 + 0.5) * 5.0,
+                    (iz as f64 + 0.5) * 5.0,
+                ]);
+            }
+        }
+    }
+    let got = knearest(&xyz, &b, 4, None, Some(3.0)).unwrap();
+    let brute = knearest_brute(&xyz, &b, 4, None).unwrap();
+    assert_rows_match("film", &got, &brute);
+}
+
+fn cutoff_keys(
+    cell: &Cell,
+    xyz: &[[f64; 3]],
+    cutoff: f64,
+    half: bool,
+) -> Vec<(usize, usize, [i32; 3])> {
+    let w = cell.widths();
+    let repeats = [
+        (cutoff / w[0]).ceil() as i32,
+        (cutoff / w[1]).ceil() as i32,
+        (cutoff / w[2]).ceil() as i32,
+    ];
+    let cut2 = cutoff * cutoff;
+    let mut want = Vec::new();
+    for (i, pi_raw) in xyz.iter().enumerate() {
+        let pi = cell.cartesian(cell.fractional(*pi_raw));
+        for (j, pj_raw) in xyz.iter().enumerate() {
+            let pj = cell.cartesian(cell.fractional(*pj_raw));
+            for na in -repeats[0]..=repeats[0] {
+                for nb in -repeats[1]..=repeats[1] {
+                    for nc in -repeats[2]..=repeats[2] {
+                        if i == j && na == 0 && nb == 0 && nc == 0 {
+                            continue;
+                        }
+                        let shift = [na, nb, nc];
+                        let d2 = cell.dist2_shifted(pi, pj, cell.lattice_shift(na, nb, nc));
+                        if d2 < cut2 && (!half || keep_half_key(i, j, shift)) {
+                            want.push((i, j, shift));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    want.sort();
+    want
+}
+
+fn keep_half_key(i: usize, j: usize, shift: [i32; 3]) -> bool {
+    if i != j {
+        return i < j;
+    }
+    for s in shift {
+        if s != 0 {
+            return s < 0;
+        }
+    }
+    true
+}
+
+fn assert_cutoff(label: &str, cell: &Cell, xyz: &[[f64; 3]], cutoff: f64) {
+    for half in [false, true] {
+        let got = pairs_within(xyz, cell, cutoff, None, Some(3.0), half).unwrap();
+        let mut keys: Vec<_> = got.iter().map(|p| (p.i, p.j, p.shift)).collect();
+        keys.sort();
+        let want = cutoff_keys(cell, xyz, cutoff, half);
+        assert_eq!(keys, want, "{label} half={half}");
+        for pair in &got {
+            let pi = cell.cartesian(cell.fractional(xyz[pair.i]));
+            let pj = cell.cartesian(cell.fractional(xyz[pair.j]));
+            let d2 = cell.dist2_shifted(
+                pi,
+                pj,
+                cell.lattice_shift(pair.shift[0], pair.shift[1], pair.shift[2]),
+            );
+            assert!((pair.dist2 - d2).abs() < 1e-9, "{label}");
+        }
+    }
+}
+
+#[test]
+fn cutoff_list_matches_shift_scan_on_consumer_cells() {
+    let film = Cell::ortho(20.0, 20.0, 40.0).unwrap();
+    let mut film_xyz = Vec::new();
+    for iz in 0..2 {
+        for iy in 0..4 {
+            for ix in 0..4 {
+                film_xyz.push([
+                    (ix as f64 + 0.5) * 5.0,
+                    (iy as f64 + 0.5) * 5.0,
+                    (iz as f64 + 0.5) * 5.0,
+                ]);
+            }
+        }
+    }
+    assert_cutoff("film", &film, &film_xyz, 6.0);
+
+    let hex = Cell::from_vectors(
+        [10.0, 0.0, 0.0],
+        [5.0, 8.660254037844386, 0.0],
+        [0.0, 0.0, 12.0],
+        [0.0, 0.0, 0.0],
+    )
+    .unwrap();
+    assert_cutoff("hex", &hex, &points_in_cell(&hex, 12, 3), 4.0);
+
+    let tilt = Cell::from_lammps(-2.0, 8.0, 0.0, 4.0, 0.0, 7.0, -2.0, 0.0, 0.0).unwrap();
+    assert_cutoff("tilt", &tilt, &points_in_cell(&tilt, 12, 7), 2.2);
+}
+
+#[test]
+fn tilted_dump_matches_euclidean() {
+    // seams genice sH: LAMMPS bound with an xy tilt, scaled down.
+    let b = Cell::from_lammps(-2.0, 8.0, 0.0, 4.0, 0.0, 7.0, -2.0, 0.0, 0.0).unwrap();
+    assert!(b.is_restricted());
+    assert!(!b.is_ortho());
+    let xyz = points_in_cell(&b, 24, 7);
+    let got = knearest(&xyz, &b, 4, None, Some(1.5)).unwrap();
+    let brute = knearest_brute(&xyz, &b, 4, None).unwrap();
+    assert_rows_match("tilt", &got, &brute);
+}
+
+#[test]
+fn unreduced_grid_matches_lattice_scan() {
+    // Shift (-7, 7, 0) is the Euclidean image here. A 27-image check misses it.
+    let b = unreduced_skew();
+    let xyz = points_in_cell(&b, 24, 99);
+    let oracle = lattice_knearest(&xyz, &b, 4, None, 24);
+    for hint in [None, Some(0.05), Some(0.2), Some(3.0)] {
+        let linked = knearest(&xyz, &b, 4, None, hint).unwrap();
+        assert_rows_match(&format!("unreduced hint={hint:?}"), &linked, &oracle);
+    }
+}
+
+#[test]
+fn skewed_triclinic_matches_lattice_scan() {
+    let b = Cell::from_vectors(
+        [4.0, 0.1, 0.0],
+        [3.2, 0.8, 0.05],
+        [0.4, -0.3, 3.5],
+        [1.0, -2.0, 0.5],
+    )
+    .unwrap();
+    let xyz = points_in_cell(&b, 20, 1234);
+    let mask: Vec<bool> = xyz.iter().enumerate().map(|(i, _)| i % 5 != 0).collect();
+    let oracle = lattice_knearest(&xyz, &b, 3, Some(&mask), 4);
+    for hint in [Some(0.4), None, Some(2.5)] {
+        let linked = knearest(&xyz, &b, 3, Some(&mask), hint).unwrap();
+        assert_rows_match(&format!("skew hint={hint:?}"), &linked, &oracle);
+    }
 }

@@ -5,8 +5,8 @@ use std::ptr;
 
 use dlpk::pyo3::PyDLPack;
 use dlpk::sys::{
-    DLDevice, DLDeviceType, DLManagedTensor, DLManagedTensorVersioned, DLTensor, DLPACK_FLAG_BITMASK_IS_COPIED,
-    DLPACK_FLAG_BITMASK_READ_ONLY,
+    DLDevice, DLDeviceType, DLManagedTensor, DLManagedTensorVersioned, DLTensor,
+    DLPACK_FLAG_BITMASK_IS_COPIED, DLPACK_FLAG_BITMASK_READ_ONLY,
 };
 use dlpk::{DLPackTensor, GetDLPackDataType};
 use linkcell::lc_cell;
@@ -186,7 +186,11 @@ impl StreamDlpack {
             .transpose()?
             .is_some_and(|version| version.0 >= 1);
         let cap = self.inner.__dlpack__(
-            py, None, if versioned { max_version } else { None }, dl_device, copy,
+            py,
+            None,
+            if versioned { max_version } else { None },
+            dl_device,
+            copy,
         )?;
         if versioned {
             Ok(cap)
@@ -244,13 +248,17 @@ fn legacy_capsule(py: Python<'_>, owner: Py<PyCapsule>) -> PyResult<Py<PyCapsule
     // releases the buffer; each protocol owns exactly one deleter call.
     unsafe {
         let capsule = pyo3::ffi::PyCapsule_New(
-            managed.cast(), crate::DLTENSOR.as_ptr(), Some(legacy_capsule_destructor),
+            managed.cast(),
+            crate::DLTENSOR.as_ptr(),
+            Some(legacy_capsule_destructor),
         );
         if capsule.is_null() {
             legacy_tensor_deleter(managed);
             return Err(PyErr::fetch(py));
         }
-        Ok(Bound::from_owned_ptr(py, capsule).cast_into::<PyCapsule>()?.unbind())
+        Ok(Bound::from_owned_ptr(py, capsule)
+            .cast_into::<PyCapsule>()?
+            .unbind())
     }
 }
 

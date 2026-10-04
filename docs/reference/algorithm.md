@@ -1,9 +1,9 @@
 # Algorithm
 
 Linked-cell k-nearest search in `src/knearest.rs`. Allen and
-Tildesley linked cells, a k-heap per source, Chebyshev shells until
-the k-th neighbour cannot lie outside the visited cube. The search
-takes no cutoff.
+Tildesley linked cells, a k-heap per source, and a rectangular index
+box that grows until the k-th neighbour cannot lie past an unvisited
+face. The search takes no cutoff.
 
 ## Inputs
 
@@ -24,7 +24,8 @@ fill unused slots with `-1`.
 2. Store the Cartesian image in the primary cell (`Cell::cartesian`).
 3. Bin in fractional space: `floor(s * n*)`, clamped to
    `[0, n* - 1]`.
-4. Chain each active point onto a linked list per bin.
+4. Count occupants per bin, exclusive-scan the counts, and store the
+   active indices in cell order.
 
 `nx, ny, nz` are `floor(width / edge)`, at least 1. `cell_min` is the
 smallest of the three actual cell edges (perpendicular width over
@@ -33,10 +34,14 @@ a sheared box uses `Hinv` only for this fold.
 
 ## Shells
 
-For each source, walk integer cell offsets `(dx, dy, dz)` in
-Chebyshev shells. Shell `reach` is the surface
-`max(|dx|, |dy|, |dz|) == reach` (`reach == 1` also visits the home
-cell). `max_reach` is `max(nx, ny, nz) / 2 + 1`.
+For each source, walk integer cell offsets `(dx, dy, dz)`. The first
+visit is the 3×3×3 around the home bin. After that the index box
+grows one axis at a time: an axis whose unvisited plane is already
+farther than the k-th neighbour stays put, and a short face can take
+another layer while the long faces do not. A cube shell is the case
+where all three planes fail together. `max_reach` is the space
+diagonal of the walk cell, in units of the shortest bin edge, and at
+least half the longest bin count.
 
 Each offset maps to:
 
@@ -53,12 +58,41 @@ is a separate visit. Skipping those repeats (one shift per unique
 bin) misses images. That construction, and the ortho cheap path, is
 in [MIC and cells](../explanation/mic-and-cells.md).
 
+## Basis
+
+An orthorhombic box is already the basis the shells walk.
+A restricted triclinic box (LAMMPS dump bounds, a CON file with a
+non-right angle, the cells seams and rgsaddle pass) is tilt-reduced
+in place, GROMACS `correct_box`, and the shift is the triangular
+product. A general orientation is Minkowski-reduced (Nguyen–Stehlé).
+The basis spans the same Cartesian lattice. A 27-image check on that
+basis can still miss a closer shift; the shell cap is the space
+diagonal divided by the minimum cell height, and the frontier test
+stops the walk once the k-th neighbour is certified.
+`pairs_within` keeps the caller's basis, because the returned shift
+`S` is an integer combination of that H. Its index box grows the
+same way, one axis at a time, out to the cutoff. The C, C++, and
+Python entries are that list (`lc_pairs_within`,
+`linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
+neighbour list is this call.
+
 ## Heap and stop
 
-A max-heap of size `k` stores `(dist2, index)`. For `k <= 16` it
-lives on the stack. After each shell, if the heap is full and the
-worst `dist2` is at most `(reach * cell_min)^2`, no unvisited point
-can beat the k-th neighbour, and the walk stops.
+A max-heap of size `k` stores `(dist2, index)`, ordered
+lexicographically so an equal distance keeps the smaller index. For
+`k <= 16` it lives on the stack. Occupants of a bin are a contiguous
+slice. A cell is skipped when the perpendicular distance from the
+source to that image's slab is already at least the worst heap entry.
+
+After each shell, if the heap is full and the worst `dist2` is at
+most the squared perpendicular distance to the nearest unvisited
+lattice plane, the walk stops. Bins are half-open, so every unvisited
+point lies strictly past that plane: a neighbour that sits on the
+plane is still the nearest, and shrinking the plane would walk another
+shell. The older `reach * cell_min` bound is that distance when the
+source sits on the outer face of its cell; a source in the interior
+stops sooner. The device walk still uses `reach * cell_min`, which is
+a lower bound on the same plane, so it does not stop earlier.
 
 `knearest` returns `Neighbors` rows (`indices`, `dist2`), nearest
 first. `knearest_into` / `lc_knearest` write packed indices.
@@ -71,6 +105,16 @@ test, then a Minkowski-reduced 27-image. The 27-image of an
 unreduced H misses lattice points such as `2(a-b)`. The fractional
 wrap of a hex-prism body diagonal is not nearest. It is not the
 production walk.
+
+The citations are in [MIC and cells](../explanation/mic-and-cells.md).
+The pair kernel is Rapaport's cell shift. The expanding shells are
+Bentley, Weide, and Yao's cell technique. Schnorr–Euchner enumeration
+and McKilliam, Grant, and Clarkson's obtuse-superbase search certify
+the closest lattice vector; they do not list the k nearest sites.
+A periodic Delaunay triangulation certifies the nearest site, not the
+fourth. A kd-tree on a product of circles (Yershova and LaValle) is
+exact for one neighbour on an orthorhombic torus. Crystal-graph
+builders take a cutoff, or k neighbours inside a ball.
 
 ## Parallel
 

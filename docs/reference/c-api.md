@@ -51,6 +51,20 @@ int lc_knearest_many(const double *xyz, size_t n, size_t n_frames,
 
 `lc_knearest` is the one-frame, indices-only entry. Returns 0 on success, nonzero on failure.
 
+```c
+int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
+                    double cutoff, const int *mask, double cell_hint,
+                    int half, int *out_i, int *out_j, int *out_shift,
+                    double *out_d2, size_t cap, size_t *out_count);
+```
+
+A cutoff list is `lc_pairs_within`. Each row is one atom-image.
+`out_shift[3 * t + 0..3]` is `(na, nb, nc)`, the vesin / tonari shift
+`S` in the caller's basis. Squared distance is strictly below
+`cutoff * cutoff`. `half` nonzero keeps one side of `(i, j, S)`.
+Null `out_i`, `out_j`, `out_shift`, and `out_d2` query `*out_count`.
+A short `cap` writes that count and returns nonzero.
+
 ## Errors and version
 
 ```c
@@ -98,6 +112,18 @@ Neighbours knearest(const double *xyz, std::size_t n, const Cell &cell,
                     double cell_hint = 0.0);
 
 const char *version();
+
+struct ShiftedPair {
+  int i, j;
+  std::array<int, 3> shift;
+  double dist2;
+};
+
+std::vector<ShiftedPair> pairs_within(const double *xyz, std::size_t n,
+                                      const Cell &cell, double cutoff,
+                                      const int *mask = nullptr,
+                                      double cell_hint = 0.0,
+                                      bool half = false);
 }
 ```
 

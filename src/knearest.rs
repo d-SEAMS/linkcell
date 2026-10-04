@@ -1,11 +1,14 @@
 //! Linked-cell k-nearest search (Allen and Tildesley).
 //!
-//! Fold into the primary cell, bin on the fractional mesh, then expand
-//! Chebyshev shells until the k-th neighbour cannot sit outside the
-//! visited cube. Distances are [`crate::Cell::dist2_shifted`] plus
-//! [`crate::Cell::lattice_shift`]. The walk keys on the integer stencil,
-//! not a unique-cell stamp: occupants of one bin can need different
-//! lattice images of the same source.
+//! Fold into the primary cell, bin on the fractional mesh in cell-major
+//! order, then grow the index box until the k-th neighbour lies inside
+//! the perpendicular distance to the unvisited frontier. An orthorhombic
+//! box is walked as stored. A restricted triclinic box is tilt-reduced
+//! first. A general orientation is Minkowski-reduced. Distances are
+//! [`crate::Cell::dist2_shifted`]
+//! plus [`crate::Cell::lattice_shift`]. The walk keys on the integer
+//! stencil, not a unique-cell stamp: occupants of one bin can need
+//! different lattice images of the same source.
 //!
 //! [`knearest`] returns one [`Neighbors`] row per point. [`knearest_into`]
 //! writes packed `n * k` indices (`-1` unused). [`knearest_into_d2`]
@@ -14,23 +17,30 @@
 //! `--no-default-features` to serialize. The per-source `KHeap` stays on
 //! the stack for `k <= 16`.
 
+use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::Error;
-
-const MAX_CELLS: i64 = 16_777_216;
-
-type SearchHits = Vec<(usize, Vec<(f64, usize)>)>;
 
 fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
     simbox.dist2_euclidean(p, q)
 }
 
-fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
-    let n = (width / edge).floor().max(1.0);
-    if !n.is_finite() || n > 1_000_000.0 {
-        return Err(Error::TooManyCells);
+fn box_diameter(cell: &Cell) -> f64 {
+    let a = cell.a();
+    let b = cell.b();
+    let c = cell.c();
+    let mut best = 0.0_f64;
+    for &sa in &[-1.0, 1.0] {
+        for &sb in &[-1.0, 1.0] {
+            for &sc in &[-1.0, 1.0] {
+                let x = sa * a[0] + sb * b[0] + sc * c[0];
+                let y = sa * a[1] + sb * b[1] + sc * c[1];
+                let z = sa * a[2] + sb * b[2] + sc * c[2];
+                best = best.max(x * x + y * y + z * z);
+            }
+        }
     }
-    Ok(n as i32)
+    best.sqrt()
 }
 
 /// Bounded max-heap of `(dist2, index)`. `k <= 16` stays in
@@ -43,6 +53,8 @@ struct KHeap {
     extra_idx: Vec<usize>,
     n: usize,
     k: usize,
+    /// Slot of the lexicographic maximum `(dist2, index)`.
+    worst_at: usize,
 }
 
 impl KHeap {
@@ -60,6 +72,7 @@ impl KHeap {
             extra_idx,
             n: 0,
             k,
+            worst_at: 0,
         }
     }
 
@@ -89,29 +102,55 @@ impl KHeap {
         }
     }
 
+    fn worse_than(&self, d2: f64, j: usize, other: usize) -> bool {
+        let od = self.d2_at(other);
+        let oj = self.idx_at(other);
+        d2 > od || (d2 == od && j > oj)
+    }
+
+    fn recompute_worst(&mut self) {
+        let mut w = 0;
+        for t in 1..self.n {
+            if self.worse_than(self.d2_at(t), self.idx_at(t), w) {
+                w = t;
+            }
+        }
+        self.worst_at = w;
+    }
+
+    /// Insert the nearest image of `j`. Equal distances keep the smaller index.
     fn push(&mut self, d2: f64, j: usize) {
+        if self.n == self.k {
+            let wd = self.d2_at(self.worst_at);
+            let wj = self.idx_at(self.worst_at);
+            // A candidate that does not beat the worst cannot improve any
+            // stored image either: those distances are at most the worst.
+            if d2 > wd || (d2 == wd && j >= wj) {
+                return;
+            }
+        }
         for t in 0..self.n {
             if self.idx_at(t) == j {
                 if d2 < self.d2_at(t) {
                     self.set(t, d2, j);
+                    if t == self.worst_at {
+                        self.recompute_worst();
+                    }
                 }
                 return;
             }
         }
         if self.n < self.k {
-            self.set(self.n, d2, j);
+            let slot = self.n;
+            self.set(slot, d2, j);
+            if slot == 0 || self.worse_than(d2, j, self.worst_at) {
+                self.worst_at = slot;
+            }
             self.n += 1;
             return;
         }
-        let mut worst = 0;
-        for t in 1..self.n {
-            if self.d2_at(t) > self.d2_at(worst) {
-                worst = t;
-            }
-        }
-        if d2 < self.d2_at(worst) {
-            self.set(worst, d2, j);
-        }
+        self.set(self.worst_at, d2, j);
+        self.recompute_worst();
     }
 
     fn full(&self) -> bool {
@@ -119,28 +158,44 @@ impl KHeap {
     }
 
     fn worst(&self) -> f64 {
-        let mut w = self.d2_at(0);
-        for t in 1..self.n {
-            let v = self.d2_at(t);
-            if v > w {
-                w = v;
-            }
-        }
-        w
+        self.d2_at(self.worst_at)
     }
 
-    fn finish(self) -> Vec<(f64, usize)> {
-        let mut pairs = Vec::with_capacity(self.n);
-        for t in 0..self.n {
-            let j = if self.k <= 16 {
-                self.idx[t]
-            } else {
-                self.extra_idx[t]
-            };
-            pairs.push((self.d2_at(t), j));
+    /// Write nearest-first into caller slots. Unused tail stays as the caller left it.
+    fn write_sorted(&self, nn: &mut [i32], mut d2: Option<&mut [f64]>) {
+        if self.k <= 16 {
+            let n = self.n;
+            let mut order = [0u8; 16];
+            for (t, slot) in order.iter_mut().enumerate().take(n) {
+                *slot = t as u8;
+            }
+            order[..n].sort_by(|&a, &b| {
+                let (a, b) = (a as usize, b as usize);
+                self.d2[a]
+                    .total_cmp(&self.d2[b])
+                    .then(self.idx[a].cmp(&self.idx[b]))
+            });
+            for (t, &slot) in order[..n].iter().enumerate() {
+                let s = slot as usize;
+                nn[t] = self.idx[s] as i32;
+                if let Some(buf) = d2.as_mut() {
+                    buf[t] = self.d2[s];
+                }
+            }
+        } else {
+            let mut order: Vec<usize> = (0..self.n).collect();
+            order.sort_by(|&a, &b| {
+                self.extra_d2[a]
+                    .total_cmp(&self.extra_d2[b])
+                    .then(self.extra_idx[a].cmp(&self.extra_idx[b]))
+            });
+            for (t, &s) in order.iter().enumerate() {
+                nn[t] = self.extra_idx[s] as i32;
+                if let Some(buf) = d2.as_mut() {
+                    buf[t] = self.extra_d2[s];
+                }
+            }
         }
-        pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        pairs
     }
 }
 
@@ -280,16 +335,7 @@ fn write_one(
     if let Some(d2) = out_d2.as_mut() {
         d2.fill(f64::NAN);
     }
-    let rows = search(xyz, simbox, k, mask, cell_hint)?;
-    for (i, pairs) in rows {
-        for (t, &(d2, j)) in pairs.iter().enumerate() {
-            out_nn[i * k + t] = j as i32;
-            if let Some(buf) = out_d2.as_mut() {
-                buf[i * k + t] = d2;
-            }
-        }
-    }
-    Ok(())
+    execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
@@ -299,10 +345,13 @@ fn write_one(
 /// `cell_hint` is the target cell edge; `None` uses 3.0 in the same units
 /// as the box. Each row has `min(k, n_active - 1)` entries.
 ///
-/// Fold, bin, then expand Chebyshev shells. Distances are
+/// Fold, bin, then grow a rectangular index box. An orthorhombic cell
+/// is used as stored. A restricted triclinic cell is tilt-reduced
+/// first. A general orientation is Minkowski-reduced. Distances are
 /// [`Cell::dist2_shifted`] plus [`Cell::lattice_shift`]. The walk does
 /// not stamp unique cells: occupants of one bin can need different
-/// images.
+/// images. A full heap stops when its worst distance is at most the
+/// nearest unvisited face.
 ///
 /// ```
 /// use linkcell::{knearest, Cell};
@@ -326,21 +375,39 @@ pub fn knearest(
     cell_hint: Option<f64>,
 ) -> Result<Vec<Neighbors>, Error> {
     let n = xyz.len();
+    let Some(nk) = n.checked_mul(k) else {
+        return Err(Error::Overflow);
+    };
+    let mut nn = vec![-1i32; nk];
+    let mut d2 = vec![f64::NAN; nk];
+    write_one(xyz, simbox, k, mask, cell_hint, &mut nn, Some(&mut d2))?;
     let mut out = vec![Neighbors::default(); n];
-    for (i, pairs) in search(xyz, simbox, k, mask, cell_hint)? {
-        out[i].dist2 = pairs.iter().map(|p| p.0).collect();
-        out[i].indices = pairs.iter().map(|p| p.1).collect();
+    for i in 0..n {
+        let row_nn = &nn[i * k..(i + 1) * k];
+        let row_d2 = &d2[i * k..(i + 1) * k];
+        let m = row_nn.iter().take_while(|j| **j >= 0).count();
+        out[i].indices = row_nn[..m].iter().map(|&j| j as usize).collect();
+        out[i].dist2 = row_d2[..m].to_vec();
     }
     Ok(out)
 }
 
-fn search(
+struct Geom {
+    cols: [[f64; 3]; 3],
+    lengths: [f64; 3],
+    nbin: [i32; 3],
+    widths: [f64; 3],
+}
+
+fn execute(
     xyz: &[[f64; 3]],
     simbox: &Cell,
     k: usize,
     mask: Option<&[bool]>,
     cell_hint: Option<f64>,
-) -> Result<SearchHits, Error> {
+    out_nn: &mut [i32],
+    out_d2: Option<&mut [f64]>,
+) -> Result<(), Error> {
     if k == 0 {
         return Err(Error::ZeroK);
     }
@@ -353,121 +420,289 @@ fn search(
             return Err(Error::MaskLen);
         }
     }
-    let active: Vec<usize> = (0..n)
-        .filter(|&i| mask.map(|m| m[i]).unwrap_or(true))
-        .collect();
-    if active.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut edge = cell_hint.unwrap_or(3.0);
-    if !edge.is_finite() || edge <= 0.0 {
-        edge = 3.0;
-    }
-    let w = simbox.widths();
-    edge = edge.min(w[0]).min(w[1]).min(w[2]);
-
-    let nx = bins_1d(w[0], edge)?;
-    let ny = bins_1d(w[1], edge)?;
-    let nz = bins_1d(w[2], edge)?;
-    let ncell = (i64::from(nx))
-        .checked_mul(i64::from(ny))
-        .and_then(|v| v.checked_mul(i64::from(nz)))
-        .filter(|&v| v > 0 && v <= MAX_CELLS)
-        .ok_or(Error::TooManyCells)? as usize;
-    let invx = f64::from(nx);
-    let invy = f64::from(ny);
-    let invz = f64::from(nz);
-    let cell_min = (w[0] / f64::from(nx))
-        .min(w[1] / f64::from(ny))
-        .min(w[2] / f64::from(nz));
-
-    // Fold into the primary cell once. Pair distances are then a
-    // Cartesian subtract plus a lattice shift (vesin / LAMMPS ghosts).
-    // The walk keys on the integer stencil, not a unique rem_euclid
-    // cell: occupants of one bin can need different images.
-    let mut folded = vec![[0.0; 3]; n];
-    let mut bin = vec![(0i32, 0i32, 0i32); n];
-    for &i in &active {
-        let s = simbox.fractional(xyz[i]);
-        folded[i] = simbox.cartesian(s);
-        bin[i] = (
-            ((s[0] * invx) as i32).clamp(0, nx - 1),
-            ((s[1] * invy) as i32).clamp(0, ny - 1),
-            ((s[2] * invz) as i32).clamp(0, nz - 1),
-        );
-    }
-
-    let mut head = vec![-1isize; ncell];
-    let mut next = vec![-1isize; n];
-    let cell_index = |ix: i32, iy: i32, iz: i32| -> usize {
-        let cx = ix.rem_euclid(nx);
-        let cy = iy.rem_euclid(ny);
-        let cz = iz.rem_euclid(nz);
-        ((cz * ny + cy) * nx + cx) as usize
+    let n_active = match mask {
+        Some(m) => m.iter().filter(|&&on| on).count(),
+        None => n,
     };
-    for &i in &active {
-        let (ix, iy, iz) = bin[i];
-        let c = cell_index(ix, iy, iz);
-        next[i] = head[c];
-        head[c] = i as isize;
+    if n_active <= 1 {
+        return Ok(());
     }
 
-    let max_reach = nx.max(ny).max(nz) / 2 + 1;
-    let one = |i: usize| -> (usize, Vec<(f64, usize)>) {
-        let mut heap = KHeap::new(k);
-        let (ix, iy, iz) = bin[i];
-        let mut reach = 1i32;
-        while reach <= max_reach {
-            for dx in -reach..=reach {
-                for dy in -reach..=reach {
-                    for dz in -reach..=reach {
-                        let shell = reach == 1
-                            || dx.abs() == reach
-                            || dy.abs() == reach
-                            || dz.abs() == reach;
-                        if !shell && reach > 1 {
-                            continue;
-                        }
-                        let jx = ix + dx;
-                        let jy = iy + dy;
-                        let jz = iz + dz;
-                        let c = cell_index(jx, jy, jz);
-                        let shift = simbox.lattice_shift(
-                            jx.div_euclid(nx),
-                            jy.div_euclid(ny),
-                            jz.div_euclid(nz),
-                        );
-                        let mut j = head[c];
-                        while j >= 0 {
-                            let ju = j as usize;
-                            if ju != i {
-                                heap.push(simbox.dist2_shifted(folded[i], folded[ju], shift), ju);
-                            }
-                            j = next[ju];
-                        }
-                    }
-                }
-            }
-            if heap.full() {
-                let bound = f64::from(reach) * cell_min;
-                if heap.worst() <= bound * bound {
-                    break;
-                }
-            }
-            reach += 1;
+    // Orthorhombic MIC is the per-axis wrap. A LAMMPS / GROMACS
+    // restricted cell is tilt-reduced in place (same Cartesian frame).
+    // Anything else is Minkowski-reduced so the short vectors are the edges.
+    let walk = if simbox.is_ortho() {
+        *simbox
+    } else if simbox.is_restricted() {
+        simbox.reduce_tilts().unwrap_or(*simbox)
+    } else {
+        match minimage::minkowski_reduce(simbox) {
+            Ok(cell) => cell,
+            Err(_) => *simbox,
         }
-        (i, heap.finish())
     };
+    let edge = bins::target_edge(&walk, cell_hint, 3.0);
+    let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
+    let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
+    let nbin = [mesh.nx, mesh.ny, mesh.nz];
+    let widths = mesh.widths;
+    let cell_min = (widths[0] / f64::from(mesh.nx))
+        .min(widths[1] / f64::from(mesh.ny))
+        .min(widths[2] / f64::from(mesh.nz));
+    let need = (box_diameter(&walk) / cell_min).ceil();
+    let max_reach = if need.is_finite() && need < 1.0e7 {
+        (need as i32).saturating_add(3).max(mesh.image_reach())
+    } else {
+        mesh.image_reach()
+    };
+    let geom = Geom {
+        cols: [walk.a(), walk.b(), walk.c()],
+        lengths: walk.widths(),
+        nbin,
+        widths,
+    };
+    if walk.is_ortho() {
+        dispatch::<0>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+    } else if walk.is_restricted() {
+        dispatch::<1>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+    } else {
+        dispatch::<2>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+    }
+    Ok(())
+}
 
+fn dispatch<const MODE: u8>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    mask: Option<&[bool]>,
+    out_nn: &mut [i32],
+    out_d2: Option<&mut [f64]>,
+) {
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        Ok(active.par_iter().copied().map(one).collect())
+        match (mask, out_d2) {
+            (None, None) => {
+                out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
+                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
+                });
+            }
+            (None, Some(d2)) => {
+                out_nn
+                    .par_chunks_mut(k)
+                    .zip(d2.par_chunks_mut(k))
+                    .enumerate()
+                    .for_each(|(i, (nn, dd))| {
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                    });
+            }
+            (Some(mask), None) => {
+                out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
+                    if mask[i] {
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
+                    }
+                });
+            }
+            (Some(mask), Some(d2)) => {
+                out_nn
+                    .par_chunks_mut(k)
+                    .zip(d2.par_chunks_mut(k))
+                    .enumerate()
+                    .for_each(|(i, (nn, dd))| {
+                        if mask[i] {
+                            walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                        }
+                    });
+            }
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {
-        Ok(active.iter().copied().map(one).collect())
+        match (mask, out_d2) {
+            (None, None) => {
+                for (i, nn) in out_nn.chunks_mut(k).enumerate() {
+                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
+                }
+            }
+            (None, Some(d2)) => {
+                for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
+                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                }
+            }
+            (Some(mask), None) => {
+                for (i, nn) in out_nn.chunks_mut(k).enumerate() {
+                    if mask[i] {
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
+                    }
+                }
+            }
+            (Some(mask), Some(d2)) => {
+                for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
+                    if mask[i] {
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn walk_source<const MODE: u8>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    i: usize,
+    nn: &mut [i32],
+    d2: Option<&mut [f64]>,
+) {
+    let mut heap = KHeap::new(k);
+    let [ix, iy, iz] = mesh.bin[i];
+    let origin = mesh.frac[i];
+    let pi = mesh.folded[i];
+    // Nothing visited yet. The first layer is the 3x3x3 around the source.
+    let mut prev = [-1i32; 3];
+    let mut reach = [1i32; 3];
+    loop {
+        let mut query = CellQuery {
+            heap: &mut heap,
+            mesh,
+            geom,
+            i,
+            pi,
+            origin,
+        };
+        let allow_slab = prev[0] >= 0;
+        for_new_layer(prev, reach, |dx, dy, dz| {
+            visit_cell::<MODE>(&mut query, ix + dx, iy + dy, iz + dz, allow_slab);
+        });
+        let gaps = [
+            axis_gap(origin[0], ix, reach[0], geom.nbin[0], geom.widths[0]),
+            axis_gap(origin[1], iy, reach[1], geom.nbin[1], geom.widths[1]),
+            axis_gap(origin[2], iz, reach[2], geom.nbin[2], geom.widths[2]),
+        ];
+        if heap.full() {
+            let bound = gaps
+                .into_iter()
+                .map(|gap| {
+                    if gap > 0.0 && gap.is_finite() {
+                        gap * gap
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(f64::INFINITY, f64::min);
+            if heap.worst() <= bound {
+                break;
+            }
+        }
+        prev = reach;
+        let mut grew = false;
+        if heap.full() {
+            let worst = heap.worst();
+            for a in 0..3 {
+                let gap2 = if gaps[a] > 0.0 && gaps[a].is_finite() {
+                    gaps[a] * gaps[a]
+                } else {
+                    0.0
+                };
+                if worst > gap2 && reach[a] < max_reach {
+                    reach[a] += 1;
+                    grew = true;
+                }
+            }
+        } else {
+            for slot in &mut reach {
+                if *slot < max_reach {
+                    *slot += 1;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    heap.write_sorted(nn, d2);
+}
+
+struct CellQuery<'a> {
+    heap: &'a mut KHeap,
+    mesh: &'a Mesh,
+    geom: &'a Geom,
+    i: usize,
+    pi: [f64; 3],
+    origin: [f64; 3],
+}
+
+#[inline(always)]
+fn visit_cell<const MODE: u8>(q: &mut CellQuery<'_>, jx: i32, jy: i32, jz: i32, allow_slab: bool) {
+    let (cell, na, nb, nc) = q.mesh.locate(jx, jy, jz);
+    let lo = q.mesh.offsets[cell];
+    let hi = q.mesh.offsets[cell + 1];
+    let count = hi - lo;
+    if count == 0 {
+        return;
+    }
+    // One orthorhombic occupant is a subtract and three multiplies.
+    // The slab test is three divisions, so it only pays for a crowded bin.
+    // Mode 0 is orthorhombic: one occupant is a subtract, and the slab
+    // test costs more than the distance. Restricted and general cells
+    // keep the slab, because the shift is a matrix product.
+    if allow_slab && !(MODE == 0 && count == 1) && q.heap.full() {
+        let lb = slab_dist2(q.origin, [jx, jy, jz], q.geom.nbin, q.geom.widths);
+        if q.heap.worst() <= lb {
+            return;
+        }
+    }
+    let shift = if MODE == 0 {
+        if (na | nb | nc) == 0 {
+            [0.0; 3]
+        } else {
+            [
+                f64::from(na) * q.geom.lengths[0],
+                f64::from(nb) * q.geom.lengths[1],
+                f64::from(nc) * q.geom.lengths[2],
+            ]
+        }
+    } else if MODE == 1 {
+        // Restricted triclinic: a along x, b in the xy plane.
+        let fa = f64::from(na);
+        let fb = f64::from(nb);
+        let fc = f64::from(nc);
+        let a = q.geom.cols[0];
+        let b = q.geom.cols[1];
+        let c = q.geom.cols[2];
+        [
+            fa * a[0] + fb * b[0] + fc * c[0],
+            fb * b[1] + fc * c[1],
+            fc * c[2],
+        ]
+    } else {
+        let fa = f64::from(na);
+        let fb = f64::from(nb);
+        let fc = f64::from(nc);
+        let a = q.geom.cols[0];
+        let b = q.geom.cols[1];
+        let c = q.geom.cols[2];
+        [
+            fa * a[0] + fb * b[0] + fc * c[0],
+            fa * a[1] + fb * b[1] + fc * c[1],
+            fa * a[2] + fb * b[2] + fc * c[2],
+        ]
+    };
+    let pi = q.pi;
+    for &ju in &q.mesh.occupants[lo..hi] {
+        if ju != q.i {
+            let p = q.mesh.folded[ju];
+            let dx = p[0] + shift[0] - pi[0];
+            let dy = p[1] + shift[1] - pi[1];
+            let dz = p[2] + shift[2] - pi[2];
+            q.heap.push(dx * dx + dy * dy + dz * dz, ju);
+        }
     }
 }
 

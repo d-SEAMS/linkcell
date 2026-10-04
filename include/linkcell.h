@@ -7,6 +7,8 @@
  *   - lc_knearest writes into caller-owned out_nn (length n * k).
  *   - lc_knearest_d2 also writes out_d2 (length n * k, unused NaN).
  *   - lc_knearest_many is the frame-major batch (n_frames * n * k).
+ *   - lc_pairs_within writes caller-owned i, j, shift, dist2 rows.
+ *     Null outputs query the row count.
  *   - lc_last_error returns a thread-local pointer. Do not free. The
  *     pointer is invalid after the next lc_knearest on the same thread.
  *     lc_version does not read or write the slot.
@@ -184,6 +186,43 @@ int lc_knearest_many(const double *xyz,
  * the next `lc_knearest` on this thread. Do not free it.
  */
 const char *lc_last_error(void);
+
+/**
+ * Cutoff pairs with the vesin / tonari shift `S`.
+ *
+ * Each row is one atom-image: `out_i[t]`, `out_j[t]`,
+ * `out_shift[3*t + 0..3]` = `(na, nb, nc)`, and `out_d2[t]`.
+ * Displacement is `r_j - r_i + S H` in the caller's basis.
+ * `dist2` is strictly below `cutoff` squared. `half` nonzero keeps
+ * the canonical side of `(i, j, S)` versus `(j, i, -S)`.
+ *
+ * Pass null `out_i`, `out_j`, `out_shift`, and `out_d2` to query.
+ * `*out_count` receives the row count and the return is 0.
+ * Otherwise all four buffers are required and `cap` is their row
+ * capacity. A short buffer sets `*out_count` to the needed row count
+ * and returns nonzero without writing.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `simbox` points at one
+ * `lc_cell`. `mask`, if non-null, is readable for `n` ints.
+ * `out_count` is writable. On a fill, `out_i` and `out_j` are
+ * writable for `cap` ints, `out_shift` for `cap * 3` ints, and
+ * `out_d2` for `cap` doubles.
+ */
+int lc_pairs_within(const double *xyz,
+                    size_t n,
+                    const struct lc_cell *simbox,
+                    double cutoff,
+                    const int *mask,
+                    double cell_hint,
+                    int half,
+                    int *out_i,
+                    int *out_j,
+                    int *out_shift,
+                    double *out_d2,
+                    size_t cap,
+                    size_t *out_count);
 
 /**
  * Library version string. Process-static, NUL-terminated. Do not free.

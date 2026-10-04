@@ -23,6 +23,8 @@ header = """
  *   - lc_knearest writes into caller-owned out_nn (length n * k).
  *   - lc_knearest_d2 also writes out_d2 (length n * k, unused NaN).
  *   - lc_knearest_many is the frame-major batch (n_frames * n * k).
+ *   - lc_pairs_within writes caller-owned i, j, shift, dist2 rows.
+ *     Null outputs query the row count.
  *   - lc_last_error returns a thread-local pointer. Do not free. The
  *     pointer is invalid after the next lc_knearest on the same thread.
  *     lc_version does not read or write the slot.
@@ -104,6 +106,7 @@ include = [
     "lc_knearest",
     "lc_knearest_d2",
     "lc_knearest_many",
+    "lc_pairs_within",
     "lc_last_error",
     "lc_version",
 ]
