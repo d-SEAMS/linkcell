@@ -147,6 +147,7 @@ impl Mesh {
                 },
             );
         } else {
+            let _pop = crate::pop::JobTimer::new();
             for slot in 0..n_active {
                 let i = ids.get(slot);
                 let s = simbox.fractional(xyz[i]);
@@ -162,8 +163,11 @@ impl Mesh {
 
         buf.offsets.clear();
         buf.offsets.resize(ncell + 1, 0);
-        for c in 0..ncell {
-            buf.offsets[c + 1] = buf.offsets[c] + buf.counts[c];
+        {
+            let _pop = crate::pop::JobTimer::new();
+            for c in 0..ncell {
+                buf.offsets[c + 1] = buf.offsets[c] + buf.counts[c];
+            }
         }
         buf.cursor.clear();
         buf.cursor.resize(ncell + 1, 0);
@@ -174,6 +178,7 @@ impl Mesh {
             #[cfg(feature = "parallel")]
             scatter_parallel(ids, &buf.bin, &buf.offsets, &mut buf.occupants, nx, ny, nz);
         } else {
+            let _pop = crate::pop::JobTimer::new();
             for slot in 0..n_active {
                 let i = ids.get(slot);
                 let [ix, iy, iz] = buf.bin[i];
@@ -361,7 +366,7 @@ fn bin_parallel(
                 .zip(scratch.folded.par_iter_mut())
                 .zip(scratch.bin.par_iter_mut())
                 .zip(xyz.par_iter())
-                .for_each(|(((f, fold), b), p)| {
+                .for_each_init(crate::pop::JobTimer::new, |_timer, (((f, fold), b), p)| {
                     let s = simbox.fractional(*p);
                     let ix = bin_coord(s[0], nx);
                     let iy = bin_coord(s[1], ny);
@@ -379,23 +384,27 @@ fn bin_parallel(
             let frac_ptr = SyncPtr(scratch.frac.as_mut_ptr());
             let folded_ptr = SyncPtr(scratch.folded.as_mut_ptr());
             let bin_ptr = SyncPtr(scratch.bin.as_mut_ptr());
-            (0..n_active).into_par_iter().for_each(|slot| {
-                let i = ids.get(slot);
-                let s = simbox.fractional(xyz[i]);
-                let ix = bin_coord(s[0], nx);
-                let iy = bin_coord(s[1], ny);
-                let iz = bin_coord(s[2], nz);
-                // SAFETY: `ids` lists each point once, so these writes do not alias.
-                unsafe {
-                    frac_ptr.write(i, s);
-                    folded_ptr.write(i, simbox.cartesian(s));
-                    bin_ptr.write(i, [ix, iy, iz]);
-                }
-                hist[cell_index(ix, iy, iz, nx, ny, nz)].fetch_add(1, Ordering::Relaxed);
-            });
+            (0..n_active).into_par_iter().for_each_init(
+                crate::pop::JobTimer::new,
+                |_timer, slot| {
+                    let i = ids.get(slot);
+                    let s = simbox.fractional(xyz[i]);
+                    let ix = bin_coord(s[0], nx);
+                    let iy = bin_coord(s[1], ny);
+                    let iz = bin_coord(s[2], nz);
+                    // SAFETY: `ids` lists each point once, so these writes do not alias.
+                    unsafe {
+                        frac_ptr.write(i, s);
+                        folded_ptr.write(i, simbox.cartesian(s));
+                        bin_ptr.write(i, [ix, iy, iz]);
+                    }
+                    hist[cell_index(ix, iy, iz, nx, ny, nz)].fetch_add(1, Ordering::Relaxed);
+                },
+            );
         }
     }
 
+    let _pop = crate::pop::JobTimer::new();
     for (dst, src) in scratch.counts.iter_mut().zip(&hist) {
         *dst = src.load(Ordering::Relaxed);
     }
@@ -422,17 +431,20 @@ fn scatter_parallel(
         .collect();
     let occ = SyncPtr(occupants.as_mut_ptr());
     let n_active = ids.len();
-    (0..n_active).into_par_iter().for_each(|slot| {
-        let i = ids.get(slot);
-        let [ix, iy, iz] = bin[i];
-        let c = cell_index(ix, iy, iz, nx, ny, nz);
-        let dest = cursor[c].fetch_add(1, Ordering::Relaxed);
-        // SAFETY: each `fetch_add` returns a distinct slot, and the
-        // cell ranges partition `occupants`.
-        unsafe {
-            occ.write(dest, i);
-        }
-    });
+    (0..n_active)
+        .into_par_iter()
+        .for_each_init(crate::pop::JobTimer::new, |_timer, slot| {
+            let i = ids.get(slot);
+            let [ix, iy, iz] = bin[i];
+            let c = cell_index(ix, iy, iz, nx, ny, nz);
+            let dest = cursor[c].fetch_add(1, Ordering::Relaxed);
+            // SAFETY: each `fetch_add` returns a distinct slot, and the
+            // cell ranges partition `occupants`.
+            unsafe {
+                occ.write(dest, i);
+            }
+        });
+    let _pop = crate::pop::JobTimer::new();
     // Index order matches the serial scatter, which walks ids in order.
     // A full bin of one point is already ordered. Cutoff pairs keep visit
     // order, so a crowded bin is sorted.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // Certified linked-cell k-nearest on Kokkos::DefaultExecutionSpace.
 //
 // The caller initializes Kokkos. `box` is the walk cell: orthorhombic
@@ -19,3 +21,10 @@ struct LcKokkosBox {
 
 int lc_kokkos_knearest(const double* xyz, int n, const LcKokkosBox& box, int k,
                        double cell_hint, int* out_nn, double* out_d2);
+
+// When `slots` is non-null, each OpenMP thread adds its CPU time
+// inside its RangePolicy slices into that slot. One sample covers the
+// slice, not each index, and a preempted thread does not count the
+// stall. Pass null to leave counters off. `slots` must hold at least
+// the thread count entries.
+void lc_kokkos_pop_bind(uint64_t* slots);

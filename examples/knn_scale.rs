@@ -75,18 +75,43 @@ fn main() {
     };
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".to_string());
     let mut out = vec![-1i32; xyz.len() * k];
+    linkcell::pop_prepare();
     knearest_into(&xyz, &cell, k, None, Some(3.0), &mut out).expect("warmup");
+    linkcell::pop_reset();
     let mut acc = 0i32;
     let started = Instant::now();
     for _ in 0..reps {
         knearest_into(&xyz, &cell, k, None, Some(3.0), &mut out).expect("knearest");
         acc = acc.wrapping_add(out[0]);
     }
-    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let wall_ns = started.elapsed().as_nanos() as u64;
     std::hint::black_box(acc);
+    let useful = linkcell::pop_snapshot();
+    let ms = wall_ns as f64 / 1e6;
     println!(
         "shape={shape} threads={threads} n={} k={k} reps={reps} ms={ms:.1} ms_per={:.2}",
         xyz.len(),
         ms / reps as f64
     );
+    if !useful.is_empty() {
+        let sum: u64 = useful.iter().sum();
+        let max = useful.iter().copied().max().unwrap_or(0);
+        let avg = sum as f64 / useful.len() as f64;
+        let lb = if max == 0 { 0.0 } else { avg / max as f64 };
+        let ce = if wall_ns == 0 {
+            0.0
+        } else {
+            max as f64 / wall_ns as f64
+        };
+        let pe = lb * ce;
+        let list = useful
+            .iter()
+            .map(|ns| ns.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "pop shape={shape} threads={threads} n={} reps={reps} wall_ns={wall_ns} useful_ns={list} lb={lb:.4} ce={ce:.4} pe={pe:.4}",
+            xyz.len()
+        );
+    }
 }

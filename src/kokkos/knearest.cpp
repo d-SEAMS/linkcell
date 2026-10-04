@@ -5,7 +5,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <limits>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -508,15 +513,128 @@ void widths_of(const double col[3][3], double widths[3]) {
     widths[2] = ad / norm(ab);
 }
 
+uint64_t* pop_slots = nullptr;
+
+// One clock covers a thread's slice, not each index.
+// libgomp `schedule(static)` with no chunk size is what Kokkos OpenMP
+// `parallel_for` emits on GCC. The first `n % nthreads` threads receive
+// one extra index. The exclusive scan is not in this clock.
+struct ChunkClock {
+    uint64_t t0 = 0;
+    int end = 0;
+    int tid = 0;
+    bool on = false;
+};
+
+uint64_t thread_cpu_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+thread_local ChunkClock chunk_clock;
+
+void chunk_bounds(int n, int tid, int nt, int& start, int& end) {
+    if (nt < 1) {
+        nt = 1;
+    }
+    if (tid < 0) {
+        tid = 0;
+    }
+    int q = n / nt;
+    int rem = n % nt;
+    if (tid < rem) {
+        start = tid * (q + 1);
+        end = start + q + 1;
+    } else {
+        start = rem * (q + 1) + (tid - rem) * q;
+        end = start + q;
+    }
+}
+
+void slice_open(int n, int i) {
+    if (chunk_clock.on) {
+        return;
+    }
+#ifdef _OPENMP
+    int nt = omp_get_num_threads();
+    int tid = omp_get_thread_num();
+#else
+    int nt = 1;
+    int tid = 0;
+#endif
+    int start = 0;
+    int end = 0;
+    chunk_bounds(n, tid, nt, start, end);
+    if (i != start) {
+        return;
+    }
+    chunk_clock.t0 = thread_cpu_ns();
+    chunk_clock.end = end;
+    chunk_clock.tid = tid;
+    chunk_clock.on = true;
+}
+
+void slice_close(uint64_t* slots, int i) {
+    if (!chunk_clock.on || i + 1 != chunk_clock.end) {
+        return;
+    }
+    uint64_t t1 = thread_cpu_ns();
+    if (slots != nullptr && chunk_clock.tid >= 0 && t1 > chunk_clock.t0) {
+        slots[chunk_clock.tid] += t1 - chunk_clock.t0;
+    }
+    chunk_clock.on = false;
+}
+
+template <class F>
+struct TimedRange {
+    F inner;
+    int n;
+    uint64_t* slots;
+
+    void operator()(int i) const {
+        slice_open(n, i);
+        inner(i);
+        slice_close(slots, i);
+    }
+};
+
+template <class F>
+void parallel_n(int n, const F& f) {
+    if (n <= 0) {
+        return;
+    }
+#ifdef _OPENMP
+    if (pop_slots != nullptr) {
+        TimedRange<F> timed{f, n, pop_slots};
+        Kokkos::parallel_for(Kokkos::RangePolicy<Exec>(0, n), timed);
+        return;
+    }
+#endif
+    Kokkos::parallel_for(Kokkos::RangePolicy<Exec>(0, n), f);
+}
+
+void pop_add_serial(uint64_t t0) {
+    if (pop_slots == nullptr || t0 == 0) {
+        return;
+    }
+    uint64_t t1 = thread_cpu_ns();
+    if (t1 > t0) {
+        pop_slots[0] += t1 - t0;
+    }
+}
+
 template <int Mode>
 void launch_walk(const Geom& g, View3 frac, View3 folded, View3i bin, View1i offsets,
                  View1i occupants, View3i out_nn, View3 out_d2, bool write_d2) {
     Walk<Mode> walk{frac, folded, bin, offsets, occupants, out_nn, out_d2, g, write_d2};
-    Kokkos::parallel_for(Kokkos::RangePolicy<Exec>(0, static_cast<int>(frac.extent(0))), walk);
+    parallel_n(static_cast<int>(frac.extent(0)), walk);
     Kokkos::fence();
 }
 
 }  // namespace
+
+void lc_kokkos_pop_bind(uint64_t* slots) { pop_slots = slots; }
 
 int lc_kokkos_knearest(const double* xyz, int n, const LcKokkosBox& box, int k, double cell_hint,
                        int* out_nn, double* out_d2) {
@@ -573,19 +691,21 @@ int lc_kokkos_knearest(const double* xyz, int n, const LcKokkosBox& box, int k, 
 
     View3 xyz_d("xyz", n, 3);
     auto xyz_h = Kokkos::create_mirror_view(xyz_d);
+    uint64_t serial_copy = pop_slots == nullptr ? 0 : thread_cpu_ns();
     for (int i = 0; i < n; ++i) {
         xyz_h(i, 0) = xyz[3 * i];
         xyz_h(i, 1) = xyz[3 * i + 1];
         xyz_h(i, 2) = xyz[3 * i + 2];
     }
     Kokkos::deep_copy(xyz_d, xyz_h);
+    pop_add_serial(serial_copy);
 
     View3 frac("frac", n, 3);
     View3 folded("folded", n, 3);
     View3i bin("bin", n, 3);
     View1i counts("counts", ncell);
     Fill fill{xyz_d, frac, folded, bin, counts, g};
-    Kokkos::parallel_for(Kokkos::RangePolicy<Exec>(0, n), fill);
+    parallel_n(n, fill);
     Kokkos::fence();
 
     View1i offsets("offsets", ncell + 1);
@@ -598,11 +718,10 @@ int lc_kokkos_knearest(const double* xyz, int n, const LcKokkosBox& box, int k, 
     Kokkos::fence();
 
     View1i cursor("cursor", ncell);
-    Kokkos::parallel_for(
-        Kokkos::RangePolicy<Exec>(0, ncell), KOKKOS_LAMBDA(int c) { cursor(c) = offsets(c); });
+    parallel_n(ncell, KOKKOS_LAMBDA(int c) { cursor(c) = offsets(c); });
     View1i occupants("occupants", n);
     Scatter scatter{bin, cursor, occupants, g.nx, g.ny, g.nz};
-    Kokkos::parallel_for(Kokkos::RangePolicy<Exec>(0, n), scatter);
+    parallel_n(n, scatter);
     Kokkos::fence();
 
     View3i out_d("out", n, k);
@@ -622,10 +741,12 @@ int lc_kokkos_knearest(const double* xyz, int n, const LcKokkosBox& box, int k, 
     }
 
     auto out_h = Kokkos::create_mirror_view(out_d);
+    uint64_t serial_out = pop_slots == nullptr ? 0 : thread_cpu_ns();
     Kokkos::deep_copy(out_h, out_d);
     for (int i = 0; i < n * k; ++i) {
         out_nn[i] = out_h(i / k, i % k);
     }
+    pop_add_serial(serial_out);
     if (write_d2) {
         auto d2_h = Kokkos::create_mirror_view(d2_d);
         Kokkos::deep_copy(d2_h, d2_d);

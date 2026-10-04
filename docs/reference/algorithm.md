@@ -129,7 +129,18 @@ parallel build. `--no-default-features` keeps the whole search serial.
 
 `examples/knn_scale.rs` times one fixed problem. The box grows with
 `n` so the spacing stays 3.125. `RAYON_NUM_THREADS` has to be set
-before the process starts.
+before the process starts. `LINKCELL_POP=1` records useful time per
+worker: the monotonic clock runs only inside that worker's mesh and
+walk loops, not while it waits for another worker. Load balance is
+the average of that time over the maximum, communication efficiency
+is the maximum over the wall time, and parallel efficiency is their
+product. Strong-scaling computation scaling is the 1-thread useful
+total over the useful total at the larger thread count, per
+repetition. Global efficiency is parallel efficiency times that
+computation scaling. `scripts/bench-strong.sh` prints the hierarchy.
+Instruction scaling, IPC scaling, and frequency scaling need a PMU.
+This host's `perf_event_open` has no PMU, so those three are not
+reported.
 
 ## Device
 
@@ -145,4 +156,11 @@ parallel loops. The stop is the host plane test, not `reach * cell_min`.
 build without Kokkos stays the same. A Cuda execution space uses this
 source; the timings in the changelog were taken with the OpenMP
 backend, because the machine that measured them has no CUDA device.
-`scripts/bench-kokkos.sh` builds that bench against a Kokkos install.
+`LC_KOKKOS_POP=1` records thread CPU time for each OpenMP static
+slice of the fill, the scatter, and the walk, plus the host copies
+into and out of the views. One sample covers the slice. The exclusive
+scan and the view allocation stay outside that clock, so they widen
+the communication-efficiency gap. The hierarchy is the same one as
+the host script, and the same missing PMU means no instruction, IPC,
+or frequency scaling. `scripts/bench-kokkos.sh` builds that bench
+against a Kokkos install and prints the hierarchy.

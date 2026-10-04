@@ -428,6 +428,7 @@ fn execute(
     if n_active <= 1 {
         return Ok(());
     }
+    crate::pop::prepare();
 
     // Orthorhombic MIC is the per-axis wrap. A LAMMPS / GROMACS
     // restricted cell is tilt-reduced in place (same Cartesian frame).
@@ -486,32 +487,38 @@ fn dispatch<const MODE: u8>(
         use rayon::prelude::*;
         match (mask, out_d2) {
             (None, None) => {
-                out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
-                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
-                });
+                out_nn.par_chunks_mut(k).enumerate().for_each_init(
+                    crate::pop::JobTimer::new,
+                    |_timer, (i, nn)| {
+                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
+                    },
+                );
             }
             (None, Some(d2)) => {
                 out_nn
                     .par_chunks_mut(k)
                     .zip(d2.par_chunks_mut(k))
                     .enumerate()
-                    .for_each(|(i, (nn, dd))| {
+                    .for_each_init(crate::pop::JobTimer::new, |_timer, (i, (nn, dd))| {
                         walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
                     });
             }
             (Some(mask), None) => {
-                out_nn.par_chunks_mut(k).enumerate().for_each(|(i, nn)| {
-                    if mask[i] {
-                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
-                    }
-                });
+                out_nn.par_chunks_mut(k).enumerate().for_each_init(
+                    crate::pop::JobTimer::new,
+                    |_timer, (i, nn)| {
+                        if mask[i] {
+                            walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
+                        }
+                    },
+                );
             }
             (Some(mask), Some(d2)) => {
                 out_nn
                     .par_chunks_mut(k)
                     .zip(d2.par_chunks_mut(k))
                     .enumerate()
-                    .for_each(|(i, (nn, dd))| {
+                    .for_each_init(crate::pop::JobTimer::new, |_timer, (i, (nn, dd))| {
                         if mask[i] {
                             walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
                         }
@@ -521,6 +528,7 @@ fn dispatch<const MODE: u8>(
     }
     #[cfg(not(feature = "parallel"))]
     {
+        let _timer = crate::pop::JobTimer::new();
         match (mask, out_d2) {
             (None, None) => {
                 for (i, nn) in out_nn.chunks_mut(k).enumerate() {

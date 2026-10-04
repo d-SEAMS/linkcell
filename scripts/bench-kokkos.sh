@@ -14,7 +14,11 @@ cmake -S "$ROOT/src/kokkos" -B "$BUILD" \
 cmake --build "$BUILD" -j "$(nproc)"
 N=${LC_KOKKOS_N:-262144}
 REPS=${LC_KOKKOS_REPS:-5}
+LOG=$(mktemp)
 for t in 1 2 4 8; do
-  OMP_NUM_THREADS=$t OMP_PROC_BIND=true LC_KOKKOS_N=$N LC_KOKKOS_REPS=$REPS \
-    "$BUILD/lc_kokkos_bench" --kokkos-num-threads=$t
+  OMP_NUM_THREADS=$t OMP_PROC_BIND=true \
+    LC_KOKKOS_POP=1 LC_KOKKOS_N=$N LC_KOKKOS_REPS=$REPS \
+    "$BUILD/lc_kokkos_bench" --kokkos-num-threads=$t | tee -a "$LOG"
 done
+python3 "$ROOT/scripts/pop-report.py" < "$LOG"
+rm -f "$LOG"
