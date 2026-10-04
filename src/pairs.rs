@@ -730,8 +730,9 @@ impl Walk<'_> {
     fn gather_into(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, start: usize, end: usize) {
         let n_src = self.mesh.offsets[end] - self.mesh.offsets[start];
         let rows = self.guess_rows(n_src);
+        // reserve(n) makes capacity >= len + n.
         if found.capacity() < rows {
-            found.reserve(rows - found.capacity());
+            found.reserve(rows - found.len());
         }
         self.fill_only(found, scratch, start, end);
         self.commit(found, scratch);
@@ -787,8 +788,10 @@ impl Walk<'_> {
             rows.push(n);
             total += n;
         }
+        // reserve(n) makes capacity >= len + n. The ideal-gas estimate
+        // may already hold a shorter buffer.
         if found.capacity() < total {
-            found.reserve(total - found.capacity());
+            found.reserve(total - found.len());
         }
         let mut off = Vec::with_capacity(chunks.len() + 1);
         off.push(0usize);
@@ -1327,6 +1330,65 @@ unsafe fn avx_scan(
 mod tests {
     use super::*;
     use crate::Cell;
+
+    #[test]
+    fn tight_cluster_matches_brute_force() {
+        // Every pair sits inside the cutoff, and the box is large, so the
+        // ideal-gas row estimate is a handful. The walk still has to
+        // return the full list. 520 is above the parallel split.
+        let n = 520usize;
+        let mut xyz = vec![[0.0f64; 3]; n];
+        let g = 9i32;
+        let mut k = 0usize;
+        'fill: for z in 0..g {
+            for y in 0..g {
+                for x in 0..g {
+                    if k >= n {
+                        break 'fill;
+                    }
+                    xyz[k] = [x as f64 * 0.05, y as f64 * 0.05, z as f64 * 0.05];
+                    k += 1;
+                }
+            }
+        }
+        let sim = Cell::ortho(80.0, 80.0, 80.0).unwrap();
+        let cutoff = 2.0;
+        let cut2 = cutoff * cutoff;
+        let mut brute: Vec<(usize, usize, f64)> = Vec::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dx = xyz[j][0] - xyz[i][0];
+                let dy = xyz[j][1] - xyz[i][1];
+                let dz = xyz[j][2] - xyz[i][2];
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 < cut2 {
+                    brute.push((i, j, d2));
+                    brute.push((j, i, d2));
+                }
+            }
+        }
+        brute.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let run = || pairs_within(&xyz, &sim, cutoff, None, None, false).unwrap();
+        #[cfg(feature = "parallel")]
+        let got = {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            pool.install(run)
+        };
+        #[cfg(not(feature = "parallel"))]
+        let got = run();
+        let mut rows: Vec<(usize, usize, f64)> = got.iter().map(|p| (p.i, p.j, p.dist2)).collect();
+        rows.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        assert_eq!(rows.len(), n * (n - 1));
+        assert_eq!(rows.len(), brute.len());
+        for (got_row, brute_row) in rows.iter().zip(brute.iter()) {
+            assert_eq!(got_row.0, brute_row.0);
+            assert_eq!(got_row.1, brute_row.1);
+            assert!((got_row.2 - brute_row.2).abs() < 1e-9);
+        }
+    }
 
     #[test]
     fn far_image_is_not_rewrapped() {
