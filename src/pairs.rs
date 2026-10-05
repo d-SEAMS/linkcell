@@ -1367,7 +1367,7 @@ mod tests {
                 }
             }
         }
-        brute.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        brute.sort_by_key(|a| (a.0, a.1));
         let run = || pairs_within(&xyz, &sim, cutoff, None, None, false).unwrap();
         #[cfg(feature = "parallel")]
         let got = {
@@ -1380,7 +1380,7 @@ mod tests {
         #[cfg(not(feature = "parallel"))]
         let got = run();
         let mut rows: Vec<(usize, usize, f64)> = got.iter().map(|p| (p.i, p.j, p.dist2)).collect();
-        rows.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        rows.sort_by_key(|a| (a.0, a.1));
         assert_eq!(rows.len(), n * (n - 1));
         assert_eq!(rows.len(), brute.len());
         for (got_row, brute_row) in rows.iter().zip(brute.iter()) {
