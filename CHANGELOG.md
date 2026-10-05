@@ -10,6 +10,12 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.8] - 2026-10-04
+
+### Fixed
+
+- The dense-shell regression test sorts pair rows by index.
+
 ## [0.3.7] - 2026-10-04
 
 ### Fixed

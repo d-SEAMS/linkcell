@@ -10,7 +10,7 @@ def _pair(xyz, cell, k, **kwargs):
 
 
 def test_version():
-    assert linkcell.__version__ == "0.3.7"
+    assert linkcell.__version__ == "0.3.8"
 
 
 def test_periodic_image():
