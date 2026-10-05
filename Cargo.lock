@@ -79,7 +79,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "linkcell"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "minimage",
  "rayon",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "linkcell-python"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "cc",
  "dlpk",

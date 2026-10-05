@@ -10,6 +10,12 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.7] - 2026-10-04
+
+### Fixed
+
+- The cutoff list sizes its row buffer from the pairs it found. A shell denser than the ideal-gas estimate no longer writes past that buffer.
+
 ## [0.3.6] - 2026-10-04
 
 ### Changed
