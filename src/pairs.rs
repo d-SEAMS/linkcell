@@ -55,14 +55,13 @@ pub fn pairs_within(
     cell_hint: Option<f64>,
     half: bool,
 ) -> Result<Vec<Pair>, Error> {
-    let plan = in_pool(xyz.len(), || {
-        plan(xyz, simbox, cutoff, mask, cell_hint, half)
-    })?;
+    let est = hit_estimate(xyz.len(), simbox, cutoff);
+    let plan = in_pool(est, || plan(xyz, simbox, cutoff, mask, cell_hint, half))?;
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if let Some(words) = plan.fused() {
         return Ok(plan.fused_rows(&words));
     }
-    let found = in_pool(xyz.len(), || plan.search());
+    let found = in_pool(est, || plan.search());
     Ok(found.into_pairs())
 }
 
@@ -85,15 +84,14 @@ pub fn pairs_within_columns(
     if xyz.len() > i32::MAX as usize {
         return Err(Error::Overflow);
     }
-    let plan = in_pool(xyz.len(), || {
-        plan(xyz, simbox, cutoff, mask, cell_hint, half)
-    })?;
+    let est = hit_estimate(xyz.len(), simbox, cutoff);
+    let plan = in_pool(est, || plan(xyz, simbox, cutoff, mask, cell_hint, half))?;
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if plan.fused().is_some() {
         plan.fused_columns(out);
         return Ok(());
     }
-    let found = in_pool(xyz.len(), || plan.search());
+    let found = in_pool(est, || plan.search());
     found.fill_columns(out);
     Ok(())
 }
@@ -106,13 +104,26 @@ pub fn pairs_within_columns(
 /// still allocated on the caller's thread: glibc gives a large block on
 /// a worker its own heap and unmaps it when the block is freed, so the
 /// next call would fault every page again.
-pub(crate) fn in_pool<R: Send>(n: usize, work: impl FnOnce() -> R + Send) -> R {
+pub(crate) fn in_pool<R: Send>(hits: usize, work: impl FnOnce() -> R + Send) -> R {
     #[cfg(feature = "parallel")]
-    if walk_threads(n) > 1 && rayon::current_thread_index().is_none() {
+    if walk_threads(hits) > 1 && rayon::current_thread_index().is_none() {
         return rayon::scope(|_| work());
     }
-    let _ = n;
+    let _ = hits;
     work()
+}
+
+/// Ideal-gas count of unordered pairs within `cutoff` for `n` points.
+pub(crate) fn hit_estimate(n: usize, simbox: &Cell, cutoff: f64) -> usize {
+    let w = simbox.widths();
+    let volume = (w[0] * w[1] * w[2]).max(1.0e-30);
+    let shell = 4.1887902047863905 * cutoff * cutoff * cutoff;
+    let pairs = 0.5 * (n as f64) * (n as f64) * shell / volume;
+    if pairs.is_finite() {
+        pairs.min(usize::MAX as f64 / 2.0) as usize
+    } else {
+        0
+    }
 }
 
 /// Cutoff rows as columns: `i[t]`, `j[t]`, `shift[t]`, `dist2[t]`.
@@ -271,8 +282,9 @@ pub(crate) fn plan(
     // The box is symmetric, so each unordered pair is visited from one
     // side and written out in both shift directions when `half` is off.
     let reach = uniform_reach(dims, w, cut2, max_reach);
-    let threads = walk_threads(n_act);
-    let grid = Grid::build(xyz, simbox, active.as_deref(), dims, threads);
+    let threads = walk_threads(hit_estimate(n_act, simbox, cutoff));
+    let grid_threads = if n_act >= PARALLEL_GRID { threads } else { 1 };
+    let grid = Grid::build(xyz, simbox, active.as_deref(), dims, grid_threads);
     let partners = build_partners(&grid, simbox, reach, cut2);
     let margin = expanded_margin(&grid, &partners, cutoff);
     Ok(Plan {
@@ -286,16 +298,17 @@ pub(crate) fn plan(
     })
 }
 
-/// Threads for one search: one below 512 atoms or without `parallel`.
-fn walk_threads(n_act: usize) -> usize {
+/// Threads for one search with `hits` expected pairs: one without
+/// `parallel`, or when the search is too short to pay for waking the pool.
+fn walk_threads(hits: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
         let threads = rayon::current_num_threads().max(1);
-        if threads > 1 && n_act >= PARALLEL_PAIRS {
+        if threads > 1 && hits >= PARALLEL_PAIRS {
             return threads;
         }
     }
-    let _ = n_act;
+    let _ = hits;
     1
 }
 
@@ -812,10 +825,15 @@ struct Block {
     tri: bool,
 }
 
-/// Atom count where row ranges split across threads. Below this the
-/// pair buffer is smaller than the spawn, so the walk stays on one thread.
+/// Expected pairs where the walk splits across threads. On this 8-core
+/// host one thread is faster up to about 1024 atoms in an 18 Å cube at a
+/// 4 Å cutoff (26 thousand pairs) and slower from 1536 (58 thousand).
 #[cfg(feature = "parallel")]
-const PARALLEL_PAIRS: usize = 512;
+const PARALLEL_PAIRS: usize = 40_000;
+
+/// Active atoms where the bins are built on several threads, the same
+/// threshold as the k-nearest mesh.
+const PARALLEL_GRID: usize = 8_192;
 
 /// Hits for the whole chunk. The distance loop appends here, then one
 /// pass writes the rows. Runs share a shift so the inner loop does not.
@@ -2736,6 +2754,54 @@ mod tests {
             assert_eq!(cols(&c1), row_keys(&one), "columns half={half}");
             assert_eq!(cols(&c8), row_keys(&one), "columns eight half={half}");
         }
+    }
+
+    #[test]
+    fn dense_cluster_on_several_threads_matches_one() {
+        // The ideal-gas estimate sees 4520 atoms in a 20 Å box and splits
+        // the walk; 520 of them sit inside 0.4 Å, so their bin holds far
+        // more pairs than the estimate.
+        let sim = Cell::ortho(20.0, 20.0, 20.0).unwrap();
+        let mut xyz = Vec::new();
+        'fill: for z in 0..9 {
+            for y in 0..9 {
+                for x in 0..9 {
+                    if xyz.len() == 520 {
+                        break 'fill;
+                    }
+                    xyz.push([
+                        10.0 + x as f64 * 0.05,
+                        10.0 + y as f64 * 0.05,
+                        10.0 + z as f64 * 0.05,
+                    ]);
+                }
+            }
+        }
+        for z in 0..16 {
+            for y in 0..16 {
+                for x in 0..16 {
+                    if xyz.len() == 4520 {
+                        break;
+                    }
+                    xyz.push([
+                        x as f64 * 1.25 + 0.31,
+                        y as f64 * 1.25 + 0.17,
+                        z as f64 * 1.25 + 0.53,
+                    ]);
+                }
+            }
+        }
+        #[cfg(feature = "parallel")]
+        assert!(hit_estimate(xyz.len(), &sim, 2.0) >= PARALLEL_PAIRS);
+        let one = on_threads(1, || {
+            pairs_within(&xyz, &sim, 2.0, None, None, false).unwrap()
+        });
+        let eight = on_threads(8, || {
+            pairs_within(&xyz, &sim, 2.0, None, None, false).unwrap()
+        });
+        assert_eq!(row_keys(&one), row_keys(&eight));
+        let cluster = eight.iter().filter(|p| p.i < 520 && p.j < 520).count();
+        assert_eq!(cluster, 520 * 519);
     }
 
     #[test]
