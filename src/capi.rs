@@ -272,6 +272,12 @@ pub unsafe extern "C" fn lc_knearest_many(
 /// capacity. A short buffer sets `*out_count` to the needed row count
 /// and returns nonzero without writing.
 ///
+/// A query, or a short buffer, keeps its search on the calling thread.
+/// The next call on that thread takes it when every input is the same
+/// bit for bit (`xyz`, the box, `cutoff`, `mask`, `cell_hint`, `half`)
+/// and writes the rows without searching again. Any other call drops
+/// it. A fill that writes does not keep anything.
+///
 /// # Safety
 ///
 /// `xyz` is readable for `n * 3` doubles. `simbox` points at one
@@ -298,78 +304,254 @@ pub unsafe extern "C" fn lc_pairs_within(
     if out_count.is_null() {
         return fail_msg("null pointer");
     }
-    if n == 0 {
-        return fail(Error::Empty);
-    }
-    if xyz.is_null() || simbox.is_null() {
-        return fail_msg("null pointer");
-    }
-    if n > c_int::MAX as usize {
-        return fail(Error::Overflow);
-    }
-    let max_xyz = (isize::MAX as usize) / 3;
-    if n > max_xyz {
-        return fail(Error::Overflow);
-    }
-    let box_c = unsafe { *simbox };
-    let sim = match Cell::from_vectors(
-        [box_c.ax, box_c.ay, box_c.az],
-        [box_c.bx, box_c.by, box_c.bz],
-        [box_c.cx, box_c.cy, box_c.cz],
-        [box_c.ox, box_c.oy, box_c.oz],
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            set_error(&e.to_string());
-            return 1;
-        }
+    let (key, found) = match unsafe { pairs_call(xyz, n, simbox, cutoff, mask, cell_hint, half) } {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    let pts: &[[f64; 3]] = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
-    let mask_vec: Option<Vec<bool>> = if mask.is_null() {
-        None
-    } else {
-        let raw = unsafe { std::slice::from_raw_parts(mask, n) };
-        Some(raw.iter().map(|&v| v != 0).collect())
-    };
-    let hint = if cell_hint > 0.0 {
-        Some(cell_hint)
-    } else {
-        None
-    };
-    let pairs = match crate::pairs_within(pts, &sim, cutoff, mask_vec.as_deref(), hint, half != 0) {
-        Ok(p) => p,
-        Err(e) => return fail(e),
-    };
+    let rows = found.rows();
     unsafe {
-        *out_count = pairs.len();
+        *out_count = rows;
     }
     let query = out_i.is_null() && out_j.is_null() && out_shift.is_null() && out_d2.is_null();
     if query {
+        park(&key, found);
         clear_error();
         return 0;
     }
     if out_i.is_null() || out_j.is_null() || out_shift.is_null() || out_d2.is_null() {
         return fail_msg("null pointer");
     }
-    if cap < pairs.len() {
+    if cap < rows {
+        park(&key, found);
         return fail_msg("pair buffer is shorter than the pair count");
     }
-    let shift_len = match pairs.len().checked_mul(3) {
-        Some(v) if v <= isize::MAX as usize => v,
+    match rows.checked_mul(3) {
+        Some(v) if v <= isize::MAX as usize => {}
         _ => return fail(Error::Overflow),
-    };
-    let ii = unsafe { std::slice::from_raw_parts_mut(out_i, pairs.len()) };
-    let jj = unsafe { std::slice::from_raw_parts_mut(out_j, pairs.len()) };
-    let ss = unsafe { std::slice::from_raw_parts_mut(out_shift, shift_len) };
-    let dd = unsafe { std::slice::from_raw_parts_mut(out_d2, pairs.len()) };
-    for (t, pair) in pairs.iter().enumerate() {
-        ii[t] = pair.i as c_int;
-        jj[t] = pair.j as c_int;
-        ss[3 * t] = pair.shift[0];
-        ss[3 * t + 1] = pair.shift[1];
-        ss[3 * t + 2] = pair.shift[2];
-        dd[t] = pair.dist2;
+    }
+    // Safety: the caller gave `cap >= rows` slots in each buffer and
+    // three times that in `out_shift`.
+    unsafe {
+        found.write_columns(out_i, out_j, out_shift, out_d2);
     }
     clear_error();
     0
+}
+
+/// One cutoff row: source `i`, target `j`, shift `S`, squared distance.
+/// The C++ `linkcell::ShiftedPair` has this layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct lc_pair {
+    /// Source index.
+    pub i: c_int,
+    /// Target index.
+    pub j: c_int,
+    /// Integer cell shift `(na, nb, nc)` applied to the target.
+    pub shift: [c_int; 3],
+    /// Squared distance after the shift.
+    pub dist2: f64,
+}
+
+/// [`lc_pairs_within`] with one array of [`lc_pair`] rows.
+///
+/// Null `out` is a query: `*out_count` receives the row count and the
+/// return is 0. Otherwise `out` holds `cap` rows. A short buffer sets
+/// `*out_count` to the needed count and returns nonzero without
+/// writing. A query or a short buffer keeps its search on the calling
+/// thread for the next call with the same inputs, as in
+/// [`lc_pairs_within`].
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `simbox` points at one
+/// `lc_cell`. `mask`, if non-null, is readable for `n` ints.
+/// `out_count` is writable. On a fill, `out` is writable for `cap`
+/// rows.
+#[no_mangle]
+pub unsafe extern "C" fn lc_pairs_within_rows(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    half: c_int,
+    out: *mut lc_pair,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if out_count.is_null() {
+        return fail_msg("null pointer");
+    }
+    let (key, found) = match unsafe { pairs_call(xyz, n, simbox, cutoff, mask, cell_hint, half) } {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let rows = found.rows();
+    unsafe {
+        *out_count = rows;
+    }
+    if out.is_null() {
+        park(&key, found);
+        clear_error();
+        return 0;
+    }
+    if cap < rows {
+        park(&key, found);
+        return fail_msg("pair buffer is shorter than the pair count");
+    }
+    // Safety: the caller gave `cap >= rows` rows.
+    unsafe {
+        found.write_rows(out, |i, j, shift, dist2| lc_pair { i, j, shift, dist2 });
+    }
+    clear_error();
+    0
+}
+
+/// Check the inputs, then take the parked search or run a new one.
+unsafe fn pairs_call<'a>(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    half: c_int,
+) -> Result<(PairKey<'a>, crate::pairs::Found), c_int> {
+    if n == 0 {
+        return Err(fail(Error::Empty));
+    }
+    if xyz.is_null() || simbox.is_null() {
+        return Err(fail_msg("null pointer"));
+    }
+    if n > c_int::MAX as usize || n > (isize::MAX as usize) / 3 {
+        return Err(fail(Error::Overflow));
+    }
+    let box_c = unsafe { *simbox };
+    let sim = Cell::from_vectors(
+        [box_c.ax, box_c.ay, box_c.az],
+        [box_c.bx, box_c.by, box_c.bz],
+        [box_c.cx, box_c.cy, box_c.cz],
+        [box_c.ox, box_c.oy, box_c.oz],
+    )
+    .map_err(|e| {
+        set_error(&e.to_string());
+        1
+    })?;
+    let pts: &'a [[f64; 3]] = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_raw: Option<&'a [c_int]> = if mask.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(mask, n) })
+    };
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
+    let key = PairKey {
+        xyz: pts,
+        simbox: box_c,
+        cutoff,
+        mask: mask_raw,
+        cell_hint: hint,
+        half: half != 0,
+    };
+    if let Some(found) = take_parked(&key) {
+        return Ok((key, found));
+    }
+    let mask_vec: Option<Vec<bool>> = mask_raw.map(|m| m.iter().map(|&v| v != 0).collect());
+    match crate::pairs::search(pts, &sim, cutoff, mask_vec.as_deref(), hint, half != 0) {
+        Ok(found) => Ok((key, found)),
+        Err(e) => Err(fail(e)),
+    }
+}
+
+/// Inputs of one [`lc_pairs_within`] call, compared bit for bit.
+struct PairKey<'a> {
+    xyz: &'a [[f64; 3]],
+    simbox: lc_cell,
+    cutoff: f64,
+    mask: Option<&'a [c_int]>,
+    cell_hint: Option<f64>,
+    half: bool,
+}
+
+/// A query's search, kept until the matching fill on the same thread.
+struct ParkedPairs {
+    xyz: Vec<[f64; 3]>,
+    simbox: [u64; 12],
+    cutoff: u64,
+    mask: Option<Vec<bool>>,
+    cell_hint: Option<u64>,
+    half: bool,
+    found: crate::pairs::Found,
+}
+
+thread_local! {
+    // `const { ... }` is newer than this crate's 1.70 floor.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static PARKED_PAIRS: RefCell<Option<ParkedPairs>> = RefCell::new(None);
+}
+
+fn box_bits(c: &lc_cell) -> [u64; 12] {
+    [
+        c.ax.to_bits(),
+        c.ay.to_bits(),
+        c.az.to_bits(),
+        c.bx.to_bits(),
+        c.by.to_bits(),
+        c.bz.to_bits(),
+        c.cx.to_bits(),
+        c.cy.to_bits(),
+        c.cz.to_bits(),
+        c.ox.to_bits(),
+        c.oy.to_bits(),
+        c.oz.to_bits(),
+    ]
+}
+
+fn same_bits(a: &[[f64; 3]], b: &[[f64; 3]]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(p, q)| {
+            p[0].to_bits() == q[0].to_bits()
+                && p[1].to_bits() == q[1].to_bits()
+                && p[2].to_bits() == q[2].to_bits()
+        })
+}
+
+/// The parked search when every input matches. Any other call drops it,
+/// so a parked search never outlives the next call on this thread.
+fn take_parked(key: &PairKey<'_>) -> Option<crate::pairs::Found> {
+    let parked = PARKED_PAIRS.with(|slot| slot.borrow_mut().take())?;
+    let mask_same = match (&parked.mask, key.mask) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| x == (y != 0)),
+        _ => false,
+    };
+    let same = parked.half == key.half
+        && parked.cutoff == key.cutoff.to_bits()
+        && parked.cell_hint == key.cell_hint.map(f64::to_bits)
+        && parked.simbox == box_bits(&key.simbox)
+        && mask_same
+        && same_bits(&parked.xyz, key.xyz);
+    if same {
+        Some(parked.found)
+    } else {
+        None
+    }
+}
+
+fn park(key: &PairKey<'_>, found: crate::pairs::Found) {
+    let parked = ParkedPairs {
+        xyz: key.xyz.to_vec(),
+        simbox: box_bits(&key.simbox),
+        cutoff: key.cutoff.to_bits(),
+        mask: key.mask.map(|m| m.iter().map(|&v| v != 0).collect()),
+        cell_hint: key.cell_hint.map(f64::to_bits),
+        half: key.half,
+        found,
+    };
+    PARKED_PAIRS.with(|slot| *slot.borrow_mut() = Some(parked));
 }

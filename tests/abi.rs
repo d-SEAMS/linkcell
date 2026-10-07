@@ -67,6 +67,18 @@ extern "C" {
         cap: usize,
         out_count: *mut usize,
     ) -> c_int;
+    fn lc_pairs_within_rows(
+        xyz: *const f64,
+        n: usize,
+        simbox: *const LcCell,
+        cutoff: f64,
+        mask: *const c_int,
+        cell_hint: f64,
+        half: c_int,
+        out: *mut linkcell::lc_pair,
+        cap: usize,
+        out_count: *mut usize,
+    ) -> c_int;
 }
 
 fn ortho_c(lx: f64, ly: f64, lz: f64) -> LcCell {
@@ -460,4 +472,213 @@ fn lc_pairs_within_queries_then_writes_the_shift() {
     assert_eq!(jj[row], 1);
     assert_eq!(&shift[3 * row..3 * row + 3], &[-1, 0, 0]);
     assert!((d2[row] - 0.64).abs() < 1e-12);
+}
+
+fn lattice_xyz(side: usize, boxl: f64) -> Vec<f64> {
+    let mut xyz = Vec::with_capacity(side * side * side * 3);
+    for iz in 0..side {
+        for iy in 0..side {
+            for ix in 0..side {
+                xyz.push((ix as f64 + 0.5) * boxl / side as f64);
+                xyz.push((iy as f64 + 0.5) * boxl / side as f64);
+                xyz.push((iz as f64 + 0.5) * boxl / side as f64);
+            }
+        }
+    }
+    xyz
+}
+
+fn c_rows(xyz: &[f64], box_c: &LcCell, cutoff: f64, half: c_int) -> Vec<(i32, i32, [i32; 3], u64)> {
+    let n = xyz.len() / 3;
+    let mut count = 0usize;
+    let null = std::ptr::null_mut();
+    let rc = unsafe {
+        lc_pairs_within(
+            xyz.as_ptr(),
+            n,
+            box_c,
+            cutoff,
+            std::ptr::null(),
+            0.0,
+            half,
+            null,
+            null,
+            null,
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut ii = vec![0i32; count];
+    let mut jj = vec![0i32; count];
+    let mut ss = vec![0i32; 3 * count];
+    let mut dd = vec![0.0f64; count];
+    let rc = unsafe {
+        lc_pairs_within(
+            xyz.as_ptr(),
+            n,
+            box_c,
+            cutoff,
+            std::ptr::null(),
+            0.0,
+            half,
+            ii.as_mut_ptr(),
+            jj.as_mut_ptr(),
+            ss.as_mut_ptr(),
+            dd.as_mut_ptr(),
+            count,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut rows: Vec<_> = (0..count)
+        .map(|t| {
+            (
+                ii[t],
+                jj[t],
+                [ss[3 * t], ss[3 * t + 1], ss[3 * t + 2]],
+                dd[t].to_bits(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn c_rows_match_the_rust_list() {
+    let xyz = lattice_xyz(9, 18.0);
+    let pts: Vec<[f64; 3]> = xyz.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let cell = linkcell::Cell::ortho(18.0, 18.0, 18.0).unwrap();
+    let box_c = ortho_c(18.0, 18.0, 18.0);
+    for half in [false, true] {
+        let mut want: Vec<_> = linkcell::pairs_within(&pts, &cell, 4.0, None, None, half)
+            .unwrap()
+            .iter()
+            .map(|p| (p.i as i32, p.j as i32, p.shift, p.dist2.to_bits()))
+            .collect();
+        want.sort();
+        assert_eq!(
+            c_rows(&xyz, &box_c, 4.0, half as c_int),
+            want,
+            "half={half}"
+        );
+
+        let mut count = 0usize;
+        let rc = unsafe {
+            lc_pairs_within_rows(
+                xyz.as_ptr(),
+                pts.len(),
+                &box_c,
+                4.0,
+                std::ptr::null(),
+                0.0,
+                half as c_int,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(count, want.len());
+        let mut rows = vec![linkcell::lc_pair::default(); count];
+        let rc = unsafe {
+            lc_pairs_within_rows(
+                xyz.as_ptr(),
+                pts.len(),
+                &box_c,
+                4.0,
+                std::ptr::null(),
+                0.0,
+                half as c_int,
+                rows.as_mut_ptr(),
+                count,
+                &mut count,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.i, r.j, r.shift, r.dist2.to_bits()))
+            .collect();
+        got.sort();
+        assert_eq!(got, want, "rows half={half}");
+    }
+}
+
+#[test]
+fn a_parked_query_is_not_reused_for_other_points() {
+    let box_c = ortho_c(10.0, 10.0, 10.0);
+    let near = [0.2, 0.0, 0.0, 9.4, 0.0, 0.0];
+    let far = [0.2, 0.0, 0.0, 5.0, 0.0, 0.0];
+    let mut count = 0usize;
+    let null = std::ptr::null_mut();
+    let rc = unsafe {
+        lc_pairs_within(
+            near.as_ptr(),
+            2,
+            &box_c,
+            1.0,
+            std::ptr::null(),
+            0.0,
+            0,
+            null,
+            null,
+            null,
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(count, 2);
+    // Same buffers, different points: the fill must search again.
+    let mut ii = [7i32; 2];
+    let mut jj = [7i32; 2];
+    let mut ss = [7i32; 6];
+    let mut dd = [7.0f64; 2];
+    let rc = unsafe {
+        lc_pairs_within(
+            far.as_ptr(),
+            2,
+            &box_c,
+            1.0,
+            std::ptr::null(),
+            0.0,
+            0,
+            ii.as_mut_ptr(),
+            jj.as_mut_ptr(),
+            ss.as_mut_ptr(),
+            dd.as_mut_ptr(),
+            2,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(count, 0);
+    assert_eq!(ii, [7, 7]);
+    // A fill with the queried points still writes both rows.
+    let rc = unsafe {
+        lc_pairs_within(
+            near.as_ptr(),
+            2,
+            &box_c,
+            1.0,
+            std::ptr::null(),
+            0.0,
+            0,
+            ii.as_mut_ptr(),
+            jj.as_mut_ptr(),
+            ss.as_mut_ptr(),
+            dd.as_mut_ptr(),
+            2,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(count, 2);
+    let mut got = [(ii[0], jj[0]), (ii[1], jj[1])];
+    got.sort();
+    assert_eq!(got, [(0, 1), (1, 0)]);
 }

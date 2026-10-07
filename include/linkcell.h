@@ -90,6 +90,29 @@ typedef struct lc_cell {
     double oz;
 } lc_cell;
 
+/**
+ * One cutoff row: source `i`, target `j`, shift `S`, squared distance.
+ * The C++ `linkcell::ShiftedPair` has this layout.
+ */
+typedef struct lc_pair {
+    /**
+     * Source index.
+     */
+    int i;
+    /**
+     * Target index.
+     */
+    int j;
+    /**
+     * Integer cell shift `(na, nb, nc)` applied to the target.
+     */
+    int shift[3];
+    /**
+     * Squared distance after the shift.
+     */
+    double dist2;
+} lc_pair;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -202,6 +225,12 @@ const char *lc_last_error(void);
  * capacity. A short buffer sets `*out_count` to the needed row count
  * and returns nonzero without writing.
  *
+ * A query, or a short buffer, keeps its search on the calling thread.
+ * The next call on that thread takes it when every input is the same
+ * bit for bit (`xyz`, the box, `cutoff`, `mask`, `cell_hint`, `half`)
+ * and writes the rows without searching again. Any other call drops
+ * it. A fill that writes does not keep anything.
+ *
  * # Safety
  *
  * `xyz` is readable for `n * 3` doubles. `simbox` points at one
@@ -223,6 +252,34 @@ int lc_pairs_within(const double *xyz,
                     double *out_d2,
                     size_t cap,
                     size_t *out_count);
+
+/**
+ * [`lc_pairs_within`] with one array of [`lc_pair`] rows.
+ *
+ * Null `out` is a query: `*out_count` receives the row count and the
+ * return is 0. Otherwise `out` holds `cap` rows. A short buffer sets
+ * `*out_count` to the needed count and returns nonzero without
+ * writing. A query or a short buffer keeps its search on the calling
+ * thread for the next call with the same inputs, as in
+ * [`lc_pairs_within`].
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `simbox` points at one
+ * `lc_cell`. `mask`, if non-null, is readable for `n` ints.
+ * `out_count` is writable. On a fill, `out` is writable for `cap`
+ * rows.
+ */
+int lc_pairs_within_rows(const double *xyz,
+                         size_t n,
+                         const struct lc_cell *simbox,
+                         double cutoff,
+                         const int *mask,
+                         double cell_hint,
+                         int half,
+                         struct lc_pair *out,
+                         size_t cap,
+                         size_t *out_count);
 
 /**
  * Library version string. Process-static, NUL-terminated. Do not free.

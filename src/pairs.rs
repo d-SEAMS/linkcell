@@ -55,6 +55,66 @@ pub fn pairs_within(
     cell_hint: Option<f64>,
     half: bool,
 ) -> Result<Vec<Pair>, Error> {
+    Ok(search(xyz, simbox, cutoff, mask, cell_hint, half)?.into_pairs())
+}
+
+/// The same rows as [`pairs_within`], as four columns.
+///
+/// `i`, `j`, and `shift` are the vesin / tonari `ijS` layout and
+/// `dist2` is the squared distance. Row `t` of each column is one
+/// atom-image. The vectors are cleared, then filled once; their
+/// capacity is kept for the next call. An index above `i32::MAX` is
+/// [`Error::Overflow`].
+pub fn pairs_within_columns(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+    out: &mut PairColumns,
+) -> Result<(), Error> {
+    if xyz.len() > i32::MAX as usize {
+        return Err(Error::Overflow);
+    }
+    let found = search(xyz, simbox, cutoff, mask, cell_hint, half)?;
+    found.fill_columns(out);
+    Ok(())
+}
+
+/// Cutoff rows as columns: `i[t]`, `j[t]`, `shift[t]`, `dist2[t]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PairColumns {
+    /// Source index.
+    pub i: Vec<i32>,
+    /// Target index.
+    pub j: Vec<i32>,
+    /// Integer cell shift applied to the target (`S`).
+    pub shift: Vec<[i32; 3]>,
+    /// Squared distance after the shift.
+    pub dist2: Vec<f64>,
+}
+
+impl PairColumns {
+    /// Number of rows.
+    pub fn len(&self) -> usize {
+        self.i.len()
+    }
+
+    /// `true` when there are no rows.
+    pub fn is_empty(&self) -> bool {
+        self.i.is_empty()
+    }
+}
+
+pub(crate) fn search(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+) -> Result<Found, Error> {
     if !cutoff.is_finite() || cutoff <= 0.0 {
         return Err(Error::BadCutoff);
     }
@@ -74,32 +134,14 @@ pub fn pairs_within(
         .filter(|&i| mask.map(|m| m[i]).unwrap_or(true))
         .collect();
     if active.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Found {
+            chunks: Vec::new(),
+            half,
+        });
     }
     retain_pair_pages();
 
     let w = simbox.widths();
-    // Reserve the pair buffer before the mesh. A repeated call can then
-    // reuse that chunk instead of letting smaller allocs split it.
-    let rows = pair_capacity(active.len(), w, cutoff, half);
-    // Reserve the pair buffer before the mesh so a repeated call reuses
-    // that chunk. Several threads later write disjoint ranges of it.
-    let found = Vec::with_capacity(rows);
-    let mut scratch = Scratch::new();
-    let parallel_walk = {
-        #[cfg(feature = "parallel")]
-        {
-            rayon::current_num_threads() > 1 && active.len() >= PARALLEL_PAIRS
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            false
-        }
-    };
-    if !parallel_walk {
-        let hits = if half { rows } else { (rows + 1) / 2 };
-        scratch.reserve_more(hits);
-    }
     let mut image_count: i64 = 1;
     let mut repeats = [0i32; 3];
     for a in 0..3 {
@@ -151,19 +193,13 @@ pub fn pairs_within(
         mesh: &mesh,
         coords: &coords,
         cut2,
-        half,
         partners: &partners,
         simd: simd_mode(),
     };
-    Ok(walk.collect(found, scratch))
-}
-
-fn pair_capacity(n_src: usize, widths: [f64; 3], cutoff: f64, half: bool) -> usize {
-    let volume = (widths[0] * widths[1] * widths[2]).max(1.0e-30);
-    let shell = 4.1887902047863905 * cutoff * cutoff * cutoff;
-    let neighbors = ((n_src.max(1) as f64) * shell / volume).ceil().max(1.0);
-    let rows = neighbors * if half { 0.5 } else { 1.0 };
-    ((n_src as f64) * rows * 1.25) as usize + 16
+    Ok(Found {
+        chunks: walk.collect(),
+        half,
+    })
 }
 
 /// glibc drops a large free buffer (`MADV_DONTNEED`) and the next cutoff
@@ -355,7 +391,6 @@ struct Walk<'a> {
     mesh: &'a Mesh,
     coords: &'a Coords,
     cut2: f64,
-    half: bool,
     partners: &'a PartnerList,
     /// 2 = AVX-512, 1 = AVX, 0 = scalar.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
@@ -419,13 +454,293 @@ impl Scratch {
         }
     }
 
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    fn push(&mut self, atom: u32, j: u64, d2: f64) {
+        self.atom.push(atom);
+        self.js.push(j);
+        self.d2.push(d2);
+    }
+
     fn note(&mut self, before: usize, shift: [i32; 3]) {
         let after = self.js.len();
         if after > before {
             self.run_shift.push(shift);
             self.run_end.push(after);
         }
+    }
+}
+
+/// Every hit of one search, by cell range. Nothing is a row yet: each
+/// caller expands these once into its own layout.
+pub(crate) struct Found {
+    chunks: Vec<Scratch>,
+    half: bool,
+}
+
+impl Found {
+    fn rows_of(&self, chunk: &Scratch) -> usize {
+        if self.half {
+            chunk.js.len()
+        } else {
+            chunk.js.len() * 2
+        }
+    }
+
+    /// Output rows over every chunk.
+    pub(crate) fn rows(&self) -> usize {
+        self.chunks.iter().map(|c| self.rows_of(c)).sum()
+    }
+
+    fn offsets(&self) -> Vec<usize> {
+        let mut off = Vec::with_capacity(self.chunks.len() + 1);
+        off.push(0usize);
+        for chunk in &self.chunks {
+            off.push(off.last().copied().unwrap_or(0) + self.rows_of(chunk));
+        }
+        off
+    }
+
+    fn into_pairs(self) -> Vec<Pair> {
+        let total = self.rows();
+        let mut found: Vec<Pair> = Vec::with_capacity(total);
+        let base = RowPtr(found.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
+        // Safety: `total` slots are allocated. Chunk `t` writes the rows
+        // `off[t]..off[t + 1]`, which partition `0..total`, and nothing
+        // reads them before every chunk is done.
+        self.each_chunk(|t, off, chunk| {
+            let rows = self.rows_of(chunk);
+            if rows == 0 {
+                return;
+            }
+            let dst = unsafe { std::slice::from_raw_parts_mut(base.at(off[t]), rows) };
+            if self.half {
+                write_half(
+                    dst,
+                    &chunk.atom,
+                    &chunk.js,
+                    &chunk.d2,
+                    &chunk.run_shift,
+                    &chunk.run_end,
+                );
+            } else {
+                write_full(
+                    dst,
+                    &chunk.atom,
+                    &chunk.js,
+                    &chunk.d2,
+                    &chunk.run_shift,
+                    &chunk.run_end,
+                );
+            }
+        });
+        unsafe {
+            found.set_len(total);
+        }
+        found
+    }
+
+    /// Clear `out`, then write every row into its four columns.
+    pub(crate) fn fill_columns(&self, out: &mut PairColumns) {
+        let total = self.rows();
+        out.i.clear();
+        out.j.clear();
+        out.shift.clear();
+        out.dist2.clear();
+        out.i.reserve(total);
+        out.j.reserve(total);
+        out.shift.reserve(total);
+        out.dist2.reserve(total);
+        // Safety: each column has room for `total` rows.
+        unsafe {
+            self.write_columns(
+                out.i.as_mut_ptr(),
+                out.j.as_mut_ptr(),
+                out.shift.as_mut_ptr() as *mut i32,
+                out.dist2.as_mut_ptr(),
+            );
+            out.i.set_len(total);
+            out.j.set_len(total);
+            out.shift.set_len(total);
+            out.dist2.set_len(total);
+        }
+    }
+
+    /// # Safety
+    /// `i`, `j`, and `d2` are writable for [`Found::rows`] values and
+    /// `shift` for three times that.
+    pub(crate) unsafe fn write_columns(
+        &self,
+        i: *mut i32,
+        j: *mut i32,
+        shift: *mut i32,
+        d2: *mut f64,
+    ) {
+        let cols = ColumnPtrs {
+            i: RowPtr(i as *mut std::mem::MaybeUninit<i32>),
+            j: RowPtr(j as *mut std::mem::MaybeUninit<i32>),
+            shift: RowPtr(shift as *mut std::mem::MaybeUninit<i32>),
+            d2: RowPtr(d2 as *mut std::mem::MaybeUninit<f64>),
+        };
+        self.each_chunk(|t, off, chunk| {
+            let rows = self.rows_of(chunk);
+            if rows == 0 {
+                return;
+            }
+            let at = off[t];
+            let (ci, cj, cs, cd) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(cols.i.at(at), rows),
+                    std::slice::from_raw_parts_mut(cols.j.at(at), rows),
+                    std::slice::from_raw_parts_mut(cols.shift.at(3 * at), 3 * rows),
+                    std::slice::from_raw_parts_mut(cols.d2.at(at), rows),
+                )
+            };
+            write_columns(ci, cj, cs, cd, chunk, self.half);
+        });
+    }
+
+    /// `out[t] = row(i, j, shift, dist2)` for every row `t`.
+    ///
+    /// # Safety
+    /// `out` is writable for [`Found::rows`] values of `R`.
+    #[cfg_attr(not(feature = "capi"), allow(dead_code))]
+    pub(crate) unsafe fn write_rows<R, F>(&self, out: *mut R, row: F)
+    where
+        R: Send,
+        F: Fn(i32, i32, [i32; 3], f64) -> R + Sync,
+    {
+        let base = RowPtr(out as *mut std::mem::MaybeUninit<R>);
+        self.each_chunk(|t, off, chunk| {
+            let rows = self.rows_of(chunk);
+            if rows == 0 {
+                return;
+            }
+            let dst = unsafe { std::slice::from_raw_parts_mut(base.at(off[t]), rows) };
+            let mut at = 0usize;
+            let mut lo = 0usize;
+            for (r, &hi) in chunk.run_end.iter().enumerate() {
+                let shift = chunk.run_shift[r];
+                let neg = [-shift[0], -shift[1], -shift[2]];
+                for k in lo..hi {
+                    let a = chunk.atom[k] as i32;
+                    let b = chunk.js[k] as i32;
+                    let d = chunk.d2[k];
+                    if self.half {
+                        if keep_half(a as usize, b as usize, shift) {
+                            dst[at].write(row(a, b, shift, d));
+                        } else {
+                            dst[at].write(row(b, a, neg, d));
+                        }
+                        at += 1;
+                    } else {
+                        dst[at].write(row(a, b, shift, d));
+                        dst[at + 1].write(row(b, a, neg, d));
+                        at += 2;
+                    }
+                }
+                lo = hi;
+            }
+        });
+    }
+
+    /// `job(t, offsets, chunk)` for every chunk, on several threads when
+    /// there is more than one chunk.
+    fn each_chunk<F>(&self, job: F)
+    where
+        F: Fn(usize, &[usize], &Scratch) + Sync,
+    {
+        let off = self.offsets();
+        #[cfg(feature = "parallel")]
+        {
+            if self.chunks.len() > 1 {
+                use rayon::prelude::*;
+                self.chunks.par_iter().enumerate().for_each(|(t, chunk)| {
+                    let _timer = crate::pop::JobTimer::new();
+                    job(t, &off, chunk);
+                });
+                return;
+            }
+        }
+        for (t, chunk) in self.chunks.iter().enumerate() {
+            let _timer = crate::pop::JobTimer::new();
+            job(t, &off, chunk);
+        }
+    }
+}
+
+/// A destination several jobs write at disjoint offsets.
+///
+/// Safety: jobs write distinct slots and do not read a slot another job writes.
+struct RowPtr<T>(*mut std::mem::MaybeUninit<T>);
+impl<T> Clone for RowPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for RowPtr<T> {}
+unsafe impl<T: Send> Send for RowPtr<T> {}
+unsafe impl<T: Send> Sync for RowPtr<T> {}
+impl<T> RowPtr<T> {
+    unsafe fn at(self, index: usize) -> *mut std::mem::MaybeUninit<T> {
+        self.0.add(index)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ColumnPtrs {
+    i: RowPtr<i32>,
+    j: RowPtr<i32>,
+    shift: RowPtr<i32>,
+    d2: RowPtr<f64>,
+}
+
+#[inline(never)]
+fn write_columns(
+    ci: &mut [std::mem::MaybeUninit<i32>],
+    cj: &mut [std::mem::MaybeUninit<i32>],
+    cs: &mut [std::mem::MaybeUninit<i32>],
+    cd: &mut [std::mem::MaybeUninit<f64>],
+    chunk: &Scratch,
+    half: bool,
+) {
+    let mut out = 0usize;
+    let mut lo = 0usize;
+    for (r, &hi) in chunk.run_end.iter().enumerate() {
+        let shift = chunk.run_shift[r];
+        let neg = [-shift[0], -shift[1], -shift[2]];
+        for k in lo..hi {
+            let a = chunk.atom[k] as i32;
+            let b = chunk.js[k] as i32;
+            let d = chunk.d2[k];
+            if half {
+                let (i, j, s) = if keep_half(a as usize, b as usize, shift) {
+                    (a, b, shift)
+                } else {
+                    (b, a, neg)
+                };
+                ci[out].write(i);
+                cj[out].write(j);
+                cs[3 * out].write(s[0]);
+                cs[3 * out + 1].write(s[1]);
+                cs[3 * out + 2].write(s[2]);
+                cd[out].write(d);
+                out += 1;
+            } else {
+                ci[out].write(a);
+                cj[out].write(b);
+                cs[3 * out].write(shift[0]);
+                cs[3 * out + 1].write(shift[1]);
+                cs[3 * out + 2].write(shift[2]);
+                cd[out].write(d);
+                ci[out + 1].write(b);
+                cj[out + 1].write(a);
+                cs[3 * out + 3].write(neg[0]);
+                cs[3 * out + 4].write(neg[1]);
+                cs[3 * out + 5].write(neg[2]);
+                cd[out + 1].write(d);
+                out += 2;
+            }
+        }
+        lo = hi;
     }
 }
 
@@ -512,82 +827,20 @@ fn write_half(
 }
 
 impl Walk<'_> {
-    fn record(&self, found: &mut Vec<Pair>, i: usize, j: usize, shift: [i32; 3], dist2: f64) {
-        let neg = [-shift[0], -shift[1], -shift[2]];
-        if !self.half {
-            found.push(Pair { i, j, shift, dist2 });
-            found.push(Pair {
-                i: j,
-                j: i,
-                shift: neg,
-                dist2,
-            });
-            return;
-        }
-        if keep_half(i, j, shift) {
-            found.push(Pair { i, j, shift, dist2 });
-        } else {
-            found.push(Pair {
-                i: j,
-                j: i,
-                shift: neg,
-                dist2,
-            });
-        }
-    }
-
-    fn commit(&self, found: &mut Vec<Pair>, scratch: &Scratch) {
-        let n = scratch.js.len();
-        if n == 0 {
-            return;
-        }
-        debug_assert_eq!(scratch.atom.len(), n);
-        debug_assert_eq!(scratch.d2.len(), n);
-        let rows = if self.half { n } else { n * 2 };
-        found.reserve(rows);
-        let len0 = found.len();
-        {
-            let spare = &mut found.spare_capacity_mut()[..rows];
-            if self.half {
-                write_half(
-                    spare,
-                    &scratch.atom,
-                    &scratch.js,
-                    &scratch.d2,
-                    &scratch.run_shift,
-                    &scratch.run_end,
-                );
-            } else {
-                write_full(
-                    spare,
-                    &scratch.atom,
-                    &scratch.js,
-                    &scratch.d2,
-                    &scratch.run_shift,
-                    &scratch.run_end,
-                );
-            }
-        }
-        unsafe {
-            found.set_len(len0 + rows);
-        }
-    }
-
-    fn scan_block(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, block: &Block) {
+    fn scan_block(&self, scratch: &mut Scratch, block: &Block) {
         if block.i_lo >= block.i_hi || block.j_lo >= block.j_hi {
             return;
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            let _ = scratch;
-            self.scan_scalar(found, block);
+            self.scan_scalar(scratch, block);
         }
         #[cfg(target_arch = "x86_64")]
         {
             let ns = block.i_hi - block.i_lo;
             let span = block.j_hi - block.j_lo;
             if span == 0 || ns > MAX_SCRATCH / span {
-                self.scan_scalar(found, block);
+                self.scan_scalar(scratch, block);
                 return;
             }
             let before = scratch.js.len();
@@ -623,11 +876,12 @@ impl Walk<'_> {
                 scratch.note(before, block.shift_s);
                 return;
             }
-            self.scan_scalar(found, block);
+            self.scan_scalar(scratch, block);
         }
     }
 
-    fn scan_scalar(&self, found: &mut Vec<Pair>, block: &Block) {
+    fn scan_scalar(&self, scratch: &mut Scratch, block: &Block) {
+        let before = scratch.js.len();
         let sx = block.shift[0];
         let sy = block.shift[1];
         let sz = block.shift[2];
@@ -650,13 +904,14 @@ impl Walk<'_> {
                     if j == i && block.shift_s == [0, 0, 0] {
                         continue;
                     }
-                    self.record(found, i, j, block.shift_s, d2);
+                    scratch.push(i as u32, j as u64, d2);
                 }
             }
         }
+        scratch.note(before, block.shift_s);
     }
 
-    fn append_cell(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, cell: usize) {
+    fn append_cell(&self, scratch: &mut Scratch, cell: usize) {
         let lo = self.mesh.offsets[cell];
         let hi = self.mesh.offsets[cell + 1];
         if lo == hi {
@@ -664,7 +919,6 @@ impl Walk<'_> {
         }
         if hi - lo >= 2 {
             self.scan_block(
-                found,
                 scratch,
                 &Block {
                     i_lo: lo,
@@ -681,7 +935,6 @@ impl Walk<'_> {
         let p1 = self.partners.off[cell + 1];
         for partner in &self.partners.items[p0..p1] {
             self.scan_block(
-                found,
                 scratch,
                 &Block {
                     i_lo: lo,
@@ -696,178 +949,47 @@ impl Walk<'_> {
         }
     }
 
-    fn guess_rows(&self, n_src: usize) -> usize {
+    /// Ideal-gas hit count for `n_src` sources, with a quarter more.
+    /// A denser shell grows the buffer.
+    fn guess_hits(&self, n_src: usize) -> usize {
         let w = self.mesh.widths;
         let volume = (w[0] * w[1] * w[2]).max(1.0e-30);
         let radius = self.cut2.sqrt();
         let shell = 4.1887902047863905 * radius * radius * radius;
         let n = self.mesh.folded.len().max(1) as f64;
         let neighbors = (n * shell / volume).ceil().max(1.0);
-        let rows = neighbors * if self.half { 0.5 } else { 1.0 };
-        ((n_src as f64) * rows * 1.25) as usize
+        ((n_src as f64) * neighbors * 0.5 * 1.25) as usize
     }
 
-    #[cfg(feature = "parallel")]
-    fn row_count(&self, scratch: &Scratch) -> usize {
-        let n = scratch.js.len();
-        if self.half {
-            n
-        } else {
-            n * 2
-        }
-    }
-
-    fn fill_only(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, start: usize, end: usize) {
+    fn fill_range(&self, start: usize, end: usize) -> Scratch {
+        let _timer = crate::pop::JobTimer::new();
+        let mut scratch = Scratch::new();
         let n_src = self.mesh.offsets[end] - self.mesh.offsets[start];
-        let rows = self.guess_rows(n_src);
-        let hits = if self.half { rows } else { (rows + 1) / 2 };
-        scratch.reserve_more(hits);
+        scratch.reserve_more(self.guess_hits(n_src));
         for cell in start..end {
-            self.append_cell(found, scratch, cell);
+            self.append_cell(&mut scratch, cell);
         }
+        scratch
     }
 
-    fn gather_into(&self, found: &mut Vec<Pair>, scratch: &mut Scratch, start: usize, end: usize) {
-        let n_src = self.mesh.offsets[end] - self.mesh.offsets[start];
-        let rows = self.guess_rows(n_src);
-        // reserve(n) makes capacity >= len + n.
-        if found.capacity() < rows {
-            found.reserve(rows - found.len());
-        }
-        self.fill_only(found, scratch, start, end);
-        self.commit(found, scratch);
-    }
-
-    fn collect(&self, found: Vec<Pair>, mut scratch: Scratch) -> Vec<Pair> {
+    /// Hits by cell range: one range per thread from 512 atoms up.
+    fn collect(&self) -> Vec<Scratch> {
         let ncell = self.mesh.offsets.len() - 1;
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
             let threads = rayon::current_num_threads().max(1);
-            if threads == 1 || ncell <= 1 || self.mesh.occupants.len() < PARALLEL_PAIRS {
-                let _timer = crate::pop::JobTimer::new();
-                let mut found = found;
-                self.gather_into(&mut found, &mut scratch, 0, ncell);
-                return found;
-            }
-            let ranges = cell_ranges(&self.mesh.offsets, threads);
-            if ranges.len() <= 1 {
-                let _timer = crate::pop::JobTimer::new();
-                let mut found = found;
-                self.gather_into(&mut found, &mut scratch, 0, ncell);
-                return found;
-            }
-            let chunks: Vec<(Scratch, Vec<Pair>)> = ranges
-                .into_par_iter()
-                .map(|(start, end)| {
-                    let _timer = crate::pop::JobTimer::new();
-                    let mut scratch = Scratch::new();
-                    let mut extra = Vec::new();
-                    self.fill_only(&mut extra, &mut scratch, start, end);
-                    (scratch, extra)
-                })
-                .collect();
-            self.place_chunks(found, &chunks)
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            let _timer = crate::pop::JobTimer::new();
-            let mut found = found;
-            self.gather_into(&mut found, &mut scratch, 0, ncell);
-            found
-        }
-    }
-
-    #[cfg(feature = "parallel")]
-    fn place_chunks(&self, mut found: Vec<Pair>, chunks: &[(Scratch, Vec<Pair>)]) -> Vec<Pair> {
-        use rayon::prelude::*;
-        let mut rows = Vec::with_capacity(chunks.len());
-        let mut total = 0usize;
-        for (scratch, extra) in chunks {
-            let n = self.row_count(scratch) + extra.len();
-            rows.push(n);
-            total += n;
-        }
-        // reserve(n) makes capacity >= len + n. The ideal-gas estimate
-        // may already hold a shorter buffer.
-        if found.capacity() < total {
-            found.reserve(total - found.len());
-        }
-        let mut off = Vec::with_capacity(chunks.len() + 1);
-        off.push(0usize);
-        for n in &rows {
-            off.push(off.last().copied().unwrap() + n);
-        }
-        let base = SharePtr(found.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
-        let half = self.half;
-        // Safety: each job writes `rows[t]` slots starting at `off[t]`.
-        // Those ranges partition `0..total` and nothing reads them until
-        // every job has joined. `found.len()` stays 0 until then.
-        chunks
-            .par_iter()
-            .enumerate()
-            .for_each(|(t, (scratch, extra))| {
-                let _timer = crate::pop::JobTimer::new();
-                let mut at = off[t];
-                let hit_rows = if half {
-                    scratch.js.len()
-                } else {
-                    scratch.js.len() * 2
-                };
-                if hit_rows > 0 {
-                    let dst = unsafe { std::slice::from_raw_parts_mut(base.slot(at), hit_rows) };
-                    if half {
-                        write_half(
-                            dst,
-                            &scratch.atom,
-                            &scratch.js,
-                            &scratch.d2,
-                            &scratch.run_shift,
-                            &scratch.run_end,
-                        );
-                    } else {
-                        write_full(
-                            dst,
-                            &scratch.atom,
-                            &scratch.js,
-                            &scratch.d2,
-                            &scratch.run_shift,
-                            &scratch.run_end,
-                        );
-                    }
-                    at += hit_rows;
+            if threads > 1 && ncell > 1 && self.mesh.occupants.len() >= PARALLEL_PAIRS {
+                let ranges = cell_ranges(&self.mesh.offsets, threads);
+                if ranges.len() > 1 {
+                    return ranges
+                        .into_par_iter()
+                        .map(|(start, end)| self.fill_range(start, end))
+                        .collect();
                 }
-                if !extra.is_empty() {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            extra.as_ptr(),
-                            base.slot(at) as *mut Pair,
-                            extra.len(),
-                        );
-                    }
-                }
-            });
-        unsafe {
-            found.set_len(total);
+            }
         }
-        found
-    }
-}
-
-/// Shared destination for disjoint pair-row ranges.
-///
-/// Safety: jobs write distinct slots and do not read a slot another job writes.
-#[cfg(feature = "parallel")]
-#[derive(Clone, Copy)]
-struct SharePtr(*mut std::mem::MaybeUninit<Pair>);
-#[cfg(feature = "parallel")]
-unsafe impl Send for SharePtr {}
-#[cfg(feature = "parallel")]
-unsafe impl Sync for SharePtr {}
-#[cfg(feature = "parallel")]
-impl SharePtr {
-    unsafe fn slot(self, index: usize) -> *mut std::mem::MaybeUninit<Pair> {
-        self.0.add(index)
+        vec![self.fill_range(0, ncell)]
     }
 }
 
@@ -1387,6 +1509,39 @@ mod tests {
             assert_eq!(got_row.0, brute_row.0);
             assert_eq!(got_row.1, brute_row.1);
             assert!((got_row.2 - brute_row.2).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn columns_hold_the_same_rows() {
+        let sim = Cell::ortho(18.0, 18.0, 18.0).unwrap();
+        let mut xyz = Vec::new();
+        for iz in 0..9 {
+            for iy in 0..9 {
+                for ix in 0..9 {
+                    xyz.push([
+                        ix as f64 * 2.0 + 0.3,
+                        iy as f64 * 2.0 + 0.1,
+                        iz as f64 * 2.0 + 0.7,
+                    ]);
+                }
+            }
+        }
+        let mut cols = PairColumns::default();
+        for half in [false, true] {
+            let rows = pairs_within(&xyz, &sim, 4.0, None, None, half).unwrap();
+            pairs_within_columns(&xyz, &sim, 4.0, None, None, half, &mut cols).unwrap();
+            assert_eq!(cols.len(), rows.len());
+            let mut a: Vec<_> = rows
+                .iter()
+                .map(|p| (p.i as i32, p.j as i32, p.shift, p.dist2.to_bits()))
+                .collect();
+            let mut b: Vec<_> = (0..cols.len())
+                .map(|t| (cols.i[t], cols.j[t], cols.shift[t], cols.dist2[t].to_bits()))
+                .collect();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "half={half}");
         }
     }
 
