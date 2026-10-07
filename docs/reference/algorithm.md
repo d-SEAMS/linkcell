@@ -71,15 +71,39 @@ diagonal divided by the minimum cell height, and the frontier test
 stops the walk once the k-th neighbour is certified.
 `pairs_within` keeps the caller's basis, because the returned shift
 `S` is an integer combination of that H. Each unordered pair is
-tested once. Hits from that walk are buffered, then the rows are
-written in one pass. A full list writes both `(i, j, S)` and
-`(j, i, -S)`. With more than one thread and at least 512 atoms, each
-thread searches a slice of cells and writes a disjoint range of the
-same pair buffer. On Linux that buffer stays on the heap, so a
-repeated call does not fault those pages in again.
+tested once. A full list writes both `(i, j, S)` and `(j, i, -S)`.
+On Linux the pair buffer stays on the heap, so a repeated call does
+not fault those pages in again.
 The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.
+
+The bins are one fold, one count per bin, a scan, and a scatter into
+slot columns in bin order: positions, positions relative to the bin
+corner, their squared length, and the atom index. With more than one
+thread each pass runs on one block of atoms per thread, and the scan
+gives every thread its own run of slots in each bin, so the atom order
+inside a bin does not depend on the thread count. A search with more
+than one thread runs on a pool thread, so the caller does not run the
+serial steps while every worker spins.
+
+The distance tile is four sources against eight targets. A source
+`p`, moved into the target bin's frame, is `p'`; each lane forms
+`|r_q|^2 - 2 r_q . p'` with three fused multiply-adds, and adding
+`|p'|^2` gives the squared distance. A lane within a rounding bound of
+`cutoff^2` is decided by the direct `|q - (p - S)|^2`, so the rows are
+exactly the rows of the direct formula; the bound is a short sum of
+`2^-53` times the squares of the largest coordinates, shifts, and bin
+offsets, about `2e-10` Å² on an 18 Å cube. `dist2` of a row agrees
+with the direct value to within that bound.
+
+On one thread, a full list on AVX-512 is written straight from the
+tile: hit lanes are compressed, and four hits become eight 40-byte
+rows (or sixteen column entries) in five registers. Otherwise each
+thread buffers the hits of its range of bins, then writes them into
+the caller's layout: `Pair` rows, four columns, or `lc_pair` rows.
+Thread `k` searches and writes range `k`, so the writer reads its own
+cache.
 
 With the bin edge equal to the cutoff the search radius is 1, and the
 gap between any two cells inside that stencil is 0, so the bin test

@@ -214,10 +214,6 @@ impl Mesh {
         (cell, na, nb, nc)
     }
 
-    pub(crate) fn cell_of(&self, ix: i32, iy: i32, iz: i32) -> usize {
-        cell_index(ix, iy, iz, self.nx, self.ny, self.nz)
-    }
-
     /// Half-box of bins. The search cap is at least this, and at least
     /// the space diagonal in cell heights.
     pub(crate) fn image_reach(&self) -> i32 {
@@ -457,6 +453,46 @@ fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
         return Err(Error::TooManyCells);
     }
     Ok(n as i32)
+}
+
+/// Bins per axis for `edge`, with the same cell cap as [`Mesh::build`].
+pub(crate) fn grid_dims(simbox: &Cell, edge: f64) -> Result<[i32; 3], Error> {
+    let w = simbox.widths();
+    let n = [
+        bins_1d(w[0], edge)?,
+        bins_1d(w[1], edge)?,
+        bins_1d(w[2], edge)?,
+    ];
+    i64::from(n[0])
+        .checked_mul(i64::from(n[1]))
+        .and_then(|v| v.checked_mul(i64::from(n[2])))
+        .filter(|&v| v > 0 && v <= MAX_CELLS)
+        .ok_or(Error::TooManyCells)?;
+    Ok(n)
+}
+
+/// Folded Cartesian position and bin of `r`, the values [`Mesh::build`]
+/// stores, so a cutoff row sees the same coordinates.
+#[inline]
+pub(crate) fn fold_point(simbox: &Cell, r: [f64; 3], n: [i32; 3]) -> ([f64; 3], [i32; 3]) {
+    let s = simbox.fractional(r);
+    let b = [
+        bin_coord(s[0], n[0]),
+        bin_coord(s[1], n[1]),
+        bin_coord(s[2], n[2]),
+    ];
+    (simbox.cartesian(s), b)
+}
+
+/// Flat index of an in-range bin.
+#[inline]
+pub(crate) fn flat_cell(b: [i32; 3], n: [i32; 3]) -> usize {
+    ((b[2] * n[1] + b[1]) * n[0] + b[0]) as usize
+}
+
+/// Flat index of any bin, folded into the box.
+pub(crate) fn wrap_cell(b: [i32; 3], n: [i32; 3]) -> usize {
+    cell_index(b[0], b[1], b[2], n[0], n[1], n[2])
 }
 
 fn bin_coord(s: f64, n: i32) -> i32 {

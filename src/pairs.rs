@@ -11,7 +11,7 @@
 //! kernel wraps a raw difference into the central cell, and a second
 //! wrap on an already shifted delta changes which rows survive.
 
-use crate::bins::{self, axis_gap, Mesh};
+use crate::bins::{self, axis_gap};
 use crate::cell::Cell;
 use crate::Error;
 
@@ -55,7 +55,15 @@ pub fn pairs_within(
     cell_hint: Option<f64>,
     half: bool,
 ) -> Result<Vec<Pair>, Error> {
-    Ok(search(xyz, simbox, cutoff, mask, cell_hint, half)?.into_pairs())
+    let plan = in_pool(xyz.len(), || {
+        plan(xyz, simbox, cutoff, mask, cell_hint, half)
+    })?;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    if let Some(words) = plan.fused() {
+        return Ok(plan.fused_rows(&words));
+    }
+    let found = in_pool(xyz.len(), || plan.search());
+    Ok(found.into_pairs())
 }
 
 /// The same rows as [`pairs_within`], as four columns.
@@ -77,9 +85,34 @@ pub fn pairs_within_columns(
     if xyz.len() > i32::MAX as usize {
         return Err(Error::Overflow);
     }
-    let found = search(xyz, simbox, cutoff, mask, cell_hint, half)?;
+    let plan = in_pool(xyz.len(), || {
+        plan(xyz, simbox, cutoff, mask, cell_hint, half)
+    })?;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    if plan.fused().is_some() {
+        plan.fused_columns(out);
+        return Ok(());
+    }
+    let found = in_pool(xyz.len(), || plan.search());
     found.fill_columns(out);
     Ok(())
+}
+
+/// Run `work` on a pool thread when the call will use several threads.
+///
+/// A caller outside the pool would otherwise run the serial steps while
+/// every worker spins, one thread more than the pool has cores. Inside
+/// the pool the caller sleeps on the join instead. Output buffers are
+/// still allocated on the caller's thread: glibc gives a large block on
+/// a worker its own heap and unmaps it when the block is freed, so the
+/// next call would fault every page again.
+pub(crate) fn in_pool<R: Send>(n: usize, work: impl FnOnce() -> R + Send) -> R {
+    #[cfg(feature = "parallel")]
+    if walk_threads(n) > 1 && rayon::current_thread_index().is_none() {
+        return rayon::scope(|_| work());
+    }
+    let _ = n;
+    work()
 }
 
 /// Cutoff rows as columns: `i[t]`, `j[t]`, `shift[t]`, `dist2[t]`.
@@ -107,6 +140,50 @@ impl PairColumns {
     }
 }
 
+/// The grid, stencil, and bounds of one cutoff search.
+pub(crate) struct Plan {
+    grid: Grid,
+    partners: PartnerList,
+    cut2: f64,
+    margin: f64,
+    simd: u8,
+    half: bool,
+    threads: usize,
+}
+
+impl Plan {
+    fn walk(&self) -> Walk<'_> {
+        Walk {
+            grid: &self.grid,
+            cut2: self.cut2,
+            margin: self.margin,
+            partners: &self.partners,
+            simd: self.simd,
+        }
+    }
+
+    /// Every hit, by cell range.
+    pub(crate) fn search(&self) -> Found {
+        Found {
+            chunks: self.walk().collect(self.threads),
+            half: self.half,
+            simd: self.simd,
+        }
+    }
+
+    /// One thread, a full list, and AVX-512: the rows can be written
+    /// from the tile kernel in one pass.
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    fn fused(&self) -> Option<RowWords> {
+        if self.threads == 1 && !self.half && self.simd == 2 {
+            RowWords::of_pair()
+        } else {
+            None
+        }
+    }
+}
+
+/// [`Plan::search`] after [`plan`].
 pub(crate) fn search(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -115,6 +192,17 @@ pub(crate) fn search(
     cell_hint: Option<f64>,
     half: bool,
 ) -> Result<Found, Error> {
+    Ok(plan(xyz, simbox, cutoff, mask, cell_hint, half)?.search())
+}
+
+pub(crate) fn plan(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+) -> Result<Plan, Error> {
     if !cutoff.is_finite() || cutoff <= 0.0 {
         return Err(Error::BadCutoff);
     }
@@ -130,13 +218,20 @@ pub(crate) fn search(
             return Err(Error::MaskLen);
         }
     }
-    let active: Vec<usize> = (0..n)
-        .filter(|&i| mask.map(|m| m[i]).unwrap_or(true))
-        .collect();
-    if active.is_empty() {
-        return Ok(Found {
-            chunks: Vec::new(),
+    let active: Option<Vec<usize>> = mask.map(|m| (0..n).filter(|&i| m[i]).collect());
+    let n_act = active.as_ref().map_or(n, |a| a.len());
+    if n_act == 0 {
+        return Ok(Plan {
+            grid: Grid::empty(),
+            partners: PartnerList {
+                off: vec![0],
+                items: Vec::new(),
+            },
+            cut2: cutoff * cutoff,
+            margin: 0.0,
+            simd: 0,
             half,
+            threads: 1,
         });
     }
     retain_pair_pages();
@@ -158,48 +253,50 @@ pub(crate) fn search(
     }
 
     let edge = bins::target_edge(simbox, cell_hint, cutoff);
-    let mesh = Mesh::build(xyz, simbox, Some(&active), edge)?;
-    let cell_min = (mesh.widths[0] / f64::from(mesh.nx))
-        .min(mesh.widths[1] / f64::from(mesh.ny))
-        .min(mesh.widths[2] / f64::from(mesh.nz));
+    let dims = bins::grid_dims(simbox, edge)?;
+    let cell_min = (w[0] / f64::from(dims[0]))
+        .min(w[1] / f64::from(dims[1]))
+        .min(w[2] / f64::from(dims[2]));
     let reach_cut = (cutoff / cell_min).ceil();
     if !reach_cut.is_finite() || reach_cut > i32::MAX as f64 {
         return Err(Error::TooManyImages);
     }
     let max_reach = (reach_cut as i32)
-        .max(repeats[0] * mesh.nx)
-        .max(repeats[1] * mesh.ny)
-        .max(repeats[2] * mesh.nz)
+        .max(repeats[0] * dims[0])
+        .max(repeats[1] * dims[1])
+        .max(repeats[2] * dims[2])
         .max(1);
     let cut2 = cutoff * cutoff;
     // One reach for every atom: the shorter gap at either edge of a bin.
     // The box is symmetric, so each unordered pair is visited from one
     // side and written out in both shift directions when `half` is off.
-    let reach = uniform_reach([mesh.nx, mesh.ny, mesh.nz], mesh.widths, cut2, max_reach);
-    let nslot = mesh.occupants.len();
-    let mut coords = Coords {
-        x: vec![0.0; nslot],
-        y: vec![0.0; nslot],
-        z: vec![0.0; nslot],
-    };
-    for (slot, &i) in mesh.occupants.iter().enumerate() {
-        let p = mesh.folded[i];
-        coords.x[slot] = p[0];
-        coords.y[slot] = p[1];
-        coords.z[slot] = p[2];
-    }
-    let partners = build_partners(&mesh, simbox, reach, cut2);
-    let walk = Walk {
-        mesh: &mesh,
-        coords: &coords,
+    let reach = uniform_reach(dims, w, cut2, max_reach);
+    let threads = walk_threads(n_act);
+    let grid = Grid::build(xyz, simbox, active.as_deref(), dims, threads);
+    let partners = build_partners(&grid, simbox, reach, cut2);
+    let margin = expanded_margin(&grid, &partners, cutoff);
+    Ok(Plan {
+        grid,
+        partners,
         cut2,
-        partners: &partners,
+        margin,
         simd: simd_mode(),
-    };
-    Ok(Found {
-        chunks: walk.collect(),
         half,
+        threads,
     })
+}
+
+/// Threads for one search: one below 512 atoms or without `parallel`.
+fn walk_threads(n_act: usize) -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        let threads = rayon::current_num_threads().max(1);
+        if threads > 1 && n_act >= PARALLEL_PAIRS {
+            return threads;
+        }
+    }
+    let _ = n_act;
+    1
 }
 
 /// glibc drops a large free buffer (`MADV_DONTNEED`) and the next cutoff
@@ -228,6 +325,10 @@ struct Partner {
     hi: usize,
     shift_s: [i32; 3],
     shift: [f64; 3],
+    /// Source corner minus target corner minus `shift`: a source slot's
+    /// relative position plus this is its image relative to the target
+    /// corner.
+    delta: [f64; 3],
 }
 
 struct PartnerList {
@@ -266,15 +367,13 @@ fn bins_too_far(ortho: bool, src: [i32; 3], dst: [i32; 3], width: [f64; 3], cut2
     bound >= cut2
 }
 
-fn build_partners(mesh: &Mesh, simbox: &Cell, reach: [i32; 3], cut2: f64) -> PartnerList {
-    let nx = mesh.nx;
-    let ny = mesh.ny;
-    let nz = mesh.nz;
+fn build_partners(grid: &Grid, simbox: &Cell, reach: [i32; 3], cut2: f64) -> PartnerList {
+    let [nx, ny, nz] = grid.n;
     let ncell = (nx as usize) * (ny as usize) * (nz as usize);
     let width = [
-        mesh.widths[0] / f64::from(nx),
-        mesh.widths[1] / f64::from(ny),
-        mesh.widths[2] / f64::from(nz),
+        grid.widths[0] / f64::from(nx),
+        grid.widths[1] / f64::from(ny),
+        grid.widths[2] / f64::from(nz),
     ];
     let ortho = simbox.is_ortho();
     let [rx, ry, rz] = reach;
@@ -295,9 +394,9 @@ fn build_partners(mesh: &Mesh, simbox: &Cell, reach: [i32; 3], cut2: f64) -> Par
                             if bins_too_far(ortho, src, dst, width, cut2) {
                                 continue;
                             }
-                            let jc = mesh.cell_of(dst[0], dst[1], dst[2]);
-                            let lo = mesh.offsets[jc];
-                            let hi = mesh.offsets[jc + 1];
+                            let jc = bins::wrap_cell(dst, grid.n);
+                            let lo = grid.offsets[jc];
+                            let hi = grid.offsets[jc + 1];
                             if lo == hi {
                                 continue;
                             }
@@ -306,11 +405,18 @@ fn build_partners(mesh: &Mesh, simbox: &Cell, reach: [i32; 3], cut2: f64) -> Par
                                 dst[1].div_euclid(ny),
                                 dst[2].div_euclid(nz),
                             ];
+                            let shift = simbox.lattice_shift(shift_s[0], shift_s[1], shift_s[2]);
+                            let (a, b) = (grid.corners[cell], grid.corners[jc]);
                             items.push(Partner {
                                 lo,
                                 hi,
                                 shift_s,
-                                shift: simbox.lattice_shift(shift_s[0], shift_s[1], shift_s[2]),
+                                shift,
+                                delta: [
+                                    a[0] - b[0] - shift[0],
+                                    a[1] - b[1] - shift[1],
+                                    a[2] - b[2] - shift[2],
+                                ],
                             });
                         }
                     }
@@ -326,12 +432,305 @@ struct Coords {
     x: Vec<f64>,
     y: Vec<f64>,
     z: Vec<f64>,
+    /// Position relative to the corner of the slot's own bin.
+    rx: Vec<f64>,
+    ry: Vec<f64>,
+    rz: Vec<f64>,
+    /// `rx^2 + ry^2 + rz^2`.
+    r2: Vec<f64>,
+    /// Atom index of each slot.
+    id: Vec<u32>,
+}
+
+impl Coords {
+    fn with_len(nslot: usize) -> Self {
+        Coords {
+            x: vec![0.0; nslot],
+            y: vec![0.0; nslot],
+            z: vec![0.0; nslot],
+            rx: vec![0.0; nslot],
+            ry: vec![0.0; nslot],
+            rz: vec![0.0; nslot],
+            r2: vec![0.0; nslot],
+            id: vec![0; nslot],
+        }
+    }
+}
+
+/// Active atoms in bin order. The occupants of bin `c` are the slots
+/// `offsets[c]..offsets[c + 1]`, in atom order, so a cutoff row sees the
+/// same order as the k-nearest mesh.
+struct Grid {
+    n: [i32; 3],
+    widths: [f64; 3],
+    offsets: Vec<usize>,
+    /// Cartesian corner of every bin, `H (ix/nx, iy/ny, iz/nz) + origin`.
+    corners: Vec<[f64; 3]>,
+    coords: Coords,
+    /// Largest |component| of the folded and of the relative positions.
+    max_abs: f64,
+    max_rel: f64,
+}
+
+/// One atom's folded position and flat bin, between the two passes.
+#[derive(Clone, Copy, Default)]
+struct Folded {
+    p: [f64; 3],
+    cell: u32,
+}
+
+/// Raw slot columns for writes at disjoint slots from several threads.
+#[derive(Clone, Copy)]
+struct SlotPtrs {
+    x: RowPtr<f64>,
+    y: RowPtr<f64>,
+    z: RowPtr<f64>,
+    rx: RowPtr<f64>,
+    ry: RowPtr<f64>,
+    rz: RowPtr<f64>,
+    r2: RowPtr<f64>,
+    id: RowPtr<u32>,
+}
+
+impl SlotPtrs {
+    fn of(c: &mut Coords) -> Self {
+        let raw = |v: &mut Vec<f64>| RowPtr(v.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>);
+        SlotPtrs {
+            x: raw(&mut c.x),
+            y: raw(&mut c.y),
+            z: raw(&mut c.z),
+            rx: raw(&mut c.rx),
+            ry: raw(&mut c.ry),
+            rz: raw(&mut c.rz),
+            r2: raw(&mut c.r2),
+            id: RowPtr(c.id.as_mut_ptr() as *mut std::mem::MaybeUninit<u32>),
+        }
+    }
+
+    /// Write atom `i` at `slot`; returns the largest |component| of the
+    /// folded and of the relative position.
+    ///
+    /// # Safety
+    /// `slot` is in range and no other thread writes it.
+    #[inline(always)]
+    unsafe fn put(self, slot: usize, i: usize, p: [f64; 3], o: [f64; 3]) -> (f64, f64) {
+        let (rx, ry, rz) = (p[0] - o[0], p[1] - o[1], p[2] - o[2]);
+        (*self.x.at(slot)).write(p[0]);
+        (*self.y.at(slot)).write(p[1]);
+        (*self.z.at(slot)).write(p[2]);
+        (*self.rx.at(slot)).write(rx);
+        (*self.ry.at(slot)).write(ry);
+        (*self.rz.at(slot)).write(rz);
+        (*self.r2.at(slot)).write(rx * rx + ry * ry + rz * rz);
+        (*self.id.at(slot)).write(i as u32);
+        (
+            p[0].abs().max(p[1].abs()).max(p[2].abs()),
+            rx.abs().max(ry.abs()).max(rz.abs()),
+        )
+    }
+}
+
+impl Grid {
+    /// Fold every active atom, count each bin, scan, then scatter into
+    /// the slot columns. With several threads each pass runs on one
+    /// block of atoms per thread (a block distribution), and the scan
+    /// gives every thread its own run of slots in each bin, so atom
+    /// order inside a bin is the same as one thread's.
+    fn build(
+        xyz: &[[f64; 3]],
+        simbox: &Cell,
+        active: Option<&[usize]>,
+        n: [i32; 3],
+        threads: usize,
+    ) -> Grid {
+        let ncell = (n[0] as usize) * (n[1] as usize) * (n[2] as usize);
+        let n_act = active.map_or(xyz.len(), |a| a.len());
+        let atom = |k: usize| active.map_or(k, |a| a[k]);
+        let mut folded = vec![Folded::default(); n_act];
+        let mut corners = vec![[0.0f64; 3]; ncell];
+        let mut coords = Coords::with_len(n_act);
+        let mut offsets = vec![0usize; ncell + 1];
+        let corner = |c: usize| {
+            let ix = (c % n[0] as usize) as i32;
+            let iy = ((c / n[0] as usize) % n[1] as usize) as i32;
+            let iz = (c / (n[0] as usize * n[1] as usize)) as i32;
+            simbox.cartesian([
+                f64::from(ix) / f64::from(n[0]),
+                f64::from(iy) / f64::from(n[1]),
+                f64::from(iz) / f64::from(n[2]),
+            ])
+        };
+        let (mut max_abs, mut max_rel) = (0.0f64, 0.0f64);
+        #[cfg(feature = "parallel")]
+        if threads > 1 {
+            let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
+            let cp = RowPtr(corners.as_mut_ptr() as *mut std::mem::MaybeUninit<[f64; 3]>);
+            let p = rayon::current_num_threads().max(1);
+            let block = |k: usize, len: usize| (k * len / p, (k + 1) * len / p);
+            // Pass 1: fold a block of atoms and a block of bin corners.
+            let counts: Vec<Vec<u32>> = rayon::broadcast(|ctx| {
+                let _timer = crate::pop::JobTimer::new();
+                let k = ctx.index();
+                let mut count = vec![0u32; ncell];
+                let (lo, hi) = block(k, n_act);
+                for slot in lo..hi {
+                    let (q, b) = bins::fold_point(simbox, xyz[atom(slot)], n);
+                    let cell = bins::flat_cell(b, n);
+                    count[cell] += 1;
+                    // Safety: atom blocks are disjoint.
+                    unsafe {
+                        (*fp.at(slot)).write(Folded {
+                            p: q,
+                            cell: cell as u32,
+                        })
+                    };
+                }
+                let (clo, chi) = block(k, ncell);
+                for c in clo..chi {
+                    // Safety: corner blocks are disjoint.
+                    unsafe { (*cp.at(c)).write(corner(c)) };
+                }
+                count
+            });
+            // Scan: bin `c` starts at `offsets[c]`, and thread `k`'s run in
+            // it starts after the runs of threads `0..k`.
+            let mut start = vec![0u32; p * ncell];
+            let mut at = 0usize;
+            for c in 0..ncell {
+                offsets[c] = at;
+                for (k, count) in counts.iter().enumerate() {
+                    start[k * ncell + c] = at as u32;
+                    at += count[c] as usize;
+                }
+            }
+            offsets[ncell] = at;
+            let slots = SlotPtrs::of(&mut coords);
+            let (folded, corners, start) = (&folded, &corners, &start);
+            // Pass 2: scatter each block into its runs.
+            let maxima: Vec<(f64, f64)> = rayon::broadcast(|ctx| {
+                let _timer = crate::pop::JobTimer::new();
+                let k = ctx.index();
+                let mut next = start[k * ncell..(k + 1) * ncell].to_vec();
+                let (mut ma, mut mr) = (0.0f64, 0.0f64);
+                let (lo, hi) = block(k, n_act);
+                for (slot, f) in folded.iter().enumerate().take(hi).skip(lo) {
+                    let c = f.cell as usize;
+                    let dest = next[c] as usize;
+                    next[c] += 1;
+                    // Safety: the scan gave this thread the slots it writes.
+                    let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
+                    ma = ma.max(a);
+                    mr = mr.max(r);
+                }
+                (ma, mr)
+            });
+            for (a, r) in maxima {
+                max_abs = max_abs.max(a);
+                max_rel = max_rel.max(r);
+            }
+            return Grid {
+                n,
+                widths: simbox.widths(),
+                offsets,
+                corners: corners.clone(),
+                coords,
+                max_abs,
+                max_rel,
+            };
+        }
+        let _ = threads;
+        let _timer = crate::pop::JobTimer::new();
+        let mut count = vec![0usize; ncell];
+        for (slot, f) in folded.iter_mut().enumerate() {
+            let (q, b) = bins::fold_point(simbox, xyz[atom(slot)], n);
+            let cell = bins::flat_cell(b, n);
+            count[cell] += 1;
+            *f = Folded {
+                p: q,
+                cell: cell as u32,
+            };
+        }
+        for (c, o) in corners.iter_mut().enumerate() {
+            *o = corner(c);
+        }
+        let mut at = 0usize;
+        for c in 0..ncell {
+            offsets[c] = at;
+            at += count[c];
+            count[c] = offsets[c];
+        }
+        offsets[ncell] = at;
+        let slots = SlotPtrs::of(&mut coords);
+        for (slot, f) in folded.iter().enumerate() {
+            let c = f.cell as usize;
+            let dest = count[c];
+            count[c] += 1;
+            // Safety: one thread, and every slot is in range.
+            let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
+            max_abs = max_abs.max(a);
+            max_rel = max_rel.max(r);
+        }
+        Grid {
+            n,
+            widths: simbox.widths(),
+            offsets,
+            corners,
+            coords,
+            max_abs,
+            max_rel,
+        }
+    }
+
+    fn atoms(&self) -> usize {
+        self.coords.id.len()
+    }
+
+    /// No bins and no atoms: every search on it is empty.
+    fn empty() -> Grid {
+        Grid {
+            n: [1, 1, 1],
+            widths: [0.0; 3],
+            offsets: vec![0],
+            corners: Vec::new(),
+            coords: Coords::with_len(0),
+            max_abs: 0.0,
+            max_rel: 0.0,
+        }
+    }
+}
+
+/// Bound on the difference between the expanded squared distance
+/// `|r_q|^2 - 2 r_q . r_p' + |r_p'|^2` and the direct one
+/// `|q - (p - S)|^2`, both in double precision.
+///
+/// Each value is a short sum of terms no larger than the square of the
+/// largest magnitude in it: absolute coordinates `A`, shifts `S`,
+/// relative coordinates `R`, and block offsets `D`, per component. Every
+/// rounding is at most `2^-53` of such a term, and there are fewer than
+/// 32 of them per value; `192 = 64 * 3` covers both values and the
+/// three components. A lane within this of `cutoff^2` is decided by the
+/// direct formula, so the expanded form never changes a row.
+fn expanded_margin(grid: &Grid, partners: &PartnerList, cutoff: f64) -> f64 {
+    let (a, r) = (grid.max_abs, grid.max_rel);
+    let (mut s, mut d) = (0.0f64, 0.0f64);
+    for p in &partners.items {
+        for k in 0..3 {
+            s = s.max(p.shift[k].abs());
+            d = d.max(p.delta[k].abs());
+        }
+    }
+    let span = 2.0 * a + s + 2.0 * r + d + cutoff;
+    192.0 * f64::EPSILON * 0.5 * span * span
 }
 
 fn simd_mode() -> u8 {
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     {
-        if std::is_x86_feature_detected!("avx512f") {
+        if std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512vl")
+            && std::is_x86_feature_detected!("popcnt")
+            && std::is_x86_feature_detected!("fma")
+        {
             return 2;
         }
     }
@@ -388,9 +787,11 @@ fn uniform_reach(nbin: [i32; 3], widths: [f64; 3], cut2: f64, max_reach: i32) ->
 }
 
 struct Walk<'a> {
-    mesh: &'a Mesh,
-    coords: &'a Coords,
+    grid: &'a Grid,
     cut2: f64,
+    /// [`expanded_margin`] of this search.
+    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
+    margin: f64,
     partners: &'a PartnerList,
     /// 2 = AVX-512, 1 = AVX, 0 = scalar.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
@@ -405,6 +806,8 @@ struct Block {
     j_hi: usize,
     shift_s: [i32; 3],
     shift: [f64; 3],
+    /// [`Partner::delta`]; zero for the home cell.
+    delta: [f64; 3],
     /// Home cell: source `s` only sees occupants `s + 1 ..`.
     tri: bool,
 }
@@ -418,7 +821,7 @@ const PARALLEL_PAIRS: usize = 512;
 /// pass writes the rows. Runs share a shift so the inner loop does not.
 struct Scratch {
     atom: Vec<u32>,
-    js: Vec<u64>,
+    js: Vec<u32>,
     d2: Vec<f64>,
     run_shift: Vec<[i32; 3]>,
     run_end: Vec<usize>,
@@ -454,7 +857,7 @@ impl Scratch {
         }
     }
 
-    fn push(&mut self, atom: u32, j: u64, d2: f64) {
+    fn push(&mut self, atom: u32, j: u32, d2: f64) {
         self.atom.push(atom);
         self.js.push(j);
         self.d2.push(d2);
@@ -474,6 +877,9 @@ impl Scratch {
 pub(crate) struct Found {
     chunks: Vec<Scratch>,
     half: bool,
+    /// [`simd_mode`] of the search; the writers use the same level.
+    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
+    simd: u8,
 }
 
 impl Found {
@@ -502,6 +908,12 @@ impl Found {
     fn into_pairs(self) -> Vec<Pair> {
         let total = self.rows();
         let mut found: Vec<Pair> = Vec::with_capacity(total);
+        #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+        let words = if self.simd == 2 {
+            RowWords::of_pair()
+        } else {
+            None
+        };
         let base = RowPtr(found.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
         // Safety: `total` slots are allocated. Chunk `t` writes the rows
         // `off[t]..off[t + 1]`, which partition `0..total`, and nothing
@@ -521,16 +933,23 @@ impl Found {
                     &chunk.run_shift,
                     &chunk.run_end,
                 );
-            } else {
-                write_full(
-                    dst,
-                    &chunk.atom,
-                    &chunk.js,
-                    &chunk.d2,
-                    &chunk.run_shift,
-                    &chunk.run_end,
-                );
+                return;
             }
+            #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+            if let Some(words) = words {
+                // Safety: AVX-512 was detected for this search, and `dst`
+                // holds two rows per hit of `chunk`.
+                unsafe { write_full_avx512(dst.as_mut_ptr(), chunk, &words) };
+                return;
+            }
+            write_full(
+                dst,
+                &chunk.atom,
+                &chunk.js,
+                &chunk.d2,
+                &chunk.run_shift,
+                &chunk.run_end,
+            );
         });
         unsafe {
             found.set_len(total);
@@ -594,6 +1013,13 @@ impl Found {
                     std::slice::from_raw_parts_mut(cols.d2.at(at), rows),
                 )
             };
+            #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+            if self.simd == 2 && !self.half {
+                // Safety: AVX-512 was detected, and each column holds two
+                // rows per hit of `chunk` (three values per row of shift).
+                unsafe { write_columns_avx512(ci, cj, cs, cd, chunk) };
+                return;
+            }
             write_columns(ci, cj, cs, cd, chunk, self.half);
         });
     }
@@ -650,15 +1076,24 @@ impl Found {
     {
         let off = self.offsets();
         #[cfg(feature = "parallel")]
-        {
-            if self.chunks.len() > 1 {
+        if self.chunks.len() > 1 {
+            // Chunk `t` was searched on thread `t`; writing it there reads
+            // that core's cache.
+            if self.chunks.len() <= rayon::current_num_threads() {
+                rayon::broadcast(|ctx| {
+                    if let Some(chunk) = self.chunks.get(ctx.index()) {
+                        let _timer = crate::pop::JobTimer::new();
+                        job(ctx.index(), &off, chunk);
+                    }
+                });
+            } else {
                 use rayon::prelude::*;
                 self.chunks.par_iter().enumerate().for_each(|(t, chunk)| {
                     let _timer = crate::pop::JobTimer::new();
                     job(t, &off, chunk);
                 });
-                return;
             }
+            return;
         }
         for (t, chunk) in self.chunks.iter().enumerate() {
             let _timer = crate::pop::JobTimer::new();
@@ -744,6 +1179,10 @@ fn write_columns(
     }
 }
 
+/// Full-width stores past the last hit stay inside this many extra slots.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const STORE_SLACK: usize = 16;
+
 /// Worst-case hits kept in the scratch buffer. Larger blocks use the scalar walk.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const MAX_SCRATCH: usize = 1 << 20;
@@ -752,7 +1191,7 @@ const MAX_SCRATCH: usize = 1 << 20;
 fn write_full(
     dst: &mut [std::mem::MaybeUninit<Pair>],
     atom: &[u32],
-    js: &[u64],
+    js: &[u32],
     d2: &[f64],
     shifts: &[[i32; 3]],
     ends: &[usize],
@@ -789,7 +1228,7 @@ fn write_full(
 fn write_half(
     dst: &mut [std::mem::MaybeUninit<Pair>],
     atom: &[u32],
-    js: &[u64],
+    js: &[u32],
     d2: &[f64],
     shifts: &[[i32; 3]],
     ends: &[usize],
@@ -826,6 +1265,711 @@ fn write_half(
     }
 }
 
+/// Word slots of a 40-byte `Pair`: `i`, `j`, `dist2`, and the first of
+/// the two words that hold `shift` and its padding.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[derive(Clone, Copy)]
+struct RowWords {
+    /// Permute indices for four hits: eight rows, five registers.
+    index: [[u64; 8]; 5],
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+impl RowWords {
+    /// `None` unless `Pair` is five whole words. The layout of a Rust
+    /// struct is the compiler's choice, so it is read, not assumed.
+    fn of_pair() -> Option<Self> {
+        let p = Pair {
+            i: 0,
+            j: 0,
+            shift: [0; 3],
+            dist2: 0.0,
+        };
+        let base = &p as *const Pair as usize;
+        let at = |a: usize| a - base;
+        let off = [
+            at(&p.i as *const usize as usize),
+            at(&p.j as *const usize as usize),
+            at(&p.dist2 as *const f64 as usize),
+            at(&p.shift as *const [i32; 3] as usize),
+        ];
+        if std::mem::size_of::<Pair>() != 40 || off.iter().any(|o| o % 8 != 0) {
+            return None;
+        }
+        let (wi, wj, wd, ws) = (off[0] / 8, off[1] / 8, off[2] / 8, off[3] / 8);
+        let mut seen = [false; 5];
+        for w in [wi, wj, wd, ws, ws + 1] {
+            if w >= 5 || seen[w] {
+                return None;
+            }
+            seen[w] = true;
+        }
+        // Sources: [a0 a1 a2 a3 b0 b1 b2 b3] then [d0 d1 d2 d3 S01 S2 N01 N2].
+        // Row 2k is (a_k, b_k, S, d_k); row 2k + 1 is (b_k, a_k, -S, d_k).
+        let mut index = [[0u64; 8]; 5];
+        for r in 0..8 {
+            let (k, mirror) = ((r / 2) as u64, r % 2 == 1);
+            let mut row = [0u64; 5];
+            row[wi] = if mirror { 4 + k } else { k };
+            row[wj] = if mirror { k } else { 4 + k };
+            row[wd] = 8 + k;
+            row[ws] = if mirror { 14 } else { 12 };
+            row[ws + 1] = if mirror { 15 } else { 13 };
+            for (w, &v) in row.iter().enumerate() {
+                let t = 5 * r + w;
+                index[t / 8][t % 8] = v;
+            }
+        }
+        Some(Self { index })
+    }
+}
+
+/// `shift` as the two little-endian words of a row: `(s0, s1)` and `(s2, 0)`.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+fn shift_words(s: [i32; 3]) -> (u64, u64) {
+    (
+        u64::from(s[0] as u32) | (u64::from(s[1] as u32) << 32),
+        u64::from(s[2] as u32),
+    )
+}
+
+/// [`write_full`] four hits at a time: eight rows are five permutes of two
+/// registers and five stores.
+///
+/// # Safety
+/// AVX-512F is available, and `dst` holds two rows per hit of `chunk`.
+#[allow(clippy::incompatible_msrv)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f")]
+#[inline(never)]
+unsafe fn write_full_avx512(
+    dst: *mut std::mem::MaybeUninit<Pair>,
+    chunk: &Scratch,
+    words: &RowWords,
+) {
+    use std::arch::x86_64::{
+        __m128i, __m512i, _mm256_cvtepu32_epi64, _mm256_set_epi64x, _mm512_castsi256_si512,
+        _mm512_inserti64x4, _mm512_loadu_si512, _mm512_permutex2var_epi64, _mm512_storeu_si512,
+        _mm_loadu_si128,
+    };
+    let idx: [__m512i; 5] = [
+        _mm512_loadu_si512(words.index[0].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[1].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[2].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[3].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[4].as_ptr() as *const _),
+    ];
+    let ap = chunk.atom.as_ptr();
+    let jp = chunk.js.as_ptr();
+    let dp = chunk.d2.as_ptr();
+    let mut row = dst;
+    let mut lo = 0usize;
+    for (r, &hi) in chunk.run_end.iter().enumerate() {
+        let shift = chunk.run_shift[r];
+        let neg = [-shift[0], -shift[1], -shift[2]];
+        let (s01, s2) = shift_words(shift);
+        let (n01, n2) = shift_words(neg);
+        let sh = _mm256_set_epi64x(n2 as i64, n01 as i64, s2 as i64, s01 as i64);
+        let mut k = lo;
+        while k + 4 <= hi {
+            let a = _mm256_cvtepu32_epi64(_mm_loadu_si128(ap.add(k) as *const __m128i));
+            let b = _mm256_cvtepu32_epi64(_mm_loadu_si128(jp.add(k) as *const __m128i));
+            let ab = _mm512_inserti64x4(_mm512_castsi256_si512(a), b, 1);
+            let d = _mm512_loadu_si512(dp.add(k) as *const _);
+            let ds = _mm512_inserti64x4(d, sh, 1);
+            let out = row as *mut u64;
+            for (m, ix) in idx.iter().enumerate() {
+                _mm512_storeu_si512(
+                    out.add(8 * m) as *mut _,
+                    _mm512_permutex2var_epi64(ab, *ix, ds),
+                );
+            }
+            row = row.add(8);
+            k += 4;
+        }
+        while k < hi {
+            let i = *ap.add(k) as usize;
+            let j = *jp.add(k) as usize;
+            let dist2 = *dp.add(k);
+            (*row).write(Pair { i, j, shift, dist2 });
+            (*row.add(1)).write(Pair {
+                i: j,
+                j: i,
+                shift: neg,
+                dist2,
+            });
+            row = row.add(2);
+            k += 1;
+        }
+        lo = hi;
+    }
+}
+
+/// [`write_columns`] for a full list, eight hits (sixteen rows) at a time.
+///
+/// # Safety
+/// AVX-512F is available, and the columns hold two rows per hit of
+/// `chunk`; `cs` holds three values per row.
+#[allow(clippy::incompatible_msrv)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f")]
+#[inline(never)]
+unsafe fn write_columns_avx512(
+    ci: &mut [std::mem::MaybeUninit<i32>],
+    cj: &mut [std::mem::MaybeUninit<i32>],
+    cs: &mut [std::mem::MaybeUninit<i32>],
+    cd: &mut [std::mem::MaybeUninit<f64>],
+    chunk: &Scratch,
+) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm512_castsi256_si512, _mm512_loadu_pd, _mm512_loadu_si512,
+        _mm512_permutex2var_epi32, _mm512_permutexvar_epi32, _mm512_permutexvar_pd,
+        _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd, _mm512_storeu_si512,
+    };
+    // Row 2k is (a_k, b_k, S, d_k); row 2k + 1 is (b_k, a_k, -S, d_k).
+    let ab = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+    let ba = _mm512_setr_epi32(16, 0, 17, 1, 18, 2, 19, 3, 20, 4, 21, 5, 22, 6, 23, 7);
+    let dup_lo = _mm512_setr_epi64(0, 0, 1, 1, 2, 2, 3, 3);
+    let dup_hi = _mm512_setr_epi64(4, 4, 5, 5, 6, 6, 7, 7);
+    // Shift column of sixteen rows: (S, -S) eight times, 48 values.
+    let pat = [
+        _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3),
+        _mm512_setr_epi32(4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1),
+        _mm512_setr_epi32(2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5),
+    ];
+    let ap = chunk.atom.as_ptr();
+    let jp = chunk.js.as_ptr();
+    let dp = chunk.d2.as_ptr();
+    let ip = ci.as_mut_ptr() as *mut i32;
+    let jo = cj.as_mut_ptr() as *mut i32;
+    let sp = cs.as_mut_ptr() as *mut i32;
+    let dq = cd.as_mut_ptr() as *mut f64;
+    let mut out = 0usize;
+    let mut lo = 0usize;
+    for (r, &hi) in chunk.run_end.iter().enumerate() {
+        let s = chunk.run_shift[r];
+        let six = [
+            s[0], s[1], s[2], -s[0], -s[1], -s[2], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let src = _mm512_loadu_si512(six.as_ptr() as *const _);
+        let sv = [
+            _mm512_permutexvar_epi32(pat[0], src),
+            _mm512_permutexvar_epi32(pat[1], src),
+            _mm512_permutexvar_epi32(pat[2], src),
+        ];
+        let mut k = lo;
+        while k + 8 <= hi {
+            let a = _mm512_castsi256_si512(_mm256_loadu_si256(ap.add(k) as *const __m256i));
+            let b = _mm512_castsi256_si512(_mm256_loadu_si256(jp.add(k) as *const __m256i));
+            _mm512_storeu_si512(ip.add(out) as *mut _, _mm512_permutex2var_epi32(a, ab, b));
+            _mm512_storeu_si512(jo.add(out) as *mut _, _mm512_permutex2var_epi32(a, ba, b));
+            let d = _mm512_loadu_pd(dp.add(k));
+            _mm512_storeu_pd(dq.add(out), _mm512_permutexvar_pd(dup_lo, d));
+            _mm512_storeu_pd(dq.add(out + 8), _mm512_permutexvar_pd(dup_hi, d));
+            let so = sp.add(3 * out);
+            _mm512_storeu_si512(so as *mut _, sv[0]);
+            _mm512_storeu_si512(so.add(16) as *mut _, sv[1]);
+            _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
+            out += 16;
+            k += 8;
+        }
+        while k < hi {
+            let a = *ap.add(k) as i32;
+            let b = *jp.add(k) as i32;
+            let d = *dp.add(k);
+            *ip.add(out) = a;
+            *jo.add(out) = b;
+            *dq.add(out) = d;
+            *ip.add(out + 1) = b;
+            *jo.add(out + 1) = a;
+            *dq.add(out + 1) = d;
+            let so = sp.add(3 * out);
+            *so = s[0];
+            *so.add(1) = s[1];
+            *so.add(2) = s[2];
+            *so.add(3) = -s[0];
+            *so.add(4) = -s[1];
+            *so.add(5) = -s[2];
+            out += 2;
+            k += 1;
+        }
+        lo = hi;
+    }
+}
+
+/// Where the fused kernel writes: `Pair` rows as words, or four columns.
+/// `n` is the row count so far. Each hit vector writes whole registers
+/// past its last kept row; the next vector overwrites them, so every
+/// buffer keeps [`FUSED_SLACK`] rows of room past `n`.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+struct FusedOut {
+    rows: *mut u64,
+    ci: *mut i32,
+    cj: *mut i32,
+    cs: *mut i32,
+    cd: *mut f64,
+    n: usize,
+}
+
+/// Rows a hit vector may write past the last row it keeps.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+const FUSED_SLACK: usize = 16;
+
+/// The AVX-512 tile kernel of [`avx512_scan`] with a full list written
+/// in place: `Pair` rows when `COLS` is false, the four columns when it
+/// is true. Hit lanes are compressed, then four hits become eight rows
+/// (or sixteen column entries) in whole registers.
+///
+/// # Safety
+/// `block` indexes every column of `c`. Every buffer of `out` has room
+/// for `out.n` plus every row of the block plus [`FUSED_SLACK`].
+#[allow(clippy::incompatible_msrv)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f,avx512vl,popcnt,fma")]
+#[inline(never)]
+unsafe fn avx512_fused<const COLS: bool>(
+    c: TileCols,
+    cut2: f64,
+    margin: f64,
+    block: &Block,
+    words: &RowWords,
+    out: &mut FusedOut,
+) {
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_loadu_si256, _mm256_maskz_compress_epi32,
+        _mm256_maskz_loadu_epi32, _mm256_set_epi64x, _mm512_add_pd, _mm512_castpd_si512,
+        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_cvtepu32_epi64,
+        _mm512_extracti64x4_epi64, _mm512_fmadd_pd, _mm512_inserti64x4, _mm512_loadu_pd,
+        _mm512_loadu_si512, _mm512_mask_cmp_pd_mask, _mm512_maskz_compress_pd,
+        _mm512_maskz_loadu_pd, _mm512_permutex2var_epi32, _mm512_permutex2var_epi64,
+        _mm512_permutexvar_epi32, _mm512_permutexvar_pd, _mm512_set1_epi32, _mm512_set1_epi64,
+        _mm512_set1_pd, _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd,
+        _mm512_storeu_si512, _CMP_LT_OQ,
+    };
+    let idx: [__m512i; 5] = [
+        _mm512_loadu_si512(words.index[0].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[1].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[2].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[3].as_ptr() as *const _),
+        _mm512_loadu_si512(words.index[4].as_ptr() as *const _),
+    ];
+    let [sx, sy, sz] = block.shift;
+    let [ox, oy, oz] = block.delta;
+    let shift_s = block.shift_s;
+    let neg = [-shift_s[0], -shift_s[1], -shift_s[2]];
+    let (s01, s2) = shift_words(shift_s);
+    let (n01, n2) = shift_words(neg);
+    let sh = _mm256_set_epi64x(n2 as i64, n01 as i64, s2 as i64, s01 as i64);
+    // Columns: row 2k is (i, j_k, S, d_k) and row 2k + 1 is (j_k, i, -S, d_k).
+    let ij = _mm512_setr_epi32(0, 16, 0, 17, 0, 18, 0, 19, 0, 20, 0, 21, 0, 22, 0, 23);
+    let ji = _mm512_setr_epi32(16, 0, 17, 0, 18, 0, 19, 0, 20, 0, 21, 0, 22, 0, 23, 0);
+    let dup_lo = _mm512_setr_epi64(0, 0, 1, 1, 2, 2, 3, 3);
+    let dup_hi = _mm512_setr_epi64(4, 4, 5, 5, 6, 6, 7, 7);
+    let six = [
+        shift_s[0], shift_s[1], shift_s[2], neg[0], neg[1], neg[2], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let six = _mm512_loadu_si512(six.as_ptr() as *const _);
+    let sv = [
+        _mm512_permutexvar_epi32(
+            _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3),
+            six,
+        ),
+        _mm512_permutexvar_epi32(
+            _mm512_setr_epi32(4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1),
+            six,
+        ),
+        _mm512_permutexvar_epi32(
+            _mm512_setr_epi32(2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5),
+            six,
+        ),
+    ];
+    let cut_lo = _mm512_set1_pd(cut2 - margin);
+    let cut_hi = cut2 + margin;
+    let mut n = out.n;
+
+    // One hit decided by the direct formula: both rows, exactly.
+    macro_rules! put_one {
+        ($iu:expr, $j:expr, $d2:expr) => {{
+            let (a, b, d) = ($iu, $j, $d2);
+            if COLS {
+                *out.ci.add(n) = a as i32;
+                *out.cj.add(n) = b as i32;
+                *out.cd.add(n) = d;
+                *out.ci.add(n + 1) = b as i32;
+                *out.cj.add(n + 1) = a as i32;
+                *out.cd.add(n + 1) = d;
+                let so = out.cs.add(3 * n);
+                *so = shift_s[0];
+                *so.add(1) = shift_s[1];
+                *so.add(2) = shift_s[2];
+                *so.add(3) = neg[0];
+                *so.add(4) = neg[1];
+                *so.add(5) = neg[2];
+            } else {
+                let row = (out.rows as *mut std::mem::MaybeUninit<Pair>).add(n);
+                let (i, j) = (a as usize, b as usize);
+                (*row).write(Pair {
+                    i,
+                    j,
+                    shift: shift_s,
+                    dist2: d,
+                });
+                (*row.add(1)).write(Pair {
+                    i: j,
+                    j: i,
+                    shift: neg,
+                    dist2: d,
+                });
+            }
+            n += 2;
+        }};
+    }
+    macro_rules! direct {
+        ($s:expr, $slot:expr, $mask:expr) => {{
+            let s = $s;
+            let iu = *c.id.add(s);
+            let px = *c.x.add(s) - sx;
+            let py = *c.y.add(s) - sy;
+            let pz = *c.z.add(s) - sz;
+            let mut bits: u32 = u32::from($mask);
+            while bits != 0 {
+                let slot = $slot + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let dx = *c.x.add(slot) - px;
+                let dy = *c.y.add(slot) - py;
+                let dz = *c.z.add(slot) - pz;
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 < cut2 {
+                    put_one!(iu, *c.id.add(slot), d2);
+                }
+            }
+        }};
+    }
+    macro_rules! source {
+        ($s:expr) => {{
+            let s = $s;
+            let px = *c.rx.add(s) + ox;
+            let py = *c.ry.add(s) + oy;
+            let pz = *c.rz.add(s) + oz;
+            let pp = px * px + py * py + pz * pz;
+            (
+                *c.id.add(s),
+                _mm512_set1_pd(-2.0 * px),
+                _mm512_set1_pd(-2.0 * py),
+                _mm512_set1_pd(-2.0 * pz),
+                _mm512_set1_pd(pp),
+                _mm512_set1_pd(cut_hi - pp),
+            )
+        }};
+    }
+    // The kept lanes `lo` of one source: compress, then whole registers.
+    macro_rules! emit {
+        ($lo:expr, $iu:expr, $d2v:expr, $jids:expr) => {{
+            let lo: u8 = $lo;
+            let k = lo.count_ones() as usize;
+            let dc = _mm512_maskz_compress_pd(lo, $d2v);
+            let jc = _mm256_maskz_compress_epi32(lo, $jids);
+            if COLS {
+                let iv = _mm512_set1_epi32($iu as i32);
+                let jz = _mm512_castsi256_si512(jc);
+                _mm512_storeu_si512(
+                    out.ci.add(n) as *mut _,
+                    _mm512_permutex2var_epi32(iv, ij, jz),
+                );
+                _mm512_storeu_si512(
+                    out.cj.add(n) as *mut _,
+                    _mm512_permutex2var_epi32(iv, ji, jz),
+                );
+                _mm512_storeu_pd(out.cd.add(n), _mm512_permutexvar_pd(dup_lo, dc));
+                let so = out.cs.add(3 * n);
+                _mm512_storeu_si512(so as *mut _, sv[0]);
+                if k > 2 {
+                    _mm512_storeu_si512(so.add(16) as *mut _, sv[1]);
+                }
+                if k > 4 {
+                    _mm512_storeu_pd(out.cd.add(n + 8), _mm512_permutexvar_pd(dup_hi, dc));
+                }
+                if k > 5 {
+                    _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
+                }
+            } else {
+                let at = out.rows.add(5 * n);
+                let iv = _mm512_castsi512_si256(_mm512_set1_epi64(i64::from($iu)));
+                let jq = _mm512_cvtepu32_epi64(jc);
+                let dq = _mm512_castpd_si512(dc);
+                let ab =
+                    _mm512_inserti64x4(_mm512_castsi256_si512(iv), _mm512_castsi512_si256(jq), 1);
+                let ds = _mm512_inserti64x4(dq, sh, 1);
+                for (m, ix) in idx.iter().enumerate() {
+                    _mm512_storeu_si512(
+                        at.add(8 * m) as *mut _,
+                        _mm512_permutex2var_epi64(ab, *ix, ds),
+                    );
+                }
+                if k > 4 {
+                    let ab = _mm512_inserti64x4(
+                        _mm512_castsi256_si512(iv),
+                        _mm512_extracti64x4_epi64(jq, 1),
+                        1,
+                    );
+                    let ds = _mm512_inserti64x4(
+                        _mm512_castsi256_si512(_mm512_extracti64x4_epi64(dq, 1)),
+                        sh,
+                        1,
+                    );
+                    let at = at.add(40);
+                    for (m, ix) in idx.iter().enumerate() {
+                        _mm512_storeu_si512(
+                            at.add(8 * m) as *mut _,
+                            _mm512_permutex2var_epi64(ab, *ix, ds),
+                        );
+                    }
+                }
+            }
+            n += 2 * k;
+        }};
+    }
+    macro_rules! lanes {
+        ($s:expr, $slot:expr, $tm:expr, $src:expr, $jx:expr, $jy:expr, $jz:expr, $jr:expr, $jids:expr) => {{
+            let (iu, ax, ay, az, pp, thr) = $src;
+            let t = _mm512_fmadd_pd(
+                $jz,
+                az,
+                _mm512_fmadd_pd($jy, ay, _mm512_fmadd_pd($jx, ax, $jr)),
+            );
+            let hi: u8 = _mm512_mask_cmp_pd_mask($tm, t, thr, _CMP_LT_OQ);
+            if hi != 0 {
+                let d2v = _mm512_add_pd(t, pp);
+                let lo: u8 = _mm512_mask_cmp_pd_mask(hi, d2v, cut_lo, _CMP_LT_OQ);
+                if lo == hi {
+                    emit!(lo, iu, d2v, $jids);
+                } else {
+                    direct!($s, $slot, hi);
+                }
+            }
+        }};
+    }
+    macro_rules! load {
+        ($slot:expr, $j_hi:expr) => {{
+            let slot = $slot;
+            if slot + 8 <= $j_hi {
+                (
+                    0xffu8,
+                    _mm512_loadu_pd(c.rx.add(slot)),
+                    _mm512_loadu_pd(c.ry.add(slot)),
+                    _mm512_loadu_pd(c.rz.add(slot)),
+                    _mm512_loadu_pd(c.r2.add(slot)),
+                    _mm256_loadu_si256(c.id.add(slot) as *const __m256i),
+                )
+            } else {
+                let tm: u8 = ((1u32 << ($j_hi - slot)) - 1) as u8;
+                (
+                    tm,
+                    _mm512_maskz_loadu_pd(tm, c.rx.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.ry.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.rz.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.r2.add(slot)),
+                    _mm256_maskz_loadu_epi32(tm, c.id.add(slot) as *const i32),
+                )
+            }
+        }};
+    }
+    let j_hi = block.j_hi;
+    if !block.tri {
+        let mut s = block.i_lo;
+        while s + 4 <= block.i_hi {
+            let s0 = source!(s);
+            let s1 = source!(s + 1);
+            let s2 = source!(s + 2);
+            let s3 = source!(s + 3);
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                lanes!(s + 1, slot, tm, s1, jx, jy, jz, jr, jids);
+                lanes!(s + 2, slot, tm, s2, jx, jy, jz, jr, jids);
+                lanes!(s + 3, slot, tm, s3, jx, jy, jz, jr, jids);
+                slot += 8;
+            }
+            s += 4;
+        }
+        while s < block.i_hi {
+            let s0 = source!(s);
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                slot += 8;
+            }
+            s += 1;
+        }
+    } else {
+        for s in block.i_lo..block.i_hi {
+            let s0 = source!(s);
+            let mut slot = s + 1;
+            while slot < j_hi {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                slot += 8;
+            }
+        }
+    }
+    out.n = n;
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+impl Plan {
+    fn tile_cols(&self) -> TileCols {
+        let c = &self.grid.coords;
+        TileCols {
+            x: c.x.as_ptr(),
+            y: c.y.as_ptr(),
+            z: c.z.as_ptr(),
+            rx: c.rx.as_ptr(),
+            ry: c.ry.as_ptr(),
+            rz: c.rz.as_ptr(),
+            r2: c.r2.as_ptr(),
+            id: c.id.as_ptr(),
+        }
+    }
+
+    /// `visit(block)` for the home block and every partner of each bin,
+    /// in bin order.
+    fn each_block(&self, mut visit: impl FnMut(&Block)) {
+        let ncell = self.grid.offsets.len() - 1;
+        for cell in 0..ncell {
+            let lo = self.grid.offsets[cell];
+            let hi = self.grid.offsets[cell + 1];
+            if lo == hi {
+                continue;
+            }
+            if hi - lo >= 2 {
+                visit(&Block {
+                    i_lo: lo,
+                    i_hi: hi,
+                    j_lo: lo,
+                    j_hi: hi,
+                    shift_s: [0, 0, 0],
+                    shift: [0.0; 3],
+                    delta: [0.0; 3],
+                    tri: true,
+                });
+            }
+            let (p0, p1) = (self.partners.off[cell], self.partners.off[cell + 1]);
+            for p in &self.partners.items[p0..p1] {
+                visit(&Block {
+                    i_lo: lo,
+                    i_hi: hi,
+                    j_lo: p.lo,
+                    j_hi: p.hi,
+                    shift_s: p.shift_s,
+                    shift: p.shift,
+                    delta: p.delta,
+                    tri: false,
+                });
+            }
+        }
+    }
+
+    /// Rows a block can add, plus the unkept registers past them.
+    fn block_room(block: &Block) -> usize {
+        2 * (block.i_hi - block.i_lo) * (block.j_hi - block.j_lo) + FUSED_SLACK
+    }
+
+    /// [`Plan::fused`]: every row appended from the tile kernel.
+    fn fused_rows(&self, words: &RowWords) -> Vec<Pair> {
+        let _timer = crate::pop::JobTimer::new();
+        let cols = self.tile_cols();
+        let guess = 2 * self.walk().guess_hits(self.grid.atoms()) + FUSED_SLACK;
+        let mut out: Vec<Pair> = Vec::with_capacity(guess);
+        let mut n = 0usize;
+        self.each_block(|block| {
+            let room = Self::block_room(block);
+            if out.capacity() - n < room {
+                // Safety: the first `n` rows are written.
+                unsafe { out.set_len(n) };
+                out.reserve(room);
+            }
+            let mut fo = FusedOut {
+                rows: out.as_mut_ptr() as *mut u64,
+                ci: std::ptr::null_mut(),
+                cj: std::ptr::null_mut(),
+                cs: std::ptr::null_mut(),
+                cd: std::ptr::null_mut(),
+                n,
+            };
+            // Safety: AVX-512 was detected for this plan, and `out` has
+            // room for `n` plus the block plus the slack.
+            unsafe { avx512_fused::<false>(cols, self.cut2, self.margin, block, words, &mut fo) };
+            n = fo.n;
+        });
+        // Safety: every row below `n` is written.
+        unsafe { out.set_len(n) };
+        out
+    }
+
+    /// [`Plan::fused`] into four columns.
+    fn fused_columns(&self, out: &mut PairColumns) {
+        let _timer = crate::pop::JobTimer::new();
+        let words = match RowWords::of_pair() {
+            Some(w) => w,
+            None => return self.search().fill_columns(out),
+        };
+        let cols = self.tile_cols();
+        out.i.clear();
+        out.j.clear();
+        out.shift.clear();
+        out.dist2.clear();
+        let guess = 2 * self.walk().guess_hits(self.grid.atoms()) + FUSED_SLACK;
+        let grow = |out: &mut PairColumns, n: usize, room: usize| {
+            // Safety: the first `n` rows of every column are written.
+            unsafe {
+                out.i.set_len(n);
+                out.j.set_len(n);
+                out.shift.set_len(n);
+                out.dist2.set_len(n);
+            }
+            out.i.reserve(room);
+            out.j.reserve(room);
+            out.shift.reserve(room);
+            out.dist2.reserve(room);
+        };
+        grow(out, 0, guess);
+        let mut n = 0usize;
+        self.each_block(|block| {
+            let room = Self::block_room(block);
+            let cap = out
+                .i
+                .capacity()
+                .min(out.j.capacity())
+                .min(out.shift.capacity())
+                .min(out.dist2.capacity());
+            if cap - n < room {
+                grow(out, n, room);
+            }
+            let mut fo = FusedOut {
+                rows: std::ptr::null_mut(),
+                ci: out.i.as_mut_ptr(),
+                cj: out.j.as_mut_ptr(),
+                cs: out.shift.as_mut_ptr() as *mut i32,
+                cd: out.dist2.as_mut_ptr(),
+                n,
+            };
+            // Safety: AVX-512 was detected for this plan, and every column
+            // has room for `n` plus the block plus the slack.
+            unsafe { avx512_fused::<true>(cols, self.cut2, self.margin, block, &words, &mut fo) };
+            n = fo.n;
+        });
+        // Safety: every row below `n` is written in every column.
+        unsafe {
+            out.i.set_len(n);
+            out.j.set_len(n);
+            out.shift.set_len(n);
+            out.dist2.set_len(n);
+        }
+    }
+}
+
 impl Walk<'_> {
     fn scan_block(&self, scratch: &mut Scratch, block: &Block) {
         if block.i_lo >= block.i_hi || block.j_lo >= block.j_hi {
@@ -844,19 +1988,22 @@ impl Walk<'_> {
                 return;
             }
             let before = scratch.js.len();
-            scratch.reserve_more(ns * span);
+            scratch.reserve_more(ns * span + STORE_SLACK);
             #[cfg(linkcell_avx512)]
             if self.simd == 2 {
+                let c = &self.grid.coords;
+                let cols = TileCols {
+                    x: c.x.as_ptr(),
+                    y: c.y.as_ptr(),
+                    z: c.z.as_ptr(),
+                    rx: c.rx.as_ptr(),
+                    ry: c.ry.as_ptr(),
+                    rz: c.rz.as_ptr(),
+                    r2: c.r2.as_ptr(),
+                    id: c.id.as_ptr(),
+                };
                 unsafe {
-                    avx512_scan(
-                        &self.coords.x,
-                        &self.coords.y,
-                        &self.coords.z,
-                        &self.mesh.occupants,
-                        self.cut2,
-                        block,
-                        scratch,
-                    );
+                    avx512_scan(cols, self.cut2, self.margin, block, scratch);
                 }
                 scratch.note(before, block.shift_s);
                 return;
@@ -864,10 +2011,10 @@ impl Walk<'_> {
             if self.simd >= 1 {
                 unsafe {
                     avx_scan(
-                        &self.coords.x,
-                        &self.coords.y,
-                        &self.coords.z,
-                        &self.mesh.occupants,
+                        &self.grid.coords.x,
+                        &self.grid.coords.y,
+                        &self.grid.coords.z,
+                        &self.grid.coords.id,
                         self.cut2,
                         block,
                         scratch,
@@ -890,21 +2037,22 @@ impl Walk<'_> {
             if j_lo >= block.j_hi {
                 continue;
             }
-            let i = self.mesh.occupants[s];
-            let px = self.coords.x[s] - sx;
-            let py = self.coords.y[s] - sy;
-            let pz = self.coords.z[s] - sz;
+            let c = &self.grid.coords;
+            let i = c.id[s];
+            let px = c.x[s] - sx;
+            let py = c.y[s] - sy;
+            let pz = c.z[s] - sz;
             for slot in j_lo..block.j_hi {
-                let dx = self.coords.x[slot] - px;
-                let dy = self.coords.y[slot] - py;
-                let dz = self.coords.z[slot] - pz;
+                let dx = c.x[slot] - px;
+                let dy = c.y[slot] - py;
+                let dz = c.z[slot] - pz;
                 let d2 = dx * dx + dy * dy + dz * dz;
                 if d2 < self.cut2 {
-                    let j = self.mesh.occupants[slot];
+                    let j = c.id[slot];
                     if j == i && block.shift_s == [0, 0, 0] {
                         continue;
                     }
-                    scratch.push(i as u32, j as u64, d2);
+                    scratch.push(i, j, d2);
                 }
             }
         }
@@ -912,8 +2060,8 @@ impl Walk<'_> {
     }
 
     fn append_cell(&self, scratch: &mut Scratch, cell: usize) {
-        let lo = self.mesh.offsets[cell];
-        let hi = self.mesh.offsets[cell + 1];
+        let lo = self.grid.offsets[cell];
+        let hi = self.grid.offsets[cell + 1];
         if lo == hi {
             return;
         }
@@ -927,6 +2075,7 @@ impl Walk<'_> {
                     j_hi: hi,
                     shift_s: [0, 0, 0],
                     shift: [0.0; 3],
+                    delta: [0.0; 3],
                     tri: true,
                 },
             );
@@ -943,6 +2092,7 @@ impl Walk<'_> {
                     j_hi: partner.hi,
                     shift_s: partner.shift_s,
                     shift: partner.shift,
+                    delta: partner.delta,
                     tri: false,
                 },
             );
@@ -952,11 +2102,11 @@ impl Walk<'_> {
     /// Ideal-gas hit count for `n_src` sources, with a quarter more.
     /// A denser shell grows the buffer.
     fn guess_hits(&self, n_src: usize) -> usize {
-        let w = self.mesh.widths;
+        let w = self.grid.widths;
         let volume = (w[0] * w[1] * w[2]).max(1.0e-30);
         let radius = self.cut2.sqrt();
         let shell = 4.1887902047863905 * radius * radius * radius;
-        let n = self.mesh.folded.len().max(1) as f64;
+        let n = self.grid.atoms().max(1) as f64;
         let neighbors = (n * shell / volume).ceil().max(1.0);
         ((n_src as f64) * neighbors * 0.5 * 1.25) as usize
     }
@@ -964,7 +2114,7 @@ impl Walk<'_> {
     fn fill_range(&self, start: usize, end: usize) -> Scratch {
         let _timer = crate::pop::JobTimer::new();
         let mut scratch = Scratch::new();
-        let n_src = self.mesh.offsets[end] - self.mesh.offsets[start];
+        let n_src = self.grid.offsets[end] - self.grid.offsets[start];
         scratch.reserve_more(self.guess_hits(n_src));
         for cell in start..end {
             self.append_cell(&mut scratch, cell);
@@ -972,23 +2122,23 @@ impl Walk<'_> {
         scratch
     }
 
-    /// Hits by cell range: one range per thread from 512 atoms up.
-    fn collect(&self) -> Vec<Scratch> {
-        let ncell = self.mesh.offsets.len() - 1;
+    /// Hits by cell range: with several threads, thread `k` searches
+    /// range `k`, so the writer on that thread reads its own cache.
+    fn collect(&self, threads: usize) -> Vec<Scratch> {
+        let ncell = self.grid.offsets.len() - 1;
         #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            let threads = rayon::current_num_threads().max(1);
-            if threads > 1 && ncell > 1 && self.mesh.occupants.len() >= PARALLEL_PAIRS {
-                let ranges = cell_ranges(&self.mesh.offsets, threads);
-                if ranges.len() > 1 {
-                    return ranges
-                        .into_par_iter()
-                        .map(|(start, end)| self.fill_range(start, end))
-                        .collect();
-                }
+        if threads > 1 && ncell > 1 {
+            let ranges = cell_ranges(&self.grid.offsets, threads);
+            if ranges.len() > 1 && ranges.len() <= rayon::current_num_threads() {
+                let found: Vec<Option<Scratch>> = rayon::broadcast(|ctx| {
+                    ranges
+                        .get(ctx.index())
+                        .map(|&(start, end)| self.fill_range(start, end))
+                });
+                return found.into_iter().flatten().collect();
             }
         }
+        let _ = threads;
         vec![self.fill_range(0, ncell)]
     }
 }
@@ -1030,198 +2180,189 @@ fn cell_ranges(offsets: &[usize], threads: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// Slot columns one AVX-512 tile reads.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[derive(Clone, Copy)]
+struct TileCols {
+    x: *const f64,
+    y: *const f64,
+    z: *const f64,
+    rx: *const f64,
+    ry: *const f64,
+    rz: *const f64,
+    r2: *const f64,
+    id: *const u32,
+}
+
 /// # Safety
-/// `block` indexes `xs`, `ys`, `zs`, and `ids`. `scratch` holds every pair in the block.
+/// `block` indexes every column of `c`. `scratch` has room for every
+/// pair in the block plus [`STORE_SLACK`] slots.
+///
+/// A source `p` in the block, moved by `block.delta`, is `p'` relative
+/// to the target bin's corner. Each lane forms
+/// `t = |r_q|^2 - 2 r_q . p'` with three fused multiply-adds, and
+/// `t + |p'|^2` is its squared distance. A lane within `margin` of
+/// `cut2` is decided by the direct `|q - (p - S)|^2` of [`Walk::scan_scalar`].
 #[allow(clippy::incompatible_msrv)]
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,avx512vl,popcnt,fma")]
 #[inline(never)]
-unsafe fn avx512_scan(
-    xs: &[f64],
-    ys: &[f64],
-    zs: &[f64],
-    ids: &[usize],
-    cut2: f64,
-    block: &Block,
-    scratch: &mut Scratch,
-) {
-    use std::arch::x86_64::_mm512_mask_compressstoreu_epi64;
-    use std::arch::x86_64::_mm512_mask_compressstoreu_pd;
+unsafe fn avx512_scan(c: TileCols, cut2: f64, margin: f64, block: &Block, scratch: &mut Scratch) {
     use std::arch::x86_64::{
-        __m512i, _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_loadu_pd, _mm512_loadu_si512,
-        _mm512_mul_pd, _mm512_set1_pd, _mm512_sub_pd, _CMP_LT_OQ,
+        __m256i, _mm256_loadu_si256, _mm256_maskz_compress_epi32, _mm256_maskz_loadu_epi32,
+        _mm256_set1_epi32, _mm256_storeu_si256, _mm512_add_pd, _mm512_fmadd_pd, _mm512_loadu_pd,
+        _mm512_mask_cmp_pd_mask, _mm512_maskz_compress_pd, _mm512_maskz_loadu_pd, _mm512_set1_pd,
+        _mm512_storeu_pd, _CMP_LT_OQ,
     };
-    let xp = xs.as_ptr();
-    let yp = ys.as_ptr();
-    let zp = zs.as_ptr();
-    let idp = ids.as_ptr();
     let atom_p = scratch.atom.as_mut_ptr();
     let js_p = scratch.js.as_mut_ptr();
     let d2_p = scratch.d2.as_mut_ptr();
     let mut n = scratch.js.len();
-    let sx = block.shift[0];
-    let sy = block.shift[1];
-    let sz = block.shift[2];
-    let skip_self = block.shift_s == [0, 0, 0];
-    let cutv = _mm512_set1_pd(cut2);
+    let [sx, sy, sz] = block.shift;
+    let [ox, oy, oz] = block.delta;
+    let cut_lo = _mm512_set1_pd(cut2 - margin);
+    let cut_hi = cut2 + margin;
 
-    macro_rules! take8 {
-        ($mask:expr, $d2v:expr, $jids:expr, $iu:expr) => {{
-            let mask = $mask;
-            if mask != 0 {
-                let c = mask.count_ones() as usize;
-                _mm512_mask_compressstoreu_pd(d2_p.add(n), mask, $d2v);
-                _mm512_mask_compressstoreu_epi64(js_p.add(n) as *mut i64, mask, $jids);
-                let iu = $iu;
-                let end = n + c;
-                let mut k = n;
-                while k < end {
-                    atom_p.add(k).write(iu);
-                    k += 1;
-                }
-                n = end;
-            }
-        }};
-    }
-    macro_rules! dist8 {
-        ($jx:expr, $jy:expr, $jz:expr, $bx:expr, $by:expr, $bz:expr) => {{
-            let dx = _mm512_sub_pd($jx, $bx);
-            let dy = _mm512_sub_pd($jy, $by);
-            let dz = _mm512_sub_pd($jz, $bz);
-            _mm512_add_pd(
-                _mm512_add_pd(_mm512_mul_pd(dx, dx), _mm512_mul_pd(dy, dy)),
-                _mm512_mul_pd(dz, dz),
-            )
-        }};
-    }
-    macro_rules! keep_one {
-        ($i:expr, $iu:expr, $px:expr, $py:expr, $pz:expr, $j:expr, $jx:expr, $jy:expr, $jz:expr) => {{
-            let i = $i;
-            let j = $j;
-            if !(skip_self && j == i) {
-                let dx = $jx - $px;
-                let dy = $jy - $py;
-                let dz = $jz - $pz;
+    // Lanes of one source the expanded form cannot decide: the direct
+    // formula, one lane at a time.
+    macro_rules! direct {
+        ($s:expr, $slot:expr, $mask:expr) => {{
+            let s = $s;
+            let iu = *c.id.add(s);
+            let px = *c.x.add(s) - sx;
+            let py = *c.y.add(s) - sy;
+            let pz = *c.z.add(s) - sz;
+            let mut bits: u32 = u32::from($mask);
+            while bits != 0 {
+                let slot = $slot + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let dx = *c.x.add(slot) - px;
+                let dy = *c.y.add(slot) - py;
+                let dz = *c.z.add(slot) - pz;
                 let d2 = dx * dx + dy * dy + dz * dz;
                 if d2 < cut2 {
-                    atom_p.add(n).write($iu);
-                    js_p.add(n).write(j as u64);
+                    atom_p.add(n).write(iu);
+                    js_p.add(n).write(*c.id.add(slot));
                     d2_p.add(n).write(d2);
                     n += 1;
                 }
             }
         }};
     }
-    macro_rules! one_src {
-        ($s:expr, $j_lo:expr) => {{
+    // A source: its id lane, -2 p', |p'|^2, and the threshold on `t`.
+    macro_rules! source {
+        ($s:expr) => {{
             let s = $s;
-            let j_lo = $j_lo;
-            if j_lo < block.j_hi {
-                let i = *idp.add(s);
-                let iu = i as u32;
-                let px = *xp.add(s) - sx;
-                let py = *yp.add(s) - sy;
-                let pz = *zp.add(s) - sz;
-                let bx = _mm512_set1_pd(px);
-                let by = _mm512_set1_pd(py);
-                let bz = _mm512_set1_pd(pz);
-                let span = block.j_hi - j_lo;
-                let end = j_lo + (span & !7);
-                let mut slot = j_lo;
-                while slot < end {
-                    let jx = _mm512_loadu_pd(xp.add(slot));
-                    let jy = _mm512_loadu_pd(yp.add(slot));
-                    let jz = _mm512_loadu_pd(zp.add(slot));
-                    let jids = _mm512_loadu_si512(idp.add(slot) as *const __m512i);
-                    let d2v = dist8!(jx, jy, jz, bx, by, bz);
-                    let mask = _mm512_cmp_pd_mask(d2v, cutv, _CMP_LT_OQ);
-                    take8!(mask, d2v, jids, iu);
-                    slot += 8;
-                }
-                for slot in end..block.j_hi {
-                    let j = *idp.add(slot);
-                    let jx = *xp.add(slot);
-                    let jy = *yp.add(slot);
-                    let jz = *zp.add(slot);
-                    keep_one!(i, iu, px, py, pz, j, jx, jy, jz);
+            let px = *c.rx.add(s) + ox;
+            let py = *c.ry.add(s) + oy;
+            let pz = *c.rz.add(s) + oz;
+            let pp = px * px + py * py + pz * pz;
+            (
+                _mm256_set1_epi32(*c.id.add(s) as i32),
+                _mm512_set1_pd(-2.0 * px),
+                _mm512_set1_pd(-2.0 * py),
+                _mm512_set1_pd(-2.0 * pz),
+                _mm512_set1_pd(pp),
+                _mm512_set1_pd(cut_hi - pp),
+            )
+        }};
+    }
+    // Hit lanes are compressed in a register and stored at full width.
+    // Lanes past the hit count are scratch that the next store or
+    // `finish` overwrites; `STORE_SLACK` keeps them inside capacity.
+    // The occupants of a mesh are distinct atoms, so a zero-shift block
+    // never pairs an atom with itself: the home cell starts at `s + 1`
+    // and every partner is another bin.
+    macro_rules! lanes {
+        ($s:expr, $slot:expr, $tm:expr, $src:expr, $jx:expr, $jy:expr, $jz:expr, $jr:expr, $jids:expr) => {{
+            let (iv, ax, ay, az, pp, thr) = $src;
+            let t = _mm512_fmadd_pd(
+                $jz,
+                az,
+                _mm512_fmadd_pd($jy, ay, _mm512_fmadd_pd($jx, ax, $jr)),
+            );
+            let hi: u8 = _mm512_mask_cmp_pd_mask($tm, t, thr, _CMP_LT_OQ);
+            if hi != 0 {
+                let d2v = _mm512_add_pd(t, pp);
+                let lo: u8 = _mm512_mask_cmp_pd_mask(hi, d2v, cut_lo, _CMP_LT_OQ);
+                if lo == hi {
+                    _mm512_storeu_pd(d2_p.add(n), _mm512_maskz_compress_pd(lo, d2v));
+                    _mm256_storeu_si256(
+                        js_p.add(n) as *mut __m256i,
+                        _mm256_maskz_compress_epi32(lo, $jids),
+                    );
+                    _mm256_storeu_si256(atom_p.add(n) as *mut __m256i, iv);
+                    n += lo.count_ones() as usize;
+                } else {
+                    direct!($s, $slot, hi);
                 }
             }
         }};
     }
+    macro_rules! load {
+        ($slot:expr, $j_hi:expr) => {{
+            let slot = $slot;
+            if slot + 8 <= $j_hi {
+                (
+                    0xffu8,
+                    _mm512_loadu_pd(c.rx.add(slot)),
+                    _mm512_loadu_pd(c.ry.add(slot)),
+                    _mm512_loadu_pd(c.rz.add(slot)),
+                    _mm512_loadu_pd(c.r2.add(slot)),
+                    _mm256_loadu_si256(c.id.add(slot) as *const __m256i),
+                )
+            } else {
+                let tm: u8 = ((1u32 << ($j_hi - slot)) - 1) as u8;
+                (
+                    tm,
+                    _mm512_maskz_loadu_pd(tm, c.rx.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.ry.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.rz.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.r2.add(slot)),
+                    _mm256_maskz_loadu_epi32(tm, c.id.add(slot) as *const i32),
+                )
+            }
+        }};
+    }
 
+    let j_hi = block.j_hi;
     if !block.tri {
-        let j_lo = block.j_lo;
-        let j_hi = block.j_hi;
-        let end = j_lo + ((j_hi - j_lo) & !7);
         let mut s = block.i_lo;
         while s + 4 <= block.i_hi {
-            let i0 = *idp.add(s);
-            let i1 = *idp.add(s + 1);
-            let i2 = *idp.add(s + 2);
-            let i3 = *idp.add(s + 3);
-            let iu0 = i0 as u32;
-            let iu1 = i1 as u32;
-            let iu2 = i2 as u32;
-            let iu3 = i3 as u32;
-            let p0x = *xp.add(s) - sx;
-            let p0y = *yp.add(s) - sy;
-            let p0z = *zp.add(s) - sz;
-            let p1x = *xp.add(s + 1) - sx;
-            let p1y = *yp.add(s + 1) - sy;
-            let p1z = *zp.add(s + 1) - sz;
-            let p2x = *xp.add(s + 2) - sx;
-            let p2y = *yp.add(s + 2) - sy;
-            let p2z = *zp.add(s + 2) - sz;
-            let p3x = *xp.add(s + 3) - sx;
-            let p3y = *yp.add(s + 3) - sy;
-            let p3z = *zp.add(s + 3) - sz;
-            let b0x = _mm512_set1_pd(p0x);
-            let b0y = _mm512_set1_pd(p0y);
-            let b0z = _mm512_set1_pd(p0z);
-            let b1x = _mm512_set1_pd(p1x);
-            let b1y = _mm512_set1_pd(p1y);
-            let b1z = _mm512_set1_pd(p1z);
-            let b2x = _mm512_set1_pd(p2x);
-            let b2y = _mm512_set1_pd(p2y);
-            let b2z = _mm512_set1_pd(p2z);
-            let b3x = _mm512_set1_pd(p3x);
-            let b3y = _mm512_set1_pd(p3y);
-            let b3z = _mm512_set1_pd(p3z);
-            let mut slot = j_lo;
-            while slot < end {
-                let jx = _mm512_loadu_pd(xp.add(slot));
-                let jy = _mm512_loadu_pd(yp.add(slot));
-                let jz = _mm512_loadu_pd(zp.add(slot));
-                let jids = _mm512_loadu_si512(idp.add(slot) as *const __m512i);
-                let d0 = dist8!(jx, jy, jz, b0x, b0y, b0z);
-                let d1 = dist8!(jx, jy, jz, b1x, b1y, b1z);
-                let d2v = dist8!(jx, jy, jz, b2x, b2y, b2z);
-                let d3 = dist8!(jx, jy, jz, b3x, b3y, b3z);
-                take8!(_mm512_cmp_pd_mask(d0, cutv, _CMP_LT_OQ), d0, jids, iu0);
-                take8!(_mm512_cmp_pd_mask(d1, cutv, _CMP_LT_OQ), d1, jids, iu1);
-                take8!(_mm512_cmp_pd_mask(d2v, cutv, _CMP_LT_OQ), d2v, jids, iu2);
-                take8!(_mm512_cmp_pd_mask(d3, cutv, _CMP_LT_OQ), d3, jids, iu3);
+            let s0 = source!(s);
+            let s1 = source!(s + 1);
+            let s2 = source!(s + 2);
+            let s3 = source!(s + 3);
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                lanes!(s + 1, slot, tm, s1, jx, jy, jz, jr, jids);
+                lanes!(s + 2, slot, tm, s2, jx, jy, jz, jr, jids);
+                lanes!(s + 3, slot, tm, s3, jx, jy, jz, jr, jids);
                 slot += 8;
-            }
-            for slot in end..j_hi {
-                let j = *idp.add(slot);
-                let jx = *xp.add(slot);
-                let jy = *yp.add(slot);
-                let jz = *zp.add(slot);
-                keep_one!(i0, iu0, p0x, p0y, p0z, j, jx, jy, jz);
-                keep_one!(i1, iu1, p1x, p1y, p1z, j, jx, jy, jz);
-                keep_one!(i2, iu2, p2x, p2y, p2z, j, jx, jy, jz);
-                keep_one!(i3, iu3, p3x, p3y, p3z, j, jx, jy, jz);
             }
             s += 4;
         }
         while s < block.i_hi {
-            one_src!(s, j_lo);
+            let s0 = source!(s);
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                slot += 8;
+            }
             s += 1;
         }
     } else {
         for s in block.i_lo..block.i_hi {
-            one_src!(s, s + 1);
+            let s0 = source!(s);
+            let mut slot = s + 1;
+            while slot < j_hi {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                slot += 8;
+            }
         }
     }
     scratch.finish(n);
@@ -1236,7 +2377,7 @@ unsafe fn avx_scan(
     xs: &[f64],
     ys: &[f64],
     zs: &[f64],
-    ids: &[usize],
+    ids: &[u32],
     cut2: f64,
     block: &Block,
     scratch: &mut Scratch,
@@ -1269,7 +2410,7 @@ unsafe fn avx_scan(
                     let j = *idp.add($slot);
                     if !(skip_self && j == iatom) {
                         atom_p.add(n).write($iu);
-                        js_p.add(n).write(j as u64);
+                        js_p.add(n).write(j);
                         d2_p.add(n).write(lane[0]);
                         n += 1;
                     }
@@ -1278,7 +2419,7 @@ unsafe fn avx_scan(
                     let j = *idp.add($slot + 1);
                     if !(skip_self && j == iatom) {
                         atom_p.add(n).write($iu);
-                        js_p.add(n).write(j as u64);
+                        js_p.add(n).write(j);
                         d2_p.add(n).write(lane[1]);
                         n += 1;
                     }
@@ -1287,7 +2428,7 @@ unsafe fn avx_scan(
                     let j = *idp.add($slot + 2);
                     if !(skip_self && j == iatom) {
                         atom_p.add(n).write($iu);
-                        js_p.add(n).write(j as u64);
+                        js_p.add(n).write(j);
                         d2_p.add(n).write(lane[2]);
                         n += 1;
                     }
@@ -1296,7 +2437,7 @@ unsafe fn avx_scan(
                     let j = *idp.add($slot + 3);
                     if !(skip_self && j == iatom) {
                         atom_p.add(n).write($iu);
-                        js_p.add(n).write(j as u64);
+                        js_p.add(n).write(j);
                         d2_p.add(n).write(lane[3]);
                         n += 1;
                     }
@@ -1321,7 +2462,7 @@ unsafe fn avx_scan(
             let j_lo = $j_lo;
             if j_lo < block.j_hi {
                 let i = *idp.add(s);
-                let iu = i as u32;
+                let iu = i;
                 let px = *xp.add(s) - sx;
                 let py = *yp.add(s) - sy;
                 let pz = *zp.add(s) - sz;
@@ -1351,7 +2492,7 @@ unsafe fn avx_scan(
                     let d2 = dx * dx + dy * dy + dz * dz;
                     if d2 < cut2 {
                         atom_p.add(n).write(iu);
-                        js_p.add(n).write(j as u64);
+                        js_p.add(n).write(j);
                         d2_p.add(n).write(d2);
                         n += 1;
                     }
@@ -1368,8 +2509,8 @@ unsafe fn avx_scan(
         while s + 2 <= block.i_hi {
             let i0 = *idp.add(s);
             let i1 = *idp.add(s + 1);
-            let iu0 = i0 as u32;
-            let iu1 = i1 as u32;
+            let iu0 = i0;
+            let iu1 = i1;
             let p0x = *xp.add(s) - sx;
             let p0y = *yp.add(s) - sy;
             let p0z = *zp.add(s) - sz;
@@ -1417,7 +2558,7 @@ unsafe fn avx_scan(
                     let d2 = dx * dx + dy * dy + dz * dz;
                     if d2 < cut2 {
                         atom_p.add(n).write(iu0);
-                        js_p.add(n).write(j as u64);
+                        js_p.add(n).write(j);
                         d2_p.add(n).write(d2);
                         n += 1;
                     }
@@ -1429,7 +2570,7 @@ unsafe fn avx_scan(
                     let d2 = dx * dx + dy * dy + dz * dz;
                     if d2 < cut2 {
                         atom_p.add(n).write(iu1);
-                        js_p.add(n).write(j as u64);
+                        js_p.add(n).write(j);
                         d2_p.add(n).write(d2);
                         n += 1;
                     }
@@ -1509,6 +2650,143 @@ mod tests {
             assert_eq!(got_row.0, brute_row.0);
             assert_eq!(got_row.1, brute_row.1);
             assert!((got_row.2 - brute_row.2).abs() < 1e-9);
+        }
+    }
+
+    /// Run `f` on a pool of `threads` workers.
+    fn on_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+        #[cfg(feature = "parallel")]
+        {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(f)
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let _ = threads;
+            f()
+        }
+    }
+
+    fn row_keys(rows: &[Pair]) -> Vec<(usize, usize, [i32; 3], u64)> {
+        let mut k: Vec<_> = rows
+            .iter()
+            .map(|p| (p.i, p.j, p.shift, p.dist2.to_bits()))
+            .collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn one_thread_and_eight_write_the_same_rows() {
+        // 1000 jittered points: the one-thread call writes rows straight
+        // from the tile kernel, the eight-thread call buffers hits first.
+        let sim = Cell::ortho(18.0, 17.0, 19.0).unwrap();
+        let mut xyz = Vec::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for iz in 0..10 {
+            for iy in 0..10 {
+                for ix in 0..10 {
+                    xyz.push([
+                        (ix as f64 + 0.3 * next()) * 1.8,
+                        (iy as f64 + 0.3 * next()) * 1.7,
+                        (iz as f64 + 0.3 * next()) * 1.9,
+                    ]);
+                }
+            }
+        }
+        for half in [false, true] {
+            let one = on_threads(1, || {
+                pairs_within(&xyz, &sim, 4.0, None, None, half).unwrap()
+            });
+            let eight = on_threads(8, || {
+                pairs_within(&xyz, &sim, 4.0, None, None, half).unwrap()
+            });
+            assert_eq!(row_keys(&one), row_keys(&eight), "half={half}");
+            let mut c1 = PairColumns::default();
+            let mut c8 = PairColumns::default();
+            on_threads(1, || {
+                pairs_within_columns(&xyz, &sim, 4.0, None, None, half, &mut c1).unwrap()
+            });
+            on_threads(8, || {
+                pairs_within_columns(&xyz, &sim, 4.0, None, None, half, &mut c8).unwrap()
+            });
+            let cols = |c: &PairColumns| {
+                let mut k: Vec<_> = (0..c.len())
+                    .map(|t| {
+                        (
+                            c.i[t] as usize,
+                            c.j[t] as usize,
+                            c.shift[t],
+                            c.dist2[t].to_bits(),
+                        )
+                    })
+                    .collect();
+                k.sort();
+                k
+            };
+            assert_eq!(cols(&c1), row_keys(&one), "columns half={half}");
+            assert_eq!(cols(&c8), row_keys(&one), "columns eight half={half}");
+        }
+    }
+
+    #[test]
+    fn one_thread_matches_the_shift_scan() {
+        let sim = Cell::ortho(18.0, 18.0, 18.0).unwrap();
+        let mut xyz = Vec::new();
+        for iz in 0..9 {
+            for iy in 0..9 {
+                for ix in 0..9 {
+                    xyz.push([
+                        (ix as f64 + 0.5) * 2.0,
+                        (iy as f64 + 0.5) * 2.0,
+                        (iz as f64 + 0.5) * 2.0,
+                    ]);
+                }
+            }
+        }
+        let cutoff = 4.0;
+        let got = on_threads(1, || {
+            pairs_within(&xyz, &sim, cutoff, None, None, false).unwrap()
+        });
+        let mut keys: Vec<_> = got.iter().map(|p| (p.i, p.j, p.shift)).collect();
+        keys.sort();
+        let mut want = Vec::new();
+        for i in 0..xyz.len() {
+            for j in 0..xyz.len() {
+                for na in -1..=1 {
+                    for nb in -1..=1 {
+                        for nc in -1..=1 {
+                            if i == j && na == 0 && nb == 0 && nc == 0 {
+                                continue;
+                            }
+                            let d2 =
+                                sim.dist2_shifted(xyz[i], xyz[j], sim.lattice_shift(na, nb, nc));
+                            if d2 < cutoff * cutoff {
+                                want.push((i, j, [na, nb, nc]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        want.sort();
+        assert_eq!(keys, want);
+        for p in &got {
+            let d2 = sim.dist2_shifted(
+                xyz[p.i],
+                xyz[p.j],
+                sim.lattice_shift(p.shift[0], p.shift[1], p.shift[2]),
+            );
+            assert!((p.dist2 - d2).abs() < 1e-9);
         }
     }
 

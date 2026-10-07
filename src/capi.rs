@@ -462,7 +462,10 @@ unsafe fn pairs_call<'a>(
         return Ok((key, found));
     }
     let mask_vec: Option<Vec<bool>> = mask_raw.map(|m| m.iter().map(|&v| v != 0).collect());
-    match crate::pairs::search(pts, &sim, cutoff, mask_vec.as_deref(), hint, half != 0) {
+    let found = crate::pairs::in_pool(n, || {
+        crate::pairs::search(pts, &sim, cutoff, mask_vec.as_deref(), hint, half != 0)
+    });
+    match found {
         Ok(found) => Ok((key, found)),
         Err(e) => Err(fail(e)),
     }
