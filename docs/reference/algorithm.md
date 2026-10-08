@@ -282,16 +282,28 @@ rayon. Each source owns its heap. Sources go in bin order, reading
 their own fraction and position and every candidate's position from
 slot-ordered copies, and each writes its own row of the output: a
 neighbour's shell is then still in cache, whatever order the caller's
-points come in. With the 262144-point cube shuffled, one thread takes
-101 ms and eight take 23 ms, against 234 and 39 ms in point order
-before; in the lattice's own order the times do not change. From 8192
-active points upward the
-same feature builds the mesh in parallel: a thread writes each point's
-fractional coordinate once, histograms with atomics, then scatters
-occupants with atomics. Bins are sorted by index afterwards, so the
-occupant order matches the serial build. Below that count the mesh
-stays serial. The cubic hot path is 4096 points and does not take the
-parallel build. `--no-default-features` keeps the whole search serial.
+points come in. Sources go in blocks of two bins a side (one when bins
+hold four points or more), and a block gathers the points of the bins
+one beyond it once, each moved by its image shift as the shell walk
+moves it. A source forms all its distances eight at a time; the
+lane-wise minimum over them is eight distances of eight different
+points, so its k-th smallest bounds the k-th nearest, and only points
+at or under it reach the heap. When the k-th neighbour is within the
+plane bound of the gathered bins the answer is the shell walk's, since
+every other point lies past one of those planes; otherwise the shell
+walk resumes from the heap at its second layer. A test checks indices
+and `dist2` bits against the shell walk. For the 262144-point cube and
+k = 4 one thread takes 37 ms and eight 6.3 ms (64 and 15.6 ms with the
+points shuffled), against 66 and 11 ms (251 and 40 ms) for 0.3.8. From
+8192 active points upward the same feature builds the mesh in parallel:
+a thread writes each point's fractional coordinate and flat bin once
+and counts it into an atomic counter; the offsets are a parallel scan
+over runs of bins (a mesh can have more bins than points), the same
+counters become scatter cursors, and crowded bins are sorted by index
+in parallel, so the occupant order matches the serial build. Below that
+count the mesh stays serial. The cubic hot path is 4096 points and does
+not take the parallel build. `--no-default-features` keeps the whole
+search serial.
 
 `examples/knn_scale.rs` and `examples/pairs_scale.rs` time one fixed
 problem and always record the POP3 hierarchy. `RAYON_NUM_THREADS` has
