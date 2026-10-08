@@ -71,7 +71,31 @@ pub fn pairs_within(
     advise_huge(&mut out);
     let base = RowPtr(out.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
     let (rows, rest) = in_pool(est, || -> Result<(usize, Option<Found>), Error> {
-        let found = plan(xyz, simbox, cutoff, mask, cell_hint, half)?.search();
+        let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+        // A full list on AVX-512 with each thread's rows past L2: each
+        // thread counts its bins' rows, then writes them from the tile
+        // kernel at their offset, so no hit is buffered. A short estimate
+        // falls back to buffered hits.
+        #[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+        if let Some(words) = plan.fused_split().filter(|_| knobs::fused()) {
+            let ranges = cell_ranges(&plan.grid.offsets, plan.threads);
+            // The count costs a second search; it pays once each thread's
+            // rows outgrow L2 and their stores can run behind the tile.
+            let per = rows_guess / ranges.len().max(1);
+            if ranges.len() > 1
+                && ranges.len() <= rayon::current_num_threads()
+                && ahead(per, std::mem::size_of::<Pair>())
+            {
+                let off = plan.fused_offsets(&words, &ranges);
+                let rows = off[ranges.len()];
+                if rows <= rows_guess {
+                    // Safety: `out` holds `rows_guess >= rows` rows.
+                    unsafe { plan.fused_fill(&words, base, &ranges, &off) };
+                    return Ok((rows, None));
+                }
+            }
+        }
+        let found = plan.search();
         let rows = found.rows();
         if rows > rows_guess {
             return Ok((rows, Some(found)));
@@ -2031,9 +2055,13 @@ const AHEAD_ROWS: usize = 52;
 /// stay in a 2 MB L2 gain nothing, and the prefetches cost instructions.
 const AHEAD_FROM: usize = 3 << 20;
 
-/// Tests force the prefetch off (1) or on (2) to compare the rows.
+/// Tests force the prefetch off (1) or on (2) to compare the rows; on
+/// also takes a split full list through [`Plan::fused_fill`].
 #[cfg(test)]
 static AHEAD_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Fills through [`Plan::fused_fill`], counted for the tests.
+#[cfg(test)]
+static FUSED_FILLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether a writer of `rows` rows of `bytes` bytes prefetches ahead.
 fn ahead(rows: usize, bytes: usize) -> bool {
@@ -2891,6 +2919,9 @@ struct FusedOut {
     cs: *mut i32,
     cd: *mut f64,
     n: usize,
+    /// Rows no store may reach: rows past it belong to another thread, so
+    /// a full list's last registers before it are stored under a mask.
+    limit: usize,
 }
 
 /// Mean atoms per bin under which one thread runs the tile inlined into
@@ -2923,6 +2954,7 @@ impl FusedSink for Vec<Pair> {
             cs: std::ptr::null_mut(),
             cd: std::ptr::null_mut(),
             n,
+            limit: usize::MAX,
         }
     }
 }
@@ -2956,9 +2988,62 @@ impl FusedSink for PairColumns {
             cs: self.shift.as_mut_ptr() as *mut i32,
             cd: self.dist2.as_mut_ptr(),
             n,
+            limit: usize::MAX,
         }
     }
 }
+
+/// Counts rows: [`avx512_fused`] with `COUNT` writes nothing.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+struct Counter;
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+impl FusedSink for Counter {
+    fn room(&mut self, n: usize, _room: usize) -> FusedOut {
+        FusedOut {
+            rows: std::ptr::null_mut(),
+            ci: std::ptr::null_mut(),
+            cj: std::ptr::null_mut(),
+            cs: std::ptr::null_mut(),
+            cd: std::ptr::null_mut(),
+            n,
+            limit: usize::MAX,
+        }
+    }
+}
+
+/// The rows below `limit` of a buffer whose rows from `limit` on another
+/// thread writes.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+struct Fixed {
+    rows: *mut u64,
+    limit: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+impl FusedSink for Fixed {
+    fn room(&mut self, n: usize, _room: usize) -> FusedOut {
+        FusedOut {
+            rows: self.rows,
+            ci: std::ptr::null_mut(),
+            cj: std::ptr::null_mut(),
+            cs: std::ptr::null_mut(),
+            cd: std::ptr::null_mut(),
+            n,
+            limit: self.limit,
+        }
+    }
+}
+
+/// What [`avx512_fused`] does with its rows: write them with whole
+/// registers, count them, or write them with the registers that would
+/// pass the sink's limit stored under a mask.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+const PLAIN: u8 = 0;
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+const COUNT: u8 = 1;
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+const BOUNDED: u8 = 2;
 
 /// Rows a hit vector may write past the last row it keeps.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
@@ -2970,7 +3055,8 @@ const FUSED_SLACK: usize = 16;
 /// sixteen column entries) in whole registers; with `HALF`, each hit is
 /// one row on the side [`keep_half`] keeps, so eight hits are five
 /// registers. With `AHEAD`, each store first prefetches the line
-/// [`AHEAD_ROWS`] rows on.
+/// [`AHEAD_ROWS`] rows on. `MODE` is [`PLAIN`], [`COUNT`] (rows counted,
+/// nothing written), or [`BOUNDED`] (no store reaches `out.limit`).
 ///
 /// # Safety
 /// `block` indexes every column of `c`. Every buffer of `out` has room
@@ -2984,6 +3070,7 @@ unsafe fn avx512_fused<
     const INLINED: bool,
     const AHEAD: bool,
     const HALF: bool,
+    const MODE: u8,
 >(
     c: TileCols,
     cut2: f64,
@@ -2998,10 +3085,10 @@ unsafe fn avx512_fused<
         _mm256_set1_epi32, _mm256_storeu_si256, _mm512_add_pd, _mm512_castpd_si512,
         _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_fmadd_pd, _mm512_loadu_pd,
         _mm512_loadu_si512, _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask,
-        _mm512_mask_set1_epi32, _mm512_maskz_compress_pd, _mm512_maskz_loadu_pd,
-        _mm512_permutex2var_epi32, _mm512_permutexvar_epi32, _mm512_permutexvar_pd,
-        _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd,
-        _mm512_storeu_si512, _CMP_LT_OQ, _MM_CMPINT_LT,
+        _mm512_mask_set1_epi32, _mm512_mask_storeu_epi64, _mm512_maskz_compress_pd,
+        _mm512_maskz_loadu_pd, _mm512_permutex2var_epi32, _mm512_permutexvar_epi32,
+        _mm512_permutexvar_pd, _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32,
+        _mm512_setr_epi64, _mm512_storeu_pd, _mm512_storeu_si512, _CMP_LT_OQ, _MM_CMPINT_LT,
     };
     let [sx, sy, sz] = block.shift;
     let [ox, oy, oz] = block.delta;
@@ -3072,7 +3159,10 @@ unsafe fn avx512_fused<
     macro_rules! put_one {
         ($iu:expr, $j:expr, $d2:expr) => {{
             let (a, b, d) = ($iu, $j, $d2);
-            if HALF {
+            if MODE == COUNT {
+                let _ = (a, b, d);
+                n += if HALF { 1 } else { 2 };
+            } else if HALF {
                 let (i, j, s) = if keep_half(a as usize, b as usize, shift_s) {
                     (a, b, shift_s)
                 } else {
@@ -3174,155 +3264,182 @@ unsafe fn avx512_fused<
         ($lo:expr, $iu:expr, $d2v:expr, $jids:expr) => {{
             let lo: u8 = $lo;
             let k = lo.count_ones() as usize;
-            let dc = _mm512_maskz_compress_pd(lo, $d2v);
-            let jc = _mm256_maskz_compress_epi32(lo, $jids);
-            if HALF {
-                // Hit `h` keeps (i, j_h, S) when i < j_h, or for the source's
-                // own image when the shift says so; otherwise (j_h, i, -S).
-                let iv8 = _mm256_set1_epi32($iu as i32);
-                let mut fwd: u8 = _mm256_cmp_epu32_mask::<_MM_CMPINT_LT>(iv8, jc);
-                if self_fwd != 0 {
-                    fwd |= _mm256_cmpeq_epi32_mask(iv8, jc);
-                }
-                let mir = !fwd;
-                if COLS {
-                    if AHEAD {
-                        let at = n + AHEAD_ROWS;
-                        prefetch(out.ci.wrapping_add(at));
-                        prefetch(out.cj.wrapping_add(at));
-                        prefetch(out.cd.wrapping_add(at));
-                        prefetch(out.cs.wrapping_add(3 * at));
-                    }
-                    _mm256_storeu_si256(
-                        out.ci.add(n) as *mut _,
-                        _mm256_mask_blend_epi32(fwd, jc, iv8),
-                    );
-                    _mm256_storeu_si256(
-                        out.cj.add(n) as *mut _,
-                        _mm256_mask_blend_epi32(fwd, iv8, jc),
-                    );
-                    _mm512_storeu_pd(out.cd.add(n), dc);
-                    let m3 = MIRROR3[mir as usize];
-                    _mm512_storeu_si512(
-                        out.cs.add(3 * n) as *mut _,
-                        _mm512_mask_blend_epi32(m3 as u16, s_lo, n_lo),
-                    );
-                    _mm256_storeu_si256(
-                        out.cs.add(3 * n + 16) as *mut _,
-                        _mm256_mask_blend_epi32((m3 >> 16) as u8, s_hi, n_hi),
-                    );
-                } else {
-                    let at = out.rows.add(5 * n);
-                    let a = _mm512_mask_blend_epi32(
-                        0x00ff,
-                        _mm512_mask_set1_epi32(consts, 0x0100, $iu as i32),
-                        _mm512_castsi256_si512(jc),
-                    );
-                    let b = _mm512_castpd_si512(dc);
-                    let pick = &MIRROR32[mir as usize];
-                    let regs = (5 * k + 7) / 8;
-                    for m in 0..regs {
-                        if AHEAD {
-                            prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
-                        }
-                        let ix = _mm512_mask_blend_epi32(
-                            pick[m],
-                            _mm512_loadu_si512(words.half32[0][m].as_ptr() as *const _),
-                            _mm512_loadu_si512(words.half32[1][m].as_ptr() as *const _),
-                        );
-                        _mm512_storeu_si512(
-                            at.add(8 * m) as *mut _,
-                            _mm512_permutex2var_epi32(a, ix, b),
-                        );
-                    }
-                }
-                n += k;
+            if MODE == COUNT {
+                n += if HALF { k } else { 2 * k };
             } else {
-                if COLS {
-                    let at = n + AHEAD_ROWS;
-                    if AHEAD {
-                        prefetch(out.ci.wrapping_add(at));
-                        prefetch(out.cj.wrapping_add(at));
-                        prefetch(out.cd.wrapping_add(at));
-                        prefetch(out.cs.wrapping_add(3 * at));
+                let dc = _mm512_maskz_compress_pd(lo, $d2v);
+                let jc = _mm256_maskz_compress_epi32(lo, $jids);
+                if HALF {
+                    // Hit `h` keeps (i, j_h, S) when i < j_h, or for the source's
+                    // own image when the shift says so; otherwise (j_h, i, -S).
+                    let iv8 = _mm256_set1_epi32($iu as i32);
+                    let mut fwd: u8 = _mm256_cmp_epu32_mask::<_MM_CMPINT_LT>(iv8, jc);
+                    if self_fwd != 0 {
+                        fwd |= _mm256_cmpeq_epi32_mask(iv8, jc);
                     }
-                    let iv = _mm512_set1_epi32($iu as i32);
-                    let jz = _mm512_castsi256_si512(jc);
-                    _mm512_storeu_si512(
-                        out.ci.add(n) as *mut _,
-                        _mm512_permutex2var_epi32(iv, ij, jz),
-                    );
-                    _mm512_storeu_si512(
-                        out.cj.add(n) as *mut _,
-                        _mm512_permutex2var_epi32(iv, ji, jz),
-                    );
-                    _mm512_storeu_pd(out.cd.add(n), _mm512_permutexvar_pd(dup_lo, dc));
-                    let so = out.cs.add(3 * n);
-                    _mm512_storeu_si512(so as *mut _, sv[0]);
-                    if k > 2 {
+                    let mir = !fwd;
+                    if COLS {
                         if AHEAD {
-                            prefetch(out.cs.wrapping_add(3 * at + 16));
+                            let at = n + AHEAD_ROWS;
+                            prefetch(out.ci.wrapping_add(at));
+                            prefetch(out.cj.wrapping_add(at));
+                            prefetch(out.cd.wrapping_add(at));
+                            prefetch(out.cs.wrapping_add(3 * at));
                         }
-                        _mm512_storeu_si512(so.add(16) as *mut _, sv[1]);
-                    }
-                    if k > 4 {
-                        if AHEAD {
-                            prefetch(out.cd.wrapping_add(at + 8));
-                        }
-                        _mm512_storeu_pd(out.cd.add(n + 8), _mm512_permutexvar_pd(dup_hi, dc));
-                    }
-                    if k > 5 {
-                        if AHEAD {
-                            prefetch(out.cs.wrapping_add(3 * at + 32));
-                        }
-                        _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
-                    }
-                } else {
-                    // Dword sources, as in [`RowWords::index32`]: the eight ids
-                    // and this source's constants, then the eight distances, so
-                    // both groups of four hits permute from the same pair.
-                    let at = out.rows.add(5 * n);
-                    let a = _mm512_mask_blend_epi32(
-                        0x00ff,
-                        _mm512_mask_set1_epi32(consts, 0x0100, $iu as i32),
-                        _mm512_castsi256_si512(jc),
-                    );
-                    let b = _mm512_castpd_si512(dc);
-                    // Two rows per hit are ten words: only the registers that
-                    // hold them, so a lone hit takes two stores, not five.
-                    let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
-                    for (m, ix) in words.index32[0].iter().enumerate().take(regs) {
-                        if AHEAD {
-                            prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
-                        }
-                        _mm512_storeu_si512(
-                            at.add(8 * m) as *mut _,
-                            _mm512_permutex2var_epi32(
-                                a,
-                                _mm512_loadu_si512(ix.as_ptr() as *const _),
-                                b,
-                            ),
+                        _mm256_storeu_si256(
+                            out.ci.add(n) as *mut _,
+                            _mm256_mask_blend_epi32(fwd, jc, iv8),
                         );
-                    }
-                    if k > 4 {
-                        let at = at.add(40);
-                        let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
-                        for (m, ix) in words.index32[1].iter().enumerate().take(regs) {
+                        _mm256_storeu_si256(
+                            out.cj.add(n) as *mut _,
+                            _mm256_mask_blend_epi32(fwd, iv8, jc),
+                        );
+                        _mm512_storeu_pd(out.cd.add(n), dc);
+                        let m3 = MIRROR3[mir as usize];
+                        _mm512_storeu_si512(
+                            out.cs.add(3 * n) as *mut _,
+                            _mm512_mask_blend_epi32(m3 as u16, s_lo, n_lo),
+                        );
+                        _mm256_storeu_si256(
+                            out.cs.add(3 * n + 16) as *mut _,
+                            _mm256_mask_blend_epi32((m3 >> 16) as u8, s_hi, n_hi),
+                        );
+                    } else {
+                        let at = out.rows.add(5 * n);
+                        let a = _mm512_mask_blend_epi32(
+                            0x00ff,
+                            _mm512_mask_set1_epi32(consts, 0x0100, $iu as i32),
+                            _mm512_castsi256_si512(jc),
+                        );
+                        let b = _mm512_castpd_si512(dc);
+                        let pick = &MIRROR32[mir as usize];
+                        let regs = (5 * k + 7) / 8;
+                        for m in 0..regs {
                             if AHEAD {
                                 prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
                             }
+                            let ix = _mm512_mask_blend_epi32(
+                                pick[m],
+                                _mm512_loadu_si512(words.half32[0][m].as_ptr() as *const _),
+                                _mm512_loadu_si512(words.half32[1][m].as_ptr() as *const _),
+                            );
                             _mm512_storeu_si512(
                                 at.add(8 * m) as *mut _,
-                                _mm512_permutex2var_epi32(
-                                    a,
-                                    _mm512_loadu_si512(ix.as_ptr() as *const _),
-                                    b,
-                                ),
+                                _mm512_permutex2var_epi32(a, ix, b),
                             );
                         }
                     }
+                    n += k;
+                } else {
+                    if COLS {
+                        let at = n + AHEAD_ROWS;
+                        if AHEAD {
+                            prefetch(out.ci.wrapping_add(at));
+                            prefetch(out.cj.wrapping_add(at));
+                            prefetch(out.cd.wrapping_add(at));
+                            prefetch(out.cs.wrapping_add(3 * at));
+                        }
+                        let iv = _mm512_set1_epi32($iu as i32);
+                        let jz = _mm512_castsi256_si512(jc);
+                        _mm512_storeu_si512(
+                            out.ci.add(n) as *mut _,
+                            _mm512_permutex2var_epi32(iv, ij, jz),
+                        );
+                        _mm512_storeu_si512(
+                            out.cj.add(n) as *mut _,
+                            _mm512_permutex2var_epi32(iv, ji, jz),
+                        );
+                        _mm512_storeu_pd(out.cd.add(n), _mm512_permutexvar_pd(dup_lo, dc));
+                        let so = out.cs.add(3 * n);
+                        _mm512_storeu_si512(so as *mut _, sv[0]);
+                        if k > 2 {
+                            if AHEAD {
+                                prefetch(out.cs.wrapping_add(3 * at + 16));
+                            }
+                            _mm512_storeu_si512(so.add(16) as *mut _, sv[1]);
+                        }
+                        if k > 4 {
+                            if AHEAD {
+                                prefetch(out.cd.wrapping_add(at + 8));
+                            }
+                            _mm512_storeu_pd(out.cd.add(n + 8), _mm512_permutexvar_pd(dup_hi, dc));
+                        }
+                        if k > 5 {
+                            if AHEAD {
+                                prefetch(out.cs.wrapping_add(3 * at + 32));
+                            }
+                            _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
+                        }
+                    } else {
+                        // Dword sources, as in [`RowWords::index32`]: the eight ids
+                        // and this source's constants, then the eight distances, so
+                        // both groups of four hits permute from the same pair.
+                        let at = out.rows.add(5 * n);
+                        let a = _mm512_mask_blend_epi32(
+                            0x00ff,
+                            _mm512_mask_set1_epi32(consts, 0x0100, $iu as i32),
+                            _mm512_castsi256_si512(jc),
+                        );
+                        let b = _mm512_castpd_si512(dc);
+                        if MODE == BOUNDED && n + 2 * k + 2 > out.limit {
+                            // Whole registers reach up to six words past the rows,
+                            // into another thread's: store only the rows' words.
+                            for g in 0..2 {
+                                let words_left = (10 * k).saturating_sub(40 * g);
+                                for (m, ix) in words.index32[g].iter().enumerate() {
+                                    let valid = words_left.saturating_sub(8 * m).min(8);
+                                    if valid == 0 {
+                                        break;
+                                    }
+                                    _mm512_mask_storeu_epi64(
+                                        at.add(40 * g + 8 * m) as *mut _,
+                                        ((1u32 << valid) - 1) as u8,
+                                        _mm512_permutex2var_epi32(
+                                            a,
+                                            _mm512_loadu_si512(ix.as_ptr() as *const _),
+                                            b,
+                                        ),
+                                    );
+                                }
+                            }
+                        } else {
+                            // Two rows per hit are ten words: only the registers that
+                            // hold them, so a lone hit takes two stores, not five.
+                            let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
+                            for (m, ix) in words.index32[0].iter().enumerate().take(regs) {
+                                if AHEAD {
+                                    prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
+                                }
+                                _mm512_storeu_si512(
+                                    at.add(8 * m) as *mut _,
+                                    _mm512_permutex2var_epi32(
+                                        a,
+                                        _mm512_loadu_si512(ix.as_ptr() as *const _),
+                                        b,
+                                    ),
+                                );
+                            }
+                            if k > 4 {
+                                let at = at.add(40);
+                                let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
+                                for (m, ix) in words.index32[1].iter().enumerate().take(regs) {
+                                    if AHEAD {
+                                        prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
+                                    }
+                                    _mm512_storeu_si512(
+                                        at.add(8 * m) as *mut _,
+                                        _mm512_permutex2var_epi32(
+                                            a,
+                                            _mm512_loadu_si512(ix.as_ptr() as *const _),
+                                            b,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    n += 2 * k;
                 }
-                n += 2 * k;
             }
         }};
     }
@@ -3447,11 +3564,10 @@ impl Plan {
         TileCols::of(&self.grid)
     }
 
-    /// `visit(block)` for the home block and every partner of each bin,
-    /// in bin order.
-    fn each_block(&self, mut visit: impl FnMut(&Block)) {
-        let ncell = self.grid.offsets.len() - 1;
-        for cell in 0..ncell {
+    /// `visit(block)` for the home block and every partner of each bin in
+    /// `c_lo..c_hi`, in bin order.
+    fn each_block_in(&self, c_lo: usize, c_hi: usize, mut visit: impl FnMut(&Block)) {
+        for cell in c_lo..c_hi {
             let lo = self.grid.offsets[cell];
             let hi = self.grid.offsets[cell + 1];
             if lo == hi {
@@ -3537,50 +3653,67 @@ impl Plan {
         sink: &mut S,
         ahead: bool,
     ) -> usize {
+        let all = (0, self.grid.offsets.len() - 1, 0);
         if self.half {
-            self.fused_side::<COLS, true, S>(words, sink, ahead)
+            self.fused_side::<COLS, true, PLAIN, S>(words, sink, ahead, all)
         } else {
-            self.fused_side::<COLS, false, S>(words, sink, ahead)
+            self.fused_side::<COLS, false, PLAIN, S>(words, sink, ahead, all)
         }
     }
 
-    /// [`Plan::fused_sink`] for one kind of list.
-    fn fused_side<const COLS: bool, const HALF: bool, S: FusedSink>(
+    /// [`Plan::fused_sink`] for one kind of list, over the bins `range.0`
+    /// up to `range.1` from row `range.2`, in [`avx512_fused`]'s `MODE`.
+    fn fused_side<const COLS: bool, const HALF: bool, const MODE: u8, S: FusedSink>(
         &self,
         words: &RowWords,
         sink: &mut S,
         ahead: bool,
+        range: (usize, usize, usize),
     ) -> usize {
         let cols = self.tile_cols();
         let inline = self.grid.atoms() < INLINE_BLOCKS * (self.grid.offsets.len() - 1);
+        let r = range;
         // Safety: AVX-512 was detected for this plan.
         unsafe {
             match (inline, ahead) {
-                (true, false) => self.fused_into::<COLS, false, HALF, S>(cols, words, sink),
-                (true, true) => self.fused_into::<COLS, true, HALF, S>(cols, words, sink),
-                (false, false) => self.fused_blocks::<COLS, false, HALF, S>(cols, words, sink),
-                (false, true) => self.fused_blocks::<COLS, true, HALF, S>(cols, words, sink),
+                (true, false) => {
+                    self.fused_into::<COLS, false, HALF, MODE, S>(cols, words, sink, r)
+                }
+                (true, true) => self.fused_into::<COLS, true, HALF, MODE, S>(cols, words, sink, r),
+                (false, false) => {
+                    self.fused_blocks::<COLS, false, HALF, MODE, S>(cols, words, sink, r)
+                }
+                (false, true) => {
+                    self.fused_blocks::<COLS, true, HALF, MODE, S>(cols, words, sink, r)
+                }
             }
         }
     }
 
-    /// [`Plan::each_block`] with the tile kernel out of line.
+    /// [`Plan::each_block_in`] with the tile kernel out of line.
     ///
     /// # Safety
     /// AVX-512F, AVX-512VL, POPCNT, and FMA are available.
-    unsafe fn fused_blocks<const COLS: bool, const AHEAD: bool, const HALF: bool, S: FusedSink>(
+    unsafe fn fused_blocks<
+        const COLS: bool,
+        const AHEAD: bool,
+        const HALF: bool,
+        const MODE: u8,
+        S: FusedSink,
+    >(
         &self,
         cols: TileCols,
         words: &RowWords,
         sink: &mut S,
+        (c_lo, c_hi, n0): (usize, usize, usize),
     ) -> usize {
-        let mut n = 0usize;
-        self.each_block(|block| {
+        let mut n = n0;
+        self.each_block_in(c_lo, c_hi, |block| {
             let mut fo = sink.room(n, Self::block_room::<HALF>(block));
             // Safety: the sink has room for `n` plus the block plus the
             // slack, and the features are the caller's.
             unsafe {
-                avx512_fused::<COLS, false, AHEAD, HALF>(
+                avx512_fused::<COLS, false, AHEAD, HALF, MODE>(
                     cols,
                     self.cut2,
                     self.margin,
@@ -3596,22 +3729,28 @@ impl Plan {
 
     /// The block loop of [`Plan::fused_sink`] for sparse bins, compiled
     /// with the tile's target features so the tile inlines into it:
-    /// [`Plan::each_block`]'s order, the home block of each bin and then
+    /// [`Plan::each_block_in`]'s order, the home block of each bin and then
     /// its partners.
     ///
     /// # Safety
     /// AVX-512F, AVX-512VL, POPCNT, and FMA are available.
     #[allow(clippy::incompatible_msrv)]
     #[target_feature(enable = "avx512f,avx512vl,popcnt,fma")]
-    unsafe fn fused_into<const COLS: bool, const AHEAD: bool, const HALF: bool, S: FusedSink>(
+    unsafe fn fused_into<
+        const COLS: bool,
+        const AHEAD: bool,
+        const HALF: bool,
+        const MODE: u8,
+        S: FusedSink,
+    >(
         &self,
         cols: TileCols,
         words: &RowWords,
         sink: &mut S,
+        (c_lo, c_hi, n0): (usize, usize, usize),
     ) -> usize {
-        let mut n = 0usize;
-        let ncell = self.grid.offsets.len() - 1;
-        for cell in 0..ncell {
+        let mut n = n0;
+        for cell in c_lo..c_hi {
             let (lo, hi) = (self.grid.offsets[cell], self.grid.offsets[cell + 1]);
             if lo == hi {
                 continue;
@@ -3656,7 +3795,7 @@ impl Plan {
                 let mut fo = sink.room(n, Self::block_room::<HALF>(&block));
                 // Safety: the sink has room for `n` plus the block plus the
                 // slack, and the features are the caller's.
-                avx512_fused::<COLS, true, AHEAD, HALF>(
+                avx512_fused::<COLS, true, AHEAD, HALF, MODE>(
                     cols,
                     self.cut2,
                     self.margin,
@@ -3668,6 +3807,70 @@ impl Plan {
             }
         }
         n
+    }
+
+    /// Several threads, a full list, and AVX-512: each thread counts the
+    /// rows of its bins, then writes them from the tile kernel in place.
+    #[cfg(feature = "parallel")]
+    fn fused_split(&self) -> Option<RowWords> {
+        if self.threads > 1 && !self.half && self.simd == 2 {
+            RowWords::of_pair()
+        } else {
+            None
+        }
+    }
+
+    /// The first row of each range of bins in `ranges`, then the total,
+    /// counted on one thread a range.
+    #[cfg(feature = "parallel")]
+    fn fused_offsets(&self, words: &RowWords, ranges: &[(usize, usize)]) -> Vec<usize> {
+        let counts: Vec<usize> = rayon::broadcast(|ctx| {
+            ranges.get(ctx.index()).map_or(0, |&(lo, hi)| {
+                let _timer = crate::pop::JobTimer::new();
+                self.fused_side::<false, false, COUNT, _>(words, &mut Counter, false, (lo, hi, 0))
+            })
+        });
+        let mut off = Vec::with_capacity(ranges.len() + 1);
+        off.push(0usize);
+        for c in counts.iter().take(ranges.len()) {
+            off.push(off[off.len() - 1] + c);
+        }
+        off
+    }
+
+    /// The rows of `ranges[t]` at `off[t]..off[t + 1]` of `base`, written
+    /// from the tile kernel on thread `t`.
+    ///
+    /// # Safety
+    /// `base` holds `off[ranges.len()]` rows.
+    #[cfg(feature = "parallel")]
+    unsafe fn fused_fill(
+        &self,
+        words: &RowWords,
+        base: RowPtr<Pair>,
+        ranges: &[(usize, usize)],
+        off: &[usize],
+    ) {
+        #[cfg(test)]
+        FUSED_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rayon::broadcast(|ctx| {
+            let t = ctx.index();
+            if let Some(&(lo, hi)) = ranges.get(t) {
+                let _timer = crate::pop::JobTimer::new();
+                let mut sink = Fixed {
+                    rows: base.ptr() as *mut u64,
+                    limit: off[t + 1],
+                };
+                let ahead = ahead(off[t + 1] - off[t], std::mem::size_of::<Pair>());
+                let n = self.fused_side::<false, false, BOUNDED, _>(
+                    words,
+                    &mut sink,
+                    ahead,
+                    (lo, hi, off[t]),
+                );
+                debug_assert_eq!(n, off[t + 1]);
+            }
+        });
     }
 
     /// [`Plan::fused`] into four columns.
@@ -4992,8 +5195,69 @@ mod tests {
         }
     }
 
+    /// Tests that set [`AHEAD_TEST`] take this, so one does not turn the
+    /// other's forcing off.
+    static AHEAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn split_tile_fill_writes_the_one_thread_rows() {
+        let _held = AHEAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Each thread counts its bins' rows, then the tile writes them at
+        // their offset, under a mask at the end of each range: the rows,
+        // their order, and their bits must be the one-thread tile's, on
+        // full bins with box culling, sparse bins, a sheared cell, and a
+        // mask.
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut state = 0xa54f_f53a_5f1d_36f1u64;
+        let mut unit = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let cells = [
+            Cell::ortho(18.0, 17.0, 19.0).unwrap(),
+            Cell::from_vectors(
+                [18.0, 0.0, 0.0],
+                [3.0, 17.5, 0.0],
+                [-2.0, 1.5, 18.5],
+                [0.2, -0.1, 0.0],
+            )
+            .unwrap(),
+            Cell::ortho(40.0, 39.0, 41.0).unwrap(),
+        ];
+        // The fill needs the pool and AVX-512; elsewhere the rows still
+        // match through the buffered writers.
+        let split = cfg!(all(
+            feature = "parallel",
+            target_arch = "x86_64",
+            linkcell_avx512
+        )) && simd_mode() == 2;
+        for (c, sim) in cells.iter().enumerate() {
+            let n = if c == 2 { 3000 } else { 4000 };
+            let xyz: Vec<[f64; 3]> = (0..n)
+                .map(|_| sim.cartesian([unit(), unit(), unit()]))
+                .collect();
+            let mask: Vec<bool> = (0..n).map(|k| k % 7 != 3).collect();
+            for m in [None, Some(mask.as_slice())] {
+                let one = on_threads(1, || pairs_within(&xyz, sim, 4.0, m, None, false).unwrap());
+                let fills = FUSED_FILLS.load(Relaxed);
+                AHEAD_TEST.store(2, Relaxed);
+                let eight = on_threads(8, || pairs_within(&xyz, sim, 4.0, m, None, false).unwrap());
+                AHEAD_TEST.store(0, Relaxed);
+                assert!(
+                    !split || FUSED_FILLS.load(Relaxed) > fills,
+                    "cell {c}: the split fill did not run"
+                );
+                assert!(one.len() > 10_000);
+                assert!(one == eight, "cell {c} mask={}", m.is_some());
+            }
+        }
+    }
+
     #[test]
     fn prefetching_writers_write_the_same_rows_in_order() {
+        let _held = AHEAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Every writer with its prefetch forced on and forced off: the
         // tile kernel (out of line with full bins, inlined with sparse
         // ones) for rows and columns on one thread, and the buffered
