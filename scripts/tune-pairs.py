@@ -17,9 +17,10 @@ at a 4 Å cutoff, moved by `--jitter` times the lattice step at random.
 Knobs: `cell_hint` (bin edge, 0 for the cutoff), `split_pairs` (expected
 pairs where the walk splits across threads), `grid_atoms` (atoms from
 which a split walk builds its bins on several threads), `fused` (one
-thread writes a full list from the tile), and `chunks` (bin ranges per
-thread in a split search). Only the knobs that can act at the pool's
-thread count are searched.
+thread writes a full list from the tile), `chunks` (bin ranges per
+thread in a split search), and `ahead_from` (output bytes per thread
+from which the row writers prefetch ahead of their stores). Only the
+knobs that can act at the pool's thread count are searched.
 """
 
 import argparse
@@ -46,14 +47,22 @@ extern "C" float tune_pairs(const double *xyz, const double *simbox,
     lc_tune_set(1, grid_atoms);
     lc_tune_set(2, fused);
     lc_tune_set(3, chunks);
+    lc_tune_set(4, ahead_from);
     if (lc_tune_pairs(xyz, (size_t)n, simbox, @CUTOFF@, cell_hint, @REPS@, out) != 0)
         return 1.0e30f;
     return (float)out[0];
 }
 """
 
-DEFAULTS = {"split_pairs": 10_000, "grid_atoms": 1_024, "fused": 1, "chunks": 1, "cell_hint": 0.0}
-KEYS = {"split_pairs": 0, "grid_atoms": 1, "fused": 2, "chunks": 3}
+DEFAULTS = {
+    "split_pairs": 10_000,
+    "grid_atoms": 1_024,
+    "fused": 1,
+    "chunks": 1,
+    "ahead_from": 3 << 20,
+    "cell_hint": 0.0,
+}
+KEYS = {"split_pairs": 0, "grid_atoms": 1, "fused": 2, "chunks": 3, "ahead_from": 4}
 
 
 def lattice(n, boxl, jitter, seed):
@@ -117,7 +126,7 @@ def main():
     print(f"default: {ref[0]:.4f} ms per call, {int(ref[1])} rows, {threads} threads", flush=True)
 
     edges = [0.0] + [round(f * args.cutoff, 4) for f in (0.5, 0.5625, 0.6, 0.75, 0.9, 1.125, 1.25, 1.5)]
-    tune_params = {"cell_hint": edges}
+    tune_params = {"cell_hint": edges, "ahead_from": [0, 1 << 20, 2 << 20, 3 << 20, 6 << 20, 1 << 40]}
     if threads > 1:
         tune_params["split_pairs"] = [2_500, 5_000, 10_000, 20_000, 40_000]
         tune_params["grid_atoms"] = [512, 1_024, 2_048, 4_096, 8_192, 1 << 30]

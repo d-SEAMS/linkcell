@@ -1599,13 +1599,16 @@ pub(crate) mod knobs {
     pub(crate) const FUSED: usize = 2;
     #[cfg(feature = "tune")]
     pub(crate) const CHUNKS: usize = 3;
+    #[cfg(feature = "tune")]
+    pub(crate) const AHEAD_FROM: usize = 4;
 
     #[cfg(feature = "tune")]
-    pub(crate) static VALUES: [std::sync::atomic::AtomicUsize; 4] = [
+    pub(crate) static VALUES: [std::sync::atomic::AtomicUsize; 5] = [
         std::sync::atomic::AtomicUsize::new(super::DEFAULT_SPLIT_PAIRS),
         std::sync::atomic::AtomicUsize::new(super::PARALLEL_GRID),
         std::sync::atomic::AtomicUsize::new(1),
         std::sync::atomic::AtomicUsize::new(1),
+        std::sync::atomic::AtomicUsize::new(super::AHEAD_FROM),
     ];
 
     #[cfg(feature = "tune")]
@@ -1646,6 +1649,14 @@ pub(crate) mod knobs {
         return get(CHUNKS).max(1);
         #[cfg(not(feature = "tune"))]
         1
+    }
+
+    /// Output bytes per thread from which the writers prefetch ahead.
+    pub(crate) fn ahead_from() -> usize {
+        #[cfg(feature = "tune")]
+        return get(AHEAD_FROM);
+        #[cfg(not(feature = "tune"))]
+        super::AHEAD_FROM
     }
 }
 
@@ -1776,6 +1787,7 @@ impl Found {
                 return;
             }
             let dst = unsafe { std::slice::from_raw_parts_mut(base.at(off[t]), rows) };
+            let ahead = ahead(rows, std::mem::size_of::<Pair>());
             if self.half {
                 write_half(
                     dst,
@@ -1784,6 +1796,7 @@ impl Found {
                     &chunk.d2,
                     &chunk.run_shift,
                     &chunk.run_end,
+                    ahead,
                 );
                 return;
             }
@@ -1791,7 +1804,13 @@ impl Found {
             if let Some(words) = words {
                 // Safety: AVX-512 was detected for this search, and `dst`
                 // holds two rows per hit of `chunk`.
-                unsafe { write_full_avx512(dst.as_mut_ptr(), chunk, &words) };
+                unsafe {
+                    if ahead {
+                        write_full_avx512::<true>(dst.as_mut_ptr(), chunk, &words)
+                    } else {
+                        write_full_avx512::<false>(dst.as_mut_ptr(), chunk, &words)
+                    }
+                };
                 return;
             }
             write_full(
@@ -1801,6 +1820,7 @@ impl Found {
                 &chunk.d2,
                 &chunk.run_shift,
                 &chunk.run_end,
+                ahead,
             );
         });
     }
@@ -1861,14 +1881,21 @@ impl Found {
                     std::slice::from_raw_parts_mut(cols.d2.at(at), rows),
                 )
             };
+            let ahead = ahead(rows, COLUMN_BYTES);
             #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
             if self.simd == 2 && !self.half {
                 // Safety: AVX-512 was detected, and each column holds two
                 // rows per hit of `chunk` (three values per row of shift).
-                unsafe { write_columns_avx512(ci, cj, cs, cd, chunk) };
+                unsafe {
+                    if ahead {
+                        write_columns_avx512::<true>(ci, cj, cs, cd, chunk)
+                    } else {
+                        write_columns_avx512::<false>(ci, cj, cs, cd, chunk)
+                    }
+                };
                 return;
             }
-            write_columns(ci, cj, cs, cd, chunk, self.half);
+            write_columns(ci, cj, cs, cd, chunk, self.half, ahead);
         });
     }
 
@@ -1889,6 +1916,7 @@ impl Found {
                 return;
             }
             let dst = unsafe { std::slice::from_raw_parts_mut(base.at(off[t]), rows) };
+            let ahead = ahead(rows, std::mem::size_of::<R>());
             let mut at = 0usize;
             let mut lo = 0usize;
             for (r, &hi) in chunk.run_end.iter().enumerate() {
@@ -1898,6 +1926,12 @@ impl Found {
                     let a = chunk.atom[k] as i32;
                     let b = chunk.js[k] as i32;
                     let d = chunk.d2[k];
+                    if ahead {
+                        prefetch(dst.as_ptr().wrapping_add(at + AHEAD_ROWS));
+                        if !self.half {
+                            prefetch(dst.as_ptr().wrapping_add(at + AHEAD_ROWS + 1));
+                        }
+                    }
                     if self.half {
                         if keep_half(a as usize, b as usize, shift) {
                             dst[at].write(row(a, b, shift, d));
@@ -1982,6 +2016,50 @@ struct ColumnPtrs {
     d2: RowPtr<f64>,
 }
 
+/// Rows past each store that the writers prefetch (about 2 KB of `Pair`
+/// rows). A store whose line is out in L3 otherwise waits at the head of
+/// the store buffer, and once the buffer fills the walk behind it stalls
+/// too, so the walk and the row stream take turns instead of overlapping.
+const AHEAD_ROWS: usize = 52;
+
+/// Output bytes per thread from which the writers prefetch: rows that
+/// stay in a 2 MB L2 gain nothing, and the prefetches cost instructions.
+const AHEAD_FROM: usize = 3 << 20;
+
+/// Tests force the prefetch off (1) or on (2) to compare the rows.
+#[cfg(test)]
+static AHEAD_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether a writer of `rows` rows of `bytes` bytes prefetches ahead.
+fn ahead(rows: usize, bytes: usize) -> bool {
+    #[cfg(test)]
+    match AHEAD_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    rows.saturating_mul(bytes) >= knobs::ahead_from()
+}
+
+/// Bytes of one row in the four columns.
+const COLUMN_BYTES: usize = 2 * std::mem::size_of::<i32>()
+    + std::mem::size_of::<[i32; 3]>()
+    + std::mem::size_of::<f64>();
+
+/// Prefetch the line holding `p`, which may lie past the end of its
+/// buffer.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: a prefetch never faults and changes nothing the program
+    // can read, wherever it points.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 #[inline(never)]
 fn write_columns(
     ci: &mut [std::mem::MaybeUninit<i32>],
@@ -1990,6 +2068,7 @@ fn write_columns(
     cd: &mut [std::mem::MaybeUninit<f64>],
     chunk: &Scratch,
     half: bool,
+    ahead: bool,
 ) {
     let mut out = 0usize;
     let mut lo = 0usize;
@@ -2000,6 +2079,16 @@ fn write_columns(
             let a = chunk.atom[k] as i32;
             let b = chunk.js[k] as i32;
             let d = chunk.d2[k];
+            // Every eighth row: eight rows are under a line of `i`, `j`,
+            // and `dist2`, and a line and a half of `shift`.
+            if ahead && out % 8 == 0 {
+                let at = out + AHEAD_ROWS;
+                prefetch(ci.as_ptr().wrapping_add(at));
+                prefetch(cj.as_ptr().wrapping_add(at));
+                prefetch(cd.as_ptr().wrapping_add(at));
+                prefetch(cs.as_ptr().wrapping_add(3 * at));
+                prefetch(cs.as_ptr().wrapping_add(3 * at + 16));
+            }
             if half {
                 let (i, j, s) = if keep_half(a as usize, b as usize, shift) {
                     (a, b, shift)
@@ -2049,6 +2138,7 @@ fn write_full(
     d2: &[f64],
     shifts: &[[i32; 3]],
     ends: &[usize],
+    ahead: bool,
 ) {
     let dp = dst.as_mut_ptr();
     let ap = atom.as_ptr();
@@ -2064,6 +2154,12 @@ fn write_full(
                 let i = (*ap.add(k)) as usize;
                 let j = (*jp.add(k)) as usize;
                 let dist2 = *yp.add(k);
+                if ahead {
+                    // Two rows are 80 bytes: one prefetch would skip a
+                    // line in five.
+                    prefetch(dp.add(out).wrapping_add(AHEAD_ROWS));
+                    prefetch(dp.add(out).wrapping_add(AHEAD_ROWS + 1));
+                }
                 (*dp.add(out)).write(Pair { i, j, shift, dist2 });
                 (*dp.add(out + 1)).write(Pair {
                     i: j,
@@ -2086,6 +2182,7 @@ fn write_half(
     d2: &[f64],
     shifts: &[[i32; 3]],
     ends: &[usize],
+    ahead: bool,
 ) {
     let dp = dst.as_mut_ptr();
     let ap = atom.as_ptr();
@@ -2101,6 +2198,9 @@ fn write_half(
                 let i = (*ap.add(k)) as usize;
                 let j = (*jp.add(k)) as usize;
                 let dist2 = *yp.add(k);
+                if ahead {
+                    prefetch(dp.add(out).wrapping_add(AHEAD_ROWS));
+                }
                 let pair = if keep_half(i, j, shift) {
                     Pair { i, j, shift, dist2 }
                 } else {
@@ -2217,7 +2317,7 @@ fn shift_words(s: [i32; 3]) -> (u64, u64) {
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 #[target_feature(enable = "avx512f")]
 #[inline(never)]
-unsafe fn write_full_avx512(
+unsafe fn write_full_avx512<const AHEAD: bool>(
     dst: *mut std::mem::MaybeUninit<Pair>,
     chunk: &Scratch,
     words: &RowWords,
@@ -2254,6 +2354,9 @@ unsafe fn write_full_avx512(
             let ds = _mm512_inserti64x4(d, sh, 1);
             let out = row as *mut u64;
             for (m, ix) in idx.iter().enumerate() {
+                if AHEAD {
+                    prefetch(out.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
+                }
                 _mm512_storeu_si512(
                     out.add(8 * m) as *mut _,
                     _mm512_permutex2var_epi64(ab, *ix, ds),
@@ -2289,7 +2392,7 @@ unsafe fn write_full_avx512(
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 #[target_feature(enable = "avx512f")]
 #[inline(never)]
-unsafe fn write_columns_avx512(
+unsafe fn write_columns_avx512<const AHEAD: bool>(
     ci: &mut [std::mem::MaybeUninit<i32>],
     cj: &mut [std::mem::MaybeUninit<i32>],
     cs: &mut [std::mem::MaybeUninit<i32>],
@@ -2334,6 +2437,16 @@ unsafe fn write_columns_avx512(
         ];
         let mut k = lo;
         while k + 8 <= hi {
+            if AHEAD {
+                let at = out + AHEAD_ROWS;
+                prefetch(ip.wrapping_add(at));
+                prefetch(jo.wrapping_add(at));
+                prefetch(dq.wrapping_add(at));
+                prefetch(dq.wrapping_add(at + 8));
+                prefetch(sp.wrapping_add(3 * at));
+                prefetch(sp.wrapping_add(3 * at + 16));
+                prefetch(sp.wrapping_add(3 * at + 32));
+            }
             let a = _mm512_castsi256_si512(_mm256_loadu_si256(ap.add(k) as *const __m256i));
             let b = _mm512_castsi256_si512(_mm256_loadu_si256(jp.add(k) as *const __m256i));
             _mm512_storeu_si512(ip.add(out) as *mut _, _mm512_permutex2var_epi32(a, ab, b));
@@ -2544,7 +2657,8 @@ const FUSED_SLACK: usize = 16;
 /// The AVX-512 tile kernel of [`avx512_scan`] with a full list written
 /// in place: `Pair` rows when `COLS` is false, the four columns when it
 /// is true. Hit lanes are compressed, then four hits become eight rows
-/// (or sixteen column entries) in whole registers.
+/// (or sixteen column entries) in whole registers. With `AHEAD`, each
+/// store first prefetches the line [`AHEAD_ROWS`] rows on.
 ///
 /// # Safety
 /// `block` indexes every column of `c`. Every buffer of `out` has room
@@ -2553,7 +2667,7 @@ const FUSED_SLACK: usize = 16;
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 #[target_feature(enable = "avx512f,avx512vl,popcnt,fma")]
 #[inline]
-unsafe fn avx512_fused<const COLS: bool, const INLINED: bool>(
+unsafe fn avx512_fused<const COLS: bool, const INLINED: bool, const AHEAD: bool>(
     c: TileCols,
     cut2: f64,
     margin: f64,
@@ -2688,6 +2802,13 @@ unsafe fn avx512_fused<const COLS: bool, const INLINED: bool>(
             let dc = _mm512_maskz_compress_pd(lo, $d2v);
             let jc = _mm256_maskz_compress_epi32(lo, $jids);
             if COLS {
+                let at = n + AHEAD_ROWS;
+                if AHEAD {
+                    prefetch(out.ci.wrapping_add(at));
+                    prefetch(out.cj.wrapping_add(at));
+                    prefetch(out.cd.wrapping_add(at));
+                    prefetch(out.cs.wrapping_add(3 * at));
+                }
                 let iv = _mm512_set1_epi32($iu as i32);
                 let jz = _mm512_castsi256_si512(jc);
                 _mm512_storeu_si512(
@@ -2702,12 +2823,21 @@ unsafe fn avx512_fused<const COLS: bool, const INLINED: bool>(
                 let so = out.cs.add(3 * n);
                 _mm512_storeu_si512(so as *mut _, sv[0]);
                 if k > 2 {
+                    if AHEAD {
+                        prefetch(out.cs.wrapping_add(3 * at + 16));
+                    }
                     _mm512_storeu_si512(so.add(16) as *mut _, sv[1]);
                 }
                 if k > 4 {
+                    if AHEAD {
+                        prefetch(out.cd.wrapping_add(at + 8));
+                    }
                     _mm512_storeu_pd(out.cd.add(n + 8), _mm512_permutexvar_pd(dup_hi, dc));
                 }
                 if k > 5 {
+                    if AHEAD {
+                        prefetch(out.cs.wrapping_add(3 * at + 32));
+                    }
                     _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
                 }
             } else {
@@ -2725,6 +2855,9 @@ unsafe fn avx512_fused<const COLS: bool, const INLINED: bool>(
                 // hold them, so a lone hit takes two stores, not five.
                 let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
                 for (m, ix) in words.index32[0].iter().enumerate().take(regs) {
+                    if AHEAD {
+                        prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
+                    }
                     _mm512_storeu_si512(
                         at.add(8 * m) as *mut _,
                         _mm512_permutex2var_epi32(
@@ -2738,6 +2871,9 @@ unsafe fn avx512_fused<const COLS: bool, const INLINED: bool>(
                     let at = at.add(40);
                     let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
                     for (m, ix) in words.index32[1].iter().enumerate().take(regs) {
+                        if AHEAD {
+                            prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
+                        }
                         _mm512_storeu_si512(
                             at.add(8 * m) as *mut _,
                             _mm512_permutex2var_epi32(
@@ -2927,56 +3063,73 @@ impl Plan {
     /// [`Plan::fused`]: every row appended from the tile kernel.
     fn fused_rows(&self, words: &RowWords) -> Vec<Pair> {
         let _timer = crate::pop::JobTimer::new();
-        let cols = self.tile_cols();
         let guess = 2 * self.walk().guess_hits(self.grid.atoms()) + FUSED_SLACK;
         let mut out: Vec<Pair> = Vec::with_capacity(guess);
         advise_huge(&mut out);
-        let ncell = self.grid.offsets.len() - 1;
-        if self.grid.atoms() < INLINE_BLOCKS * ncell {
-            // Safety: AVX-512 was detected for this plan.
-            let n = unsafe { self.fused_into::<false, _>(cols, words, &mut out) };
-            // Safety: every row below `n` is written.
-            unsafe { out.set_len(n) };
-            return out;
-        }
-        let mut n = 0usize;
-        self.each_block(|block| {
-            let room = Self::block_room(block);
-            if out.capacity() - n < room {
-                // Safety: the first `n` rows are written.
-                unsafe { out.set_len(n) };
-                out.reserve(room);
-            }
-            let mut fo = FusedOut {
-                rows: out.as_mut_ptr() as *mut u64,
-                ci: std::ptr::null_mut(),
-                cj: std::ptr::null_mut(),
-                cs: std::ptr::null_mut(),
-                cd: std::ptr::null_mut(),
-                n,
-            };
-            // Safety: AVX-512 was detected for this plan, and `out` has
-            // room for `n` plus the block plus the slack.
-            unsafe {
-                avx512_fused::<false, false>(cols, self.cut2, self.margin, block, words, &mut fo)
-            };
-            n = fo.n;
-        });
+        let ahead = ahead(guess, std::mem::size_of::<Pair>());
+        let n = self.fused_sink::<false, _>(words, &mut out, ahead);
         // Safety: every row below `n` is written.
         unsafe { out.set_len(n) };
         out
     }
 
-    /// The block loop of [`Plan::fused_rows`] and [`Plan::fused_columns`],
-    /// compiled with the tile's target features so the tile inlines into
-    /// it: [`Plan::each_block`]'s order, the home block of each bin and
-    /// then its partners.
+    /// The tile kernel over every block into `sink`: inlined into its
+    /// block loop when bins are sparse, and prefetching ahead of its
+    /// stores when `ahead`. Returns the rows written.
+    fn fused_sink<const COLS: bool, S: FusedSink>(
+        &self,
+        words: &RowWords,
+        sink: &mut S,
+        ahead: bool,
+    ) -> usize {
+        let cols = self.tile_cols();
+        let inline = self.grid.atoms() < INLINE_BLOCKS * (self.grid.offsets.len() - 1);
+        // Safety: AVX-512 was detected for this plan.
+        unsafe {
+            match (inline, ahead) {
+                (true, false) => self.fused_into::<COLS, false, S>(cols, words, sink),
+                (true, true) => self.fused_into::<COLS, true, S>(cols, words, sink),
+                (false, false) => self.fused_blocks::<COLS, false, S>(cols, words, sink),
+                (false, true) => self.fused_blocks::<COLS, true, S>(cols, words, sink),
+            }
+        }
+    }
+
+    /// [`Plan::each_block`] with the tile kernel out of line.
+    ///
+    /// # Safety
+    /// AVX-512F, AVX-512VL, POPCNT, and FMA are available.
+    unsafe fn fused_blocks<const COLS: bool, const AHEAD: bool, S: FusedSink>(
+        &self,
+        cols: TileCols,
+        words: &RowWords,
+        sink: &mut S,
+    ) -> usize {
+        let mut n = 0usize;
+        self.each_block(|block| {
+            let mut fo = sink.room(n, Self::block_room(block));
+            // Safety: the sink has room for `n` plus the block plus the
+            // slack, and the features are the caller's.
+            unsafe {
+                avx512_fused::<COLS, false, AHEAD>(
+                    cols, self.cut2, self.margin, block, words, &mut fo,
+                )
+            };
+            n = fo.n;
+        });
+        n
+    }
+
+    /// The block loop of [`Plan::fused_sink`] for sparse bins, compiled
+    /// with the tile's target features so the tile inlines into it:
+    /// [`Plan::each_block`]'s order, the home block of each bin and then
+    /// its partners.
     ///
     /// # Safety
     /// AVX-512F, AVX-512VL, POPCNT, and FMA are available.
     #[allow(clippy::incompatible_msrv)]
     #[target_feature(enable = "avx512f,avx512vl,popcnt,fma")]
-    unsafe fn fused_into<const COLS: bool, S: FusedSink>(
+    unsafe fn fused_into<const COLS: bool, const AHEAD: bool, S: FusedSink>(
         &self,
         cols: TileCols,
         words: &RowWords,
@@ -3029,7 +3182,9 @@ impl Plan {
                 let mut fo = sink.room(n, Self::block_room(&block));
                 // Safety: the sink has room for `n` plus the block plus the
                 // slack, and the features are the caller's.
-                avx512_fused::<COLS, true>(cols, self.cut2, self.margin, &block, words, &mut fo);
+                avx512_fused::<COLS, true, AHEAD>(
+                    cols, self.cut2, self.margin, &block, words, &mut fo,
+                );
                 n = fo.n;
             }
         }
@@ -3043,67 +3198,17 @@ impl Plan {
             Some(w) => w,
             None => return self.search().fill_columns(out),
         };
-        let cols = self.tile_cols();
         out.i.clear();
         out.j.clear();
         out.shift.clear();
         out.dist2.clear();
         let guess = 2 * self.walk().guess_hits(self.grid.atoms()) + FUSED_SLACK;
-        let grow = |out: &mut PairColumns, n: usize, room: usize| {
-            // Safety: the first `n` rows of every column are written.
-            unsafe {
-                out.i.set_len(n);
-                out.j.set_len(n);
-                out.shift.set_len(n);
-                out.dist2.set_len(n);
-            }
-            out.i.reserve(room);
-            out.j.reserve(room);
-            out.shift.reserve(room);
-            out.dist2.reserve(room);
-        };
-        grow(out, 0, guess);
+        out.i.reserve(guess);
+        out.j.reserve(guess);
+        out.shift.reserve(guess);
+        out.dist2.reserve(guess);
         out.advise_huge();
-        let ncell = self.grid.offsets.len() - 1;
-        if self.grid.atoms() < INLINE_BLOCKS * ncell {
-            // Safety: AVX-512 was detected for this plan.
-            let n = unsafe { self.fused_into::<true, _>(cols, &words, out) };
-            // Safety: every row below `n` is written in every column.
-            unsafe {
-                out.i.set_len(n);
-                out.j.set_len(n);
-                out.shift.set_len(n);
-                out.dist2.set_len(n);
-            }
-            return;
-        }
-        let mut n = 0usize;
-        self.each_block(|block| {
-            let room = Self::block_room(block);
-            let cap = out
-                .i
-                .capacity()
-                .min(out.j.capacity())
-                .min(out.shift.capacity())
-                .min(out.dist2.capacity());
-            if cap - n < room {
-                grow(out, n, room);
-            }
-            let mut fo = FusedOut {
-                rows: std::ptr::null_mut(),
-                ci: out.i.as_mut_ptr(),
-                cj: out.j.as_mut_ptr(),
-                cs: out.shift.as_mut_ptr() as *mut i32,
-                cd: out.dist2.as_mut_ptr(),
-                n,
-            };
-            // Safety: AVX-512 was detected for this plan, and every column
-            // has room for `n` plus the block plus the slack.
-            unsafe {
-                avx512_fused::<true, false>(cols, self.cut2, self.margin, block, &words, &mut fo)
-            };
-            n = fo.n;
-        });
+        let n = self.fused_sink::<true, _>(&words, out, ahead(guess, COLUMN_BYTES));
         // Safety: every row below `n` is written in every column.
         unsafe {
             out.i.set_len(n);
@@ -4336,6 +4441,84 @@ mod tests {
                         (p.i as i32, p.j as i32, p.shift, p.dist2.to_bits()),
                         "half={half} row {t}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefetching_writers_write_the_same_rows_in_order() {
+        // Every writer with its prefetch forced on and forced off: the
+        // tile kernel (out of line with full bins, inlined with sparse
+        // ones) for rows and columns on one thread, and the buffered
+        // writers for rows, columns, and half lists on eight.
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut state = 0xbb67_ae85_84ca_a73bu64;
+        let mut unit = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let dense = Cell::ortho(18.0, 17.0, 19.0).unwrap();
+        let sparse = Cell::ortho(40.0, 39.0, 41.0).unwrap();
+        let sets: Vec<(Cell, Vec<[f64; 3]>)> = vec![
+            (
+                dense,
+                (0..4000)
+                    .map(|_| dense.cartesian([unit(), unit(), unit()]))
+                    .collect(),
+            ),
+            (
+                sparse,
+                (0..3000)
+                    .map(|_| sparse.cartesian([unit(), unit(), unit()]))
+                    .collect(),
+            ),
+        ];
+        let run = |sim: &Cell, xyz: &[[f64; 3]], threads: usize, half: bool| {
+            on_threads(threads, || {
+                let rows = pairs_within(xyz, sim, 4.0, None, None, half).unwrap();
+                let mut cols = PairColumns::default();
+                pairs_within_columns(xyz, sim, 4.0, None, None, half, &mut cols).unwrap();
+                (rows, cols)
+            })
+        };
+        for (sim, xyz) in &sets {
+            for threads in [1, 8] {
+                for half in [false, true] {
+                    AHEAD_TEST.store(1, Relaxed);
+                    let off = run(sim, xyz, threads, half);
+                    AHEAD_TEST.store(2, Relaxed);
+                    let on = run(sim, xyz, threads, half);
+                    AHEAD_TEST.store(0, Relaxed);
+                    assert!(off.0.len() > 10_000);
+                    assert!(off.0 == on.0, "rows: threads={threads} half={half}");
+                    assert!(off.1 == on.1, "columns: threads={threads} half={half}");
+                    // The C rows (`lc_pairs_within_rows`).
+                    #[cfg(feature = "capi")]
+                    {
+                        let c_rows = |mode: u8| {
+                            AHEAD_TEST.store(mode, Relaxed);
+                            on_threads(threads, || {
+                                let found = search(xyz, sim, 4.0, None, None, half).unwrap();
+                                let n = found.rows();
+                                let mut out: Vec<(i32, i32, [i32; 3], u64)> =
+                                    Vec::with_capacity(n);
+                                // Safety: `out` holds `n` rows.
+                                unsafe {
+                                    found.write_rows(out.as_mut_ptr(), |i, j, s, d| {
+                                        (i, j, s, d.to_bits())
+                                    });
+                                    out.set_len(n);
+                                }
+                                out
+                            })
+                        };
+                        let (off, on) = (c_rows(1), c_rows(2));
+                        AHEAD_TEST.store(0, Relaxed);
+                        assert!(off == on, "C rows: threads={threads} half={half}");
+                    }
                 }
             }
         }

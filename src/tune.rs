@@ -17,7 +17,9 @@ use crate::Cell;
 /// 1 = active atoms from which a split walk builds its bins on several
 /// threads, 2 = one thread writes a full list from the tile (nonzero) or
 /// buffers its hits first (zero), 3 = bin ranges per thread in a split
-/// search. Returns 0, or 1 for an unknown key or a negative value.
+/// search, 4 = output bytes per thread from which the row writers
+/// prefetch ahead of their stores. Returns 0, or 1 for an unknown key or
+/// a negative value.
 #[no_mangle]
 pub extern "C" fn lc_tune_set(key: c_int, value: f64) -> c_int {
     let slot = match key {
@@ -25,6 +27,7 @@ pub extern "C" fn lc_tune_set(key: c_int, value: f64) -> c_int {
         1 => knobs::GRID_ATOMS,
         2 => knobs::FUSED,
         3 => knobs::CHUNKS,
+        4 => knobs::AHEAD_FROM,
         _ => return 1,
     };
     if value.is_nan() || value < 0.0 {
