@@ -234,7 +234,14 @@ caller. The POP3 figures below are the threads inside one search:
 the share that sub-communicator already assigned to this call.
 
 The `parallel` Cargo feature (on by default) maps sources with
-rayon. Each source owns its heap. From 8192 active points upward the
+rayon. Each source owns its heap. Sources go in bin order, reading
+their own fraction and position and every candidate's position from
+slot-ordered copies, and each writes its own row of the output: a
+neighbour's shell is then still in cache, whatever order the caller's
+points come in. With the 262144-point cube shuffled, one thread takes
+101 ms and eight take 23 ms, against 234 and 39 ms in point order
+before; in the lattice's own order the times do not change. From 8192
+active points upward the
 same feature builds the mesh in parallel: a thread writes each point's
 fractional coordinate once, histograms with atomics, then scatters
 occupants with atomics. Bins are sorted by index afterwards, so the
