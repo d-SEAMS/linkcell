@@ -2214,7 +2214,10 @@ unsafe fn avx512_fused<const COLS: bool>(
                 let ab =
                     _mm512_inserti64x4(_mm512_castsi256_si512(iv), _mm512_castsi512_si256(jq), 1);
                 let ds = _mm512_inserti64x4(dq, sh, 1);
-                for (m, ix) in idx.iter().enumerate() {
+                // Two rows per hit are ten words: only the registers that
+                // hold them, so a lone hit takes two stores, not five.
+                let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
+                for (m, ix) in idx.iter().enumerate().take(regs) {
                     _mm512_storeu_si512(
                         at.add(8 * m) as *mut _,
                         _mm512_permutex2var_epi64(ab, *ix, ds),
@@ -2232,7 +2235,8 @@ unsafe fn avx512_fused<const COLS: bool>(
                         1,
                     );
                     let at = at.add(40);
-                    for (m, ix) in idx.iter().enumerate() {
+                    let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
+                    for (m, ix) in idx.iter().enumerate().take(regs) {
                         _mm512_storeu_si512(
                             at.add(8 * m) as *mut _,
                             _mm512_permutex2var_epi64(ab, *ix, ds),
