@@ -2470,6 +2470,73 @@ struct FusedOut {
     n: usize,
 }
 
+/// Mean atoms per bin under which one thread runs the tile inlined into
+/// its block loop: with a few atoms a block, the call into the tile is
+/// most of the block (256 atoms in the 18 Å cube, four a bin, 0.020 ->
+/// 0.017 ms), while with full bins the tile's own register allocation is
+/// a little better out of line.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+const INLINE_BLOCKS: usize = 8;
+
+/// Where [`Plan::fused_into`] writes: room for `room` more rows past the
+/// first `n`, on demand.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+trait FusedSink {
+    fn room(&mut self, n: usize, room: usize) -> FusedOut;
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+impl FusedSink for Vec<Pair> {
+    fn room(&mut self, n: usize, room: usize) -> FusedOut {
+        if self.capacity() - n < room {
+            // Safety: the first `n` rows are written.
+            unsafe { self.set_len(n) };
+            self.reserve(room);
+        }
+        FusedOut {
+            rows: self.as_mut_ptr() as *mut u64,
+            ci: std::ptr::null_mut(),
+            cj: std::ptr::null_mut(),
+            cs: std::ptr::null_mut(),
+            cd: std::ptr::null_mut(),
+            n,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+impl FusedSink for PairColumns {
+    fn room(&mut self, n: usize, room: usize) -> FusedOut {
+        let cap = self
+            .i
+            .capacity()
+            .min(self.j.capacity())
+            .min(self.shift.capacity())
+            .min(self.dist2.capacity());
+        if cap - n < room {
+            // Safety: the first `n` rows of every column are written.
+            unsafe {
+                self.i.set_len(n);
+                self.j.set_len(n);
+                self.shift.set_len(n);
+                self.dist2.set_len(n);
+            }
+            self.i.reserve(room);
+            self.j.reserve(room);
+            self.shift.reserve(room);
+            self.dist2.reserve(room);
+        }
+        FusedOut {
+            rows: std::ptr::null_mut(),
+            ci: self.i.as_mut_ptr(),
+            cj: self.j.as_mut_ptr(),
+            cs: self.shift.as_mut_ptr() as *mut i32,
+            cd: self.dist2.as_mut_ptr(),
+            n,
+        }
+    }
+}
+
 /// Rows a hit vector may write past the last row it keeps.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 const FUSED_SLACK: usize = 16;
@@ -2485,8 +2552,8 @@ const FUSED_SLACK: usize = 16;
 #[allow(clippy::incompatible_msrv)]
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 #[target_feature(enable = "avx512f,avx512vl,popcnt,fma")]
-#[inline(never)]
-unsafe fn avx512_fused<const COLS: bool>(
+#[inline]
+unsafe fn avx512_fused<const COLS: bool, const INLINED: bool>(
     c: TileCols,
     cut2: f64,
     margin: f64,
@@ -2864,6 +2931,14 @@ impl Plan {
         let guess = 2 * self.walk().guess_hits(self.grid.atoms()) + FUSED_SLACK;
         let mut out: Vec<Pair> = Vec::with_capacity(guess);
         advise_huge(&mut out);
+        let ncell = self.grid.offsets.len() - 1;
+        if self.grid.atoms() < INLINE_BLOCKS * ncell {
+            // Safety: AVX-512 was detected for this plan.
+            let n = unsafe { self.fused_into::<false, _>(cols, words, &mut out) };
+            // Safety: every row below `n` is written.
+            unsafe { out.set_len(n) };
+            return out;
+        }
         let mut n = 0usize;
         self.each_block(|block| {
             let room = Self::block_room(block);
@@ -2882,12 +2957,83 @@ impl Plan {
             };
             // Safety: AVX-512 was detected for this plan, and `out` has
             // room for `n` plus the block plus the slack.
-            unsafe { avx512_fused::<false>(cols, self.cut2, self.margin, block, words, &mut fo) };
+            unsafe {
+                avx512_fused::<false, false>(cols, self.cut2, self.margin, block, words, &mut fo)
+            };
             n = fo.n;
         });
         // Safety: every row below `n` is written.
         unsafe { out.set_len(n) };
         out
+    }
+
+    /// The block loop of [`Plan::fused_rows`] and [`Plan::fused_columns`],
+    /// compiled with the tile's target features so the tile inlines into
+    /// it: [`Plan::each_block`]'s order, the home block of each bin and
+    /// then its partners.
+    ///
+    /// # Safety
+    /// AVX-512F, AVX-512VL, POPCNT, and FMA are available.
+    #[allow(clippy::incompatible_msrv)]
+    #[target_feature(enable = "avx512f,avx512vl,popcnt,fma")]
+    unsafe fn fused_into<const COLS: bool, S: FusedSink>(
+        &self,
+        cols: TileCols,
+        words: &RowWords,
+        sink: &mut S,
+    ) -> usize {
+        let mut n = 0usize;
+        let ncell = self.grid.offsets.len() - 1;
+        for cell in 0..ncell {
+            let (lo, hi) = (self.grid.offsets[cell], self.grid.offsets[cell + 1]);
+            if lo == hi {
+                continue;
+            }
+            let (p0, p1) = (self.partners.off[cell], self.partners.off[cell + 1]);
+            for q in p0..=p1 {
+                let block = if q == p0 {
+                    if hi - lo < 2 {
+                        continue;
+                    }
+                    Block {
+                        i_lo: lo,
+                        i_hi: hi,
+                        j_lo: lo,
+                        j_hi: hi,
+                        shift_s: [0, 0, 0],
+                        shift: [0.0; 3],
+                        delta: [0.0; 3],
+                        tri: true,
+                        jv: self.grid.boxes.vstart[cell],
+                        ig: self.grid.boxes.gstart[cell],
+                    }
+                } else {
+                    let p = &self.partners.items[q - 1];
+                    let (j_lo, j_hi) = (self.grid.offsets[p.jc], self.grid.offsets[p.jc + 1]);
+                    if j_lo == j_hi {
+                        continue;
+                    }
+                    Block {
+                        i_lo: lo,
+                        i_hi: hi,
+                        j_lo,
+                        j_hi,
+                        shift_s: p.shift_s,
+                        shift: p.shift,
+                        delta: p.delta,
+                        tri: false,
+                        jv: self.grid.boxes.vstart[p.jc],
+                        ig: self.grid.boxes.gstart[cell],
+                    }
+                };
+                let mut fo = sink.room(n, Self::block_room(&block));
+                // Safety: the sink has room for `n` plus the block plus the
+                // slack, and the features are the caller's.
+                avx512_fused::<COLS, true>(cols, self.cut2, self.margin, &block, words, &mut fo);
+                n = fo.n;
+            }
+        }
+        n
     }
 
     /// [`Plan::fused`] into four columns.
@@ -2918,6 +3064,19 @@ impl Plan {
         };
         grow(out, 0, guess);
         out.advise_huge();
+        let ncell = self.grid.offsets.len() - 1;
+        if self.grid.atoms() < INLINE_BLOCKS * ncell {
+            // Safety: AVX-512 was detected for this plan.
+            let n = unsafe { self.fused_into::<true, _>(cols, &words, out) };
+            // Safety: every row below `n` is written in every column.
+            unsafe {
+                out.i.set_len(n);
+                out.j.set_len(n);
+                out.shift.set_len(n);
+                out.dist2.set_len(n);
+            }
+            return;
+        }
         let mut n = 0usize;
         self.each_block(|block| {
             let room = Self::block_room(block);
@@ -2940,7 +3099,9 @@ impl Plan {
             };
             // Safety: AVX-512 was detected for this plan, and every column
             // has room for `n` plus the block plus the slack.
-            unsafe { avx512_fused::<true>(cols, self.cut2, self.margin, block, &words, &mut fo) };
+            unsafe {
+                avx512_fused::<true, false>(cols, self.cut2, self.margin, block, &words, &mut fo)
+            };
             n = fo.n;
         });
         // Safety: every row below `n` is written in every column.
@@ -4118,6 +4279,65 @@ mod tests {
             a.sort();
             b.sort();
             assert_eq!(a, b, "half={half}");
+        }
+    }
+
+    #[test]
+    fn sparse_bins_write_the_same_rows_on_one_thread_and_eight() {
+        // Under eight atoms a bin, one thread runs the tile inlined into its
+        // block loop, for rows and for columns; eight threads buffer hits.
+        // 3000 atoms in a 40 A cell: about three a bin, and enough pairs
+        // that eight threads split the walk.
+        let cells = [
+            Cell::ortho(40.0, 39.0, 41.0).unwrap(),
+            Cell::from_vectors(
+                [40.0, 0.0, 0.0],
+                [6.0, 39.0, 0.0],
+                [-4.0, 3.0, 40.5],
+                [0.3, 0.0, -0.2],
+            )
+            .unwrap(),
+        ];
+        let mut state = 0x6a09_e667_f3bc_c908u64;
+        let mut unit = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for sim in &cells {
+            let xyz: Vec<[f64; 3]> = (0..3000)
+                .map(|_| sim.cartesian([unit(), unit(), unit()]))
+                .collect();
+            assert!(
+                walk_threads(hit_estimate(xyz.len(), sim, 4.0)) > 1 || !cfg!(feature = "parallel")
+            );
+            for half in [false, true] {
+                let (one, one_cols) = on_threads(1, || {
+                    let rows = pairs_within(&xyz, sim, 4.0, None, None, half).unwrap();
+                    let mut cols = PairColumns::default();
+                    pairs_within_columns(&xyz, sim, 4.0, None, None, half, &mut cols).unwrap();
+                    (rows, cols)
+                });
+                let eight = on_threads(8, || {
+                    pairs_within(&xyz, sim, 4.0, None, None, half).unwrap()
+                });
+                assert!(one.len() > 10_000, "half={half}");
+                assert!(one == eight, "half={half}: rows differ in content or order");
+                assert_eq!(one_cols.len(), one.len());
+                for (t, p) in one.iter().enumerate() {
+                    assert_eq!(
+                        (
+                            one_cols.i[t],
+                            one_cols.j[t],
+                            one_cols.shift[t],
+                            one_cols.dist2[t].to_bits()
+                        ),
+                        (p.i as i32, p.j as i32, p.shift, p.dist2.to_bits()),
+                        "half={half} row {t}"
+                    );
+                }
+            }
         }
     }
 
