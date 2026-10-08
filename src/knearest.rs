@@ -504,96 +504,81 @@ fn dispatch<const MODE: u8>(
     out_nn: &mut [i32],
     out_d2: Option<&mut [f64]>,
 ) {
+    // Masked points are not in the mesh, so every slot is an active source.
+    let _ = mask;
+    // Sources go in bin order: consecutive sources are neighbours, so their
+    // shells share cache lines whatever order the caller's points came in.
+    // Source `i` writes its own row, `out[i * k ..]`.
+    let nn = RowsOut(out_nn.as_mut_ptr());
+    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
+    let [nx, ny, _] = geom.nbin;
+    let cell = |c: usize| {
+        let c = c as i32;
+        [c % nx, (c / nx) % ny, c / (nx * ny)]
+    };
+    let job = |c: usize| {
+        let bin = cell(c);
+        for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+            let i = mesh.occupants[slot];
+            // Safety: each source owns row `i` of both outputs, and the
+            // caller sized them to `n * k`.
+            let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+            walk_source::<MODE>(mesh, geom, k, max_reach, bin, slot, row, row_d2);
+        }
+    };
+    let ncell = mesh.offsets.len() - 1;
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        match (mask, out_d2) {
-            (None, None) => {
-                out_nn.par_chunks_mut(k).enumerate().for_each_init(
-                    crate::pop::JobTimer::new,
-                    |_timer, (i, nn)| {
-                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
-                    },
-                );
-            }
-            (None, Some(d2)) => {
-                out_nn
-                    .par_chunks_mut(k)
-                    .zip(d2.par_chunks_mut(k))
-                    .enumerate()
-                    .for_each_init(crate::pop::JobTimer::new, |_timer, (i, (nn, dd))| {
-                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
-                    });
-            }
-            (Some(mask), None) => {
-                out_nn.par_chunks_mut(k).enumerate().for_each_init(
-                    crate::pop::JobTimer::new,
-                    |_timer, (i, nn)| {
-                        if mask[i] {
-                            walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
-                        }
-                    },
-                );
-            }
-            (Some(mask), Some(d2)) => {
-                out_nn
-                    .par_chunks_mut(k)
-                    .zip(d2.par_chunks_mut(k))
-                    .enumerate()
-                    .for_each_init(crate::pop::JobTimer::new, |_timer, (i, (nn, dd))| {
-                        if mask[i] {
-                            walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
-                        }
-                    });
-            }
-        }
+        (0..ncell)
+            .into_par_iter()
+            .with_min_len(64)
+            .for_each_init(crate::pop::JobTimer::new, |_timer, c| job(c));
     }
     #[cfg(not(feature = "parallel"))]
     {
         let _timer = crate::pop::JobTimer::new();
-        match (mask, out_d2) {
-            (None, None) => {
-                for (i, nn) in out_nn.chunks_mut(k).enumerate() {
-                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
-                }
-            }
-            (None, Some(d2)) => {
-                for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
-                    walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
-                }
-            }
-            (Some(mask), None) => {
-                for (i, nn) in out_nn.chunks_mut(k).enumerate() {
-                    if mask[i] {
-                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, None);
-                    }
-                }
-            }
-            (Some(mask), Some(d2)) => {
-                for (i, (nn, dd)) in out_nn.chunks_mut(k).zip(d2.chunks_mut(k)).enumerate() {
-                    if mask[i] {
-                        walk_source::<MODE>(mesh, geom, k, max_reach, i, nn, Some(dd));
-                    }
-                }
-            }
+        for c in 0..ncell {
+            job(c);
         }
     }
 }
 
+/// An output many sources write, one row each.
+#[derive(Clone, Copy)]
+struct RowsOut<T>(*mut T);
+unsafe impl<T: Send> Send for RowsOut<T> {}
+unsafe impl<T: Send> Sync for RowsOut<T> {}
+
+impl<T> RowsOut<T> {
+    /// Row `i` of width `k`.
+    ///
+    /// # Safety
+    /// The output holds row `i`, and no other job touches it while the
+    /// slice lives.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn row<'a>(self, i: usize, k: usize) -> &'a mut [T] {
+        std::slice::from_raw_parts_mut(self.0.add(i * k), k)
+    }
+}
+
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn walk_source<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
     k: usize,
     max_reach: i32,
-    i: usize,
+    bin: [i32; 3],
+    slot: usize,
     nn: &mut [i32],
     d2: Option<&mut [f64]>,
 ) {
     let mut heap = KHeap::new(k);
-    let [ix, iy, iz] = mesh.bin[i];
-    let origin = mesh.frac[i];
-    let pi = mesh.folded[i];
+    let [ix, iy, iz] = bin;
+    let i = mesh.occupants[slot];
+    let origin = mesh.slot_frac[slot];
+    let pi = mesh.slot_folded[slot];
     // Nothing visited yet. The first layer is the 3x3x3 around the source.
     let mut prev = [-1i32; 3];
     let mut reach = [1i32; 3];
@@ -726,9 +711,11 @@ fn visit_cell<const MODE: u8>(q: &mut CellQuery<'_>, jx: i32, jy: i32, jz: i32, 
         ]
     };
     let pi = q.pi;
-    for &ju in &q.mesh.occupants[lo..hi] {
+    for (&ju, &p) in q.mesh.occupants[lo..hi]
+        .iter()
+        .zip(&q.mesh.slot_folded[lo..hi])
+    {
         if ju != q.i {
-            let p = q.mesh.folded[ju];
             let dx = p[0] + shift[0] - pi[0];
             let dy = p[1] + shift[1] - pi[1];
             let dz = p[2] + shift[2] - pi[2];

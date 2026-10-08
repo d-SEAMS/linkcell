@@ -27,6 +27,8 @@ const CERT_ABS: f64 = 1.0e-12;
 struct Recycled {
     frac: Vec<[f64; 3]>,
     folded: Vec<[f64; 3]>,
+    slot_frac: Vec<[f64; 3]>,
+    slot_folded: Vec<[f64; 3]>,
     bin: Vec<[i32; 3]>,
     offsets: Vec<usize>,
     occupants: Vec<usize>,
@@ -65,6 +67,10 @@ pub(crate) struct Mesh {
     pub widths: [f64; 3],
     pub frac: Vec<[f64; 3]>,
     pub folded: Vec<[f64; 3]>,
+    /// `frac` and `folded` of each slot's occupant, in slot order: a walk
+    /// in bin order reads them in runs whatever order the atoms came in.
+    pub(crate) slot_frac: Vec<[f64; 3]>,
+    pub(crate) slot_folded: Vec<[f64; 3]>,
     pub bin: Vec<[i32; 3]>,
     pub(crate) offsets: Vec<usize>,
     pub(crate) occupants: Vec<usize>,
@@ -77,6 +83,8 @@ impl Drop for Mesh {
         recycle(Recycled {
             frac: std::mem::take(&mut self.frac),
             folded: std::mem::take(&mut self.folded),
+            slot_frac: std::mem::take(&mut self.slot_frac),
+            slot_folded: std::mem::take(&mut self.slot_folded),
             bin: std::mem::take(&mut self.bin),
             offsets: std::mem::take(&mut self.offsets),
             occupants: std::mem::take(&mut self.occupants),
@@ -204,6 +212,28 @@ impl Mesh {
             }
         }
 
+        buf.slot_frac.clear();
+        buf.slot_folded.clear();
+        {
+            let _pop = crate::pop::JobTimer::new();
+            let (frac, folded) = (&buf.frac, &buf.folded);
+            #[cfg(feature = "parallel")]
+            if parallel {
+                use rayon::prelude::*;
+                buf.slot_frac
+                    .par_extend(buf.occupants.par_iter().map(|&i| frac[i]));
+                buf.slot_folded
+                    .par_extend(buf.occupants.par_iter().map(|&i| folded[i]));
+            }
+            if buf.slot_frac.len() != n_active {
+                buf.slot_frac.clear();
+                buf.slot_frac.extend(buf.occupants.iter().map(|&i| frac[i]));
+                buf.slot_folded.clear();
+                buf.slot_folded
+                    .extend(buf.occupants.iter().map(|&i| folded[i]));
+            }
+        }
+
         Ok(Self {
             nx,
             ny,
@@ -211,6 +241,8 @@ impl Mesh {
             widths,
             frac: buf.frac,
             folded: buf.folded,
+            slot_frac: buf.slot_frac,
+            slot_folded: buf.slot_folded,
             bin: buf.bin,
             offsets: buf.offsets,
             occupants: buf.occupants,
