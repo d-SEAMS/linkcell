@@ -265,6 +265,7 @@ impl Plan {
 }
 
 /// [`Plan::search`] after [`plan`].
+#[cfg_attr(not(feature = "capi"), allow(dead_code))]
 pub(crate) fn search(
     xyz: &[[f64; 3]],
     simbox: &Cell,
