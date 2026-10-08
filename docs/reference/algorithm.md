@@ -146,25 +146,35 @@ block (256 atoms in the 18 Å cube: 0.020 to 0.017 ms).
 Otherwise each thread buffers the hits of its range of bins, then
 writes them into the caller's layout: `Pair` rows, four columns, or
 `lc_pair` rows. Thread `k` searches and writes range `k`, so the writer
-reads its own cache. On one core the 29 MB of 40-byte rows for 4096
-atoms take 0.97 to 1.08 ms on this host to store in a store-only probe
-(a memset of the same bytes 0.85 ms; written from buffered hits, which
-also reads the hits back, 1.1 to 1.2 ms, aligned to cache lines or
-not), which is most of a one-thread call: the tile's own work is about
-0.7 ms, of which about 0.3 ms runs behind the stores, and the call
-1.4 ms. A probe of those stores with work between them bounds what any
-arrangement of this tile can reach: work spread evenly between the
-stores hides almost entirely (0.57 ms of it adds 0.04 ms), the same
-work bunched every 16 stores adds 0.22 ms, and any loads between the
-stores slow them (one load per store burst adds 0.1 ms, four add
-0.2 ms). With stores of whole aligned lines, half a millisecond of
-evenly spread work, and only two or three loads per hit vector, the
-probe takes 1.25 to 1.29 ms; the tile reads its targets, sources, and
-boxes, about six loads per hit vector. On Linux the `Pair`
-vector and the columns of at least 4 MB that a call allocates are
-advised to use transparent huge pages on their 2 MB-aligned interior,
-so those stores walk the page tables once per 2 MB; buffers a caller
-passes in are left alone.
+reads its own cache.
+
+On one core the 29 MB of 40-byte rows for 4096 atoms are most of a
+one-thread call. A row store whose line is out in L3 waits at the head
+of the store buffer for the line, and once the buffer fills, the tile
+behind it stalls too, so the walk and the row stream took turns: the
+same walk with its rows folded into a ring that stays in L2 took
+0.93 ms, the call 1.47 ms. Every writer now prefetches the line
+`AHEAD_ROWS` (52, about 2 KB of rows) past each store once its output
+passes 3 MB a thread, so the store finds its line in L1: the tile for
+rows and for columns, the buffered AVX-512 writers, and the scalar row,
+half-list, column, and C writers. The one-thread call drops to 1.15 to
+1.21 ms. Smaller lists stay in a 2 MB L2 and only pay the instructions,
+so 256 and 1024 atoms do not prefetch; from 1536 atoms the gain is 10
+to 16%, on two and four threads 2 to 4%, and on eight threads none,
+where the cores share the L3's bandwidth rather than each waiting on its
+own fill buffers. A store-only probe bounds the rest: straight 64-byte
+stores of those 29 MB with the same prefetch take 0.95 ms (a memset
+0.85 ms), and the same stores in the tile's own bursts, two to ten
+registers a hit vector, 1.03 to 1.16 ms, depending on how predictable
+the burst lengths are. The walk is within that range, and dropping both
+compresses, or broadcasting each group's sources from memory, does not
+change it: the tile's own work now runs behind the stores. Staging the
+rows in L1 and copying them out in 1 to 4 KB bursts, or streaming every
+few lines past the cache, was slower. On Linux the `Pair` vector and the
+columns of at least 4 MB that a call allocates are advised to use
+transparent huge pages on their 2 MB-aligned interior, so those stores
+walk the page tables once per 2 MB (without the advice the call takes
+1.32 ms); buffers a caller passes in are left alone.
 
 The bindings write their own layout from the same hits: Python and
 `pairs_within_columns` get the `ijS` columns without a `Pair` vector,
@@ -221,8 +231,9 @@ most vectors after three fused multiply-adds and a compare.
 The walk's thresholds and paths can be autotuned. The `tune` feature
 builds `lc_tune_set` (expected pairs where the walk splits, atoms from
 which a split walk builds its bins on several threads, the one-thread
-full list written from the tile or buffered first, and bin ranges per
-thread) and `lc_tune_pairs`, a timed call that returns a checksum of its
+full list written from the tile or buffered first, bin ranges per
+thread, and the output bytes per thread from which the writers
+prefetch) and `lc_tune_pairs`, a timed call that returns a checksum of its
 rows; the shipped header declares neither. `scripts/tune-pairs.py`
 drives them with Kernel Tuner, one compiled C function per
 configuration, and checks every configuration's rows against the
