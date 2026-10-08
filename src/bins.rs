@@ -148,7 +148,22 @@ impl Mesh {
             );
         } else {
             let _pop = crate::pop::JobTimer::new();
-            for slot in 0..n_active {
+            #[allow(unused_mut)]
+            let mut start = 0usize;
+            #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+            if let Active::All(len) = ids {
+                let counts = &mut buf.counts;
+                start = fold_mesh_avx512(
+                    simbox,
+                    xyz,
+                    [nx, ny, nz],
+                    0,
+                    len,
+                    (&mut buf.frac, &mut buf.folded, &mut buf.bin),
+                    |c| counts[c] += 1,
+                );
+            }
+            for slot in start..n_active {
                 let i = ids.get(slot);
                 let s = simbox.fractional(xyz[i]);
                 let ix = bin_coord(s[0], nx);
@@ -350,21 +365,39 @@ fn bin_parallel(
 
     match ids {
         Active::All(_) => {
+            const CHUNK: usize = 4096;
             scratch
                 .frac
-                .par_iter_mut()
-                .zip(scratch.folded.par_iter_mut())
-                .zip(scratch.bin.par_iter_mut())
-                .zip(xyz.par_iter())
+                .par_chunks_mut(CHUNK)
+                .zip(scratch.folded.par_chunks_mut(CHUNK))
+                .zip(scratch.bin.par_chunks_mut(CHUNK))
+                .zip(xyz.par_chunks(CHUNK))
                 .for_each_init(crate::pop::JobTimer::new, |_timer, (((f, fold), b), p)| {
-                    let s = simbox.fractional(*p);
-                    let ix = bin_coord(s[0], nx);
-                    let iy = bin_coord(s[1], ny);
-                    let iz = bin_coord(s[2], nz);
-                    *f = s;
-                    *fold = simbox.cartesian(s);
-                    *b = [ix, iy, iz];
-                    hist[cell_index(ix, iy, iz, nx, ny, nz)].fetch_add(1, Ordering::Relaxed);
+                    let len = p.len();
+                    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+                    let start = fold_mesh_avx512(
+                        simbox,
+                        p,
+                        nbin,
+                        0,
+                        len,
+                        (&mut *f, &mut *fold, &mut *b),
+                        |c| {
+                            hist[c].fetch_add(1, Ordering::Relaxed);
+                        },
+                    );
+                    #[cfg(not(all(target_arch = "x86_64", linkcell_avx512)))]
+                    let start = 0usize;
+                    for t in start..len {
+                        let s = simbox.fractional(p[t]);
+                        let ix = bin_coord(s[0], nx);
+                        let iy = bin_coord(s[1], ny);
+                        let iz = bin_coord(s[2], nz);
+                        f[t] = s;
+                        fold[t] = simbox.cartesian(s);
+                        b[t] = [ix, iy, iz];
+                        hist[cell_index(ix, iy, iz, nx, ny, nz)].fetch_add(1, Ordering::Relaxed);
+                    }
                 });
         }
         Active::List(_) => {
@@ -453,6 +486,179 @@ fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
         return Err(Error::TooManyCells);
     }
     Ok(n as i32)
+}
+
+/// Box constants of the eight-wide fold.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+pub(crate) struct Fold8 {
+    origin: [f64; 3],
+    widths: [f64; 3],
+    h: [[f64; 3]; 3],
+    hinv: [[f64; 3]; 3],
+    ortho: bool,
+    n: [i32; 3],
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+impl Fold8 {
+    pub(crate) fn new(simbox: &Cell, n: [i32; 3]) -> Self {
+        Fold8 {
+            origin: simbox.origin(),
+            widths: simbox.widths(),
+            h: simbox.h(),
+            hinv: simbox.hinv(),
+            ortho: simbox.is_ortho(),
+            n,
+        }
+    }
+}
+
+/// Fractional coordinates, folded positions, and bins of the eight
+/// packed `x y z` rows at `base`, with [`Cell::fractional`],
+/// [`Cell::cartesian`], and the bin truncation of [`Mesh::build`] done
+/// lane by lane in the same order (a division, or the `Hinv` product,
+/// then `wrap01`; `H` then the origin), so every value is the same bits.
+///
+/// # Safety
+/// AVX-512F is available and `base` is readable for 24 doubles.
+#[allow(clippy::incompatible_msrv, clippy::type_complexity)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f")]
+#[inline]
+pub(crate) unsafe fn fold8(
+    f: &Fold8,
+    base: *const f64,
+) -> ([[f64; 8]; 3], [[f64; 8]; 3], [[i32; 8]; 3]) {
+    use std::arch::x86_64::{
+        __m512d, _mm256_max_epi32, _mm256_min_epi32, _mm256_set1_epi32, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_cvttpd_epi32, _mm512_div_pd,
+        _mm512_loadu_pd, _mm512_mask_blend_pd, _mm512_mask_permutex2var_pd, _mm512_mul_pd,
+        _mm512_permutex2var_pd, _mm512_roundscale_pd, _mm512_set1_pd, _mm512_setr_epi64,
+        _mm512_setzero_pd, _mm512_storeu_pd, _mm512_sub_pd, _CMP_GE_OQ,
+    };
+    let bc = |v: f64| _mm512_set1_pd(v);
+    let one = bc(1.0);
+    let (o, w, h, hinv, n) = (f.origin, f.widths, f.h, f.hinv, f.n);
+    // `wrap01`: subtract the floor, and a value that rounds to one is zero.
+    let wrap01 = |s: __m512d| {
+        let t = _mm512_sub_pd(s, _mm512_roundscale_pd::<0x09>(s));
+        _mm512_mask_blend_pd(
+            _mm512_cmp_pd_mask::<_CMP_GE_OQ>(t, one),
+            t,
+            _mm512_setzero_pd(),
+        )
+    };
+    let a = _mm512_loadu_pd(base);
+    let b = _mm512_loadu_pd(base.add(8));
+    let c = _mm512_loadu_pd(base.add(16));
+    let x = _mm512_mask_permutex2var_pd(
+        _mm512_permutex2var_pd(a, _mm512_setr_epi64(0, 3, 6, 9, 12, 15, 0, 0), b),
+        0xc0,
+        _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 10, 13),
+        c,
+    );
+    let y = _mm512_mask_permutex2var_pd(
+        _mm512_permutex2var_pd(a, _mm512_setr_epi64(1, 4, 7, 10, 13, 0, 0, 0), b),
+        0xe0,
+        _mm512_setr_epi64(0, 0, 0, 0, 0, 8, 11, 14),
+        c,
+    );
+    let z = _mm512_mask_permutex2var_pd(
+        _mm512_permutex2var_pd(a, _mm512_setr_epi64(2, 5, 8, 11, 14, 0, 0, 0), b),
+        0xe0,
+        _mm512_setr_epi64(0, 0, 0, 0, 0, 9, 12, 15),
+        c,
+    );
+    let d = [
+        _mm512_sub_pd(x, bc(o[0])),
+        _mm512_sub_pd(y, bc(o[1])),
+        _mm512_sub_pd(z, bc(o[2])),
+    ];
+    let s = if f.ortho {
+        [
+            wrap01(_mm512_div_pd(d[0], bc(w[0]))),
+            wrap01(_mm512_div_pd(d[1], bc(w[1]))),
+            wrap01(_mm512_div_pd(d[2], bc(w[2]))),
+        ]
+    } else {
+        let row = |r: usize| {
+            _mm512_add_pd(
+                _mm512_add_pd(
+                    _mm512_mul_pd(bc(hinv[0][r]), d[0]),
+                    _mm512_mul_pd(bc(hinv[1][r]), d[1]),
+                ),
+                _mm512_mul_pd(bc(hinv[2][r]), d[2]),
+            )
+        };
+        [wrap01(row(0)), wrap01(row(1)), wrap01(row(2))]
+    };
+    let cart = |r: usize| {
+        _mm512_add_pd(
+            _mm512_add_pd(
+                _mm512_add_pd(
+                    _mm512_mul_pd(bc(h[0][r]), s[0]),
+                    _mm512_mul_pd(bc(h[1][r]), s[1]),
+                ),
+                _mm512_mul_pd(bc(h[2][r]), s[2]),
+            ),
+            bc(o[r]),
+        )
+    };
+    let bin = |ax: usize| {
+        let t = _mm512_cvttpd_epi32(_mm512_mul_pd(s[ax], bc(f64::from(n[ax]))));
+        _mm256_min_epi32(
+            _mm256_max_epi32(t, _mm256_setzero_si256()),
+            _mm256_set1_epi32(n[ax] - 1),
+        )
+    };
+    let mut so = [[0.0f64; 8]; 3];
+    let mut po = [[0.0f64; 8]; 3];
+    let mut bo = [[0i32; 8]; 3];
+    for ax in 0..3 {
+        _mm512_storeu_pd(so[ax].as_mut_ptr(), s[ax]);
+        _mm512_storeu_pd(po[ax].as_mut_ptr(), cart(ax));
+        _mm256_storeu_si256(bo[ax].as_mut_ptr() as *mut _, bin(ax));
+    }
+    (so, po, bo)
+}
+
+/// The three per-point arrays of a mesh: fractional, folded, bin.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+type MeshOut<'a> = (&'a mut [[f64; 3]], &'a mut [[f64; 3]], &'a mut [[i32; 3]]);
+
+/// Fold `xyz[lo..hi]` into `frac`, `folded`, and `bin` at the same
+/// indices, eight at a time on AVX-512, and add each to `counts`;
+/// returns the first index left for the scalar fold.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+fn fold_mesh_avx512(
+    simbox: &Cell,
+    xyz: &[[f64; 3]],
+    n: [i32; 3],
+    lo: usize,
+    hi: usize,
+    out: MeshOut<'_>,
+    mut count: impl FnMut(usize),
+) -> usize {
+    if !std::is_x86_feature_detected!("avx512f") {
+        return lo;
+    }
+    let (frac, folded, bin) = out;
+    let f = Fold8::new(simbox, n);
+    let flat = xyz.as_ptr() as *const f64;
+    let mut k = lo;
+    while k + 8 <= hi {
+        // Safety: AVX-512F was detected and rows `k..k + 8` are in `xyz`.
+        let (s, p, b) = unsafe { fold8(&f, flat.add(3 * k)) };
+        for l in 0..8 {
+            let i = k + l;
+            frac[i] = [s[0][l], s[1][l], s[2][l]];
+            folded[i] = [p[0][l], p[1][l], p[2][l]];
+            bin[i] = [b[0][l], b[1][l], b[2][l]];
+            count(cell_index(b[0][l], b[1][l], b[2][l], n[0], n[1], n[2]));
+        }
+        k += 8;
+    }
+    k
 }
 
 /// Bins per axis for `edge`, with the same cell cap as [`Mesh::build`].

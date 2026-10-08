@@ -3,7 +3,8 @@
 //! The box grows with `n` so the spacing stays 3.125, the cubic hot-path
 //! density. Set `RAYON_NUM_THREADS` before the process starts. Env:
 //! `KNN_SCALE_N` (default 262144), `KNN_SCALE_K` (default 4),
-//! `KNN_SCALE_REPS` (default 6), `KNN_SCALE_SHAPE` (`cubic` or `tilt`).
+//! `KNN_SCALE_REPS` (default 6), `KNN_SCALE_SHAPE` (`cubic` or `tilt`),
+//! `KNN_SCALE_HINT` (bin edge, default 3.0).
 
 use std::time::Instant;
 
@@ -68,6 +69,10 @@ fn main() {
     let k = env_usize("KNN_SCALE_K", 4);
     let reps = env_usize("KNN_SCALE_REPS", 6);
     let shape = std::env::var("KNN_SCALE_SHAPE").unwrap_or_else(|_| "cubic".to_string());
+    let hint: f64 = std::env::var("KNN_SCALE_HINT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3.0);
     let (xyz, cell) = match shape.as_str() {
         "cubic" => cubic(nside),
         "tilt" => tilt(nside),
@@ -77,12 +82,12 @@ fn main() {
     let mut out = vec![-1i32; xyz.len() * k];
     linkcell::pop_engage();
     linkcell::pop_prepare();
-    knearest_into(&xyz, &cell, k, None, Some(3.0), &mut out).expect("warmup");
+    knearest_into(&xyz, &cell, k, None, Some(hint), &mut out).expect("warmup");
     linkcell::pop_reset();
     let mut acc = 0i32;
     let started = Instant::now();
     for _ in 0..reps {
-        knearest_into(&xyz, &cell, k, None, Some(3.0), &mut out).expect("knearest");
+        knearest_into(&xyz, &cell, k, None, Some(hint), &mut out).expect("knearest");
         acc = acc.wrapping_add(out[0]);
     }
     let wall_ns = started.elapsed().as_nanos() as u64;

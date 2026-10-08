@@ -616,107 +616,16 @@ unsafe fn fold_avx512(
     folded: RowPtr<Folded>,
     count: &mut [u32],
 ) -> usize {
-    use std::arch::x86_64::{
-        __m512d, _mm256_max_epi32, _mm256_min_epi32, _mm256_set1_epi32, _mm256_setzero_si256,
-        _mm256_storeu_si256, _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_cvttpd_epi32, _mm512_div_pd,
-        _mm512_loadu_pd, _mm512_mask_blend_pd, _mm512_mask_permutex2var_pd, _mm512_mul_pd,
-        _mm512_permutex2var_pd, _mm512_roundscale_pd, _mm512_set1_pd, _mm512_setr_epi64,
-        _mm512_setzero_pd, _mm512_storeu_pd, _mm512_sub_pd, _CMP_GE_OQ,
-    };
-    let o = simbox.origin();
-    let w = simbox.widths();
-    let h = simbox.h();
-    let hi_inv = simbox.hinv();
-    let ortho = simbox.is_ortho();
-    let bc = |v: f64| _mm512_set1_pd(v);
-    let one = bc(1.0);
-    let nf = [
-        bc(f64::from(n[0])),
-        bc(f64::from(n[1])),
-        bc(f64::from(n[2])),
-    ];
-    let top = [
-        _mm256_set1_epi32(n[0] - 1),
-        _mm256_set1_epi32(n[1] - 1),
-        _mm256_set1_epi32(n[2] - 1),
-    ];
-    let ix_x = _mm512_setr_epi64(0, 3, 6, 9, 12, 15, 0, 0);
-    let ix_x2 = _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 10, 13);
-    let ix_y = _mm512_setr_epi64(1, 4, 7, 10, 13, 0, 0, 0);
-    let ix_y2 = _mm512_setr_epi64(0, 0, 0, 0, 0, 8, 11, 14);
-    let ix_z = _mm512_setr_epi64(2, 5, 8, 11, 14, 0, 0, 0);
-    let ix_z2 = _mm512_setr_epi64(0, 0, 0, 0, 0, 9, 12, 15);
-    // `wrap01`: subtract the floor, and a value that rounds to one is zero.
-    let wrap01 = |s: __m512d| {
-        let t = _mm512_sub_pd(s, _mm512_roundscale_pd::<0x09>(s));
-        _mm512_mask_blend_pd(
-            _mm512_cmp_pd_mask::<_CMP_GE_OQ>(t, one),
-            t,
-            _mm512_setzero_pd(),
-        )
-    };
+    let f = bins::Fold8::new(simbox, n);
     let flat = xyz.as_ptr() as *const f64;
     let mut k = lo;
     while k + 8 <= hi {
-        let base = flat.add(3 * k);
-        let a = _mm512_loadu_pd(base);
-        let b = _mm512_loadu_pd(base.add(8));
-        let c = _mm512_loadu_pd(base.add(16));
-        let x = _mm512_mask_permutex2var_pd(_mm512_permutex2var_pd(a, ix_x, b), 0xc0, ix_x2, c);
-        let y = _mm512_mask_permutex2var_pd(_mm512_permutex2var_pd(a, ix_y, b), 0xe0, ix_y2, c);
-        let z = _mm512_mask_permutex2var_pd(_mm512_permutex2var_pd(a, ix_z, b), 0xe0, ix_z2, c);
-        let d = [
-            _mm512_sub_pd(x, bc(o[0])),
-            _mm512_sub_pd(y, bc(o[1])),
-            _mm512_sub_pd(z, bc(o[2])),
-        ];
-        let s = if ortho {
-            [
-                wrap01(_mm512_div_pd(d[0], bc(w[0]))),
-                wrap01(_mm512_div_pd(d[1], bc(w[1]))),
-                wrap01(_mm512_div_pd(d[2], bc(w[2]))),
-            ]
-        } else {
-            let row = |r: usize| {
-                _mm512_add_pd(
-                    _mm512_add_pd(
-                        _mm512_mul_pd(bc(hi_inv[0][r]), d[0]),
-                        _mm512_mul_pd(bc(hi_inv[1][r]), d[1]),
-                    ),
-                    _mm512_mul_pd(bc(hi_inv[2][r]), d[2]),
-                )
-            };
-            [wrap01(row(0)), wrap01(row(1)), wrap01(row(2))]
-        };
-        let cart = |r: usize| {
-            _mm512_add_pd(
-                _mm512_add_pd(
-                    _mm512_add_pd(
-                        _mm512_mul_pd(bc(h[0][r]), s[0]),
-                        _mm512_mul_pd(bc(h[1][r]), s[1]),
-                    ),
-                    _mm512_mul_pd(bc(h[2][r]), s[2]),
-                ),
-                bc(o[r]),
-            )
-        };
-        let bin = |a: usize| {
-            let t = _mm512_cvttpd_epi32(_mm512_mul_pd(s[a], nf[a]));
-            _mm256_min_epi32(_mm256_max_epi32(t, _mm256_setzero_si256()), top[a])
-        };
-        let (mut px, mut py, mut pz) = ([0.0f64; 8], [0.0f64; 8], [0.0f64; 8]);
-        let (mut bx, mut by, mut bz) = ([0i32; 8], [0i32; 8], [0i32; 8]);
-        _mm512_storeu_pd(px.as_mut_ptr(), cart(0));
-        _mm512_storeu_pd(py.as_mut_ptr(), cart(1));
-        _mm512_storeu_pd(pz.as_mut_ptr(), cart(2));
-        _mm256_storeu_si256(bx.as_mut_ptr() as *mut _, bin(0));
-        _mm256_storeu_si256(by.as_mut_ptr() as *mut _, bin(1));
-        _mm256_storeu_si256(bz.as_mut_ptr() as *mut _, bin(2));
+        let (_, p, b) = bins::fold8(&f, flat.add(3 * k));
         for l in 0..8 {
-            let cell = bins::flat_cell([bx[l], by[l], bz[l]], n);
+            let cell = bins::flat_cell([b[0][l], b[1][l], b[2][l]], n);
             count[cell] += 1;
             (*folded.at(k + l)).write(Folded {
-                p: [px[l], py[l], pz[l]],
+                p: [p[0][l], p[1][l], p[2][l]],
                 cell: cell as u32,
             });
         }
