@@ -5,6 +5,8 @@
 //! `KNN_SCALE_N` (default 262144), `KNN_SCALE_K` (default 4),
 //! `KNN_SCALE_REPS` (default 6), `KNN_SCALE_SHAPE` (`cubic` or `tilt`),
 //! `KNN_SCALE_HINT` (bin edge, default 3.0).
+//! `KNN_SCALE_SHUFFLE` (a seed) permutes the atoms, so their order no longer follows
+//! their position, as in a snapshot after a run.
 
 use std::time::Instant;
 
@@ -64,6 +66,17 @@ fn tilt(nside: usize) -> (Vec<[f64; 3]>, Cell) {
     (xyz, cell)
 }
 
+/// Fisher-Yates with an xorshift stream from `seed`.
+fn shuffle(xyz: &mut [[f64; 3]], seed: u64) {
+    let mut s = seed.max(1);
+    for i in (1..xyz.len()).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        xyz.swap(i, (s % (i as u64 + 1)) as usize);
+    }
+}
+
 fn main() {
     let nside = nside_of(env_usize("KNN_SCALE_N", 262_144));
     let k = env_usize("KNN_SCALE_K", 4);
@@ -73,11 +86,17 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3.0);
-    let (xyz, cell) = match shape.as_str() {
+    let (mut xyz, cell) = match shape.as_str() {
         "cubic" => cubic(nside),
         "tilt" => tilt(nside),
         other => panic!("unknown KNN_SCALE_SHAPE {other}"),
     };
+    if let Some(seed) = std::env::var("KNN_SCALE_SHUFFLE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        shuffle(&mut xyz, seed);
+    }
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".to_string());
     let mut out = vec![-1i32; xyz.len() * k];
     linkcell::pop_engage();

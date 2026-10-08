@@ -2,6 +2,8 @@
 //!
 //! Env: `PAIRS_N` (default 4096), `PAIRS_REPS` (default 5),
 //! `PAIRS_HALF` (default 0), `PAIRS_HINT` (bin edge, or the cutoff).
+//! `PAIRS_SHUFFLE` (a seed) permutes the atoms, so their order no longer follows
+//! their position, as in a snapshot after a run.
 //! `RAYON_NUM_THREADS` is read at startup. The line reports the first
 //! three calls, then the mean of the timed reps after that. Those
 //! timed reps always record the POP3 hierarchy.
@@ -40,6 +42,17 @@ fn fill(n: usize) -> Vec<[f64; 3]> {
     xyz
 }
 
+/// Fisher-Yates with an xorshift stream from `seed`.
+fn shuffle(xyz: &mut [[f64; 3]], seed: u64) {
+    let mut s = seed.max(1);
+    for i in (1..xyz.len()).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        xyz.swap(i, (s % (i as u64 + 1)) as usize);
+    }
+}
+
 fn main() {
     let n = env_usize("PAIRS_N", 4096);
     let reps = env_usize("PAIRS_REPS", 5).max(1);
@@ -48,7 +61,13 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok());
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".to_string());
-    let xyz = fill(n);
+    let mut xyz = fill(n);
+    if let Some(seed) = std::env::var("PAIRS_SHUFFLE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        shuffle(&mut xyz, seed);
+    }
     let cell = Cell::ortho(18.0, 18.0, 18.0).expect("box");
     linkcell::pop_engage();
     linkcell::pop_prepare();
