@@ -1060,9 +1060,11 @@ struct Block {
 #[cfg(feature = "parallel")]
 const PARALLEL_PAIRS: usize = 10_000;
 
-/// Active atoms where the bins are built on several threads, the same
-/// threshold as the k-nearest mesh.
-const PARALLEL_GRID: usize = 8_192;
+/// Active atoms from which a split walk also builds its bins on several
+/// threads. The fold then wakes the workers the search uses next; at 1024
+/// atoms in an 18 Å cube on this 8-core host the two builds tie, and at
+/// 4096 the threaded one is faster.
+const PARALLEL_GRID: usize = 1_024;
 
 /// Hits for the whole chunk. The distance loop appends here, then one
 /// pass writes the rows. Runs share a shift so the inner loop does not.
