@@ -84,10 +84,18 @@ corner, their squared length, and the atom index. The fold takes eight
 points at a time on AVX-512 with minimage's own operations in its order
 (the division or the `Hinv` product, `wrap01`, the bin truncation, and
 `H`), so every position and bin is the same bits as `Cell::fractional`
-and `Cell::cartesian`; the k-nearest mesh uses the same fold. From 8192
-atoms each pass runs on one block of atoms per thread, and the scan
-gives every thread its own run of slots in each bin, so the atom order
-inside a bin does not depend on the thread count.
+and `Cell::cartesian`; the k-nearest mesh uses the same fold. When the
+walk splits across threads, from 1024 atoms each pass runs on one block
+of atoms per thread, and the scan gives every thread its own run of
+slots in each bin, so the atom order inside a bin does not depend on
+the thread count. That first pass also wakes the workers the search
+uses next. A grid lends its slot columns, offsets, corners, fold, and
+counts back when it drops, and the next grid of a similar size takes
+them without zeroing them, since every value is written before it is
+read. Which bins each bin looks into, with their shifts and corner
+offsets, depends only on the box, the bin counts, the reach, and the
+cutoff; the last such stencil is kept under that key, and the walk
+reads each target bin's occupancy from the offsets.
 
 The walk splits across threads from an ideal-gas estimate of ten
 thousand pairs (on this 8-core host one thread is faster at 512 atoms
@@ -143,6 +151,16 @@ box misses the cutoff was timed on this host for the 4096-atom cube at
 a 4 Å cutoff: about 2.8 ms on one thread and 0.98 ms on eight, against
 2.68 ms and 0.87 ms for the distance tile alone. The walk keeps the
 distance tile. A cluster bitmask would still expand into the same row.
+
+Columns half a cutoff across along `b` and `c`, each sorted along `a`
+in eighth-cutoff bins, with a window into every neighbour column for
+each four sources, test about half as many vectors as the 27-bin
+stencil (200 thousand against 442 thousand source-vectors for that
+cube). They were slower on this host: about 1.9 ms on one thread and
+0.48 ms on eight, against 1.6 ms and 0.38 ms. Almost every vector in a
+window holds a hit, so each one pays the compress and the row permutes,
+and those share the one 512-bit shuffle port; the 27-bin tile skips
+most vectors after three fused multiply-adds and a compare.
 
 ## Heap and stop
 
