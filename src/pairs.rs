@@ -68,6 +68,7 @@ pub fn pairs_within(
     // ideal-gas estimate; search and write then run in one pool entry.
     let rows_guess = row_guess(est, half);
     let mut out: Vec<Pair> = Vec::with_capacity(rows_guess);
+    advise_huge(&mut out);
     let base = RowPtr(out.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
     let (rows, rest) = in_pool(est, || -> Result<(usize, Option<Found>), Error> {
         let found = plan(xyz, simbox, cutoff, mask, cell_hint, half)?.search();
@@ -87,6 +88,45 @@ pub fn pairs_within(
     // Safety: every row below `rows` is written.
     unsafe { out.set_len(rows) };
     Ok(out)
+}
+
+/// Ask Linux to back the 2 MB-aligned interior of a large buffer this
+/// library allocated with transparent huge pages, so the row stores take
+/// one page walk per 2 MB rather than per 4 KB. It is advice: the system's
+/// policy decides, and nothing outside the buffer is touched.
+fn advise_huge<T>(buf: &mut Vec<T>) {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        const HUGE: usize = 1 << 21;
+        const MADV_HUGEPAGE: std::ffi::c_int = 14;
+        extern "C" {
+            fn madvise(
+                addr: *mut std::ffi::c_void,
+                len: usize,
+                advice: std::ffi::c_int,
+            ) -> std::ffi::c_int;
+        }
+        let bytes = buf.capacity().saturating_mul(std::mem::size_of::<T>());
+        if bytes < 2 * HUGE {
+            return;
+        }
+        let start = buf.as_mut_ptr() as usize;
+        let lo = (start + HUGE - 1) & !(HUGE - 1);
+        let hi = (start + bytes) & !(HUGE - 1);
+        if hi > lo {
+            // Safety: `lo..hi` lies inside the buffer's allocation, and the
+            // advice changes neither its contents nor its mapping.
+            unsafe { madvise(lo as *mut std::ffi::c_void, hi - lo, MADV_HUGEPAGE) };
+        }
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    let _ = buf;
 }
 
 /// Rows to reserve for `hits` expected pairs: a quarter more than the
@@ -137,6 +177,7 @@ pub fn pairs_within_columns(
     out.j.reserve(rows_guess);
     out.shift.reserve(rows_guess);
     out.dist2.reserve(rows_guess);
+    out.advise_huge();
     let ptrs = ColumnPtrs {
         i: RowPtr(out.i.as_mut_ptr() as *mut std::mem::MaybeUninit<i32>),
         j: RowPtr(out.j.as_mut_ptr() as *mut std::mem::MaybeUninit<i32>),
@@ -218,6 +259,14 @@ impl PairColumns {
     /// `true` when there are no rows.
     pub fn is_empty(&self) -> bool {
         self.i.is_empty()
+    }
+
+    /// [`advise_huge`] for every column.
+    fn advise_huge(&mut self) {
+        advise_huge(&mut self.i);
+        advise_huge(&mut self.j);
+        advise_huge(&mut self.shift);
+        advise_huge(&mut self.dist2);
     }
 }
 
@@ -2814,6 +2863,7 @@ impl Plan {
         let cols = self.tile_cols();
         let guess = 2 * self.walk().guess_hits(self.grid.atoms()) + FUSED_SLACK;
         let mut out: Vec<Pair> = Vec::with_capacity(guess);
+        advise_huge(&mut out);
         let mut n = 0usize;
         self.each_block(|block| {
             let room = Self::block_room(block);
@@ -2867,6 +2917,7 @@ impl Plan {
             out.dist2.reserve(room);
         };
         grow(out, 0, guess);
+        out.advise_huge();
         let mut n = 0usize;
         self.each_block(|block| {
             let room = Self::block_room(block);
