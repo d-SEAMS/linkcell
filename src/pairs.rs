@@ -2042,9 +2042,8 @@ fn ahead(rows: usize, bytes: usize) -> bool {
 }
 
 /// Bytes of one row in the four columns.
-const COLUMN_BYTES: usize = 2 * std::mem::size_of::<i32>()
-    + std::mem::size_of::<[i32; 3]>()
-    + std::mem::size_of::<f64>();
+const COLUMN_BYTES: usize =
+    2 * std::mem::size_of::<i32>() + std::mem::size_of::<[i32; 3]>() + std::mem::size_of::<f64>();
 
 /// Prefetch the line holding `p`, which may lie past the end of its
 /// buffer.
@@ -2753,8 +2752,8 @@ unsafe fn avx512_fused<
         __m256i, _mm256_cmp_epu32_mask, _mm256_cmpeq_epi32_mask, _mm256_loadu_si256,
         _mm256_mask_blend_epi32, _mm256_maskz_compress_epi32, _mm256_maskz_loadu_epi32,
         _mm256_set1_epi32, _mm256_storeu_si256, _mm512_add_pd, _mm512_castpd_si512,
-        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_fmadd_pd,
-        _mm512_loadu_pd, _mm512_loadu_si512, _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask,
+        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_fmadd_pd, _mm512_loadu_pd,
+        _mm512_loadu_si512, _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask,
         _mm512_mask_set1_epi32, _mm512_maskz_compress_pd, _mm512_maskz_loadu_pd,
         _mm512_permutex2var_epi32, _mm512_permutexvar_epi32, _mm512_permutexvar_pd,
         _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd,
@@ -2995,76 +2994,60 @@ unsafe fn avx512_fused<
                 }
                 n += k;
             } else {
-            if COLS {
-                let at = n + AHEAD_ROWS;
-                if AHEAD {
-                    prefetch(out.ci.wrapping_add(at));
-                    prefetch(out.cj.wrapping_add(at));
-                    prefetch(out.cd.wrapping_add(at));
-                    prefetch(out.cs.wrapping_add(3 * at));
-                }
-                let iv = _mm512_set1_epi32($iu as i32);
-                let jz = _mm512_castsi256_si512(jc);
-                _mm512_storeu_si512(
-                    out.ci.add(n) as *mut _,
-                    _mm512_permutex2var_epi32(iv, ij, jz),
-                );
-                _mm512_storeu_si512(
-                    out.cj.add(n) as *mut _,
-                    _mm512_permutex2var_epi32(iv, ji, jz),
-                );
-                _mm512_storeu_pd(out.cd.add(n), _mm512_permutexvar_pd(dup_lo, dc));
-                let so = out.cs.add(3 * n);
-                _mm512_storeu_si512(so as *mut _, sv[0]);
-                if k > 2 {
+                if COLS {
+                    let at = n + AHEAD_ROWS;
                     if AHEAD {
-                        prefetch(out.cs.wrapping_add(3 * at + 16));
+                        prefetch(out.ci.wrapping_add(at));
+                        prefetch(out.cj.wrapping_add(at));
+                        prefetch(out.cd.wrapping_add(at));
+                        prefetch(out.cs.wrapping_add(3 * at));
                     }
-                    _mm512_storeu_si512(so.add(16) as *mut _, sv[1]);
-                }
-                if k > 4 {
-                    if AHEAD {
-                        prefetch(out.cd.wrapping_add(at + 8));
-                    }
-                    _mm512_storeu_pd(out.cd.add(n + 8), _mm512_permutexvar_pd(dup_hi, dc));
-                }
-                if k > 5 {
-                    if AHEAD {
-                        prefetch(out.cs.wrapping_add(3 * at + 32));
-                    }
-                    _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
-                }
-            } else {
-                // Dword sources, as in [`RowWords::index32`]: the eight ids
-                // and this source's constants, then the eight distances, so
-                // both groups of four hits permute from the same pair.
-                let at = out.rows.add(5 * n);
-                let a = _mm512_mask_blend_epi32(
-                    0x00ff,
-                    _mm512_mask_set1_epi32(consts, 0x0100, $iu as i32),
-                    _mm512_castsi256_si512(jc),
-                );
-                let b = _mm512_castpd_si512(dc);
-                // Two rows per hit are ten words: only the registers that
-                // hold them, so a lone hit takes two stores, not five.
-                let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
-                for (m, ix) in words.index32[0].iter().enumerate().take(regs) {
-                    if AHEAD {
-                        prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
-                    }
+                    let iv = _mm512_set1_epi32($iu as i32);
+                    let jz = _mm512_castsi256_si512(jc);
                     _mm512_storeu_si512(
-                        at.add(8 * m) as *mut _,
-                        _mm512_permutex2var_epi32(
-                            a,
-                            _mm512_loadu_si512(ix.as_ptr() as *const _),
-                            b,
-                        ),
+                        out.ci.add(n) as *mut _,
+                        _mm512_permutex2var_epi32(iv, ij, jz),
                     );
-                }
-                if k > 4 {
-                    let at = at.add(40);
-                    let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
-                    for (m, ix) in words.index32[1].iter().enumerate().take(regs) {
+                    _mm512_storeu_si512(
+                        out.cj.add(n) as *mut _,
+                        _mm512_permutex2var_epi32(iv, ji, jz),
+                    );
+                    _mm512_storeu_pd(out.cd.add(n), _mm512_permutexvar_pd(dup_lo, dc));
+                    let so = out.cs.add(3 * n);
+                    _mm512_storeu_si512(so as *mut _, sv[0]);
+                    if k > 2 {
+                        if AHEAD {
+                            prefetch(out.cs.wrapping_add(3 * at + 16));
+                        }
+                        _mm512_storeu_si512(so.add(16) as *mut _, sv[1]);
+                    }
+                    if k > 4 {
+                        if AHEAD {
+                            prefetch(out.cd.wrapping_add(at + 8));
+                        }
+                        _mm512_storeu_pd(out.cd.add(n + 8), _mm512_permutexvar_pd(dup_hi, dc));
+                    }
+                    if k > 5 {
+                        if AHEAD {
+                            prefetch(out.cs.wrapping_add(3 * at + 32));
+                        }
+                        _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
+                    }
+                } else {
+                    // Dword sources, as in [`RowWords::index32`]: the eight ids
+                    // and this source's constants, then the eight distances, so
+                    // both groups of four hits permute from the same pair.
+                    let at = out.rows.add(5 * n);
+                    let a = _mm512_mask_blend_epi32(
+                        0x00ff,
+                        _mm512_mask_set1_epi32(consts, 0x0100, $iu as i32),
+                        _mm512_castsi256_si512(jc),
+                    );
+                    let b = _mm512_castpd_si512(dc);
+                    // Two rows per hit are ten words: only the registers that
+                    // hold them, so a lone hit takes two stores, not five.
+                    let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
+                    for (m, ix) in words.index32[0].iter().enumerate().take(regs) {
                         if AHEAD {
                             prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
                         }
@@ -3077,9 +3060,25 @@ unsafe fn avx512_fused<
                             ),
                         );
                     }
+                    if k > 4 {
+                        let at = at.add(40);
+                        let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
+                        for (m, ix) in words.index32[1].iter().enumerate().take(regs) {
+                            if AHEAD {
+                                prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
+                            }
+                            _mm512_storeu_si512(
+                                at.add(8 * m) as *mut _,
+                                _mm512_permutex2var_epi32(
+                                    a,
+                                    _mm512_loadu_si512(ix.as_ptr() as *const _),
+                                    b,
+                                ),
+                            );
+                        }
+                    }
                 }
-            }
-            n += 2 * k;
+                n += 2 * k;
             }
         }};
     }
@@ -3338,7 +3337,12 @@ impl Plan {
             // slack, and the features are the caller's.
             unsafe {
                 avx512_fused::<COLS, false, AHEAD, HALF>(
-                    cols, self.cut2, self.margin, block, words, &mut fo,
+                    cols,
+                    self.cut2,
+                    self.margin,
+                    block,
+                    words,
+                    &mut fo,
                 )
             };
             n = fo.n;
@@ -3409,7 +3413,12 @@ impl Plan {
                 // Safety: the sink has room for `n` plus the block plus the
                 // slack, and the features are the caller's.
                 avx512_fused::<COLS, true, AHEAD, HALF>(
-                    cols, self.cut2, self.margin, &block, words, &mut fo,
+                    cols,
+                    self.cut2,
+                    self.margin,
+                    &block,
+                    words,
+                    &mut fo,
                 );
                 n = fo.n;
             }
@@ -4701,10 +4710,19 @@ mod tests {
             let xyz: Vec<[f64; 3]> = (0..250)
                 .map(|_| sim.cartesian([unit(), unit(), unit()]))
                 .collect();
-            let one = on_threads(1, || pairs_within(&xyz, sim, 7.5, None, None, true).unwrap());
-            let eight = on_threads(8, || pairs_within(&xyz, sim, 7.5, None, None, true).unwrap());
-            let full = on_threads(1, || pairs_within(&xyz, sim, 7.5, None, None, false).unwrap());
-            assert!(one.iter().any(|p| p.i == p.j), "no periodic self-image rows");
+            let one = on_threads(1, || {
+                pairs_within(&xyz, sim, 7.5, None, None, true).unwrap()
+            });
+            let eight = on_threads(8, || {
+                pairs_within(&xyz, sim, 7.5, None, None, true).unwrap()
+            });
+            let full = on_threads(1, || {
+                pairs_within(&xyz, sim, 7.5, None, None, false).unwrap()
+            });
+            assert!(
+                one.iter().any(|p| p.i == p.j),
+                "no periodic self-image rows"
+            );
             assert!(one == eight, "one thread and eight differ");
             let mut want: Vec<_> = full
                 .iter()
@@ -4787,8 +4805,7 @@ mod tests {
                             on_threads(threads, || {
                                 let found = search(xyz, sim, 4.0, None, None, half).unwrap();
                                 let n = found.rows();
-                                let mut out: Vec<(i32, i32, [i32; 3], u64)> =
-                                    Vec::with_capacity(n);
+                                let mut out: Vec<(i32, i32, [i32; 3], u64)> = Vec::with_capacity(n);
                                 // Safety: `out` holds `n` rows.
                                 unsafe {
                                     found.write_rows(out.as_mut_ptr(), |i, j, s, d| {
