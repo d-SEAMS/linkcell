@@ -485,12 +485,23 @@ fn execute(
         nbin,
         widths,
     };
-    if walk.is_ortho() {
-        dispatch::<0>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
-    } else if walk.is_restricted() {
-        dispatch::<1>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
-    } else {
-        dispatch::<2>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2);
+    match (
+        block_side(&mesh, nbin),
+        walk.is_ortho(),
+        walk.is_restricted(),
+    ) {
+        (Some(side), true, _) => {
+            dispatch_blocks::<0>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
+        }
+        (Some(side), false, true) => {
+            dispatch_blocks::<1>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
+        }
+        (Some(side), false, false) => {
+            dispatch_blocks::<2>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
+        }
+        (None, true, _) => dispatch::<0>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
+        (None, false, true) => dispatch::<1>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
+        (None, false, false) => dispatch::<2>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
     }
     Ok(())
 }
@@ -541,6 +552,260 @@ fn dispatch<const MODE: u8>(
         for c in 0..ncell {
             job(c);
         }
+    }
+}
+
+/// Bins a side of the source blocks of [`dispatch_blocks`] for this mesh:
+/// two when bins hold few points, so eight bins share one gather, and one
+/// otherwise. `None` when a candidate box would wrap onto itself.
+fn block_side(mesh: &Mesh, nbin: [i32; 3]) -> Option<i32> {
+    #[cfg(test)]
+    if NO_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let ncell = nbin.iter().map(|&n| n as usize).product::<usize>().max(1);
+    let side = if mesh.occupants.len() < 4 * ncell {
+        2
+    } else {
+        1
+    };
+    nbin.iter().all(|&n| n >= side + 2).then_some(side)
+}
+
+/// Tests turn the blocks off to compare against the shell walk.
+#[cfg(test)]
+static NO_BLOCKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The points around one block of bins, each moved by its image shift as
+/// [`visit_cell`] moves it, and their indices.
+#[derive(Default)]
+struct Candidates {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z: Vec<f64>,
+    id: Vec<u64>,
+    /// One source's distances, read only through a raw pointer.
+    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
+    d2: Vec<f64>,
+}
+
+/// [`dispatch`] by blocks of `side` bins a side: a block's sources share
+/// one candidate list, the occupants of the `side + 2` bins a side around
+/// the block with their images, gathered once. A source's own 3 x 3 x 3
+/// bins lie inside it, so when the source's k-th neighbour is within the
+/// shell walk's first plane bound the answer is among the candidates:
+/// every other point lies strictly past that plane. Distances are formed
+/// as [`visit_cell`] forms them, and the heap keeps the same k, so every
+/// row is the shell walk's; a source the bound does not settle takes the
+/// shell walk.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_blocks<const MODE: u8>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    side: i32,
+    out_nn: &mut [i32],
+    out_d2: Option<&mut [f64]>,
+) {
+    let nn = RowsOut(out_nn.as_mut_ptr());
+    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
+    let [nx, ny, nz] = geom.nbin;
+    let blocks = [
+        (nx + side - 1) / side,
+        (ny + side - 1) / side,
+        (nz + side - 1) / side,
+    ];
+    let nblock = (blocks[0] * blocks[1] * blocks[2]) as usize;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    let wide = std::is_x86_feature_detected!("avx512f");
+    let job = |cand: &mut Candidates, blk: usize| {
+        let blk = blk as i32;
+        let x0 = side * (blk % blocks[0]);
+        let y0 = side * ((blk / blocks[0]) % blocks[1]);
+        let z0 = side * (blk / (blocks[0] * blocks[1]));
+        cand.x.clear();
+        cand.y.clear();
+        cand.z.clear();
+        cand.id.clear();
+        for dz in -1..=side {
+            for dy in -1..=side {
+                for dx in -1..=side {
+                    let (cell, na, nb, nc) = mesh.locate(x0 + dx, y0 + dy, z0 + dz);
+                    let shift = image_shift::<MODE>(geom, na, nb, nc);
+                    for slot in mesh.offsets[cell]..mesh.offsets[cell + 1] {
+                        let p = mesh.slot_folded[slot];
+                        cand.x.push(p[0] + shift[0]);
+                        cand.y.push(p[1] + shift[1]);
+                        cand.z.push(p[2] + shift[2]);
+                        cand.id.push(mesh.occupants[slot] as u64);
+                    }
+                }
+            }
+        }
+        for iz in z0..(z0 + side).min(nz) {
+            for iy in y0..(y0 + side).min(ny) {
+                for ix in x0..(x0 + side).min(nx) {
+                    let c = ((iz * ny + iy) * nx + ix) as usize;
+                    for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+                        let i = mesh.occupants[slot];
+                        // Safety: each source owns row `i` of both outputs,
+                        // and the caller sized them to `n * k`.
+                        let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+                        let mut heap = KHeap::new(k);
+                        let pi = mesh.slot_folded[slot];
+                        #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+                        if wide {
+                            // Safety: AVX-512F was detected.
+                            unsafe { scan_avx512(cand, pi, i, &mut heap) };
+                        } else {
+                            scan(cand, pi, i, &mut heap);
+                        }
+                        #[cfg(not(all(target_arch = "x86_64", linkcell_avx512)))]
+                        scan(cand, pi, i, &mut heap);
+                        let bound = first_bound(mesh.slot_frac[slot], [ix, iy, iz], geom);
+                        if heap.full() && heap.worst() <= bound {
+                            heap.write_sorted(row, row_d2);
+                        } else {
+                            walk_source::<MODE>(
+                                mesh,
+                                geom,
+                                k,
+                                max_reach,
+                                [ix, iy, iz],
+                                slot,
+                                row,
+                                row_d2,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        (0..nblock).into_par_iter().with_min_len(8).for_each_init(
+            || (crate::pop::JobTimer::new(), Candidates::default()),
+            |(_timer, cand), blk| job(cand, blk),
+        );
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _timer = crate::pop::JobTimer::new();
+        let mut cand = Candidates::default();
+        for blk in 0..nblock {
+            job(&mut cand, blk);
+        }
+    }
+}
+
+/// The squared plane bound of the shell walk's first layer, the 3 x 3 x 3
+/// bins around `bin`, as [`walk_source`] forms it.
+fn first_bound(origin: [f64; 3], bin: [i32; 3], geom: &Geom) -> f64 {
+    (0..3)
+        .map(|a| {
+            let gap = axis_gap(origin[a], bin[a], 1, geom.nbin[a], geom.widths[a]);
+            if gap > 0.0 && gap.is_finite() {
+                gap * gap
+            } else {
+                0.0
+            }
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Push every candidate but the source itself.
+fn scan(cand: &Candidates, pi: [f64; 3], i: usize, heap: &mut KHeap) {
+    for t in 0..cand.x.len() {
+        let j = cand.id[t] as usize;
+        if j != i {
+            let dx = cand.x[t] - pi[0];
+            let dy = cand.y[t] - pi[1];
+            let dz = cand.z[t] - pi[2];
+            heap.push(dx * dx + dy * dy + dz * dz, j);
+        }
+    }
+}
+
+/// [`scan`] eight candidates at a time, in two passes. The first forms
+/// every distance and the lane-wise minimum over all of them: eight
+/// distances of eight different candidates, so the k-th smallest of them
+/// bounds the k-th nearest from above. The second pushes only candidates
+/// at or under that bound (and under the heap's worst once it is full),
+/// which are all [`KHeap::push`] could keep.
+///
+/// # Safety
+/// AVX-512F is available.
+#[allow(clippy::incompatible_msrv)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f")]
+unsafe fn scan_avx512(cand: &mut Candidates, pi: [f64; 3], i: usize, heap: &mut KHeap) {
+    use std::arch::x86_64::{
+        _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_cmpneq_epi64_mask, _mm512_loadu_pd,
+        _mm512_mask_blend_pd, _mm512_maskz_loadu_epi64, _mm512_maskz_loadu_pd, _mm512_min_pd,
+        _mm512_mul_pd, _mm512_set1_epi64, _mm512_set1_pd, _mm512_storeu_pd, _mm512_sub_pd,
+        _CMP_LE_OQ, _CMP_LT_OQ,
+    };
+    let m = cand.x.len();
+    let padded = (m + 7) & !7;
+    cand.d2.clear();
+    cand.d2.reserve(padded);
+    let dp = cand.d2.as_mut_ptr();
+    let (px, py, pz) = (
+        _mm512_set1_pd(pi[0]),
+        _mm512_set1_pd(pi[1]),
+        _mm512_set1_pd(pi[2]),
+    );
+    let me = _mm512_set1_epi64(i as i64);
+    let inf = _mm512_set1_pd(f64::INFINITY);
+    let mut low = inf;
+    let mut t = 0usize;
+    while t < m {
+        let tm: u8 = if m - t >= 8 {
+            0xff
+        } else {
+            ((1u32 << (m - t)) - 1) as u8
+        };
+        let dx = _mm512_sub_pd(_mm512_maskz_loadu_pd(tm, cand.x.as_ptr().add(t)), px);
+        let dy = _mm512_sub_pd(_mm512_maskz_loadu_pd(tm, cand.y.as_ptr().add(t)), py);
+        let dz = _mm512_sub_pd(_mm512_maskz_loadu_pd(tm, cand.z.as_ptr().add(t)), pz);
+        let d2 = _mm512_add_pd(
+            _mm512_add_pd(_mm512_mul_pd(dx, dx), _mm512_mul_pd(dy, dy)),
+            _mm512_mul_pd(dz, dz),
+        );
+        let ids = _mm512_maskz_loadu_epi64(tm, cand.id.as_ptr().add(t) as *const i64);
+        let keep = _mm512_cmpneq_epi64_mask(ids, me) & tm;
+        // The source itself and lanes past the end never count.
+        let d2 = _mm512_mask_blend_pd(keep, inf, d2);
+        low = _mm512_min_pd(low, d2);
+        _mm512_storeu_pd(dp.add(t), d2);
+        t += 8;
+    }
+    let mut bound = f64::INFINITY;
+    if heap.k <= 8 {
+        let mut lanes = [0.0f64; 8];
+        _mm512_storeu_pd(lanes.as_mut_ptr(), low);
+        lanes.sort_unstable_by(f64::total_cmp);
+        bound = lanes[heap.k - 1];
+    }
+    let mut t = 0usize;
+    while t < padded {
+        let limit = if heap.full() {
+            heap.worst().min(bound)
+        } else {
+            bound
+        };
+        let d2 = _mm512_loadu_pd(dp.add(t));
+        let mut take: u8 = _mm512_cmp_pd_mask::<_CMP_LE_OQ>(d2, _mm512_set1_pd(limit))
+            & _mm512_cmp_pd_mask::<_CMP_LT_OQ>(d2, inf);
+        while take != 0 {
+            let l = take.trailing_zeros() as usize;
+            take &= take - 1;
+            heap.push(*dp.add(t + l), cand.id[t + l] as usize);
+        }
+        t += 8;
     }
 }
 
@@ -654,6 +919,47 @@ struct CellQuery<'a> {
     origin: [f64; 3],
 }
 
+/// Cartesian shift of image `(na, nb, nc)` of a bin.
+#[inline(always)]
+fn image_shift<const MODE: u8>(geom: &Geom, na: i32, nb: i32, nc: i32) -> [f64; 3] {
+    if MODE == 0 {
+        if (na | nb | nc) == 0 {
+            [0.0; 3]
+        } else {
+            [
+                f64::from(na) * geom.lengths[0],
+                f64::from(nb) * geom.lengths[1],
+                f64::from(nc) * geom.lengths[2],
+            ]
+        }
+    } else if MODE == 1 {
+        // Restricted triclinic: a along x, b in the xy plane.
+        let fa = f64::from(na);
+        let fb = f64::from(nb);
+        let fc = f64::from(nc);
+        let a = geom.cols[0];
+        let b = geom.cols[1];
+        let c = geom.cols[2];
+        [
+            fa * a[0] + fb * b[0] + fc * c[0],
+            fb * b[1] + fc * c[1],
+            fc * c[2],
+        ]
+    } else {
+        let fa = f64::from(na);
+        let fb = f64::from(nb);
+        let fc = f64::from(nc);
+        let a = geom.cols[0];
+        let b = geom.cols[1];
+        let c = geom.cols[2];
+        [
+            fa * a[0] + fb * b[0] + fc * c[0],
+            fa * a[1] + fb * b[1] + fc * c[1],
+            fa * a[2] + fb * b[2] + fc * c[2],
+        ]
+    }
+}
+
 #[inline(always)]
 fn visit_cell<const MODE: u8>(q: &mut CellQuery<'_>, jx: i32, jy: i32, jz: i32, allow_slab: bool) {
     let (cell, na, nb, nc) = q.mesh.locate(jx, jy, jz);
@@ -674,42 +980,7 @@ fn visit_cell<const MODE: u8>(q: &mut CellQuery<'_>, jx: i32, jy: i32, jz: i32, 
             return;
         }
     }
-    let shift = if MODE == 0 {
-        if (na | nb | nc) == 0 {
-            [0.0; 3]
-        } else {
-            [
-                f64::from(na) * q.geom.lengths[0],
-                f64::from(nb) * q.geom.lengths[1],
-                f64::from(nc) * q.geom.lengths[2],
-            ]
-        }
-    } else if MODE == 1 {
-        // Restricted triclinic: a along x, b in the xy plane.
-        let fa = f64::from(na);
-        let fb = f64::from(nb);
-        let fc = f64::from(nc);
-        let a = q.geom.cols[0];
-        let b = q.geom.cols[1];
-        let c = q.geom.cols[2];
-        [
-            fa * a[0] + fb * b[0] + fc * c[0],
-            fb * b[1] + fc * c[1],
-            fc * c[2],
-        ]
-    } else {
-        let fa = f64::from(na);
-        let fb = f64::from(nb);
-        let fc = f64::from(nc);
-        let a = q.geom.cols[0];
-        let b = q.geom.cols[1];
-        let c = q.geom.cols[2];
-        [
-            fa * a[0] + fb * b[0] + fc * c[0],
-            fa * a[1] + fb * b[1] + fc * c[1],
-            fa * a[2] + fb * b[2] + fc * c[2],
-        ]
-    };
+    let shift = image_shift::<MODE>(q.geom, na, nb, nc);
     let pi = q.pi;
     for (&ju, &p) in q.mesh.occupants[lo..hi]
         .iter()
@@ -882,6 +1153,101 @@ mod scale_mesh_tests {
         for &i in active.iter().step_by(900) {
             assert_certified(&cell, &xyz, &active, i, &rows[i]);
             assert!(rows[i + 1].indices.is_empty());
+        }
+    }
+
+    #[test]
+    fn blocks_write_the_shell_walk_rows() {
+        // Lattices a few ulps off (many equal distances, so index order
+        // decides), random points, and a sparse box, in an orthorhombic,
+        // a restricted, and a general cell; bins of one point and of
+        // several, so both block sides run; k up to 20, past the bound
+        // of the two-pass scan.
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let cells = [
+            Cell::ortho(25.0, 25.0, 25.0).unwrap(),
+            Cell::from_vectors(
+                [25.0, 0.0, 0.0],
+                [4.0, 24.0, 0.0],
+                [-3.0, 2.0, 24.5],
+                [0.0; 3],
+            )
+            .unwrap(),
+            Cell::from_vectors(
+                [24.0, 3.0, -2.0],
+                [2.5, 23.5, 3.0],
+                [-1.5, 2.0, 24.0],
+                [0.5, 0.0, -0.5],
+            )
+            .unwrap(),
+        ];
+        for sim in &cells {
+            let mut sets: Vec<Vec<[f64; 3]>> = Vec::new();
+            let mut lattice = Vec::new();
+            for iz in 0..10 {
+                for iy in 0..10 {
+                    for ix in 0..10 {
+                        let mut s = [
+                            (ix as f64 + 0.5) / 10.0,
+                            (iy as f64 + 0.5) / 10.0,
+                            (iz as f64 + 0.5) / 10.0,
+                        ];
+                        for v in s.iter_mut() {
+                            let ulps = (next() % 7) as i64 - 3;
+                            *v = f64::from_bits((v.to_bits() as i64 + ulps) as u64);
+                        }
+                        lattice.push(sim.cartesian(s));
+                    }
+                }
+            }
+            sets.push(lattice);
+            let unit = |v: u64| (v >> 11) as f64 / (1u64 << 53) as f64;
+            sets.push(
+                (0..1500)
+                    .map(|_| sim.cartesian([unit(next()), unit(next()), unit(next())]))
+                    .collect(),
+            );
+            sets.push(
+                (0..60)
+                    .map(|_| sim.cartesian([unit(next()), unit(next()), unit(next())]))
+                    .collect(),
+            );
+            for xyz in &sets {
+                let mask: Vec<bool> = (0..xyz.len()).map(|t| t % 7 != 3).collect();
+                for hint in [Some(2.4), Some(5.0)] {
+                    for k in [1, 4, 8, 12, 20] {
+                        for mask in [None, Some(mask.as_slice())] {
+                            let blocked = knearest(xyz, sim, k, mask, hint).unwrap();
+                            NO_BLOCKS.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let walked = knearest(xyz, sim, k, mask, hint).unwrap();
+                            NO_BLOCKS.store(false, std::sync::atomic::Ordering::Relaxed);
+                            for (i, (b, w)) in blocked.iter().zip(&walked).enumerate() {
+                                assert_eq!(
+                                    b.indices,
+                                    w.indices,
+                                    "n={} k={k} hint={hint:?} i={i}",
+                                    xyz.len()
+                                );
+                                let bits = |r: &Neighbors| -> Vec<u64> {
+                                    r.dist2.iter().map(|d| d.to_bits()).collect()
+                                };
+                                assert_eq!(
+                                    bits(b),
+                                    bits(w),
+                                    "n={} k={k} hint={hint:?} i={i}",
+                                    xyz.len()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
