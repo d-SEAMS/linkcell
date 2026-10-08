@@ -2077,6 +2077,9 @@ fn write_half(
 struct RowWords {
     /// Permute indices for four hits: eight rows, five registers.
     index: [[u64; 8]; 5],
+    /// Dword permute indices for up to eight hits from two registers, one
+    /// table of five registers per four hits.
+    index32: [[[u32; 16]; 5]; 2],
 }
 
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
@@ -2112,6 +2115,9 @@ impl RowWords {
         // Sources: [a0 a1 a2 a3 b0 b1 b2 b3] then [d0 d1 d2 d3 S01 S2 N01 N2].
         // Row 2k is (a_k, b_k, S, d_k); row 2k + 1 is (b_k, a_k, -S, d_k).
         let mut index = [[0u64; 8]; 5];
+        // Dword sources: [j0 .. j7, i, 0, s0, s1, s2, n0, n1, n2] then the
+        // eight distances, two dwords each. Group `g` holds hits 4g..4g + 3.
+        let mut index32 = [[[0u32; 16]; 5]; 2];
         for r in 0..8 {
             let (k, mirror) = ((r / 2) as u64, r % 2 == 1);
             let mut row = [0u64; 5];
@@ -2124,8 +2130,23 @@ impl RowWords {
                 let t = 5 * r + w;
                 index[t / 8][t % 8] = v;
             }
+            for (g, table) in index32.iter_mut().enumerate() {
+                let h = (4 * g + r / 2) as u32;
+                let mut row = [[0u32; 2]; 5];
+                row[wi] = if mirror { [h, 9] } else { [8, 9] };
+                row[wj] = if mirror { [8, 9] } else { [h, 9] };
+                row[wd] = [16 + 2 * h, 17 + 2 * h];
+                row[ws] = if mirror { [13, 14] } else { [10, 11] };
+                row[ws + 1] = if mirror { [15, 9] } else { [12, 9] };
+                for (w, pair) in row.iter().enumerate() {
+                    for (half, &v) in pair.iter().enumerate() {
+                        let q = 10 * r + 2 * w + half;
+                        table[q / 16][q % 16] = v;
+                    }
+                }
+            }
         }
-        Some(Self { index })
+        Some(Self { index, index32 })
     }
 }
 
@@ -2425,30 +2446,22 @@ unsafe fn avx512_fused<const COLS: bool>(
     out: &mut FusedOut,
 ) {
     use std::arch::x86_64::{
-        __m256i, __m512i, _mm256_loadu_si256, _mm256_maskz_compress_epi32,
-        _mm256_maskz_loadu_epi32, _mm256_set_epi64x, _mm512_add_pd, _mm512_castpd_si512,
-        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_cvtepu32_epi64,
-        _mm512_extracti64x4_epi64, _mm512_fmadd_pd, _mm512_inserti64x4, _mm512_loadu_pd,
-        _mm512_loadu_si512, _mm512_mask_cmp_pd_mask, _mm512_maskz_compress_pd,
-        _mm512_maskz_loadu_pd, _mm512_permutex2var_epi32, _mm512_permutex2var_epi64,
-        _mm512_permutexvar_epi32, _mm512_permutexvar_pd, _mm512_set1_epi32, _mm512_set1_epi64,
-        _mm512_set1_pd, _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd,
+        __m256i, _mm256_loadu_si256, _mm256_maskz_compress_epi32, _mm256_maskz_loadu_epi32,
+        _mm512_add_pd, _mm512_castpd_si512, _mm512_castsi256_si512, _mm512_fmadd_pd,
+        _mm512_loadu_pd, _mm512_loadu_si512, _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask,
+        _mm512_mask_set1_epi32, _mm512_maskz_compress_pd, _mm512_maskz_loadu_pd,
+        _mm512_permutex2var_epi32, _mm512_permutexvar_epi32, _mm512_permutexvar_pd,
+        _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd,
         _mm512_storeu_si512, _CMP_LT_OQ,
     };
-    let idx: [__m512i; 5] = [
-        _mm512_loadu_si512(words.index[0].as_ptr() as *const _),
-        _mm512_loadu_si512(words.index[1].as_ptr() as *const _),
-        _mm512_loadu_si512(words.index[2].as_ptr() as *const _),
-        _mm512_loadu_si512(words.index[3].as_ptr() as *const _),
-        _mm512_loadu_si512(words.index[4].as_ptr() as *const _),
-    ];
     let [sx, sy, sz] = block.shift;
     let [ox, oy, oz] = block.delta;
     let shift_s = block.shift_s;
     let neg = [-shift_s[0], -shift_s[1], -shift_s[2]];
-    let (s01, s2) = shift_words(shift_s);
-    let (n01, n2) = shift_words(neg);
-    let sh = _mm256_set_epi64x(n2 as i64, n01 as i64, s2 as i64, s01 as i64);
+    // Dwords 8..16 of the row source: the source id, a zero, S, and -S.
+    let consts = _mm512_setr_epi32(
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, shift_s[0], shift_s[1], shift_s[2], neg[0], neg[1], neg[2],
+    );
     // Columns: row 2k is (i, j_k, S, d_k) and row 2k + 1 is (j_k, i, -S, d_k).
     let ij = _mm512_setr_epi32(0, 16, 0, 17, 0, 18, 0, 19, 0, 20, 0, 21, 0, 22, 0, 23);
     let ji = _mm512_setr_epi32(16, 0, 17, 0, 18, 0, 19, 0, 20, 0, 21, 0, 22, 0, 23, 0);
@@ -2582,39 +2595,40 @@ unsafe fn avx512_fused<const COLS: bool>(
                     _mm512_storeu_si512(so.add(32) as *mut _, sv[2]);
                 }
             } else {
+                // Dword sources, as in [`RowWords::index32`]: the eight ids
+                // and this source's constants, then the eight distances, so
+                // both groups of four hits permute from the same pair.
                 let at = out.rows.add(5 * n);
-                let iv = _mm512_castsi512_si256(_mm512_set1_epi64(i64::from($iu)));
-                let jq = _mm512_cvtepu32_epi64(jc);
-                let dq = _mm512_castpd_si512(dc);
-                let ab =
-                    _mm512_inserti64x4(_mm512_castsi256_si512(iv), _mm512_castsi512_si256(jq), 1);
-                let ds = _mm512_inserti64x4(dq, sh, 1);
+                let a = _mm512_mask_blend_epi32(
+                    0x00ff,
+                    _mm512_mask_set1_epi32(consts, 0x0100, $iu as i32),
+                    _mm512_castsi256_si512(jc),
+                );
+                let b = _mm512_castpd_si512(dc);
                 // Two rows per hit are ten words: only the registers that
                 // hold them, so a lone hit takes two stores, not five.
                 let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
-                for (m, ix) in idx.iter().enumerate().take(regs) {
+                for (m, ix) in words.index32[0].iter().enumerate().take(regs) {
                     _mm512_storeu_si512(
                         at.add(8 * m) as *mut _,
-                        _mm512_permutex2var_epi64(ab, *ix, ds),
+                        _mm512_permutex2var_epi32(
+                            a,
+                            _mm512_loadu_si512(ix.as_ptr() as *const _),
+                            b,
+                        ),
                     );
                 }
                 if k > 4 {
-                    let ab = _mm512_inserti64x4(
-                        _mm512_castsi256_si512(iv),
-                        _mm512_extracti64x4_epi64(jq, 1),
-                        1,
-                    );
-                    let ds = _mm512_inserti64x4(
-                        _mm512_castsi256_si512(_mm512_extracti64x4_epi64(dq, 1)),
-                        sh,
-                        1,
-                    );
                     let at = at.add(40);
                     let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
-                    for (m, ix) in idx.iter().enumerate().take(regs) {
+                    for (m, ix) in words.index32[1].iter().enumerate().take(regs) {
                         _mm512_storeu_si512(
                             at.add(8 * m) as *mut _,
-                            _mm512_permutex2var_epi64(ab, *ix, ds),
+                            _mm512_permutex2var_epi32(
+                                a,
+                                _mm512_loadu_si512(ix.as_ptr() as *const _),
+                                b,
+                            ),
                         );
                     }
                 }
