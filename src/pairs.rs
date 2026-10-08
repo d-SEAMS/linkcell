@@ -511,6 +511,7 @@ fn build_partners(grid: &Grid, simbox: &Cell, reach: [i32; 3], cut2: f64) -> Par
     PartnerList { off, items }
 }
 
+#[derive(Default)]
 struct Coords {
     x: Vec<f64>,
     y: Vec<f64>,
@@ -526,16 +527,71 @@ struct Coords {
 }
 
 impl Coords {
-    fn with_len(nslot: usize) -> Self {
-        Coords {
-            x: vec![0.0; nslot],
-            y: vec![0.0; nslot],
-            z: vec![0.0; nslot],
-            rx: vec![0.0; nslot],
-            ry: vec![0.0; nslot],
-            rz: vec![0.0; nslot],
-            r2: vec![0.0; nslot],
-            id: vec![0; nslot],
+    /// Empty columns with room for `nslot` slots each.
+    fn clear_for(&mut self, nslot: usize) {
+        for v in [
+            &mut self.x,
+            &mut self.y,
+            &mut self.z,
+            &mut self.rx,
+            &mut self.ry,
+            &mut self.rz,
+            &mut self.r2,
+        ] {
+            v.clear();
+            v.reserve(nslot);
+        }
+        self.id.clear();
+        self.id.reserve(nslot);
+    }
+
+    /// # Safety
+    /// Every column holds `nslot` written slots.
+    unsafe fn set_len(&mut self, nslot: usize) {
+        for v in [
+            &mut self.x,
+            &mut self.y,
+            &mut self.z,
+            &mut self.rx,
+            &mut self.ry,
+            &mut self.rz,
+            &mut self.r2,
+        ] {
+            v.set_len(nslot);
+        }
+        self.id.set_len(nslot);
+    }
+}
+
+/// Buffers a grid lends back when it drops, so the next search of a
+/// similar size neither allocates nor faults them in.
+#[derive(Default)]
+struct GridBufs {
+    offsets: Vec<usize>,
+    corners: Vec<[f64; 3]>,
+    coords: Coords,
+    folded: Vec<Folded>,
+    tally: Vec<u32>,
+}
+
+static GRID_POOL: std::sync::Mutex<Option<GridBufs>> = std::sync::Mutex::new(None);
+
+fn take_grid_bufs() -> GridBufs {
+    GRID_POOL
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or_default()
+}
+
+fn give_grid_bufs(bufs: GridBufs) {
+    const MAX_KEEP: usize = 1 << 20;
+    if bufs.coords.x.capacity() > MAX_KEEP || bufs.offsets.capacity() > MAX_KEEP {
+        return;
+    }
+    if let Ok(mut slot) = GRID_POOL.lock() {
+        if slot.is_none() {
+            *slot = Some(bufs);
         }
     }
 }
@@ -553,6 +609,21 @@ struct Grid {
     /// Largest |component| of the folded and of the relative positions.
     max_abs: f64,
     max_rel: f64,
+    /// The fold and the counts, kept for the next grid.
+    folded: Vec<Folded>,
+    tally: Vec<u32>,
+}
+
+impl Drop for Grid {
+    fn drop(&mut self) {
+        give_grid_bufs(GridBufs {
+            offsets: std::mem::take(&mut self.offsets),
+            corners: std::mem::take(&mut self.corners),
+            coords: std::mem::take(&mut self.coords),
+            folded: std::mem::take(&mut self.folded),
+            tally: std::mem::take(&mut self.tally),
+        });
+    }
 }
 
 /// One atom's folded position and flat bin, between the two passes.
@@ -702,10 +773,26 @@ impl Grid {
         let ncell = (n[0] as usize) * (n[1] as usize) * (n[2] as usize);
         let n_act = active.map_or(xyz.len(), |a| a.len());
         let atom = |k: usize| active.map_or(k, |a| a[k]);
-        let mut folded = vec![Folded::default(); n_act];
-        let mut corners = vec![[0.0f64; 3]; ncell];
-        let mut coords = Coords::with_len(n_act);
-        let mut offsets = vec![0usize; ncell + 1];
+        // Buffers come from the last grid and are not zeroed: the fold
+        // writes every atom, the corner pass every bin, and the scatter
+        // every slot, before any of them is read.
+        let GridBufs {
+            mut offsets,
+            mut corners,
+            mut coords,
+            mut folded,
+            mut tally,
+        } = take_grid_bufs();
+        offsets.clear();
+        offsets.reserve(ncell + 1);
+        corners.clear();
+        corners.reserve(ncell);
+        coords.clear_for(n_act);
+        folded.clear();
+        folded.reserve(n_act);
+        let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
+        let cp = RowPtr(corners.as_mut_ptr() as *mut std::mem::MaybeUninit<[f64; 3]>);
+        let slots = SlotPtrs::of(&mut coords);
         let corner = |c: usize| {
             let ix = (c % n[0] as usize) as i32;
             let iy = ((c / n[0] as usize) % n[1] as usize) as i32;
@@ -718,98 +805,108 @@ impl Grid {
         };
         let (mut max_abs, mut max_rel) = (0.0f64, 0.0f64);
         #[cfg(feature = "parallel")]
-        if threads > 1 {
-            let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
-            let cp = RowPtr(corners.as_mut_ptr() as *mut std::mem::MaybeUninit<[f64; 3]>);
-            let p = rayon::current_num_threads().max(1);
-            let block = |k: usize, len: usize| (k * len / p, (k + 1) * len / p);
-            // Pass 1: fold a block of atoms and a block of bin corners.
-            let counts: Vec<Vec<u32>> = rayon::broadcast(|ctx| {
-                let _timer = crate::pop::JobTimer::new();
-                let k = ctx.index();
-                let mut count = vec![0u32; ncell];
-                let (lo, hi) = block(k, n_act);
-                // Atom blocks are disjoint, so each thread owns its range.
-                fold_range(simbox, xyz, active, n, lo, hi, fp, &mut count);
-                let (clo, chi) = block(k, ncell);
-                for c in clo..chi {
-                    // Safety: corner blocks are disjoint.
-                    unsafe { (*cp.at(c)).write(corner(c)) };
+        let parallel = threads > 1;
+        #[cfg(not(feature = "parallel"))]
+        let parallel = {
+            let _ = threads;
+            false
+        };
+        if parallel {
+            #[cfg(feature = "parallel")]
+            {
+                let p = rayon::current_num_threads().max(1);
+                let block = |k: usize, len: usize| (k * len / p, (k + 1) * len / p);
+                // Pass 1: fold a block of atoms and a block of bin corners.
+                let counts: Vec<Vec<u32>> = rayon::broadcast(|ctx| {
+                    let _timer = crate::pop::JobTimer::new();
+                    let k = ctx.index();
+                    let mut count = vec![0u32; ncell];
+                    let (lo, hi) = block(k, n_act);
+                    // Atom blocks are disjoint, so each thread owns its range.
+                    fold_range(simbox, xyz, active, n, lo, hi, fp, &mut count);
+                    let (clo, chi) = block(k, ncell);
+                    for c in clo..chi {
+                        // Safety: corner blocks are disjoint.
+                        unsafe { (*cp.at(c)).write(corner(c)) };
+                    }
+                    count
+                });
+                // Safety: pass 1 wrote every atom and every corner.
+                unsafe {
+                    folded.set_len(n_act);
+                    corners.set_len(ncell);
                 }
-                count
-            });
-            // Scan: bin `c` starts at `offsets[c]`, and thread `k`'s run in
-            // it starts after the runs of threads `0..k`.
-            let mut start = vec![0u32; p * ncell];
-            let mut at = 0usize;
-            for c in 0..ncell {
-                offsets[c] = at;
-                for (k, count) in counts.iter().enumerate() {
-                    start[k * ncell + c] = at as u32;
-                    at += count[c] as usize;
+                // Scan: bin `c` starts at `offsets[c]`, and thread `k`'s run
+                // in it starts after the runs of threads `0..k`.
+                let mut start = vec![0u32; p * ncell];
+                let mut at = 0usize;
+                for c in 0..ncell {
+                    offsets.push(at);
+                    for (k, count) in counts.iter().enumerate() {
+                        start[k * ncell + c] = at as u32;
+                        at += count[c] as usize;
+                    }
+                }
+                offsets.push(at);
+                let (folded, corners, start) = (&folded, &corners, &start);
+                // Pass 2: scatter each block into its runs.
+                let maxima: Vec<(f64, f64)> = rayon::broadcast(|ctx| {
+                    let _timer = crate::pop::JobTimer::new();
+                    let k = ctx.index();
+                    let mut next = start[k * ncell..(k + 1) * ncell].to_vec();
+                    let (mut ma, mut mr) = (0.0f64, 0.0f64);
+                    let (lo, hi) = block(k, n_act);
+                    for (slot, f) in folded.iter().enumerate().take(hi).skip(lo) {
+                        let c = f.cell as usize;
+                        let dest = next[c] as usize;
+                        next[c] += 1;
+                        // Safety: the scan gave this thread the slots it writes.
+                        let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
+                        ma = ma.max(a);
+                        mr = mr.max(r);
+                    }
+                    (ma, mr)
+                });
+                for (a, r) in maxima {
+                    max_abs = max_abs.max(a);
+                    max_rel = max_rel.max(r);
                 }
             }
-            offsets[ncell] = at;
-            let slots = SlotPtrs::of(&mut coords);
-            let (folded, corners, start) = (&folded, &corners, &start);
-            // Pass 2: scatter each block into its runs.
-            let maxima: Vec<(f64, f64)> = rayon::broadcast(|ctx| {
-                let _timer = crate::pop::JobTimer::new();
-                let k = ctx.index();
-                let mut next = start[k * ncell..(k + 1) * ncell].to_vec();
-                let (mut ma, mut mr) = (0.0f64, 0.0f64);
-                let (lo, hi) = block(k, n_act);
-                for (slot, f) in folded.iter().enumerate().take(hi).skip(lo) {
-                    let c = f.cell as usize;
-                    let dest = next[c] as usize;
-                    next[c] += 1;
-                    // Safety: the scan gave this thread the slots it writes.
-                    let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
-                    ma = ma.max(a);
-                    mr = mr.max(r);
-                }
-                (ma, mr)
-            });
-            for (a, r) in maxima {
+        } else {
+            let _timer = crate::pop::JobTimer::new();
+            tally.clear();
+            tally.resize(ncell, 0);
+            fold_range(simbox, xyz, active, n, 0, n_act, fp, &mut tally);
+            for c in 0..ncell {
+                // Safety: `corners` has room for every bin.
+                unsafe { (*cp.at(c)).write(corner(c)) };
+            }
+            // Safety: the fold wrote every atom and the loop every corner.
+            unsafe {
+                folded.set_len(n_act);
+                corners.set_len(ncell);
+            }
+            // `tally` becomes the next free slot of each bin.
+            let mut at = 0usize;
+            for t in tally.iter_mut() {
+                offsets.push(at);
+                let count = *t as usize;
+                *t = at as u32;
+                at += count;
+            }
+            offsets.push(at);
+            for (slot, f) in folded.iter().enumerate() {
+                let c = f.cell as usize;
+                let dest = tally[c] as usize;
+                tally[c] += 1;
+                // Safety: one thread, and every slot is in range.
+                let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
                 max_abs = max_abs.max(a);
                 max_rel = max_rel.max(r);
             }
-            return Grid {
-                n,
-                widths: simbox.widths(),
-                offsets,
-                corners: corners.clone(),
-                coords,
-                max_abs,
-                max_rel,
-            };
         }
-        let _ = threads;
-        let _timer = crate::pop::JobTimer::new();
-        let mut tally = vec![0u32; ncell];
-        let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
-        fold_range(simbox, xyz, active, n, 0, n_act, fp, &mut tally);
-        for (c, o) in corners.iter_mut().enumerate() {
-            *o = corner(c);
-        }
-        let mut count = vec![0usize; ncell];
-        let mut at = 0usize;
-        for c in 0..ncell {
-            offsets[c] = at;
-            at += tally[c] as usize;
-            count[c] = offsets[c];
-        }
-        offsets[ncell] = at;
-        let slots = SlotPtrs::of(&mut coords);
-        for (slot, f) in folded.iter().enumerate() {
-            let c = f.cell as usize;
-            let dest = count[c];
-            count[c] += 1;
-            // Safety: one thread, and every slot is in range.
-            let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
-            max_abs = max_abs.max(a);
-            max_rel = max_rel.max(r);
-        }
+        // Safety: the scatter wrote every slot of every column once.
+        unsafe { coords.set_len(n_act) };
         Grid {
             n,
             widths: simbox.widths(),
@@ -818,6 +915,8 @@ impl Grid {
             coords,
             max_abs,
             max_rel,
+            folded,
+            tally,
         }
     }
 
@@ -832,9 +931,11 @@ impl Grid {
             widths: [0.0; 3],
             offsets: vec![0],
             corners: Vec::new(),
-            coords: Coords::with_len(0),
+            coords: Coords::default(),
             max_abs: 0.0,
             max_rel: 0.0,
+            folded: Vec::new(),
+            tally: Vec::new(),
         }
     }
 }
