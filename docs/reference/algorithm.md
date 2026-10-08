@@ -138,7 +138,17 @@ tile: hit lanes are compressed, and four hits become eight 40-byte
 rows (or sixteen column entries) in five registers. The rows are dword
 permutes of two registers, one holding the eight compressed targets,
 the source, and both shifts, the other the eight compressed distances,
-so the second four hits of a vector permute from the same pair. When
+so the second four hits of a vector permute from the same pair. A half
+list is written from the tile too, one row per hit on the side
+`keep_half` keeps: one compare of the source against the compressed
+targets picks each hit's side (a target with the source's own index,
+which only an image of the source's own bin holds, takes the shift's
+side), and each register of rows is one permute through an index
+blended between the forward and the mirrored table, so eight hits are
+five registers; the columns blend `i`, `j`, the shift, and `dist2` the
+same way. Before, a half list searched into the hit buffer and wrote
+each row with a scalar branch on its side, and took longer than the
+full list (4096 atoms: 1.33 ms, now 0.82 ms; 0.3.8 1.88 ms). When
 bins hold under eight atoms on average the block loop runs as a twin
 compiled with the tile's target features and the tile inlines into it,
 since with a few atoms a block the call into the tile is most of the
