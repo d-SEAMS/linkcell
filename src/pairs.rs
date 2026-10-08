@@ -952,10 +952,10 @@ struct Block {
 }
 
 /// Expected pairs where the walk splits across threads. On this 8-core
-/// host one thread is faster up to about 1024 atoms in an 18 Å cube at a
-/// 4 Å cutoff (26 thousand pairs) and slower from 1536 (58 thousand).
+/// host one thread is faster at 512 atoms in an 18 Å cube at a 4 Å
+/// cutoff (6 thousand pairs) and slower from 768 (14 thousand).
 #[cfg(feature = "parallel")]
-const PARALLEL_PAIRS: usize = 40_000;
+const PARALLEL_PAIRS: usize = 10_000;
 
 /// Active atoms where the bins are built on several threads, the same
 /// threshold as the k-nearest mesh.
