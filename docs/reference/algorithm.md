@@ -78,18 +78,26 @@ The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.
 
-The bins are one fold, one count per bin, a scan, and a scatter into
+The bins are one fold, one count per key, a scan, and a scatter into
 slot columns in bin order: positions, positions relative to the bin
-corner, their squared length, and the atom index. The fold takes eight
-points at a time on AVX-512 with minimage's own operations in its order
-(the division or the `Hinv` product, `wrap01`, the bin truncation, and
-`H`), so every position and bin is the same bits as `Cell::fractional`
-and `Cell::cartesian`; the k-nearest mesh uses the same fold. When the
-walk splits across threads, from 1024 atoms each pass runs on one block
-of atoms per thread, and the scan gives every thread its own run of
-slots in each bin, so the atom order inside a bin does not depend on
-the thread count. That first pass also wakes the workers the search
-uses next. A grid lends its slot columns, offsets, corners, fold, and
+corner, their squared length, and the atom index. Inside a bin the
+slots follow a Morton code of the atom's sub-cell, two or four per axis
+so that a sub-cell holds about one atom, then atom index. Eight slots
+in a row, one vector of targets, are then a compact block of the bin
+whatever order the caller's atoms come in; with the atoms of a lattice
+shuffled, the one-thread 4096-atom call takes 1.67 ms with that order
+and 2.21 ms in atom order. The fold takes eight points at a time on
+AVX-512 with minimage's own operations in its order (the division or
+the `Hinv` product, `wrap01`, the bin truncation, and `H`), so every
+position and bin is the same bits as `Cell::fractional` and
+`Cell::cartesian`; the k-nearest mesh uses the same fold. When the walk
+splits across threads, from 1024 atoms each thread folds one block of
+atoms and groups it by bin in its own staging area. Each thread then
+owns a run of bins, balanced by atoms, reads their atoms from every
+staging area in thread order, sorts each bin by sub-cell with a stable
+count, and writes its run of slots alone, so the order is the same as
+one thread's and no cache line is written by two threads. The first
+pass also wakes the workers the search uses next. A grid lends its slot columns, offsets, corners, fold, and
 counts back when it drops, and the next grid of a similar size takes
 them without zeroing them, since every value is written before it is
 read. Which bins each bin looks into, with their shifts and corner
