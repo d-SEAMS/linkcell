@@ -29,11 +29,12 @@ struct Recycled {
     folded: Vec<[f64; 3]>,
     slot_frac: Vec<[f64; 3]>,
     slot_folded: Vec<[f64; 3]>,
-    bin: Vec<[i32; 3]>,
+    key: Vec<u32>,
     offsets: Vec<usize>,
     occupants: Vec<usize>,
     counts: Vec<usize>,
     cursor: Vec<usize>,
+    hist: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 thread_local! {
@@ -71,11 +72,13 @@ pub(crate) struct Mesh {
     /// in bin order reads them in runs whatever order the atoms came in.
     pub(crate) slot_frac: Vec<[f64; 3]>,
     pub(crate) slot_folded: Vec<[f64; 3]>,
-    pub bin: Vec<[i32; 3]>,
+    /// Flat bin of each point, in point order.
+    key: Vec<u32>,
     pub(crate) offsets: Vec<usize>,
     pub(crate) occupants: Vec<usize>,
     counts: Vec<usize>,
     cursor: Vec<usize>,
+    hist: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for Mesh {
@@ -85,11 +88,12 @@ impl Drop for Mesh {
             folded: std::mem::take(&mut self.folded),
             slot_frac: std::mem::take(&mut self.slot_frac),
             slot_folded: std::mem::take(&mut self.slot_folded),
-            bin: std::mem::take(&mut self.bin),
+            key: std::mem::take(&mut self.key),
             offsets: std::mem::take(&mut self.offsets),
             occupants: std::mem::take(&mut self.occupants),
             counts: std::mem::take(&mut self.counts),
             cursor: std::mem::take(&mut self.cursor),
+            hist: std::mem::take(&mut self.hist),
         });
     }
 }
@@ -130,31 +134,48 @@ impl Mesh {
         if buf.frac.len() != n {
             buf.frac.resize(n, [0.0; 3]);
             buf.folded.resize(n, [0.0; 3]);
-            buf.bin.resize(n, [0; 3]);
+            buf.key.resize(n, 0);
         }
-        buf.counts.clear();
-        buf.counts.resize(ncell, 0);
 
         #[cfg(feature = "parallel")]
         let parallel = n_active >= PARALLEL_MESH;
         #[cfg(not(feature = "parallel"))]
         let parallel = false;
+        if buf.offsets.len() != ncell + 1 {
+            buf.offsets.clear();
+            buf.offsets.resize(ncell + 1, 0);
+        }
+        buf.occupants.resize(n_active, 0);
 
         if parallel {
             #[cfg(feature = "parallel")]
-            bin_parallel(
-                xyz,
-                simbox,
-                ids,
-                [nx, ny, nz],
-                MeshScratch {
-                    frac: &mut buf.frac,
-                    folded: &mut buf.folded,
-                    bin: &mut buf.bin,
-                    counts: &mut buf.counts,
-                },
-            );
+            {
+                // Counts, offsets, and cursors in parallel over the bins:
+                // there can be more bins than points.
+                if buf.hist.len() != ncell {
+                    buf.hist.clear();
+                    buf.hist
+                        .resize_with(ncell, || std::sync::atomic::AtomicUsize::new(0));
+                }
+                zero_parallel(&buf.hist);
+                bin_parallel(
+                    xyz,
+                    simbox,
+                    ids,
+                    [nx, ny, nz],
+                    MeshScratch {
+                        frac: &mut buf.frac,
+                        folded: &mut buf.folded,
+                        key: &mut buf.key,
+                        hist: &buf.hist,
+                    },
+                );
+                prefix_parallel(&buf.hist, &mut buf.offsets);
+                scatter_parallel(ids, &buf.key, &buf.offsets, &buf.hist, &mut buf.occupants);
+            }
         } else {
+            buf.counts.clear();
+            buf.counts.resize(ncell, 0);
             let _pop = crate::pop::JobTimer::new();
             #[allow(unused_mut)]
             let mut start = 0usize;
@@ -167,45 +188,34 @@ impl Mesh {
                     [nx, ny, nz],
                     0,
                     len,
-                    (&mut buf.frac, &mut buf.folded, &mut buf.bin),
+                    (&mut buf.frac, &mut buf.folded, &mut buf.key),
                     |c| counts[c] += 1,
                 );
             }
             for slot in start..n_active {
                 let i = ids.get(slot);
                 let s = simbox.fractional(xyz[i]);
-                let ix = bin_coord(s[0], nx);
-                let iy = bin_coord(s[1], ny);
-                let iz = bin_coord(s[2], nz);
+                let b = [
+                    bin_coord(s[0], nx),
+                    bin_coord(s[1], ny),
+                    bin_coord(s[2], nz),
+                ];
+                let c = flat_cell(b, [nx, ny, nz]);
                 buf.frac[i] = s;
                 buf.folded[i] = simbox.cartesian(s);
-                buf.bin[i] = [ix, iy, iz];
-                buf.counts[cell_index(ix, iy, iz, nx, ny, nz)] += 1;
+                buf.key[i] = c as u32;
+                buf.counts[c] += 1;
             }
-        }
-
-        buf.offsets.clear();
-        buf.offsets.resize(ncell + 1, 0);
-        {
             let _pop = crate::pop::JobTimer::new();
+            buf.offsets[0] = 0;
             for c in 0..ncell {
                 buf.offsets[c + 1] = buf.offsets[c] + buf.counts[c];
             }
-        }
-        buf.cursor.clear();
-        buf.cursor.resize(ncell + 1, 0);
-        buf.cursor.copy_from_slice(&buf.offsets);
-        buf.occupants.resize(n_active, 0);
-
-        if parallel {
-            #[cfg(feature = "parallel")]
-            scatter_parallel(ids, &buf.bin, &buf.offsets, &mut buf.occupants, nx, ny, nz);
-        } else {
-            let _pop = crate::pop::JobTimer::new();
+            buf.cursor.clear();
+            buf.cursor.extend_from_slice(&buf.offsets[..ncell]);
             for slot in 0..n_active {
                 let i = ids.get(slot);
-                let [ix, iy, iz] = buf.bin[i];
-                let c = cell_index(ix, iy, iz, nx, ny, nz);
+                let c = buf.key[i] as usize;
                 let dest = buf.cursor[c];
                 buf.occupants[dest] = i;
                 buf.cursor[c] = dest + 1;
@@ -243,11 +253,12 @@ impl Mesh {
             folded: buf.folded,
             slot_frac: buf.slot_frac,
             slot_folded: buf.slot_folded,
-            bin: buf.bin,
+            key: buf.key,
             offsets: buf.offsets,
             occupants: buf.occupants,
             counts: buf.counts,
             cursor: buf.cursor,
+            hist: buf.hist,
         })
     }
 
@@ -369,14 +380,62 @@ impl<T> SyncPtr<T> {
     unsafe fn write(self, index: usize, value: T) {
         self.0.add(index).write(value);
     }
+
+    /// The pointer; a closure that calls this captures the whole `SyncPtr`.
+    fn get(self) -> *mut T {
+        self.0
+    }
 }
 
 #[cfg(feature = "parallel")]
 struct MeshScratch<'a> {
     frac: &'a mut [[f64; 3]],
     folded: &'a mut [[f64; 3]],
-    bin: &'a mut [[i32; 3]],
-    counts: &'a mut [usize],
+    key: &'a mut [u32],
+    hist: &'a [std::sync::atomic::AtomicUsize],
+}
+
+/// Every counter to zero, in parallel.
+#[cfg(feature = "parallel")]
+fn zero_parallel(hist: &[std::sync::atomic::AtomicUsize]) {
+    use rayon::prelude::*;
+    hist.par_chunks(1 << 14).for_each(|c| {
+        for h in c {
+            h.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// `offsets[c]` is the sum of the counts before bin `c`, in parallel over
+/// runs of bins.
+#[cfg(feature = "parallel")]
+fn prefix_parallel(hist: &[std::sync::atomic::AtomicUsize], offsets: &mut [usize]) {
+    use rayon::prelude::*;
+    use std::sync::atomic::Ordering;
+    let ncell = hist.len();
+    let run = (ncell / (4 * rayon::current_num_threads()).max(1)).max(1 << 12);
+    let sums: Vec<usize> = hist
+        .par_chunks(run)
+        .map(|c| c.iter().map(|h| h.load(Ordering::Relaxed)).sum())
+        .collect();
+    let mut base = Vec::with_capacity(sums.len());
+    let mut acc = 0usize;
+    for s in &sums {
+        base.push(acc);
+        acc += s;
+    }
+    offsets[ncell] = acc;
+    offsets[..ncell]
+        .par_chunks_mut(run)
+        .zip(hist.par_chunks(run))
+        .zip(base.par_iter())
+        .for_each(|((out, h), &b)| {
+            let mut a = b;
+            for (o, h) in out.iter_mut().zip(h) {
+                *o = a;
+                a += h.load(Ordering::Relaxed);
+            }
+        });
 }
 
 #[cfg(feature = "parallel")]
@@ -388,11 +447,10 @@ fn bin_parallel(
     scratch: MeshScratch<'_>,
 ) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     let [nx, ny, nz] = nbin;
-    let ncell = scratch.counts.len();
-    let hist: Vec<AtomicUsize> = (0..ncell).map(|_| AtomicUsize::new(0)).collect();
+    let hist = scratch.hist;
     let n_active = ids.len();
 
     match ids {
@@ -402,7 +460,7 @@ fn bin_parallel(
                 .frac
                 .par_chunks_mut(CHUNK)
                 .zip(scratch.folded.par_chunks_mut(CHUNK))
-                .zip(scratch.bin.par_chunks_mut(CHUNK))
+                .zip(scratch.key.par_chunks_mut(CHUNK))
                 .zip(xyz.par_chunks(CHUNK))
                 .for_each_init(crate::pop::JobTimer::new, |_timer, (((f, fold), b), p)| {
                     let len = p.len();
@@ -422,13 +480,18 @@ fn bin_parallel(
                     let start = 0usize;
                     for t in start..len {
                         let s = simbox.fractional(p[t]);
-                        let ix = bin_coord(s[0], nx);
-                        let iy = bin_coord(s[1], ny);
-                        let iz = bin_coord(s[2], nz);
+                        let c = flat_cell(
+                            [
+                                bin_coord(s[0], nx),
+                                bin_coord(s[1], ny),
+                                bin_coord(s[2], nz),
+                            ],
+                            nbin,
+                        );
                         f[t] = s;
                         fold[t] = simbox.cartesian(s);
-                        b[t] = [ix, iy, iz];
-                        hist[cell_index(ix, iy, iz, nx, ny, nz)].fetch_add(1, Ordering::Relaxed);
+                        b[t] = c as u32;
+                        hist[c].fetch_add(1, Ordering::Relaxed);
                     }
                 });
         }
@@ -438,78 +501,83 @@ fn bin_parallel(
             // before the histogram is read.
             let frac_ptr = SyncPtr(scratch.frac.as_mut_ptr());
             let folded_ptr = SyncPtr(scratch.folded.as_mut_ptr());
-            let bin_ptr = SyncPtr(scratch.bin.as_mut_ptr());
+            let key_ptr = SyncPtr(scratch.key.as_mut_ptr());
             (0..n_active).into_par_iter().for_each_init(
                 crate::pop::JobTimer::new,
                 |_timer, slot| {
                     let i = ids.get(slot);
                     let s = simbox.fractional(xyz[i]);
-                    let ix = bin_coord(s[0], nx);
-                    let iy = bin_coord(s[1], ny);
-                    let iz = bin_coord(s[2], nz);
+                    let c = flat_cell(
+                        [
+                            bin_coord(s[0], nx),
+                            bin_coord(s[1], ny),
+                            bin_coord(s[2], nz),
+                        ],
+                        nbin,
+                    );
                     // SAFETY: `ids` lists each point once, so these writes do not alias.
                     unsafe {
                         frac_ptr.write(i, s);
                         folded_ptr.write(i, simbox.cartesian(s));
-                        bin_ptr.write(i, [ix, iy, iz]);
+                        key_ptr.write(i, c as u32);
                     }
-                    hist[cell_index(ix, iy, iz, nx, ny, nz)].fetch_add(1, Ordering::Relaxed);
+                    hist[c].fetch_add(1, Ordering::Relaxed);
                 },
             );
         }
     }
-
-    let _pop = crate::pop::JobTimer::new();
-    for (dst, src) in scratch.counts.iter_mut().zip(&hist) {
-        *dst = src.load(Ordering::Relaxed);
-    }
 }
 
+/// Scatter the points into their bins with `cursor` (the counts) as
+/// atomic cursors, then sort each bin of several points, so the order is
+/// the serial scatter's, which walks the points in order.
 #[cfg(feature = "parallel")]
 fn scatter_parallel(
     ids: Active<'_>,
-    bin: &[[i32; 3]],
+    key: &[u32],
     offsets: &[usize],
+    cursor: &[std::sync::atomic::AtomicUsize],
     occupants: &mut [usize],
-    nx: i32,
-    ny: i32,
-    nz: i32,
 ) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     let ncell = offsets.len() - 1;
-    let cursor: Vec<AtomicUsize> = offsets[..ncell]
-        .iter()
-        .copied()
-        .map(AtomicUsize::new)
-        .collect();
+    cursor
+        .par_chunks(1 << 14)
+        .zip(offsets[..ncell].par_chunks(1 << 14))
+        .for_each(|(c, o)| {
+            for (c, &o) in c.iter().zip(o) {
+                c.store(o, Ordering::Relaxed);
+            }
+        });
     let occ = SyncPtr(occupants.as_mut_ptr());
     let n_active = ids.len();
     (0..n_active)
         .into_par_iter()
         .for_each_init(crate::pop::JobTimer::new, |_timer, slot| {
             let i = ids.get(slot);
-            let [ix, iy, iz] = bin[i];
-            let c = cell_index(ix, iy, iz, nx, ny, nz);
-            let dest = cursor[c].fetch_add(1, Ordering::Relaxed);
+            let dest = cursor[key[i] as usize].fetch_add(1, Ordering::Relaxed);
             // SAFETY: each `fetch_add` returns a distinct slot, and the
             // cell ranges partition `occupants`.
             unsafe {
                 occ.write(dest, i);
             }
         });
-    let _pop = crate::pop::JobTimer::new();
-    // Index order matches the serial scatter, which walks ids in order.
-    // A full bin of one point is already ordered. Cutoff pairs keep visit
-    // order, so a crowded bin is sorted.
-    for c in 0..ncell {
-        let lo = offsets[c];
-        let hi = offsets[c + 1];
-        if hi - lo > 1 {
-            occupants[lo..hi].sort_unstable();
+    // Bins are disjoint runs of slots, so runs of bins sort apart.
+    let run = (ncell / (4 * rayon::current_num_threads()).max(1)).max(1 << 12);
+    let starts: Vec<usize> = (0..ncell).step_by(run).collect();
+    starts.par_iter().for_each(|&c0| {
+        for c in c0..(c0 + run).min(ncell) {
+            let (lo, hi) = (offsets[c], offsets[c + 1]);
+            if hi - lo > 1 {
+                // SAFETY: bin `c` is slots `lo..hi`, and no other run of
+                // bins holds it.
+                let bin = unsafe { std::slice::from_raw_parts_mut(occ.get().add(lo), hi - lo) };
+                bin.sort_unstable();
+            }
         }
-    }
+    });
 }
 
 fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
@@ -675,11 +743,11 @@ pub(crate) unsafe fn fold8_regs(
     (s, [cart(0), cart(1), cart(2)], [bin(0), bin(1), bin(2)])
 }
 
-/// The three per-point arrays of a mesh: fractional, folded, bin.
+/// The three per-point arrays of a mesh: fractional, folded, flat bin.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-type MeshOut<'a> = (&'a mut [[f64; 3]], &'a mut [[f64; 3]], &'a mut [[i32; 3]]);
+type MeshOut<'a> = (&'a mut [[f64; 3]], &'a mut [[f64; 3]], &'a mut [u32]);
 
-/// Fold `xyz[lo..hi]` into `frac`, `folded`, and `bin` at the same
+/// Fold `xyz[lo..hi]` into `frac`, `folded`, and `key` at the same
 /// indices, eight at a time on AVX-512, and add each to `counts`;
 /// returns the first index left for the scalar fold.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
@@ -695,7 +763,7 @@ fn fold_mesh_avx512(
     if !std::is_x86_feature_detected!("avx512f") {
         return lo;
     }
-    let (frac, folded, bin) = out;
+    let (frac, folded, key) = out;
     let f = Fold8::new(simbox, n);
     let flat = xyz.as_ptr() as *const f64;
     let mut k = lo;
@@ -706,8 +774,9 @@ fn fold_mesh_avx512(
             let i = k + l;
             frac[i] = [s[0][l], s[1][l], s[2][l]];
             folded[i] = [p[0][l], p[1][l], p[2][l]];
-            bin[i] = [b[0][l], b[1][l], b[2][l]];
-            count(cell_index(b[0][l], b[1][l], b[2][l], n[0], n[1], n[2]));
+            let c = flat_cell([b[0][l], b[1][l], b[2][l]], n);
+            key[i] = c as u32;
+            count(c);
         }
         k += 8;
     }
