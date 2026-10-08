@@ -78,15 +78,22 @@ The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.
 
-The bins are one fold, one count per key, a scan, and a scatter into
+The bins are one fold, one count per key, a scan, and a fill of the
 slot columns in bin order: positions, positions relative to the bin
-corner, their squared length, and the atom index. Inside a bin the
+corner, their squared length, and the atom index. The fold writes
+position and key columns, with the key formed in registers from the
+eight-wide fold; the scan steps bin indices rather than dividing; then
+the atom numbers are sorted by key and every slot column is filled
+front to back, so the random accesses are reads of the fold. For 4096
+atoms on one thread the bins take 0.038 ms (0.044 ms shuffled), against
+0.061 and 0.082 ms with the key formed per lane and a scatter into the
+slot columns. Inside a bin the
 slots follow a Morton code of the atom's sub-cell, two or four per axis
 so that a sub-cell holds about one atom, then atom index. Eight slots
 in a row, one vector of targets, are then a compact block of the bin
 whatever order the caller's atoms come in; with the atoms of a lattice
-shuffled, the one-thread 4096-atom call takes 1.67 ms with that order
-and 2.21 ms in atom order. The fold takes eight points at a time on
+shuffled, the one-thread 4096-atom call took 1.67 ms with that order
+and 2.21 ms in atom order when the order was added. The fold takes eight points at a time on
 AVX-512 with minimage's own operations in its order (the division or
 the `Hinv` product, `wrap01`, the bin truncation, and `H`), so every
 position and bin is the same bits as `Cell::fractional` and
@@ -154,11 +161,28 @@ shift once per cell pair. The extra traffic is the hit buffer and the
 
 GROMACS nbnxn stores a cluster-pair list and an interaction bitmask,
 and the force kernel reads that list. This call returns one atom-image
-row. Morton-ordering each bin and skipping a 4×8 tile whose certified
-box misses the cutoff was timed on this host for the 4096-atom cube at
-a 4 Å cutoff: about 2.8 ms on one thread and 0.98 ms on eight, against
-2.68 ms and 0.87 ms for the distance tile alone. The walk keeps the
-distance tile. A cluster bitmask would still expand into the same row.
+row, so its clusters are decided per search. With each bin in Morton
+order, a run of eight targets from a bin's first slot and a run of four
+sources are compact clusters, and the bins record each run's bounding
+box in the bin's relative coordinates. For a source run and a partner
+bin, the tile moves the source box into the target frame and tests it
+against eight target boxes in one vector; a target run whose box is at
+least `cutoff^2` plus twice the rounding bound away is not loaded.
+Every source lies inside its moved box (rounding is monotonic) and
+every target inside its own, so a skipped run holds no lane the tile
+would keep: the rows, their order, and their bits do not change, and a
+test compares them against the tile with the boxes off. The boxes are
+built when the bins hold four runs of eight on average and tested for
+partner bins of four runs or more; with fewer, the bin stencil has
+already culled at that scale and the box test costs more than it skips
+(it made the 256- and 1024-atom calls 20 to 40% slower). For the
+4096-atom cube at 4 Å, 64 atoms per bin, 82% of the 444 thousand
+source-vectors held no pair; with the boxes 124 thousand are tested, and
+the one-thread call drops from 1.49 to 1.42 ms. Those vectors were
+cheap, three fused multiply-adds and a compare mostly hidden behind the
+row stores, so the gain is the compute that did not overlap. An earlier
+box test per 4×8 tile, one box pair at a time, was slower than the tile
+alone. A cluster bitmask would still expand into the same row.
 
 Columns half a cutoff across along `b` and `c`, each sorted along `a`
 in eighth-cutoff bins, with a window into every neighbour column for
