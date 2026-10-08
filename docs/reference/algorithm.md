@@ -80,12 +80,25 @@ neighbour list is this call.
 
 The bins are one fold, one count per bin, a scan, and a scatter into
 slot columns in bin order: positions, positions relative to the bin
-corner, their squared length, and the atom index. With more than one
-thread each pass runs on one block of atoms per thread, and the scan
+corner, their squared length, and the atom index. The fold takes eight
+points at a time on AVX-512 with minimage's own operations in its order
+(the division or the `Hinv` product, `wrap01`, the bin truncation, and
+`H`), so every position and bin is the same bits as `Cell::fractional`
+and `Cell::cartesian`; the k-nearest mesh uses the same fold. From 8192
+atoms each pass runs on one block of atoms per thread, and the scan
 gives every thread its own run of slots in each bin, so the atom order
-inside a bin does not depend on the thread count. A search with more
-than one thread runs on a pool thread, so the caller does not run the
-serial steps while every worker spins.
+inside a bin does not depend on the thread count.
+
+The walk splits across threads from an ideal-gas estimate of ten
+thousand pairs (on this 8-core host one thread is faster at 512 atoms
+in an 18 Å cube at 4 Å, eight from 768). A split call reserves the row
+buffer on the caller's thread from that estimate, then builds the bins,
+searches, and writes in one pool entry: the caller does not run the
+serial steps while every worker spins, and does not wake between
+search and write. A short estimate grows the buffer on the caller's
+thread. glibc gives a large block allocated on a worker its own heap
+and unmaps it when the block is freed, so the buffer the caller keeps
+is allocated where the caller runs.
 
 The distance tile is four sources against eight targets. A source
 `p`, moved into the target bin's frame, is `p'`; each lane forms
@@ -103,7 +116,15 @@ rows (or sixteen column entries) in five registers. Otherwise each
 thread buffers the hits of its range of bins, then writes them into
 the caller's layout: `Pair` rows, four columns, or `lc_pair` rows.
 Thread `k` searches and writes range `k`, so the writer reads its own
-cache.
+cache. On one core the 29 MB of 40-byte rows for 4096 atoms take about
+0.9 to 1.1 ms on this host, which is most of a one-thread call.
+
+The bindings write their own layout from the same hits: Python and
+`pairs_within_columns` get the `ijS` columns without a `Pair` vector,
+`lc_pairs_within` writes the caller's columns, and a count query keeps
+its search for the matching fill on the same thread.
+`lc_pairs_within_rows` writes `lc_pair` rows, which the C++
+`ShiftedPair` vector uses directly.
 
 With the bin edge equal to the cutoff the search radius is 1, and the
 gap between any two cells inside that stencil is 0, so the bin test

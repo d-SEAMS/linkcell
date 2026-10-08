@@ -218,7 +218,10 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   nearest unvisited face.
 - A cutoff pair list is `pairs_within` / `lc_pairs_within` /
   `linkcell.pairs_within`: atom-image rows with the caller's shift
-  `S`. `knearest` is the k-nearest list.
+  `S`. `knearest` is the k-nearest list. `pairs_within_columns`,
+  `lc_pairs_within_rows`, and the Python call write the `ijS` columns
+  or `lc_pair` rows straight from the search, and a C count query
+  keeps its search for the fill that follows on the same thread.
 
 ## License
 
