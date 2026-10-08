@@ -661,8 +661,9 @@ fn give_grid_bufs(bufs: GridBufs) {
 }
 
 /// Active atoms in bin order. The occupants of bin `c` are the slots
-/// `offsets[c]..offsets[c + 1]`, in atom order, so a cutoff row sees the
-/// same order as the k-nearest mesh.
+/// `offsets[c]..offsets[c + 1]`, ordered inside the bin by [`Keys`] and
+/// then by atom index, so eight slots in a row are a compact block
+/// whatever the input order.
 struct Grid {
     n: [i32; 3],
     widths: [f64; 3],
@@ -690,11 +691,76 @@ impl Drop for Grid {
     }
 }
 
+/// One atom in a thread's staging area: folded position, sub-cell inside
+/// its bin, and atom index.
+#[cfg(feature = "parallel")]
+#[derive(Clone, Copy, Default)]
+struct Staged {
+    p: [f64; 3],
+    sub: u32,
+    atom: u32,
+}
+
 /// One atom's folded position and flat bin, between the two passes.
 #[derive(Clone, Copy, Default)]
 struct Folded {
     p: [f64; 3],
     cell: u32,
+}
+
+/// Sort keys of the slots: the bin, then a Morton code of the atom's
+/// sub-cell, `sub` per axis (a power of two), so a run of slots inside a
+/// bin covers a compact part of it.
+#[derive(Clone, Copy)]
+struct Keys {
+    n: [i32; 3],
+    sub: i32,
+}
+
+impl Keys {
+    /// Sub-cells per axis for `n_act` atoms in `ncell` bins: about one
+    /// atom per sub-cell, so eight slots in a row are a compact block, and
+    /// never more keys than atoms.
+    fn sub_for(n_act: usize, ncell: usize) -> i32 {
+        let per_bin = n_act / ncell.max(1);
+        if per_bin >= 48 {
+            4
+        } else if per_bin >= 6 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Sub-cells per axis over the whole box.
+    fn fine(self) -> [i32; 3] {
+        [
+            self.n[0] * self.sub,
+            self.n[1] * self.sub,
+            self.n[2] * self.sub,
+        ]
+    }
+
+    /// Keys per bin.
+    fn per_bin(self) -> usize {
+        (self.sub * self.sub * self.sub) as usize
+    }
+
+    /// Key of the sub-cell `b`: the bin's flat index times
+    /// [`Keys::per_bin`], plus the Morton code inside the bin.
+    #[inline(always)]
+    fn key(self, b: [i32; 3]) -> usize {
+        let shift = self.sub.trailing_zeros();
+        let low = self.sub - 1;
+        let coarse = bins::flat_cell([b[0] >> shift, b[1] >> shift, b[2] >> shift], self.n);
+        // Interleave the low bits of the three axes, x lowest.
+        let spread = |v: i32| {
+            let v = (v & low) as usize;
+            (v & 1) | ((v & 2) << 2) | ((v & 4) << 4)
+        };
+        let m = spread(b[0]) | (spread(b[1]) << 1) | (spread(b[2]) << 2);
+        coarse * self.per_bin() + m
+    }
 }
 
 /// Fold atoms `lo..hi` into `folded` and count each bin, exactly as
@@ -705,25 +771,32 @@ fn fold_range(
     simbox: &Cell,
     xyz: &[[f64; 3]],
     active: Option<&[usize]>,
-    n: [i32; 3],
+    keys: Keys,
+    by_bin: bool,
     lo: usize,
     hi: usize,
     folded: RowPtr<Folded>,
     count: &mut [u32],
 ) {
+    let shift = if by_bin {
+        keys.per_bin().trailing_zeros()
+    } else {
+        0
+    };
     #[allow(unused_mut)]
     let mut slot = lo;
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if active.is_none() && std::is_x86_feature_detected!("avx512f") {
         // Safety: AVX-512F was detected, `lo..hi` indexes `xyz`, and this
         // caller owns `folded` over that range.
-        slot = unsafe { fold_avx512(simbox, xyz, n, lo, hi, folded, count) };
+        slot = unsafe { fold_avx512(simbox, xyz, keys, shift, lo, hi, folded, count) };
     }
+    let fine = keys.fine();
     for k in slot..hi {
         let i = active.map_or(k, |a| a[k]);
-        let (q, b) = bins::fold_point(simbox, xyz[i], n);
-        let cell = bins::flat_cell(b, n);
-        count[cell] += 1;
+        let (q, b) = bins::fold_point(simbox, xyz[i], fine);
+        let cell = keys.key(b);
+        count[cell >> shift] += 1;
         // Safety: the caller owns `folded` over `lo..hi`.
         unsafe {
             (*folded.at(k)).write(Folded {
@@ -746,20 +819,21 @@ fn fold_range(
 unsafe fn fold_avx512(
     simbox: &Cell,
     xyz: &[[f64; 3]],
-    n: [i32; 3],
+    keys: Keys,
+    shift: u32,
     lo: usize,
     hi: usize,
     folded: RowPtr<Folded>,
     count: &mut [u32],
 ) -> usize {
-    let f = bins::Fold8::new(simbox, n);
+    let f = bins::Fold8::new(simbox, keys.fine());
     let flat = xyz.as_ptr() as *const f64;
     let mut k = lo;
     while k + 8 <= hi {
         let (_, p, b) = bins::fold8(&f, flat.add(3 * k));
         for l in 0..8 {
-            let cell = bins::flat_cell([b[0][l], b[1][l], b[2][l]], n);
-            count[cell] += 1;
+            let cell = keys.key([b[0][l], b[1][l], b[2][l]]);
+            count[cell >> shift] += 1;
             (*folded.at(k + l)).write(Folded {
                 p: [p[0][l], p[1][l], p[2][l]],
                 cell: cell as u32,
@@ -822,11 +896,12 @@ impl SlotPtrs {
 }
 
 impl Grid {
-    /// Fold every active atom, count each bin, scan, then scatter into
-    /// the slot columns. With several threads each pass runs on one
-    /// block of atoms per thread (a block distribution), and the scan
-    /// gives every thread its own run of slots in each bin, so atom
-    /// order inside a bin is the same as one thread's.
+    /// Fold every active atom, count each key, scan, then scatter into
+    /// the slot columns. With several threads each thread folds one block
+    /// of atoms (a block distribution) and groups it by bin in its own
+    /// staging area; then each thread owns a run of bins, reads them from
+    /// every staging area in thread order, sorts them by sub-cell, and
+    /// writes its run of slots alone. The order is one thread's.
     fn build(
         xyz: &[[f64; 3]],
         simbox: &Cell,
@@ -868,6 +943,12 @@ impl Grid {
             ])
         };
         let (mut max_abs, mut max_rel) = (0.0f64, 0.0f64);
+        let keys = Keys {
+            n,
+            sub: Keys::sub_for(n_act, ncell),
+        };
+        let per = keys.per_bin();
+        let nkey = ncell * per;
         #[cfg(feature = "parallel")]
         let parallel = threads > 1;
         #[cfg(not(feature = "parallel"))]
@@ -880,54 +961,93 @@ impl Grid {
             {
                 let p = rayon::current_num_threads().max(1);
                 let block = |k: usize, len: usize| (k * len / p, (k + 1) * len / p);
-                // Pass 1: fold a block of atoms and a block of bin corners.
-                let counts: Vec<Vec<u32>> = rayon::broadcast(|ctx| {
+                let shift = per.trailing_zeros();
+                // Pass 1: each thread folds a block of atoms, groups it by bin
+                // in its own staging area (atom order inside a bin), and folds
+                // a block of bin corners.
+                let staged: Vec<(Vec<Staged>, Vec<usize>)> = rayon::broadcast(|ctx| {
                     let _timer = crate::pop::JobTimer::new();
                     let k = ctx.index();
-                    let mut count = vec![0u32; ncell];
                     let (lo, hi) = block(k, n_act);
+                    let mut count = vec![0u32; ncell];
                     // Atom blocks are disjoint, so each thread owns its range.
-                    fold_range(simbox, xyz, active, n, lo, hi, fp, &mut count);
+                    fold_range(simbox, xyz, active, keys, true, lo, hi, fp, &mut count);
+                    let mut first = Vec::with_capacity(ncell + 1);
+                    let mut at = 0usize;
+                    for &c in &count {
+                        first.push(at);
+                        at += c as usize;
+                    }
+                    first.push(at);
+                    let mut next = first.clone();
+                    let mut stage = vec![Staged::default(); hi - lo];
+                    for slot in lo..hi {
+                        // Safety: the fold above wrote this thread's atoms.
+                        let f = unsafe { (*fp.at(slot)).assume_init() };
+                        let c = (f.cell >> shift) as usize;
+                        stage[next[c]] = Staged {
+                            p: f.p,
+                            sub: f.cell & (per as u32 - 1),
+                            atom: atom(slot) as u32,
+                        };
+                        next[c] += 1;
+                    }
                     let (clo, chi) = block(k, ncell);
                     for c in clo..chi {
                         // Safety: corner blocks are disjoint.
                         unsafe { (*cp.at(c)).write(corner(c)) };
                     }
-                    count
+                    (stage, first)
                 });
-                // Safety: pass 1 wrote every atom and every corner.
-                unsafe {
-                    folded.set_len(n_act);
-                    corners.set_len(ncell);
-                }
-                // Scan: bin `c` starts at `offsets[c]`, and thread `k`'s run
-                // in it starts after the runs of threads `0..k`.
-                let mut start = vec![0u32; p * ncell];
+                // Safety: pass 1 wrote every corner; the grid keeps no fold.
+                unsafe { corners.set_len(ncell) };
+                // Scan: bin `c` starts at `offsets[c]`.
                 let mut at = 0usize;
                 for c in 0..ncell {
                     offsets.push(at);
-                    for (k, count) in counts.iter().enumerate() {
-                        start[k * ncell + c] = at as u32;
-                        at += count[c] as usize;
+                    for (_, first) in &staged {
+                        at += first[c + 1] - first[c];
                     }
                 }
                 offsets.push(at);
-                let (folded, corners, start) = (&folded, &corners, &start);
-                // Pass 2: scatter each block into its runs.
+                // Pass 2: each thread owns a run of bins, balanced by atoms,
+                // reads their atoms from every staging area in thread order
+                // (so in atom order), sorts each bin by sub-cell with a stable
+                // count, and writes that run of slots alone: the order is one
+                // thread's, and no cache line is written by two threads.
+                let ranges = cell_ranges(&offsets, p);
+                let (staged, corners, offsets, ranges) = (&staged, &corners, &offsets, &ranges);
                 let maxima: Vec<(f64, f64)> = rayon::broadcast(|ctx| {
                     let _timer = crate::pop::JobTimer::new();
-                    let k = ctx.index();
-                    let mut next = start[k * ncell..(k + 1) * ncell].to_vec();
                     let (mut ma, mut mr) = (0.0f64, 0.0f64);
-                    let (lo, hi) = block(k, n_act);
-                    for (slot, f) in folded.iter().enumerate().take(hi).skip(lo) {
-                        let c = f.cell as usize;
-                        let dest = next[c] as usize;
-                        next[c] += 1;
-                        // Safety: the scan gave this thread the slots it writes.
-                        let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
-                        ma = ma.max(a);
-                        mr = mr.max(r);
+                    let Some(&(clo, chi)) = ranges.get(ctx.index()) else {
+                        return (ma, mr);
+                    };
+                    let mut bucket = vec![0usize; per + 1];
+                    for c in clo..chi {
+                        bucket.iter_mut().for_each(|b| *b = 0);
+                        for (stage, first) in staged {
+                            for e in &stage[first[c]..first[c + 1]] {
+                                bucket[e.sub as usize + 1] += 1;
+                            }
+                        }
+                        let mut acc = offsets[c];
+                        for b in bucket.iter_mut() {
+                            acc += *b;
+                            *b = acc;
+                        }
+                        for (stage, first) in staged {
+                            for e in &stage[first[c]..first[c + 1]] {
+                                let dest = bucket[e.sub as usize];
+                                bucket[e.sub as usize] += 1;
+                                // Safety: bin `c`, and so its slots, belongs to
+                                // this thread alone.
+                                let (a, r) =
+                                    unsafe { slots.put(dest, e.atom as usize, e.p, corners[c]) };
+                                ma = ma.max(a);
+                                mr = mr.max(r);
+                            }
+                        }
                     }
                     (ma, mr)
                 });
@@ -939,8 +1059,8 @@ impl Grid {
         } else {
             let _timer = crate::pop::JobTimer::new();
             tally.clear();
-            tally.resize(ncell, 0);
-            fold_range(simbox, xyz, active, n, 0, n_act, fp, &mut tally);
+            tally.resize(nkey, 0);
+            fold_range(simbox, xyz, active, keys, false, 0, n_act, fp, &mut tally);
             for c in 0..ncell {
                 // Safety: `corners` has room for every bin.
                 unsafe { (*cp.at(c)).write(corner(c)) };
@@ -950,10 +1070,12 @@ impl Grid {
                 folded.set_len(n_act);
                 corners.set_len(ncell);
             }
-            // `tally` becomes the next free slot of each bin.
+            // `tally` becomes the next free slot of each key.
             let mut at = 0usize;
-            for t in tally.iter_mut() {
-                offsets.push(at);
+            for (c, t) in tally.iter_mut().enumerate() {
+                if c % per == 0 {
+                    offsets.push(at);
+                }
                 let count = *t as usize;
                 *t = at as u32;
                 at += count;
@@ -964,7 +1086,7 @@ impl Grid {
                 let dest = tally[c] as usize;
                 tally[c] += 1;
                 // Safety: one thread, and every slot is in range.
-                let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c]) };
+                let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c / per]) };
                 max_abs = max_abs.max(a);
                 max_rel = max_rel.max(r);
             }
@@ -3149,6 +3271,49 @@ mod tests {
     }
 
     #[test]
+    fn sub_cells_keep_the_same_rows_in_the_same_order_on_eight_threads() {
+        // 64 atoms per bin, so each bin is sorted by 4x4x4 sub-cells, and
+        // above the threaded-bins threshold, so eight threads sort them in
+        // a third pass. Atom order is shuffled, so it does not follow position.
+        let sim = Cell::ortho(18.0, 18.0, 18.0).unwrap();
+        let mut state = 0x5851_f42d_4c95_7f2du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut xyz = Vec::new();
+        for iz in 0..16 {
+            for iy in 0..16 {
+                for ix in 0..16 {
+                    let j = |v: u64| 0.3 * ((v >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
+                    xyz.push([
+                        (ix as f64 + 0.5 + j(next())) * 1.125,
+                        (iy as f64 + 0.5 + j(next())) * 1.125,
+                        (iz as f64 + 0.5 + j(next())) * 1.125,
+                    ]);
+                }
+            }
+        }
+        for i in (1..xyz.len()).rev() {
+            let k = (next() % (i as u64 + 1)) as usize;
+            xyz.swap(i, k);
+        }
+        assert!(xyz.len() >= PARALLEL_GRID);
+        for half in [false, true] {
+            let one = on_threads(1, || {
+                pairs_within(&xyz, &sim, 4.0, None, None, half).unwrap()
+            });
+            let eight = on_threads(8, || {
+                pairs_within(&xyz, &sim, 4.0, None, None, half).unwrap()
+            });
+            assert_eq!(one.len(), eight.len(), "half={half}");
+            assert!(one == eight, "half={half}: rows differ in content or order");
+        }
+    }
+
+    #[test]
     fn vector_fold_matches_fold_point_bit_for_bit() {
         let cells = [
             Cell::ortho(18.0, 17.0, 19.0).unwrap(),
@@ -3195,7 +3360,17 @@ mod tests {
             let mut folded = vec![Folded::default(); xyz.len()];
             let mut count = vec![0u32; 140];
             let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
-            fold_range(sim, &xyz, None, n, 0, xyz.len(), fp, &mut count);
+            fold_range(
+                sim,
+                &xyz,
+                None,
+                Keys { n, sub: 1 },
+                false,
+                0,
+                xyz.len(),
+                fp,
+                &mut count,
+            );
             let mut want_count = vec![0u32; 140];
             for (k, r) in xyz.iter().enumerate() {
                 let (q, b) = bins::fold_point(sim, *r, n);
