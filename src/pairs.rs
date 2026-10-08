@@ -56,13 +56,44 @@ pub fn pairs_within(
     half: bool,
 ) -> Result<Vec<Pair>, Error> {
     let est = hit_estimate(xyz.len(), simbox, cutoff);
-    let plan = in_pool(est, || plan(xyz, simbox, cutoff, mask, cell_hint, half))?;
-    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-    if let Some(words) = plan.fused() {
-        return Ok(plan.fused_rows(&words));
+    if walk_threads(est) == 1 {
+        let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+        #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+        if let Some(words) = plan.fused() {
+            return Ok(plan.fused_rows(&words));
+        }
+        return Ok(plan.search().into_pairs());
     }
-    let found = in_pool(est, || plan.search());
-    Ok(found.into_pairs())
+    // The buffer is reserved here, on the caller's thread, from the
+    // ideal-gas estimate; search and write then run in one pool entry.
+    let rows_guess = row_guess(est, half);
+    let mut out: Vec<Pair> = Vec::with_capacity(rows_guess);
+    let base = RowPtr(out.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
+    let (rows, rest) = in_pool(est, || -> Result<(usize, Option<Found>), Error> {
+        let found = plan(xyz, simbox, cutoff, mask, cell_hint, half)?.search();
+        let rows = found.rows();
+        if rows > rows_guess {
+            return Ok((rows, Some(found)));
+        }
+        // Safety: `out` holds `rows_guess >= rows` rows.
+        unsafe { found.write_pairs(base.ptr()) };
+        Ok((rows, None))
+    })?;
+    if let Some(found) = rest {
+        out.reserve(rows);
+        // Safety: `out` now holds `rows` rows.
+        unsafe { found.write_pairs(out.as_mut_ptr()) };
+    }
+    // Safety: every row below `rows` is written.
+    unsafe { out.set_len(rows) };
+    Ok(out)
+}
+
+/// Rows to reserve for `hits` expected pairs: a quarter more than the
+/// ideal gas, two rows per pair on a full list.
+fn row_guess(hits: usize, half: bool) -> usize {
+    let rows = if half { hits } else { hits.saturating_mul(2) };
+    rows.saturating_add(rows / 4).saturating_add(64)
 }
 
 /// The same rows as [`pairs_within`], as four columns.
@@ -85,14 +116,53 @@ pub fn pairs_within_columns(
         return Err(Error::Overflow);
     }
     let est = hit_estimate(xyz.len(), simbox, cutoff);
-    let plan = in_pool(est, || plan(xyz, simbox, cutoff, mask, cell_hint, half))?;
-    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-    if plan.fused().is_some() {
-        plan.fused_columns(out);
+    if walk_threads(est) == 1 {
+        let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+        #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+        if plan.fused().is_some() {
+            plan.fused_columns(out);
+            return Ok(());
+        }
+        plan.search().fill_columns(out);
         return Ok(());
     }
-    let found = in_pool(est, || plan.search());
-    found.fill_columns(out);
+    // Columns are reserved on the caller's thread; search and write run
+    // in one pool entry.
+    let rows_guess = row_guess(est, half);
+    out.i.clear();
+    out.j.clear();
+    out.shift.clear();
+    out.dist2.clear();
+    out.i.reserve(rows_guess);
+    out.j.reserve(rows_guess);
+    out.shift.reserve(rows_guess);
+    out.dist2.reserve(rows_guess);
+    let ptrs = ColumnPtrs {
+        i: RowPtr(out.i.as_mut_ptr() as *mut std::mem::MaybeUninit<i32>),
+        j: RowPtr(out.j.as_mut_ptr() as *mut std::mem::MaybeUninit<i32>),
+        shift: RowPtr(out.shift.as_mut_ptr() as *mut std::mem::MaybeUninit<i32>),
+        d2: RowPtr(out.dist2.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>),
+    };
+    let (rows, rest) = in_pool(est, || -> Result<(usize, Option<Found>), Error> {
+        let found = plan(xyz, simbox, cutoff, mask, cell_hint, half)?.search();
+        let rows = found.rows();
+        if rows > rows_guess {
+            return Ok((rows, Some(found)));
+        }
+        // Safety: every column holds `rows_guess >= rows` rows.
+        unsafe { found.write_columns(ptrs.i.ptr(), ptrs.j.ptr(), ptrs.shift.ptr(), ptrs.d2.ptr()) };
+        Ok((rows, None))
+    })?;
+    match rest {
+        Some(found) => found.fill_columns(out),
+        // Safety: every row below `rows` is written in every column.
+        None => unsafe {
+            out.i.set_len(rows);
+            out.j.set_len(rows);
+            out.shift.set_len(rows);
+            out.dist2.set_len(rows);
+        },
+    }
     Ok(())
 }
 
@@ -492,6 +562,169 @@ struct Folded {
     cell: u32,
 }
 
+/// Fold atoms `lo..hi` into `folded` and count each bin, exactly as
+/// [`bins::fold_point`]: unmasked atoms go eight at a time on AVX-512,
+/// with the same operations in the same order.
+#[allow(clippy::too_many_arguments)]
+fn fold_range(
+    simbox: &Cell,
+    xyz: &[[f64; 3]],
+    active: Option<&[usize]>,
+    n: [i32; 3],
+    lo: usize,
+    hi: usize,
+    folded: RowPtr<Folded>,
+    count: &mut [u32],
+) {
+    let mut slot = lo;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    if active.is_none() && std::is_x86_feature_detected!("avx512f") {
+        // Safety: AVX-512F was detected, `lo..hi` indexes `xyz`, and this
+        // caller owns `folded` over that range.
+        slot = unsafe { fold_avx512(simbox, xyz, n, lo, hi, folded, count) };
+    }
+    for k in slot..hi {
+        let i = active.map_or(k, |a| a[k]);
+        let (q, b) = bins::fold_point(simbox, xyz[i], n);
+        let cell = bins::flat_cell(b, n);
+        count[cell] += 1;
+        // Safety: the caller owns `folded` over `lo..hi`.
+        unsafe {
+            (*folded.at(k)).write(Folded {
+                p: q,
+                cell: cell as u32,
+            })
+        };
+    }
+}
+
+/// [`fold_range`] for eight unmasked atoms at a time; returns the first
+/// slot left for the scalar fold.
+///
+/// # Safety
+/// AVX-512F is available, `lo..hi` indexes `xyz`, and the caller owns
+/// `folded` over that range.
+#[allow(clippy::incompatible_msrv, clippy::too_many_arguments)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f")]
+unsafe fn fold_avx512(
+    simbox: &Cell,
+    xyz: &[[f64; 3]],
+    n: [i32; 3],
+    lo: usize,
+    hi: usize,
+    folded: RowPtr<Folded>,
+    count: &mut [u32],
+) -> usize {
+    use std::arch::x86_64::{
+        __m512d, _mm256_max_epi32, _mm256_min_epi32, _mm256_set1_epi32, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_cvttpd_epi32, _mm512_div_pd,
+        _mm512_loadu_pd, _mm512_mask_blend_pd, _mm512_mask_permutex2var_pd, _mm512_mul_pd,
+        _mm512_permutex2var_pd, _mm512_roundscale_pd, _mm512_set1_pd, _mm512_setr_epi64,
+        _mm512_setzero_pd, _mm512_storeu_pd, _mm512_sub_pd, _CMP_GE_OQ,
+    };
+    let o = simbox.origin();
+    let w = simbox.widths();
+    let h = simbox.h();
+    let hi_inv = simbox.hinv();
+    let ortho = simbox.is_ortho();
+    let bc = |v: f64| _mm512_set1_pd(v);
+    let one = bc(1.0);
+    let nf = [
+        bc(f64::from(n[0])),
+        bc(f64::from(n[1])),
+        bc(f64::from(n[2])),
+    ];
+    let top = [
+        _mm256_set1_epi32(n[0] - 1),
+        _mm256_set1_epi32(n[1] - 1),
+        _mm256_set1_epi32(n[2] - 1),
+    ];
+    let ix_x = _mm512_setr_epi64(0, 3, 6, 9, 12, 15, 0, 0);
+    let ix_x2 = _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 10, 13);
+    let ix_y = _mm512_setr_epi64(1, 4, 7, 10, 13, 0, 0, 0);
+    let ix_y2 = _mm512_setr_epi64(0, 0, 0, 0, 0, 8, 11, 14);
+    let ix_z = _mm512_setr_epi64(2, 5, 8, 11, 14, 0, 0, 0);
+    let ix_z2 = _mm512_setr_epi64(0, 0, 0, 0, 0, 9, 12, 15);
+    // `wrap01`: subtract the floor, and a value that rounds to one is zero.
+    let wrap01 = |s: __m512d| {
+        let t = _mm512_sub_pd(s, _mm512_roundscale_pd::<0x09>(s));
+        _mm512_mask_blend_pd(
+            _mm512_cmp_pd_mask::<_CMP_GE_OQ>(t, one),
+            t,
+            _mm512_setzero_pd(),
+        )
+    };
+    let flat = xyz.as_ptr() as *const f64;
+    let mut k = lo;
+    while k + 8 <= hi {
+        let base = flat.add(3 * k);
+        let a = _mm512_loadu_pd(base);
+        let b = _mm512_loadu_pd(base.add(8));
+        let c = _mm512_loadu_pd(base.add(16));
+        let x = _mm512_mask_permutex2var_pd(_mm512_permutex2var_pd(a, ix_x, b), 0xc0, ix_x2, c);
+        let y = _mm512_mask_permutex2var_pd(_mm512_permutex2var_pd(a, ix_y, b), 0xe0, ix_y2, c);
+        let z = _mm512_mask_permutex2var_pd(_mm512_permutex2var_pd(a, ix_z, b), 0xe0, ix_z2, c);
+        let d = [
+            _mm512_sub_pd(x, bc(o[0])),
+            _mm512_sub_pd(y, bc(o[1])),
+            _mm512_sub_pd(z, bc(o[2])),
+        ];
+        let s = if ortho {
+            [
+                wrap01(_mm512_div_pd(d[0], bc(w[0]))),
+                wrap01(_mm512_div_pd(d[1], bc(w[1]))),
+                wrap01(_mm512_div_pd(d[2], bc(w[2]))),
+            ]
+        } else {
+            let row = |r: usize| {
+                _mm512_add_pd(
+                    _mm512_add_pd(
+                        _mm512_mul_pd(bc(hi_inv[0][r]), d[0]),
+                        _mm512_mul_pd(bc(hi_inv[1][r]), d[1]),
+                    ),
+                    _mm512_mul_pd(bc(hi_inv[2][r]), d[2]),
+                )
+            };
+            [wrap01(row(0)), wrap01(row(1)), wrap01(row(2))]
+        };
+        let cart = |r: usize| {
+            _mm512_add_pd(
+                _mm512_add_pd(
+                    _mm512_add_pd(
+                        _mm512_mul_pd(bc(h[0][r]), s[0]),
+                        _mm512_mul_pd(bc(h[1][r]), s[1]),
+                    ),
+                    _mm512_mul_pd(bc(h[2][r]), s[2]),
+                ),
+                bc(o[r]),
+            )
+        };
+        let bin = |a: usize| {
+            let t = _mm512_cvttpd_epi32(_mm512_mul_pd(s[a], nf[a]));
+            _mm256_min_epi32(_mm256_max_epi32(t, _mm256_setzero_si256()), top[a])
+        };
+        let (mut px, mut py, mut pz) = ([0.0f64; 8], [0.0f64; 8], [0.0f64; 8]);
+        let (mut bx, mut by, mut bz) = ([0i32; 8], [0i32; 8], [0i32; 8]);
+        _mm512_storeu_pd(px.as_mut_ptr(), cart(0));
+        _mm512_storeu_pd(py.as_mut_ptr(), cart(1));
+        _mm512_storeu_pd(pz.as_mut_ptr(), cart(2));
+        _mm256_storeu_si256(bx.as_mut_ptr() as *mut _, bin(0));
+        _mm256_storeu_si256(by.as_mut_ptr() as *mut _, bin(1));
+        _mm256_storeu_si256(bz.as_mut_ptr() as *mut _, bin(2));
+        for l in 0..8 {
+            let cell = bins::flat_cell([bx[l], by[l], bz[l]], n);
+            count[cell] += 1;
+            (*folded.at(k + l)).write(Folded {
+                p: [px[l], py[l], pz[l]],
+                cell: cell as u32,
+            });
+        }
+        k += 8;
+    }
+    k
+}
+
 /// Raw slot columns for writes at disjoint slots from several threads.
 #[derive(Clone, Copy)]
 struct SlotPtrs {
@@ -586,18 +819,8 @@ impl Grid {
                 let k = ctx.index();
                 let mut count = vec![0u32; ncell];
                 let (lo, hi) = block(k, n_act);
-                for slot in lo..hi {
-                    let (q, b) = bins::fold_point(simbox, xyz[atom(slot)], n);
-                    let cell = bins::flat_cell(b, n);
-                    count[cell] += 1;
-                    // Safety: atom blocks are disjoint.
-                    unsafe {
-                        (*fp.at(slot)).write(Folded {
-                            p: q,
-                            cell: cell as u32,
-                        })
-                    };
-                }
+                // Atom blocks are disjoint, so each thread owns its range.
+                fold_range(simbox, xyz, active, n, lo, hi, fp, &mut count);
                 let (clo, chi) = block(k, ncell);
                 for c in clo..chi {
                     // Safety: corner blocks are disjoint.
@@ -653,23 +876,17 @@ impl Grid {
         }
         let _ = threads;
         let _timer = crate::pop::JobTimer::new();
-        let mut count = vec![0usize; ncell];
-        for (slot, f) in folded.iter_mut().enumerate() {
-            let (q, b) = bins::fold_point(simbox, xyz[atom(slot)], n);
-            let cell = bins::flat_cell(b, n);
-            count[cell] += 1;
-            *f = Folded {
-                p: q,
-                cell: cell as u32,
-            };
-        }
+        let mut tally = vec![0u32; ncell];
+        let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
+        fold_range(simbox, xyz, active, n, 0, n_act, fp, &mut tally);
         for (c, o) in corners.iter_mut().enumerate() {
             *o = corner(c);
         }
+        let mut count = vec![0usize; ncell];
         let mut at = 0usize;
         for c in 0..ncell {
             offsets[c] = at;
-            at += count[c];
+            at += tally[c] as usize;
             count[c] = offsets[c];
         }
         offsets[ncell] = at;
@@ -926,16 +1143,28 @@ impl Found {
     fn into_pairs(self) -> Vec<Pair> {
         let total = self.rows();
         let mut found: Vec<Pair> = Vec::with_capacity(total);
+        // Safety: `total` slots are allocated.
+        unsafe {
+            self.write_pairs(found.as_mut_ptr());
+            found.set_len(total);
+        }
+        found
+    }
+
+    /// Every row, written at `out`.
+    ///
+    /// # Safety
+    /// `out` has room for [`Found::rows`] rows.
+    unsafe fn write_pairs(&self, out: *mut Pair) {
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
         let words = if self.simd == 2 {
             RowWords::of_pair()
         } else {
             None
         };
-        let base = RowPtr(found.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
-        // Safety: `total` slots are allocated. Chunk `t` writes the rows
-        // `off[t]..off[t + 1]`, which partition `0..total`, and nothing
-        // reads them before every chunk is done.
+        let base = RowPtr(out as *mut std::mem::MaybeUninit<Pair>);
+        // Chunk `t` writes the rows `off[t]..off[t + 1]`, which partition
+        // `0..rows`, and nothing reads them before every chunk is done.
         self.each_chunk(|t, off, chunk| {
             let rows = self.rows_of(chunk);
             if rows == 0 {
@@ -969,10 +1198,6 @@ impl Found {
                 &chunk.run_end,
             );
         });
-        unsafe {
-            found.set_len(total);
-        }
-        found
     }
 
     /// Clear `out`, then write every row into its four columns.
@@ -1135,6 +1360,12 @@ unsafe impl<T: Send> Sync for RowPtr<T> {}
 impl<T> RowPtr<T> {
     unsafe fn at(self, index: usize) -> *mut std::mem::MaybeUninit<T> {
         self.0.add(index)
+    }
+
+    /// The pointer itself; a closure that calls this captures the whole
+    /// `RowPtr`, which is `Send`, not the raw field.
+    fn ptr(self) -> *mut T {
+        self.0 as *mut T
     }
 }
 
@@ -2753,6 +2984,68 @@ mod tests {
             };
             assert_eq!(cols(&c1), row_keys(&one), "columns half={half}");
             assert_eq!(cols(&c8), row_keys(&one), "columns eight half={half}");
+        }
+    }
+
+    #[test]
+    fn vector_fold_matches_fold_point_bit_for_bit() {
+        let cells = [
+            Cell::ortho(18.0, 17.0, 19.0).unwrap(),
+            Cell::from_vectors(
+                [10.0, 0.0, 0.0],
+                [5.0, 8.660254037844386, 0.0],
+                [1.0, -2.0, 9.5],
+                [0.3, -1.0, 2.0],
+            )
+            .unwrap(),
+            Cell::from_vectors(
+                [9.0, 3.0, 2.0],
+                [1.0, 9.0, -2.0],
+                [-1.5, 2.0, 9.5],
+                [0.0; 3],
+            )
+            .unwrap(),
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for sim in &cells {
+            let mut xyz: Vec<[f64; 3]> = (0..203)
+                .map(|_| {
+                    [
+                        (next() - 0.3) * 60.0,
+                        (next() - 0.7) * 45.0,
+                        (next() - 0.5) * 80.0,
+                    ]
+                })
+                .collect();
+            let w = sim.widths();
+            xyz.extend_from_slice(&[
+                [0.0; 3],
+                [w[0], w[1], w[2]],
+                [-0.0, -1e-300, 1e-300],
+                [w[0] * 0.5, -w[1], 3.0 * w[2]],
+            ]);
+            let n = [5, 4, 7];
+            let mut folded = vec![Folded::default(); xyz.len()];
+            let mut count = vec![0u32; 140];
+            let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
+            fold_range(sim, &xyz, None, n, 0, xyz.len(), fp, &mut count);
+            let mut want_count = vec![0u32; 140];
+            for (k, r) in xyz.iter().enumerate() {
+                let (q, b) = bins::fold_point(sim, *r, n);
+                let cell = bins::flat_cell(b, n);
+                want_count[cell] += 1;
+                assert_eq!(folded[k].cell as usize, cell, "atom {k}");
+                for (a, (got, want)) in folded[k].p.iter().zip(q).enumerate() {
+                    assert_eq!(got.to_bits(), want.to_bits(), "atom {k} axis {a}");
+                }
+            }
+            assert_eq!(count, want_count);
         }
     }
 
