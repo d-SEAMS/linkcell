@@ -1788,6 +1788,22 @@ impl Found {
             }
             let dst = unsafe { std::slice::from_raw_parts_mut(base.at(off[t]), rows) };
             let ahead = ahead(rows, std::mem::size_of::<Pair>());
+            #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+            if let Some(words) = words {
+                let at = dst.as_mut_ptr();
+                // Safety: AVX-512 was detected for this search, and `dst`
+                // holds the rows of `chunk`, two per hit on a full list and
+                // one on a half list.
+                unsafe {
+                    match (self.half, ahead) {
+                        (false, true) => write_full_avx512::<true>(at, chunk, &words),
+                        (false, false) => write_full_avx512::<false>(at, chunk, &words),
+                        (true, true) => write_half_avx512::<true>(at, chunk, &words),
+                        (true, false) => write_half_avx512::<false>(at, chunk, &words),
+                    }
+                };
+                return;
+            }
             if self.half {
                 write_half(
                     dst,
@@ -1798,19 +1814,6 @@ impl Found {
                     &chunk.run_end,
                     ahead,
                 );
-                return;
-            }
-            #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-            if let Some(words) = words {
-                // Safety: AVX-512 was detected for this search, and `dst`
-                // holds two rows per hit of `chunk`.
-                unsafe {
-                    if ahead {
-                        write_full_avx512::<true>(dst.as_mut_ptr(), chunk, &words)
-                    } else {
-                        write_full_avx512::<false>(dst.as_mut_ptr(), chunk, &words)
-                    }
-                };
                 return;
             }
             write_full(
@@ -1883,14 +1886,16 @@ impl Found {
             };
             let ahead = ahead(rows, COLUMN_BYTES);
             #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-            if self.simd == 2 && !self.half {
-                // Safety: AVX-512 was detected, and each column holds two
-                // rows per hit of `chunk` (three values per row of shift).
+            if self.simd == 2 {
+                // Safety: AVX-512 was detected, and each column holds the
+                // rows of `chunk`, two per hit on a full list and one on a
+                // half list (three values per row of shift).
                 unsafe {
-                    if ahead {
-                        write_columns_avx512::<true>(ci, cj, cs, cd, chunk)
-                    } else {
-                        write_columns_avx512::<false>(ci, cj, cs, cd, chunk)
+                    match (self.half, ahead) {
+                        (false, true) => write_columns_avx512::<true>(ci, cj, cs, cd, chunk),
+                        (false, false) => write_columns_avx512::<false>(ci, cj, cs, cd, chunk),
+                        (true, true) => write_half_columns_avx512::<true>(ci, cj, cs, cd, chunk),
+                        (true, false) => write_half_columns_avx512::<false>(ci, cj, cs, cd, chunk),
                     }
                 };
                 return;
@@ -2232,6 +2237,16 @@ struct RowWords {
     /// five registers for eight hits: `(i, j, S, d)` from table 0 and
     /// `(j, i, -S, d)` from table 1, picked per row by [`MIRROR32`].
     half32: [[[u32; 16]; 5]; 2],
+    /// Buffered half rows, eight a time, from `[i0 .. i7, j0 .. j7]` and
+    /// the eight distances: the dword of each row's `i`, `j`, and `dist2`
+    /// in `rows_ij`, the dwords those fill in `rows_keep` (the high halves
+    /// of `i` and `j` stay zero), and where `S` (dwords 0..3 of a source)
+    /// or `-S` (dwords 3..6) go in `rows_s` and `rows_n` (dword 6, zero,
+    /// elsewhere).
+    rows_ij: [[u32; 16]; 5],
+    rows_keep: [u16; 5],
+    rows_s: [[u32; 16]; 5],
+    rows_n: [[u32; 16]; 5],
 }
 
 /// For each set of mirrored hits among eight (bit `h` for hit `h`), the
@@ -2357,10 +2372,39 @@ impl RowWords {
                 }
             }
         }
+        let mut rows_ij = [[0u32; 16]; 5];
+        let mut rows_keep = [0u16; 5];
+        let mut rows_s = [[6u32; 16]; 5];
+        let mut rows_n = [[6u32; 16]; 5];
+        for h in 0..8u32 {
+            let at = |w: usize, half: usize| {
+                let q = 10 * h as usize + 2 * w + half;
+                (q / 16, q % 16)
+            };
+            for (w, src) in [(wi, h), (wj, 8 + h)] {
+                let (m, d) = at(w, 0);
+                rows_ij[m][d] = src;
+                rows_keep[m] |= 1 << d;
+            }
+            for half in 0..2 {
+                let (m, d) = at(wd, half);
+                rows_ij[m][d] = 16 + 2 * h + half as u32;
+                rows_keep[m] |= 1 << d;
+            }
+            for (w, half, k) in [(ws, 0, 0u32), (ws, 1, 1), (ws + 1, 0, 2)] {
+                let (m, d) = at(w, half);
+                rows_s[m][d] = k;
+                rows_n[m][d] = 3 + k;
+            }
+        }
         Some(Self {
             index,
             index32,
             half32,
+            rows_ij,
+            rows_keep,
+            rows_s,
+            rows_n,
         })
     }
 }
@@ -2545,6 +2589,206 @@ unsafe fn write_columns_avx512<const AHEAD: bool>(
             *so.add(4) = -s[1];
             *so.add(5) = -s[2];
             out += 2;
+            k += 1;
+        }
+        lo = hi;
+    }
+}
+
+/// [`write_half`] eight hits at a time: each register of rows is one
+/// zero-masked permute of the hits' sides and distances, with `S` or `-S`
+/// blended in per row.
+///
+/// # Safety
+/// AVX-512F and AVX-512VL are available, and `dst` holds one row per hit
+/// of `chunk`.
+#[allow(clippy::incompatible_msrv)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+unsafe fn write_half_avx512<const AHEAD: bool>(
+    dst: *mut std::mem::MaybeUninit<Pair>,
+    chunk: &Scratch,
+    words: &RowWords,
+) {
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_cmp_epu32_mask, _mm256_cmpeq_epi32_mask, _mm256_loadu_si256,
+        _mm256_mask_blend_epi32, _mm512_castsi256_si512, _mm512_inserti64x4, _mm512_loadu_si512,
+        _mm512_mask_blend_epi32, _mm512_maskz_permutex2var_epi32, _mm512_or_si512,
+        _mm512_permutexvar_epi32, _mm512_setr_epi32, _mm512_storeu_si512, _MM_CMPINT_LT,
+    };
+    let load = |t: &[u32; 16]| _mm512_loadu_si512(t.as_ptr() as *const _);
+    let ij: [__m512i; 5] = std::array::from_fn(|m| load(&words.rows_ij[m]));
+    let ap = chunk.atom.as_ptr();
+    let jp = chunk.js.as_ptr();
+    let dp = chunk.d2.as_ptr();
+    let mut out = 0usize;
+    let mut lo = 0usize;
+    for (r, &hi) in chunk.run_end.iter().enumerate() {
+        let s = chunk.run_shift[r];
+        let neg = [-s[0], -s[1], -s[2]];
+        let self_fwd: u8 = if keep_half(0, 0, s) { 0xff } else { 0 };
+        let six = _mm512_setr_epi32(
+            s[0], s[1], s[2], neg[0], neg[1], neg[2], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let fs: [__m512i; 5] =
+            std::array::from_fn(|m| _mm512_permutexvar_epi32(load(&words.rows_s[m]), six));
+        let ns: [__m512i; 5] =
+            std::array::from_fn(|m| _mm512_permutexvar_epi32(load(&words.rows_n[m]), six));
+        let mut k = lo;
+        while k + 8 <= hi {
+            let a = _mm256_loadu_si256(ap.add(k) as *const __m256i);
+            let b = _mm256_loadu_si256(jp.add(k) as *const __m256i);
+            // Row `h` keeps (a_h, b_h, S) when a_h < b_h, or for an atom's
+            // own image when the shift says so; otherwise (b_h, a_h, -S).
+            let fwd = _mm256_cmp_epu32_mask::<_MM_CMPINT_LT>(a, b)
+                | (_mm256_cmpeq_epi32_mask(a, b) & self_fwd);
+            let sides = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_mask_blend_epi32(fwd, b, a)),
+                _mm256_mask_blend_epi32(fwd, a, b),
+            );
+            let d = _mm512_loadu_si512(dp.add(k) as *const _);
+            let pick = &MIRROR32[!fwd as usize];
+            let row = dst.add(out) as *mut u64;
+            for m in 0..5 {
+                if AHEAD {
+                    prefetch(row.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
+                }
+                let v = _mm512_maskz_permutex2var_epi32(words.rows_keep[m], sides, ij[m], d);
+                let sh = _mm512_mask_blend_epi32(pick[m], fs[m], ns[m]);
+                _mm512_storeu_si512(row.add(8 * m) as *mut _, _mm512_or_si512(v, sh));
+            }
+            out += 8;
+            k += 8;
+        }
+        while k < hi {
+            let (i, j, dist2) = (*ap.add(k) as usize, *jp.add(k) as usize, *dp.add(k));
+            let pair = if keep_half(i, j, s) {
+                Pair {
+                    i,
+                    j,
+                    shift: s,
+                    dist2,
+                }
+            } else {
+                Pair {
+                    i: j,
+                    j: i,
+                    shift: neg,
+                    dist2,
+                }
+            };
+            (*dst.add(out)).write(pair);
+            out += 1;
+            k += 1;
+        }
+        lo = hi;
+    }
+}
+
+/// [`write_columns`] for a half list, eight hits (eight rows) at a time:
+/// one compare picks each hit's side, as in the tile kernel.
+///
+/// # Safety
+/// AVX-512F and AVX-512VL are available, and the columns hold one row
+/// per hit of `chunk`; `cs` holds three values per row.
+#[allow(clippy::incompatible_msrv)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+unsafe fn write_half_columns_avx512<const AHEAD: bool>(
+    ci: &mut [std::mem::MaybeUninit<i32>],
+    cj: &mut [std::mem::MaybeUninit<i32>],
+    cs: &mut [std::mem::MaybeUninit<i32>],
+    cd: &mut [std::mem::MaybeUninit<f64>],
+    chunk: &Scratch,
+) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmp_epu32_mask, _mm256_cmpeq_epi32_mask, _mm256_loadu_si256,
+        _mm256_mask_blend_epi32, _mm256_storeu_si256, _mm512_castsi512_si256, _mm512_loadu_pd,
+        _mm512_mask_blend_epi32, _mm512_permutexvar_epi32, _mm512_setr_epi32, _mm512_storeu_pd,
+        _mm512_storeu_si512, _MM_CMPINT_LT,
+    };
+    let ap = chunk.atom.as_ptr();
+    let jp = chunk.js.as_ptr();
+    let dp = chunk.d2.as_ptr();
+    let ip = ci.as_mut_ptr() as *mut i32;
+    let jo = cj.as_mut_ptr() as *mut i32;
+    let sp = cs.as_mut_ptr() as *mut i32;
+    let dq = cd.as_mut_ptr() as *mut f64;
+    let mut out = 0usize;
+    let mut lo = 0usize;
+    for (r, &hi) in chunk.run_end.iter().enumerate() {
+        let s = chunk.run_shift[r];
+        let neg = [-s[0], -s[1], -s[2]];
+        let self_fwd: u8 = if keep_half(0, 0, s) { 0xff } else { 0 };
+        let six = _mm512_setr_epi32(
+            s[0], s[1], s[2], neg[0], neg[1], neg[2], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        // The shift column of eight rows, all S or all -S: dwords 0..16
+        // and 16..24.
+        let s_lo = _mm512_permutexvar_epi32(
+            _mm512_setr_epi32(0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0),
+            six,
+        );
+        let n_lo = _mm512_permutexvar_epi32(
+            _mm512_setr_epi32(3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5, 3),
+            six,
+        );
+        let s_hi = _mm512_castsi512_si256(_mm512_permutexvar_epi32(
+            _mm512_setr_epi32(1, 2, 0, 1, 2, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0),
+            six,
+        ));
+        let n_hi = _mm512_castsi512_si256(_mm512_permutexvar_epi32(
+            _mm512_setr_epi32(4, 5, 3, 4, 5, 3, 4, 5, 3, 3, 3, 3, 3, 3, 3, 3),
+            six,
+        ));
+        let mut k = lo;
+        while k + 8 <= hi {
+            if AHEAD {
+                let at = out + AHEAD_ROWS;
+                prefetch(ip.wrapping_add(at));
+                prefetch(jo.wrapping_add(at));
+                prefetch(dq.wrapping_add(at));
+                prefetch(sp.wrapping_add(3 * at));
+                prefetch(sp.wrapping_add(3 * at + 16));
+            }
+            let a = _mm256_loadu_si256(ap.add(k) as *const __m256i);
+            let b = _mm256_loadu_si256(jp.add(k) as *const __m256i);
+            // Row `h` keeps (a_h, b_h, S) when a_h < b_h, or for an atom's
+            // own image when the shift says so; otherwise (b_h, a_h, -S).
+            let fwd = _mm256_cmp_epu32_mask::<_MM_CMPINT_LT>(a, b)
+                | (_mm256_cmpeq_epi32_mask(a, b) & self_fwd);
+            _mm256_storeu_si256(ip.add(out) as *mut _, _mm256_mask_blend_epi32(fwd, b, a));
+            _mm256_storeu_si256(jo.add(out) as *mut _, _mm256_mask_blend_epi32(fwd, a, b));
+            _mm512_storeu_pd(dq.add(out), _mm512_loadu_pd(dp.add(k)));
+            let m3 = MIRROR3[!fwd as usize];
+            _mm512_storeu_si512(
+                sp.add(3 * out) as *mut _,
+                _mm512_mask_blend_epi32(m3 as u16, s_lo, n_lo),
+            );
+            _mm256_storeu_si256(
+                sp.add(3 * out + 16) as *mut _,
+                _mm256_mask_blend_epi32((m3 >> 16) as u8, s_hi, n_hi),
+            );
+            out += 8;
+            k += 8;
+        }
+        while k < hi {
+            let (a, b, d) = (*ap.add(k), *jp.add(k), *dp.add(k));
+            let (i, j, t) = if keep_half(a as usize, b as usize, s) {
+                (a, b, s)
+            } else {
+                (b, a, neg)
+            };
+            *ip.add(out) = i as i32;
+            *jo.add(out) = j as i32;
+            *dq.add(out) = d;
+            let so = sp.add(3 * out);
+            *so = t[0];
+            *so.add(1) = t[1];
+            *so.add(2) = t[2];
+            out += 1;
             k += 1;
         }
         lo = hi;
