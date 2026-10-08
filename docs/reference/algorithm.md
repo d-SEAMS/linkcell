@@ -156,6 +156,17 @@ bins hold under eight atoms on average the block loop runs as a twin
 compiled with the tile's target features and the tile inlines into it,
 since with a few atoms a block the call into the tile is most of the
 block (256 atoms in the 18 Å cube: 0.020 to 0.017 ms).
+On several threads, a full list of `Pair` rows on AVX-512 whose rows
+outgrow a thread's L2 (the same 3 MB a thread as the prefetch) is
+written from the tile as well: each thread counts the rows of its range
+of bins (the tile with nothing written), the counts give each range its
+first row, and each thread then writes its range from the tile at that
+row, the registers that would reach the next range's rows stored under
+a mask. The count is a second search, which the row stores running
+behind the tile pay for only with large lists: at 4096 atoms eight
+threads take 0.278 ms instead of 0.321 and two threads 0.938 instead of
+1.006, while 1536 to 3000 atoms on eight threads were 8 to 24% slower
+that way and keep the buffered path.
 Otherwise each thread buffers the hits of its range of bins, then
 writes them into the caller's layout: `Pair` rows, four columns, or
 `lc_pair` rows. Thread `k` searches and writes range `k`, so the writer
