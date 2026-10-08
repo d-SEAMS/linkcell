@@ -224,7 +224,7 @@ impl PairColumns {
 /// The grid, stencil, and bounds of one cutoff search.
 pub(crate) struct Plan {
     grid: Grid,
-    partners: PartnerList,
+    partners: std::sync::Arc<PartnerList>,
     cut2: f64,
     margin: f64,
     simd: u8,
@@ -304,10 +304,13 @@ pub(crate) fn plan(
     if n_act == 0 {
         return Ok(Plan {
             grid: Grid::empty(),
-            partners: PartnerList {
+            partners: std::sync::Arc::new(PartnerList {
+                key: ([0; 12], [1, 1, 1], [0; 3], 0),
                 off: vec![0],
                 items: Vec::new(),
-            },
+                s_max: 0.0,
+                d_max: 0.0,
+            }),
             cut2: cutoff * cutoff,
             margin: 0.0,
             simd: 0,
@@ -355,7 +358,7 @@ pub(crate) fn plan(
     let threads = walk_threads(hit_estimate(n_act, simbox, cutoff));
     let grid_threads = if n_act >= PARALLEL_GRID { threads } else { 1 };
     let grid = Grid::build(xyz, simbox, active.as_deref(), dims, grid_threads);
-    let partners = build_partners(&grid, simbox, reach, cut2);
+    let partners = partners_for(&grid, simbox, reach, cut2);
     let margin = expanded_margin(&grid, &partners, cutoff);
     Ok(Plan {
         grid,
@@ -404,8 +407,8 @@ fn retain_pair_pages() {
 }
 
 struct Partner {
-    lo: usize,
-    hi: usize,
+    /// Target bin.
+    jc: usize,
     shift_s: [i32; 3],
     shift: [f64; 3],
     /// Source corner minus target corner minus `shift`: a source slot's
@@ -414,9 +417,54 @@ struct Partner {
     delta: [f64; 3],
 }
 
+/// The bins each bin looks into, with their shifts. It depends on the
+/// box, the bin counts, the reach, and the cutoff, not on the atoms, so a
+/// search of the same box reuses it; the walk skips an empty target bin.
 struct PartnerList {
+    key: PartnerKey,
     off: Vec<usize>,
     items: Vec<Partner>,
+    /// Largest |component| of any shift and of any `delta`.
+    s_max: f64,
+    d_max: f64,
+}
+
+/// The box (edges and origin, as bits), the bin counts, the reach, and
+/// the squared cutoff.
+type PartnerKey = ([u64; 12], [i32; 3], [i32; 3], u64);
+
+static PARTNERS: std::sync::Mutex<Option<std::sync::Arc<PartnerList>>> =
+    std::sync::Mutex::new(None);
+
+/// [`build_partners`], or the last list when its key matches.
+fn partners_for(
+    grid: &Grid,
+    simbox: &Cell,
+    reach: [i32; 3],
+    cut2: f64,
+) -> std::sync::Arc<PartnerList> {
+    let h = simbox.h();
+    let o = simbox.origin();
+    let mut boxbits = [0u64; 12];
+    for a in 0..3 {
+        for b in 0..3 {
+            boxbits[3 * a + b] = h[a][b].to_bits();
+        }
+        boxbits[9 + a] = o[a].to_bits();
+    }
+    let key: PartnerKey = (boxbits, grid.n, reach, cut2.to_bits());
+    if let Ok(slot) = PARTNERS.lock() {
+        if let Some(list) = slot.as_ref() {
+            if list.key == key {
+                return std::sync::Arc::clone(list);
+            }
+        }
+    }
+    let built = std::sync::Arc::new(build_partners(grid, simbox, reach, cut2, key));
+    if let Ok(mut slot) = PARTNERS.lock() {
+        *slot = Some(std::sync::Arc::clone(&built));
+    }
+    built
 }
 
 fn bin_gap(src: i32, dst: i32, width: f64) -> f64 {
@@ -450,7 +498,13 @@ fn bins_too_far(ortho: bool, src: [i32; 3], dst: [i32; 3], width: [f64; 3], cut2
     bound >= cut2
 }
 
-fn build_partners(grid: &Grid, simbox: &Cell, reach: [i32; 3], cut2: f64) -> PartnerList {
+fn build_partners(
+    grid: &Grid,
+    simbox: &Cell,
+    reach: [i32; 3],
+    cut2: f64,
+    key: PartnerKey,
+) -> PartnerList {
     let [nx, ny, nz] = grid.n;
     let ncell = (nx as usize) * (ny as usize) * (nz as usize);
     let width = [
@@ -462,6 +516,7 @@ fn build_partners(grid: &Grid, simbox: &Cell, reach: [i32; 3], cut2: f64) -> Par
     let [rx, ry, rz] = reach;
     let mut off = vec![0usize; ncell + 1];
     let mut items = Vec::new();
+    let (mut s_max, mut d_max) = (0.0f64, 0.0f64);
     for iz in 0..nz {
         for iy in 0..ny {
             for ix in 0..nx {
@@ -478,11 +533,6 @@ fn build_partners(grid: &Grid, simbox: &Cell, reach: [i32; 3], cut2: f64) -> Par
                                 continue;
                             }
                             let jc = bins::wrap_cell(dst, grid.n);
-                            let lo = grid.offsets[jc];
-                            let hi = grid.offsets[jc + 1];
-                            if lo == hi {
-                                continue;
-                            }
                             let shift_s = [
                                 dst[0].div_euclid(nx),
                                 dst[1].div_euclid(ny),
@@ -490,16 +540,20 @@ fn build_partners(grid: &Grid, simbox: &Cell, reach: [i32; 3], cut2: f64) -> Par
                             ];
                             let shift = simbox.lattice_shift(shift_s[0], shift_s[1], shift_s[2]);
                             let (a, b) = (grid.corners[cell], grid.corners[jc]);
+                            let delta = [
+                                a[0] - b[0] - shift[0],
+                                a[1] - b[1] - shift[1],
+                                a[2] - b[2] - shift[2],
+                            ];
+                            for k in 0..3 {
+                                s_max = s_max.max(shift[k].abs());
+                                d_max = d_max.max(delta[k].abs());
+                            }
                             items.push(Partner {
-                                lo,
-                                hi,
+                                jc,
                                 shift_s,
                                 shift,
-                                delta: [
-                                    a[0] - b[0] - shift[0],
-                                    a[1] - b[1] - shift[1],
-                                    a[2] - b[2] - shift[2],
-                                ],
+                                delta,
                             });
                         }
                     }
@@ -508,7 +562,13 @@ fn build_partners(grid: &Grid, simbox: &Cell, reach: [i32; 3], cut2: f64) -> Par
             }
         }
     }
-    PartnerList { off, items }
+    PartnerList {
+        key,
+        off,
+        items,
+        s_max,
+        d_max,
+    }
 }
 
 #[derive(Default)]
@@ -953,13 +1013,7 @@ impl Grid {
 /// direct formula, so the expanded form never changes a row.
 fn expanded_margin(grid: &Grid, partners: &PartnerList, cutoff: f64) -> f64 {
     let (a, r) = (grid.max_abs, grid.max_rel);
-    let (mut s, mut d) = (0.0f64, 0.0f64);
-    for p in &partners.items {
-        for k in 0..3 {
-            s = s.max(p.shift[k].abs());
-            d = d.max(p.delta[k].abs());
-        }
-    }
+    let (s, d) = (partners.s_max, partners.d_max);
     let span = 2.0 * a + s + 2.0 * r + d + cutoff;
     192.0 * f64::EPSILON * 0.5 * span * span
 }
@@ -2120,11 +2174,15 @@ impl Plan {
             }
             let (p0, p1) = (self.partners.off[cell], self.partners.off[cell + 1]);
             for p in &self.partners.items[p0..p1] {
+                let (j_lo, j_hi) = (self.grid.offsets[p.jc], self.grid.offsets[p.jc + 1]);
+                if j_lo == j_hi {
+                    continue;
+                }
                 visit(&Block {
                     i_lo: lo,
                     i_hi: hi,
-                    j_lo: p.lo,
-                    j_hi: p.hi,
+                    j_lo,
+                    j_hi,
                     shift_s: p.shift_s,
                     shift: p.shift,
                     delta: p.delta,
@@ -2346,13 +2404,20 @@ impl Walk<'_> {
         let p0 = self.partners.off[cell];
         let p1 = self.partners.off[cell + 1];
         for partner in &self.partners.items[p0..p1] {
+            let (j_lo, j_hi) = (
+                self.grid.offsets[partner.jc],
+                self.grid.offsets[partner.jc + 1],
+            );
+            if j_lo == j_hi {
+                continue;
+            }
             self.scan_block(
                 scratch,
                 &Block {
                     i_lo: lo,
                     i_hi: hi,
-                    j_lo: partner.lo,
-                    j_hi: partner.hi,
+                    j_lo,
+                    j_hi,
                     shift_s: partner.shift_s,
                     shift: partner.shift,
                     delta: partner.delta,
