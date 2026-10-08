@@ -69,6 +69,7 @@ fn box_diameter(cell: &Cell) -> f64 {
 /// Bounded max-heap of `(dist2, index)`. `k <= 16` stays in
 /// `[f64; 16]` / `[usize; 16]` so the pair loop does not allocate;
 /// larger `k` uses `extra_*` vectors.
+#[derive(Clone)]
 struct KHeap {
     d2: [f64; 16],
     idx: [usize; 16],
@@ -97,6 +98,12 @@ impl KHeap {
             k,
             worst_at: 0,
         }
+    }
+
+    /// Empty again, for the next source.
+    fn clear(&mut self) {
+        self.n = 0;
+        self.worst_at = 0;
     }
 
     fn d2_at(&self, t: usize) -> f64 {
@@ -192,12 +199,23 @@ impl KHeap {
             for (t, slot) in order.iter_mut().enumerate().take(n) {
                 *slot = t as u8;
             }
-            order[..n].sort_by(|&a, &b| {
+            // Insertion sort: a handful of entries.
+            let before = |a: u8, b: u8| {
                 let (a, b) = (a as usize, b as usize);
                 self.d2[a]
                     .total_cmp(&self.d2[b])
                     .then(self.idx[a].cmp(&self.idx[b]))
-            });
+                    .is_lt()
+            };
+            for t in 1..n {
+                let x = order[t];
+                let mut u = t;
+                while u > 0 && before(x, order[u - 1]) {
+                    order[u] = order[u - 1];
+                    u -= 1;
+                }
+                order[u] = x;
+            }
             for (t, &slot) in order[..n].iter().enumerate() {
                 let s = slot as usize;
                 nn[t] = self.idx[s] as i32;
@@ -534,7 +552,7 @@ fn dispatch<const MODE: u8>(
             // Safety: each source owns row `i` of both outputs, and the
             // caller sized them to `n * k`.
             let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
-            walk_source::<MODE>(mesh, geom, k, max_reach, bin, slot, row, row_d2);
+            walk_source::<MODE>(mesh, geom, k, max_reach, bin, slot, row, row_d2, None);
         }
     };
     let ncell = mesh.offsets.len() - 1;
@@ -591,13 +609,13 @@ struct Candidates {
 
 /// [`dispatch`] by blocks of `side` bins a side: a block's sources share
 /// one candidate list, the occupants of the `side + 2` bins a side around
-/// the block with their images, gathered once. A source's own 3 x 3 x 3
-/// bins lie inside it, so when the source's k-th neighbour is within the
-/// shell walk's first plane bound the answer is among the candidates:
-/// every other point lies strictly past that plane. Distances are formed
-/// as [`visit_cell`] forms them, and the heap keeps the same k, so every
-/// row is the shell walk's; a source the bound does not settle takes the
-/// shell walk.
+/// the block with their images, gathered once. When a source's k-th
+/// neighbour is within the plane bound of the gathered bins, the answer
+/// is among the candidates: every other point lies strictly past one of
+/// those planes. Distances are formed as [`visit_cell`] forms them and
+/// the heap keeps the same k, so every row is the shell walk's; a source
+/// the bound does not settle resumes the shell walk from its heap, which
+/// holds its 3 x 3 x 3 bins already.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_blocks<const MODE: u8>(
     mesh: &Mesh,
@@ -619,7 +637,7 @@ fn dispatch_blocks<const MODE: u8>(
     let nblock = (blocks[0] * blocks[1] * blocks[2]) as usize;
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     let wide = std::is_x86_feature_detected!("avx512f");
-    let job = |cand: &mut Candidates, blk: usize| {
+    let job = |cand: &mut Candidates, heap: &mut KHeap, blk: usize| {
         let blk = blk as i32;
         let x0 = side * (blk % blocks[0]);
         let y0 = side * ((blk / blocks[0]) % blocks[1]);
@@ -628,8 +646,27 @@ fn dispatch_blocks<const MODE: u8>(
         cand.y.clear();
         cand.z.clear();
         cand.id.clear();
+        let interior =
+            x0 >= 1 && y0 >= 1 && z0 >= 1 && x0 + side < nx && y0 + side < ny && z0 + side < nz;
         for dz in -1..=side {
             for dy in -1..=side {
+                // Inside the box a row of bins is one run of slots with no
+                // shift: `p + 0` is `p`.
+                if interior {
+                    let row = ((z0 + dz) * ny + (y0 + dy)) * nx + x0;
+                    let (lo, hi) = (
+                        mesh.offsets[(row - 1) as usize],
+                        mesh.offsets[(row + side + 1) as usize],
+                    );
+                    for slot in lo..hi {
+                        let p = mesh.slot_folded[slot];
+                        cand.x.push(p[0]);
+                        cand.y.push(p[1]);
+                        cand.z.push(p[2]);
+                        cand.id.push(mesh.occupants[slot] as u64);
+                    }
+                    continue;
+                }
                 for dx in -1..=side {
                     let (cell, na, nb, nc) = mesh.locate(x0 + dx, y0 + dy, z0 + dz);
                     let shift = image_shift::<MODE>(geom, na, nb, nc);
@@ -643,6 +680,7 @@ fn dispatch_blocks<const MODE: u8>(
                 }
             }
         }
+        let planes = box_planes([x0, y0, z0], side, geom);
         for iz in z0..(z0 + side).min(nz) {
             for iy in y0..(y0 + side).min(ny) {
                 for ix in x0..(x0 + side).min(nx) {
@@ -652,18 +690,18 @@ fn dispatch_blocks<const MODE: u8>(
                         // Safety: each source owns row `i` of both outputs,
                         // and the caller sized them to `n * k`.
                         let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
-                        let mut heap = KHeap::new(k);
+                        heap.clear();
                         let pi = mesh.slot_folded[slot];
                         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
                         if wide {
                             // Safety: AVX-512F was detected.
-                            unsafe { scan_avx512(cand, pi, i, &mut heap) };
+                            unsafe { scan_avx512(cand, pi, i, heap) };
                         } else {
-                            scan(cand, pi, i, &mut heap);
+                            scan(cand, pi, i, heap);
                         }
                         #[cfg(not(all(target_arch = "x86_64", linkcell_avx512)))]
-                        scan(cand, pi, i, &mut heap);
-                        let bound = first_bound(mesh.slot_frac[slot], [ix, iy, iz], geom);
+                        scan(cand, pi, i, heap);
+                        let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
                         if heap.full() && heap.worst() <= bound {
                             heap.write_sorted(row, row_d2);
                         } else {
@@ -676,6 +714,7 @@ fn dispatch_blocks<const MODE: u8>(
                                 slot,
                                 row,
                                 row_d2,
+                                Some(heap.clone()),
                             );
                         }
                     }
@@ -687,26 +726,48 @@ fn dispatch_blocks<const MODE: u8>(
     {
         use rayon::prelude::*;
         (0..nblock).into_par_iter().with_min_len(8).for_each_init(
-            || (crate::pop::JobTimer::new(), Candidates::default()),
-            |(_timer, cand), blk| job(cand, blk),
+            || {
+                (
+                    crate::pop::JobTimer::new(),
+                    Candidates::default(),
+                    KHeap::new(k),
+                )
+            },
+            |(_timer, cand, heap), blk| job(cand, heap, blk),
         );
     }
     #[cfg(not(feature = "parallel"))]
     {
         let _timer = crate::pop::JobTimer::new();
         let mut cand = Candidates::default();
+        let mut heap = KHeap::new(k);
         for blk in 0..nblock {
-            job(&mut cand, blk);
+            job(&mut cand, &mut heap, blk);
         }
     }
 }
 
-/// The squared plane bound of the shell walk's first layer, the 3 x 3 x 3
-/// bins around `bin`, as [`walk_source`] forms it.
-fn first_bound(origin: [f64; 3], bin: [i32; 3], geom: &Geom) -> f64 {
+/// Fractional planes of the gathered bins, from `corner - 1` to `corner +
+/// side` on each axis: `[lower, upper]` per axis.
+fn box_planes(corner: [i32; 3], side: i32, geom: &Geom) -> [[f64; 2]; 3] {
+    std::array::from_fn(|a| {
+        let nf = f64::from(geom.nbin[a]);
+        [
+            f64::from(corner[a] - 1) / nf,
+            f64::from(corner[a] + side + 1) / nf,
+        ]
+    })
+}
+
+/// The squared plane bound of the gathered bins, formed as [`axis_gap`]
+/// forms the shell walk's: bins are half-open, so every point not
+/// gathered lies strictly past one of these planes.
+fn box_bound(origin: [f64; 3], planes: &[[f64; 2]; 3], geom: &Geom) -> f64 {
     (0..3)
         .map(|a| {
-            let gap = axis_gap(origin[a], bin[a], 1, geom.nbin[a], geom.widths[a]);
+            let plus = (planes[a][1] - origin[a]) * geom.widths[a];
+            let minus = (origin[a] - planes[a][0]) * geom.widths[a];
+            let gap = plus.min(minus);
             if gap > 0.0 && gap.is_finite() {
                 gap * gap
             } else {
@@ -827,6 +888,10 @@ impl<T> RowsOut<T> {
     }
 }
 
+/// The shell walk of one source. `start` is a heap that already holds
+/// every point of the source's 3 x 3 x 3 bins (and maybe more): the walk
+/// then begins at the next layer, and a point it meets again changes
+/// nothing, since the heap keeps one image per point.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn walk_source<const MODE: u8>(
@@ -838,8 +903,10 @@ fn walk_source<const MODE: u8>(
     slot: usize,
     nn: &mut [i32],
     d2: Option<&mut [f64]>,
+    start: Option<KHeap>,
 ) {
-    let mut heap = KHeap::new(k);
+    let resumed = start.is_some();
+    let mut heap = start.unwrap_or_else(|| KHeap::new(k));
     let [ix, iy, iz] = bin;
     let i = mesh.occupants[slot];
     let origin = mesh.slot_frac[slot];
@@ -847,19 +914,23 @@ fn walk_source<const MODE: u8>(
     // Nothing visited yet. The first layer is the 3x3x3 around the source.
     let mut prev = [-1i32; 3];
     let mut reach = [1i32; 3];
+    let mut first = true;
     loop {
-        let mut query = CellQuery {
-            heap: &mut heap,
-            mesh,
-            geom,
-            i,
-            pi,
-            origin,
-        };
-        let allow_slab = prev[0] >= 0;
-        for_new_layer(prev, reach, |dx, dy, dz| {
-            visit_cell::<MODE>(&mut query, ix + dx, iy + dy, iz + dz, allow_slab);
-        });
+        if !(first && resumed) {
+            let mut query = CellQuery {
+                heap: &mut heap,
+                mesh,
+                geom,
+                i,
+                pi,
+                origin,
+            };
+            let allow_slab = prev[0] >= 0;
+            for_new_layer(prev, reach, |dx, dy, dz| {
+                visit_cell::<MODE>(&mut query, ix + dx, iy + dy, iz + dz, allow_slab);
+            });
+        }
+        first = false;
         let gaps = [
             axis_gap(origin[0], ix, reach[0], geom.nbin[0], geom.widths[0]),
             axis_gap(origin[1], iy, reach[1], geom.nbin[1], geom.widths[1]),
