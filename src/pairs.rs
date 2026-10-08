@@ -634,8 +634,9 @@ struct GridBufs {
     offsets: Vec<usize>,
     corners: Vec<[f64; 3]>,
     coords: Coords,
-    folded: Vec<Folded>,
+    fold: FoldCols,
     tally: Vec<u32>,
+    order: Vec<u32>,
 }
 
 static GRID_POOL: std::sync::Mutex<Option<GridBufs>> = std::sync::Mutex::new(None);
@@ -674,9 +675,10 @@ struct Grid {
     /// Largest |component| of the folded and of the relative positions.
     max_abs: f64,
     max_rel: f64,
-    /// The fold and the counts, kept for the next grid.
-    folded: Vec<Folded>,
+    /// The fold, the counts, and the slot order, kept for the next grid.
+    fold: FoldCols,
     tally: Vec<u32>,
+    order: Vec<u32>,
 }
 
 impl Drop for Grid {
@@ -685,8 +687,9 @@ impl Drop for Grid {
             offsets: std::mem::take(&mut self.offsets),
             corners: std::mem::take(&mut self.corners),
             coords: std::mem::take(&mut self.coords),
-            folded: std::mem::take(&mut self.folded),
+            fold: std::mem::take(&mut self.fold),
             tally: std::mem::take(&mut self.tally),
+            order: std::mem::take(&mut self.order),
         });
     }
 }
@@ -701,11 +704,69 @@ struct Staged {
     atom: u32,
 }
 
-/// One atom's folded position and flat bin, between the two passes.
-#[derive(Clone, Copy, Default)]
-struct Folded {
-    p: [f64; 3],
-    cell: u32,
+/// Every active atom's folded position and key, between the passes.
+#[derive(Default)]
+struct FoldCols {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z: Vec<f64>,
+    key: Vec<u32>,
+}
+
+impl FoldCols {
+    fn clear_for(&mut self, n: usize) {
+        for v in [&mut self.x, &mut self.y, &mut self.z] {
+            v.clear();
+            v.reserve(n);
+        }
+        self.key.clear();
+        self.key.reserve(n);
+    }
+
+    fn ptrs(&mut self) -> FoldPtrs {
+        let raw = |v: &mut Vec<f64>| RowPtr(v.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>);
+        FoldPtrs {
+            x: raw(&mut self.x),
+            y: raw(&mut self.y),
+            z: raw(&mut self.z),
+            key: RowPtr(self.key.as_mut_ptr() as *mut std::mem::MaybeUninit<u32>),
+        }
+    }
+}
+
+/// Raw [`FoldCols`] for writes at disjoint atoms from several threads.
+#[derive(Clone, Copy)]
+struct FoldPtrs {
+    x: RowPtr<f64>,
+    y: RowPtr<f64>,
+    z: RowPtr<f64>,
+    key: RowPtr<u32>,
+}
+
+impl FoldPtrs {
+    /// # Safety
+    /// `k` is in range and no other thread touches it.
+    #[inline(always)]
+    unsafe fn put(self, k: usize, p: [f64; 3], key: usize) {
+        (*self.x.at(k)).write(p[0]);
+        (*self.y.at(k)).write(p[1]);
+        (*self.z.at(k)).write(p[2]);
+        (*self.key.at(k)).write(key as u32);
+    }
+
+    /// # Safety
+    /// Atom `k` is written.
+    #[inline(always)]
+    unsafe fn get(self, k: usize) -> ([f64; 3], usize) {
+        (
+            [
+                (*self.x.at(k)).assume_init(),
+                (*self.y.at(k)).assume_init(),
+                (*self.z.at(k)).assume_init(),
+            ],
+            (*self.key.at(k)).assume_init() as usize,
+        )
+    }
 }
 
 /// Sort keys of the slots: the bin, then a Morton code of the atom's
@@ -763,9 +824,9 @@ impl Keys {
     }
 }
 
-/// Fold atoms `lo..hi` into `folded` and count each bin, exactly as
-/// [`bins::fold_point`]: unmasked atoms go eight at a time on AVX-512,
-/// with the same operations in the same order.
+/// Fold atoms `lo..hi` into `fold` and count each key (or each bin,
+/// with `by_bin`), exactly as [`bins::fold_point`]: unmasked atoms go
+/// eight at a time on AVX-512, with the same operations in the same order.
 #[allow(clippy::too_many_arguments)]
 fn fold_range(
     simbox: &Cell,
@@ -775,7 +836,7 @@ fn fold_range(
     by_bin: bool,
     lo: usize,
     hi: usize,
-    folded: RowPtr<Folded>,
+    fold: FoldPtrs,
     count: &mut [u32],
 ) {
     let shift = if by_bin {
@@ -788,31 +849,26 @@ fn fold_range(
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if active.is_none() && std::is_x86_feature_detected!("avx512f") {
         // Safety: AVX-512F was detected, `lo..hi` indexes `xyz`, and this
-        // caller owns `folded` over that range.
-        slot = unsafe { fold_avx512(simbox, xyz, keys, shift, lo, hi, folded, count) };
+        // caller owns `fold` over that range.
+        slot = unsafe { fold_avx512(simbox, xyz, keys, shift, lo, hi, fold, count) };
     }
     let fine = keys.fine();
     for k in slot..hi {
         let i = active.map_or(k, |a| a[k]);
         let (q, b) = bins::fold_point(simbox, xyz[i], fine);
-        let cell = keys.key(b);
-        count[cell >> shift] += 1;
-        // Safety: the caller owns `folded` over `lo..hi`.
-        unsafe {
-            (*folded.at(k)).write(Folded {
-                p: q,
-                cell: cell as u32,
-            })
-        };
+        let key = keys.key(b);
+        count[key >> shift] += 1;
+        // Safety: the caller owns `fold` over `lo..hi`.
+        unsafe { fold.put(k, q, key) };
     }
 }
 
-/// [`fold_range`] for eight unmasked atoms at a time; returns the first
-/// slot left for the scalar fold.
+/// [`fold_range`] for eight unmasked atoms at a time, with [`Keys::key`]
+/// in registers; returns the first slot left for the scalar fold.
 ///
 /// # Safety
 /// AVX-512F is available, `lo..hi` indexes `xyz`, and the caller owns
-/// `folded` over that range.
+/// `fold` over that range.
 #[allow(clippy::incompatible_msrv, clippy::too_many_arguments)]
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 #[target_feature(enable = "avx512f")]
@@ -823,21 +879,65 @@ unsafe fn fold_avx512(
     shift: u32,
     lo: usize,
     hi: usize,
-    folded: RowPtr<Folded>,
+    fold: FoldPtrs,
     count: &mut [u32],
 ) -> usize {
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_mullo_epi32, _mm256_or_si256,
+        _mm256_set1_epi32, _mm256_sll_epi32, _mm256_slli_epi32, _mm256_srl_epi32,
+        _mm256_storeu_si256, _mm512_storeu_pd, _mm_cvtsi32_si128,
+    };
     let f = bins::Fold8::new(simbox, keys.fine());
     let flat = xyz.as_ptr() as *const f64;
+    let bits = keys.sub.trailing_zeros() as i32;
+    let down = _mm_cvtsi32_si128(bits);
+    let up = _mm_cvtsi32_si128(3 * bits);
+    let (nx, ny) = (_mm256_set1_epi32(keys.n[0]), _mm256_set1_epi32(keys.n[1]));
+    let low = _mm256_set1_epi32(keys.sub - 1);
+    let (one, two, four) = (
+        _mm256_set1_epi32(1),
+        _mm256_set1_epi32(2),
+        _mm256_set1_epi32(4),
+    );
+    let spread = |v: __m256i| {
+        let v = _mm256_and_si256(v, low);
+        _mm256_or_si256(
+            _mm256_and_si256(v, one),
+            _mm256_or_si256(
+                _mm256_slli_epi32::<2>(_mm256_and_si256(v, two)),
+                _mm256_slli_epi32::<4>(_mm256_and_si256(v, four)),
+            ),
+        )
+    };
+    let mut lane = [0u32; 8];
     let mut k = lo;
     while k + 8 <= hi {
-        let (_, p, b) = bins::fold8(&f, flat.add(3 * k));
-        for l in 0..8 {
-            let cell = keys.key([b[0][l], b[1][l], b[2][l]]);
-            count[cell >> shift] += 1;
-            (*folded.at(k + l)).write(Folded {
-                p: [p[0][l], p[1][l], p[2][l]],
-                cell: cell as u32,
-            });
+        let (_, p, b) = bins::fold8_regs(&f, flat.add(3 * k));
+        let coarse = _mm256_add_epi32(
+            _mm256_mullo_epi32(
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(_mm256_srl_epi32(b[2], down), ny),
+                    _mm256_srl_epi32(b[1], down),
+                ),
+                nx,
+            ),
+            _mm256_srl_epi32(b[0], down),
+        );
+        let m = _mm256_or_si256(
+            spread(b[0]),
+            _mm256_or_si256(
+                _mm256_slli_epi32::<1>(spread(b[1])),
+                _mm256_slli_epi32::<2>(spread(b[2])),
+            ),
+        );
+        let key = _mm256_or_si256(_mm256_sll_epi32(coarse, up), m);
+        _mm512_storeu_pd(fold.x.ptr().add(k), p[0]);
+        _mm512_storeu_pd(fold.y.ptr().add(k), p[1]);
+        _mm512_storeu_pd(fold.z.ptr().add(k), p[2]);
+        _mm256_storeu_si256(fold.key.ptr().add(k) as *mut _, key);
+        _mm256_storeu_si256(lane.as_mut_ptr() as *mut _, key);
+        for &c in &lane {
+            count[(c >> shift) as usize] += 1;
         }
         k += 8;
     }
@@ -919,28 +1019,43 @@ impl Grid {
             mut offsets,
             mut corners,
             mut coords,
-            mut folded,
+            mut fold,
             mut tally,
+            mut order,
         } = take_grid_bufs();
         offsets.clear();
         offsets.reserve(ncell + 1);
         corners.clear();
         corners.reserve(ncell);
         coords.clear_for(n_act);
-        folded.clear();
-        folded.reserve(n_act);
-        let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
+        // The fold is read only through `fp`; its vectors stay empty.
+        fold.clear_for(n_act);
+        let fp = fold.ptrs();
         let cp = RowPtr(corners.as_mut_ptr() as *mut std::mem::MaybeUninit<[f64; 3]>);
         let slots = SlotPtrs::of(&mut coords);
-        let corner = |c: usize| {
-            let ix = (c % n[0] as usize) as i32;
-            let iy = ((c / n[0] as usize) % n[1] as usize) as i32;
-            let iz = (c / (n[0] as usize * n[1] as usize)) as i32;
-            simbox.cartesian([
-                f64::from(ix) / f64::from(n[0]),
-                f64::from(iy) / f64::from(n[1]),
-                f64::from(iz) / f64::from(n[2]),
-            ])
+        // Corners of bins `lo..hi`, stepping the bin indices rather than
+        // dividing the flat index.
+        let corners_of = |lo: usize, hi: usize| {
+            let (nx, ny) = (n[0] as usize, n[1] as usize);
+            let (mut ix, mut iy, mut iz) = (lo % nx, (lo / nx) % ny, lo / (nx * ny));
+            for c in lo..hi {
+                let corner = simbox.cartesian([
+                    f64::from(ix as i32) / f64::from(n[0]),
+                    f64::from(iy as i32) / f64::from(n[1]),
+                    f64::from(iz as i32) / f64::from(n[2]),
+                ]);
+                // Safety: the caller owns `corners` over `lo..hi`.
+                unsafe { (*cp.at(c)).write(corner) };
+                ix += 1;
+                if ix == nx {
+                    ix = 0;
+                    iy += 1;
+                    if iy == ny {
+                        iy = 0;
+                        iz += 1;
+                    }
+                }
+            }
         };
         let (mut max_abs, mut max_rel) = (0.0f64, 0.0f64);
         let keys = Keys {
@@ -983,20 +1098,18 @@ impl Grid {
                     let mut stage = vec![Staged::default(); hi - lo];
                     for slot in lo..hi {
                         // Safety: the fold above wrote this thread's atoms.
-                        let f = unsafe { (*fp.at(slot)).assume_init() };
-                        let c = (f.cell >> shift) as usize;
+                        let (p, key) = unsafe { fp.get(slot) };
+                        let c = key >> shift;
                         stage[next[c]] = Staged {
-                            p: f.p,
-                            sub: f.cell & (per as u32 - 1),
+                            p,
+                            sub: (key & (per - 1)) as u32,
                             atom: atom(slot) as u32,
                         };
                         next[c] += 1;
                     }
                     let (clo, chi) = block(k, ncell);
-                    for c in clo..chi {
-                        // Safety: corner blocks are disjoint.
-                        unsafe { (*cp.at(c)).write(corner(c)) };
-                    }
+                    // Corner blocks are disjoint.
+                    corners_of(clo, chi);
                     (stage, first)
                 });
                 // Safety: pass 1 wrote every corner; the grid keeps no fold.
@@ -1061,34 +1174,49 @@ impl Grid {
             tally.clear();
             tally.resize(nkey, 0);
             fold_range(simbox, xyz, active, keys, false, 0, n_act, fp, &mut tally);
-            for c in 0..ncell {
-                // Safety: `corners` has room for every bin.
-                unsafe { (*cp.at(c)).write(corner(c)) };
-            }
-            // Safety: the fold wrote every atom and the loop every corner.
-            unsafe {
-                folded.set_len(n_act);
-                corners.set_len(ncell);
-            }
+            corners_of(0, ncell);
+            // Safety: `corners_of` wrote every corner.
+            unsafe { corners.set_len(ncell) };
             // `tally` becomes the next free slot of each key.
             let mut at = 0usize;
-            for (c, t) in tally.iter_mut().enumerate() {
-                if c % per == 0 {
-                    offsets.push(at);
+            for bin in tally.chunks_exact_mut(per) {
+                offsets.push(at);
+                for t in bin {
+                    let count = *t as usize;
+                    *t = at as u32;
+                    at += count;
                 }
-                let count = *t as usize;
-                *t = at as u32;
-                at += count;
             }
             offsets.push(at);
-            for (slot, f) in folded.iter().enumerate() {
-                let c = f.cell as usize;
-                let dest = tally[c] as usize;
-                tally[c] += 1;
-                // Safety: one thread, and every slot is in range.
-                let (a, r) = unsafe { slots.put(dest, atom(slot), f.p, corners[c / per]) };
-                max_abs = max_abs.max(a);
-                max_rel = max_rel.max(r);
+            // Sort atom numbers by key, then fill the slot columns in slot
+            // order: the random accesses are reads of the fold, and every
+            // column is written front to back.
+            order.clear();
+            order.reserve(n_act);
+            let op = order.as_mut_ptr();
+            for k in 0..n_act {
+                // Safety: the fold wrote atom `k`; `tally` keeps each
+                // destination inside `0..n_act`.
+                unsafe {
+                    let key = (*fp.key.at(k)).assume_init() as usize;
+                    let dest = tally[key] as usize;
+                    tally[key] += 1;
+                    op.add(dest).write(k as u32);
+                }
+            }
+            for c in 0..ncell {
+                let corner = corners[c];
+                for dest in offsets[c]..offsets[c + 1] {
+                    // Safety: every slot below `n_act` holds an atom number,
+                    // the fold wrote that atom, and one thread writes.
+                    let (a, r) = unsafe {
+                        let k = *op.add(dest) as usize;
+                        let (p, _) = fp.get(k);
+                        slots.put(dest, atom(k), p, corner)
+                    };
+                    max_abs = max_abs.max(a);
+                    max_rel = max_rel.max(r);
+                }
             }
         }
         // Safety: the scatter wrote every slot of every column once.
@@ -1101,8 +1229,9 @@ impl Grid {
             coords,
             max_abs,
             max_rel,
-            folded,
+            fold,
             tally,
+            order,
         }
     }
 
@@ -1120,8 +1249,9 @@ impl Grid {
             coords: Coords::default(),
             max_abs: 0.0,
             max_rel: 0.0,
-            folded: Vec::new(),
+            fold: FoldCols::default(),
             tally: Vec::new(),
+            order: Vec::new(),
         }
     }
 }
@@ -3361,31 +3491,28 @@ mod tests {
                 [w[0] * 0.5, -w[1], 3.0 * w[2]],
             ]);
             let n = [5, 4, 7];
-            let mut folded = vec![Folded::default(); xyz.len()];
-            let mut count = vec![0u32; 140];
-            let fp = RowPtr(folded.as_mut_ptr() as *mut std::mem::MaybeUninit<Folded>);
-            fold_range(
-                sim,
-                &xyz,
-                None,
-                Keys { n, sub: 1 },
-                false,
-                0,
-                xyz.len(),
-                fp,
-                &mut count,
-            );
-            let mut want_count = vec![0u32; 140];
-            for (k, r) in xyz.iter().enumerate() {
-                let (q, b) = bins::fold_point(sim, *r, n);
-                let cell = bins::flat_cell(b, n);
-                want_count[cell] += 1;
-                assert_eq!(folded[k].cell as usize, cell, "atom {k}");
-                for (a, (got, want)) in folded[k].p.iter().zip(q).enumerate() {
-                    assert_eq!(got.to_bits(), want.to_bits(), "atom {k} axis {a}");
+            for sub in [1, 2, 4] {
+                let keys = Keys { n, sub };
+                let nkey = 140 * keys.per_bin();
+                let mut fold = FoldCols::default();
+                fold.clear_for(xyz.len());
+                let fp = fold.ptrs();
+                let mut count = vec![0u32; nkey];
+                fold_range(sim, &xyz, None, keys, false, 0, xyz.len(), fp, &mut count);
+                let mut want_count = vec![0u32; nkey];
+                for (k, r) in xyz.iter().enumerate() {
+                    let (q, b) = bins::fold_point(sim, *r, keys.fine());
+                    let key = keys.key(b);
+                    want_count[key] += 1;
+                    // Safety: the fold wrote every atom.
+                    let (p, got) = unsafe { fp.get(k) };
+                    assert_eq!(got, key, "atom {k} sub {sub}");
+                    for (a, (got, want)) in p.iter().zip(q).enumerate() {
+                        assert_eq!(got.to_bits(), want.to_bits(), "atom {k} axis {a}");
+                    }
                 }
+                assert_eq!(count, want_count);
             }
-            assert_eq!(count, want_count);
         }
     }
 

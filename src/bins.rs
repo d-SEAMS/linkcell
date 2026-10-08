@@ -561,12 +561,41 @@ pub(crate) unsafe fn fold8(
     f: &Fold8,
     base: *const f64,
 ) -> ([[f64; 8]; 3], [[f64; 8]; 3], [[i32; 8]; 3]) {
+    use std::arch::x86_64::{_mm256_storeu_si256, _mm512_storeu_pd};
+    let (s, p, b) = fold8_regs(f, base);
+    let mut so = [[0.0f64; 8]; 3];
+    let mut po = [[0.0f64; 8]; 3];
+    let mut bo = [[0i32; 8]; 3];
+    for ax in 0..3 {
+        _mm512_storeu_pd(so[ax].as_mut_ptr(), s[ax]);
+        _mm512_storeu_pd(po[ax].as_mut_ptr(), p[ax]);
+        _mm256_storeu_si256(bo[ax].as_mut_ptr() as *mut _, b[ax]);
+    }
+    (so, po, bo)
+}
+
+/// [`fold8`] in registers.
+///
+/// # Safety
+/// AVX-512F is available and `base` is readable for 24 doubles.
+#[allow(clippy::incompatible_msrv, clippy::type_complexity)]
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[target_feature(enable = "avx512f")]
+#[inline]
+pub(crate) unsafe fn fold8_regs(
+    f: &Fold8,
+    base: *const f64,
+) -> (
+    [std::arch::x86_64::__m512d; 3],
+    [std::arch::x86_64::__m512d; 3],
+    [std::arch::x86_64::__m256i; 3],
+) {
     use std::arch::x86_64::{
         __m512d, _mm256_max_epi32, _mm256_min_epi32, _mm256_set1_epi32, _mm256_setzero_si256,
-        _mm256_storeu_si256, _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_cvttpd_epi32, _mm512_div_pd,
-        _mm512_loadu_pd, _mm512_mask_blend_pd, _mm512_mask_permutex2var_pd, _mm512_mul_pd,
-        _mm512_permutex2var_pd, _mm512_roundscale_pd, _mm512_set1_pd, _mm512_setr_epi64,
-        _mm512_setzero_pd, _mm512_storeu_pd, _mm512_sub_pd, _CMP_GE_OQ,
+        _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_cvttpd_epi32, _mm512_div_pd, _mm512_loadu_pd,
+        _mm512_mask_blend_pd, _mm512_mask_permutex2var_pd, _mm512_mul_pd, _mm512_permutex2var_pd,
+        _mm512_roundscale_pd, _mm512_set1_pd, _mm512_setr_epi64, _mm512_setzero_pd, _mm512_sub_pd,
+        _CMP_GE_OQ,
     };
     let bc = |v: f64| _mm512_set1_pd(v);
     let one = bc(1.0);
@@ -643,15 +672,7 @@ pub(crate) unsafe fn fold8(
             _mm256_set1_epi32(n[ax] - 1),
         )
     };
-    let mut so = [[0.0f64; 8]; 3];
-    let mut po = [[0.0f64; 8]; 3];
-    let mut bo = [[0i32; 8]; 3];
-    for ax in 0..3 {
-        _mm512_storeu_pd(so[ax].as_mut_ptr(), s[ax]);
-        _mm512_storeu_pd(po[ax].as_mut_ptr(), cart(ax));
-        _mm256_storeu_si256(bo[ax].as_mut_ptr() as *mut _, bin(ax));
-    }
-    (so, po, bo)
+    (s, [cart(0), cart(1), cart(2)], [bin(0), bin(1), bin(2)])
 }
 
 /// The three per-point arrays of a mesh: fractional, folded, bin.
