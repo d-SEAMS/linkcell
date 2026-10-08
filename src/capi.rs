@@ -331,9 +331,11 @@ pub unsafe extern "C" fn lc_pairs_within(
     }
     // Safety: the caller gave `cap >= rows` slots in each buffer and
     // three times that in `out_shift`.
-    unsafe {
-        found.write_columns(out_i, out_j, out_shift, out_d2);
-    }
+    let cols = ColumnOut(out_i, out_j, out_shift, out_d2);
+    crate::pairs::in_pool(found.rows(), move || {
+        let (i, j, s, d) = cols.get();
+        unsafe { found.write_columns(i, j, s, d) }
+    });
     clear_error();
     0
 }
@@ -402,9 +404,11 @@ pub unsafe extern "C" fn lc_pairs_within_rows(
         return fail_msg("pair buffer is shorter than the pair count");
     }
     // Safety: the caller gave `cap >= rows` rows.
-    unsafe {
-        found.write_rows(out, |i, j, shift, dist2| lc_pair { i, j, shift, dist2 });
-    }
+    let rows_out = RowOut(out);
+    crate::pairs::in_pool(found.rows(), move || {
+        let out = rows_out.get();
+        unsafe { found.write_rows(out, |i, j, shift, dist2| lc_pair { i, j, shift, dist2 }) }
+    });
     clear_error();
     0
 }
@@ -468,6 +472,26 @@ unsafe fn pairs_call<'a>(
     match found {
         Ok(found) => Ok((key, found)),
         Err(e) => Err(fail(e)),
+    }
+}
+
+/// Caller buffers moved onto a pool thread for the fill. The caller
+/// owns them, so the fill can run where the search ran.
+#[derive(Clone, Copy)]
+struct ColumnOut(*mut c_int, *mut c_int, *mut c_int, *mut f64);
+unsafe impl Send for ColumnOut {}
+impl ColumnOut {
+    fn get(self) -> (*mut c_int, *mut c_int, *mut c_int, *mut f64) {
+        (self.0, self.1, self.2, self.3)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RowOut(*mut lc_pair);
+unsafe impl Send for RowOut {}
+impl RowOut {
+    fn get(self) -> *mut lc_pair {
+        self.0
     }
 }
 
