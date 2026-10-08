@@ -576,6 +576,7 @@ fn fold_range(
     folded: RowPtr<Folded>,
     count: &mut [u32],
 ) {
+    #[allow(unused_mut)]
     let mut slot = lo;
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if active.is_none() && std::is_x86_feature_detected!("avx512f") {
@@ -946,6 +947,7 @@ struct Block {
     shift_s: [i32; 3],
     shift: [f64; 3],
     /// [`Partner::delta`]; zero for the home cell.
+    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
     delta: [f64; 3],
     /// Home cell: source `s` only sees occupants `s + 1 ..`.
     tri: bool,
