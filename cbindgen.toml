@@ -110,7 +110,7 @@ include = [
     "lc_last_error",
     "lc_version",
 ]
-exclude = ["lc_cell_ortho", "Cell", "Error", "Neighbors", "KHeap"]
+exclude = ["lc_cell_ortho", "Cell", "Error", "Neighbors", "KHeap", "lc_tune_set", "lc_tune_pairs"]
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
 
 [export.rename]

@@ -59,7 +59,7 @@ pub fn pairs_within(
     if walk_threads(est) == 1 {
         let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-        if let Some(words) = plan.fused() {
+        if let Some(words) = plan.fused().filter(|_| knobs::fused()) {
             return Ok(plan.fused_rows(&words));
         }
         return Ok(plan.search().into_pairs());
@@ -119,7 +119,7 @@ pub fn pairs_within_columns(
     if walk_threads(est) == 1 {
         let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-        if plan.fused().is_some() {
+        if plan.fused().is_some() && knobs::fused() {
             plan.fused_columns(out);
             return Ok(());
         }
@@ -356,7 +356,11 @@ pub(crate) fn plan(
     // side and written out in both shift directions when `half` is off.
     let reach = uniform_reach(dims, w, cut2, max_reach);
     let threads = walk_threads(hit_estimate(n_act, simbox, cutoff));
-    let grid_threads = if n_act >= PARALLEL_GRID { threads } else { 1 };
+    let grid_threads = if n_act >= knobs::grid_atoms() {
+        threads
+    } else {
+        1
+    };
     let grid = Grid::build(xyz, simbox, active.as_deref(), dims, grid_threads);
     let partners = partners_for(&grid, simbox, reach, cut2);
     let margin = expanded_margin(&grid, &partners, cutoff);
@@ -377,7 +381,7 @@ fn walk_threads(hits: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
         let threads = rayon::current_num_threads().max(1);
-        if threads > 1 && hits >= PARALLEL_PAIRS {
+        if threads > 1 && hits >= knobs::split_pairs() {
             return threads;
         }
     }
@@ -1119,6 +1123,77 @@ const PARALLEL_PAIRS: usize = 10_000;
 /// atoms in an 18 Å cube on this 8-core host the two builds tie, and at
 /// 4096 the threaded one is faster.
 const PARALLEL_GRID: usize = 1_024;
+
+/// The walk's thresholds and paths as values an autotuner can set (the
+/// `tune` feature, through `lc_tune_set`); otherwise each is its
+/// constant. Every one is read once per call, outside the tiles.
+pub(crate) mod knobs {
+    // `lc_tune_set` keys.
+    #[cfg(feature = "tune")]
+    pub(crate) const SPLIT_PAIRS: usize = 0;
+    #[cfg(feature = "tune")]
+    pub(crate) const GRID_ATOMS: usize = 1;
+    #[cfg(feature = "tune")]
+    pub(crate) const FUSED: usize = 2;
+    #[cfg(feature = "tune")]
+    pub(crate) const CHUNKS: usize = 3;
+
+    #[cfg(feature = "tune")]
+    pub(crate) static VALUES: [std::sync::atomic::AtomicUsize; 4] = [
+        std::sync::atomic::AtomicUsize::new(super::DEFAULT_SPLIT_PAIRS),
+        std::sync::atomic::AtomicUsize::new(super::PARALLEL_GRID),
+        std::sync::atomic::AtomicUsize::new(1),
+        std::sync::atomic::AtomicUsize::new(1),
+    ];
+
+    #[cfg(feature = "tune")]
+    fn get(key: usize) -> usize {
+        VALUES[key].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Expected pairs where the walk splits across threads.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn split_pairs() -> usize {
+        #[cfg(feature = "tune")]
+        return get(SPLIT_PAIRS);
+        #[cfg(not(feature = "tune"))]
+        super::PARALLEL_PAIRS
+    }
+
+    /// Active atoms from which a split walk builds its bins on several threads.
+    pub(crate) fn grid_atoms() -> usize {
+        #[cfg(feature = "tune")]
+        return get(GRID_ATOMS);
+        #[cfg(not(feature = "tune"))]
+        super::PARALLEL_GRID
+    }
+
+    /// One thread writes a full list straight from the tile.
+    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
+    pub(crate) fn fused() -> bool {
+        #[cfg(feature = "tune")]
+        return get(FUSED) != 0;
+        #[cfg(not(feature = "tune"))]
+        true
+    }
+
+    /// Bin ranges per thread in a split search.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn chunks() -> usize {
+        #[cfg(feature = "tune")]
+        return get(CHUNKS).max(1);
+        #[cfg(not(feature = "tune"))]
+        1
+    }
+}
+
+/// The split knob's default: [`PARALLEL_PAIRS`], or never without `parallel`.
+#[cfg(feature = "tune")]
+#[cfg(feature = "parallel")]
+const DEFAULT_SPLIT_PAIRS: usize = PARALLEL_PAIRS;
+#[cfg(feature = "tune")]
+#[cfg(not(feature = "parallel"))]
+const DEFAULT_SPLIT_PAIRS: usize = usize::MAX;
 
 /// Hits for the whole chunk. The distance loop appends here, then one
 /// pass writes the rows. Runs share a shift so the inner loop does not.
@@ -2456,7 +2531,7 @@ impl Walk<'_> {
         let ncell = self.grid.offsets.len() - 1;
         #[cfg(feature = "parallel")]
         if threads > 1 && ncell > 1 {
-            let ranges = cell_ranges(&self.grid.offsets, threads);
+            let ranges = cell_ranges(&self.grid.offsets, threads * knobs::chunks());
             if ranges.len() > 1 && ranges.len() <= rayon::current_num_threads() {
                 let found: Vec<Option<Scratch>> = rayon::broadcast(|ctx| {
                     ranges
@@ -2464,6 +2539,13 @@ impl Walk<'_> {
                         .map(|&(start, end)| self.fill_range(start, end))
                 });
                 return found.into_iter().flatten().collect();
+            }
+            if ranges.len() > 1 {
+                use rayon::prelude::*;
+                return ranges
+                    .par_iter()
+                    .map(|&(start, end)| self.fill_range(start, end))
+                    .collect();
             }
         }
         let _ = threads;

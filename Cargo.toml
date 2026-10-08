@@ -24,6 +24,8 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 default = ["capi", "parallel"]
 capi = []
 parallel = ["dep:rayon"]
+# Autotuner hooks (`lc_tune_set`, `lc_tune_pairs`) for scripts/tune-pairs.py.
+tune = ["capi"]
 
 [dependencies]
 minimage = "0.1.3"

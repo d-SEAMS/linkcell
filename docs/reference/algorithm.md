@@ -162,6 +162,20 @@ window holds a hit, so each one pays the compress and the row permutes,
 and those share the one 512-bit shuffle port; the 27-bin tile skips
 most vectors after three fused multiply-adds and a compare.
 
+The walk's thresholds and paths can be autotuned. The `tune` feature
+builds `lc_tune_set` (expected pairs where the walk splits, atoms from
+which a split walk builds its bins on several threads, the one-thread
+full list written from the tile or buffered first, and bin ranges per
+thread) and `lc_tune_pairs`, a timed call that returns a checksum of its
+rows; the shipped header declares neither. `scripts/tune-pairs.py`
+drives them with Kernel Tuner, one compiled C function per
+configuration, and checks every configuration's rows against the
+default one. On this host, for the 4096-atom cube, the 1080
+configurations on eight threads (bin edge times both thresholds times
+one to four ranges per thread) and the 18 on one thread all put the
+defaults within timing noise of the best; a jittered lattice and 1024
+atoms on eight threads agree. Another host can rerun the script.
+
 ## Heap and stop
 
 A max-heap of size `k` stores `(dist2, index)`, ordered

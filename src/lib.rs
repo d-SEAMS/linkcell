@@ -145,5 +145,7 @@ pub use pop::{
 
 #[cfg(feature = "capi")]
 mod capi;
+#[cfg(feature = "tune")]
+mod tune;
 #[cfg(feature = "capi")]
 pub use capi::*;
