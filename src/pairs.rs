@@ -637,6 +637,124 @@ struct GridBufs {
     fold: FoldCols,
     tally: Vec<u32>,
     order: Vec<u32>,
+    boxes: Boxes,
+}
+
+/// Bounding boxes, in each bin's relative coordinates, of the slot runs
+/// the tile kernel reads together: runs of eight from a bin's first slot
+/// (targets) and runs of four (sources). A source run and a target run
+/// whose boxes are a cutoff apart hold no pair, so the kernel skips them
+/// (the cluster pairs of GROMACS, decided per search).
+#[derive(Default)]
+struct Boxes {
+    /// Whether the boxes are built: only for bins of [`CULL_RUNS`] runs of
+    /// eight on average. Without them every run start is zero.
+    on: bool,
+    /// First run of eight, and of four, of each bin; one more entry past
+    /// the last bin.
+    vstart: Vec<usize>,
+    gstart: Vec<usize>,
+    /// `lo x y z` then `hi x y z` per run of eight, with eight runs of
+    /// padding so a kernel can read eight runs from any bin's first.
+    v: [Vec<f64>; 6],
+    /// The same per run of four.
+    g: [Vec<f64>; 6],
+}
+
+impl Boxes {
+    /// Run starts of every bin, and room for every box, when `on`.
+    fn starts(&mut self, offsets: &[usize], on: bool) {
+        self.on = on;
+        self.vstart.clear();
+        self.gstart.clear();
+        if !on {
+            self.vstart.resize(offsets.len(), 0);
+            self.gstart.resize(offsets.len(), 0);
+            return;
+        }
+        let (mut v, mut g) = (0usize, 0usize);
+        for w in offsets.windows(2) {
+            self.vstart.push(v);
+            self.gstart.push(g);
+            let n = w[1] - w[0];
+            v += (n + 7) / 8;
+            g += (n + 3) / 4;
+        }
+        self.vstart.push(v);
+        self.gstart.push(g);
+        // The columns are read and written only through raw pointers, so
+        // they stay empty: `fill` writes every run, and the padding is
+        // written here.
+        for a in self.v.iter_mut() {
+            a.clear();
+            a.reserve(v + 8);
+            // Safety: the capacity covers the padding.
+            unsafe { std::ptr::write_bytes(a.as_mut_ptr().add(v), 0, 8) };
+        }
+        for a in self.g.iter_mut() {
+            a.clear();
+            a.reserve(g);
+        }
+    }
+
+    fn ptrs(&mut self) -> BoxPtrs {
+        let raw = |a: &mut Vec<f64>| RowPtr(a.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>);
+        let [v0, v1, v2, v3, v4, v5] = &mut self.v;
+        let [g0, g1, g2, g3, g4, g5] = &mut self.g;
+        BoxPtrs {
+            v: [raw(v0), raw(v1), raw(v2), raw(v3), raw(v4), raw(v5)],
+            g: [raw(g0), raw(g1), raw(g2), raw(g3), raw(g4), raw(g5)],
+        }
+    }
+}
+
+/// Raw [`Boxes`] columns for writes at disjoint bins from several threads.
+#[derive(Clone, Copy)]
+struct BoxPtrs {
+    v: [RowPtr<f64>; 6],
+    g: [RowPtr<f64>; 6],
+}
+
+impl BoxPtrs {
+    /// Boxes of the runs of slots `lo..hi` (one bin), from run `v0` of
+    /// eight and `g0` of four.
+    ///
+    /// # Safety
+    /// This thread wrote the slots, the runs are in range, and no other
+    /// thread writes them.
+    unsafe fn fill(self, slots: SlotPtrs, lo: usize, hi: usize, v0: usize, g0: usize) {
+        let (rx, ry, rz) = (slots.rx.ptr(), slots.ry.ptr(), slots.rz.ptr());
+        // Runs of four, each run of eight the union of two of them.
+        let mut last = ([0.0f64; 3], [0.0f64; 3]);
+        for (m, a) in (lo..hi).step_by(4).enumerate() {
+            let (mut l, mut h) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for s in a..(a + 4).min(hi) {
+                let r = [*rx.add(s), *ry.add(s), *rz.add(s)];
+                for ax in 0..3 {
+                    l[ax] = l[ax].min(r[ax]);
+                    h[ax] = h[ax].max(r[ax]);
+                }
+            }
+            for ax in 0..3 {
+                (*self.g[ax].at(g0 + m)).write(l[ax]);
+                (*self.g[3 + ax].at(g0 + m)).write(h[ax]);
+            }
+            let odd = m % 2 == 1;
+            if odd {
+                for ax in 0..3 {
+                    l[ax] = l[ax].min(last.0[ax]);
+                    h[ax] = h[ax].max(last.1[ax]);
+                }
+            }
+            if odd || a + 4 >= hi {
+                for ax in 0..3 {
+                    (*self.v[ax].at(v0 + m / 2)).write(l[ax]);
+                    (*self.v[3 + ax].at(v0 + m / 2)).write(h[ax]);
+                }
+            }
+            last = (l, h);
+        }
+    }
 }
 
 static GRID_POOL: std::sync::Mutex<Option<GridBufs>> = std::sync::Mutex::new(None);
@@ -679,6 +797,7 @@ struct Grid {
     fold: FoldCols,
     tally: Vec<u32>,
     order: Vec<u32>,
+    boxes: Boxes,
 }
 
 impl Drop for Grid {
@@ -690,6 +809,7 @@ impl Drop for Grid {
             fold: std::mem::take(&mut self.fold),
             tally: std::mem::take(&mut self.tally),
             order: std::mem::take(&mut self.order),
+            boxes: std::mem::take(&mut self.boxes),
         });
     }
 }
@@ -1022,6 +1142,7 @@ impl Grid {
             mut fold,
             mut tally,
             mut order,
+            mut boxes,
         } = take_grid_bufs();
         offsets.clear();
         offsets.reserve(ncell + 1);
@@ -1064,6 +1185,9 @@ impl Grid {
         };
         let per = keys.per_bin();
         let nkey = ncell * per;
+        let cull = cfg!(all(target_arch = "x86_64", linkcell_avx512))
+            && n_act >= 8 * CULL_RUNS * ncell
+            && !no_cull();
         #[cfg(feature = "parallel")]
         let parallel = threads > 1;
         #[cfg(not(feature = "parallel"))]
@@ -1123,11 +1247,15 @@ impl Grid {
                     }
                 }
                 offsets.push(at);
+                boxes.starts(&offsets, cull);
+                let bp = boxes.ptrs();
+                let (vstart, gstart) = (&boxes.vstart, &boxes.gstart);
                 // Pass 2: each thread owns a run of bins, balanced by atoms,
                 // reads their atoms from every staging area in thread order
                 // (so in atom order), sorts each bin by sub-cell with a stable
-                // count, and writes that run of slots alone: the order is one
-                // thread's, and no cache line is written by two threads.
+                // count, and writes that run of slots, and their boxes,
+                // alone: the order is one thread's, and no cache line is
+                // written by two threads.
                 let ranges = cell_ranges(&offsets, p);
                 let (staged, corners, offsets, ranges) = (&staged, &corners, &offsets, &ranges);
                 let maxima: Vec<(f64, f64)> = rayon::broadcast(|ctx| {
@@ -1160,6 +1288,12 @@ impl Grid {
                                 ma = ma.max(a);
                                 mr = mr.max(r);
                             }
+                        }
+                        if cull {
+                            // Safety: this thread wrote bin `c` and owns its runs.
+                            unsafe {
+                                bp.fill(slots, offsets[c], offsets[c + 1], vstart[c], gstart[c])
+                            };
                         }
                     }
                     (ma, mr)
@@ -1204,6 +1338,8 @@ impl Grid {
                     op.add(dest).write(k as u32);
                 }
             }
+            boxes.starts(&offsets, cull);
+            let bp = boxes.ptrs();
             for c in 0..ncell {
                 let corner = corners[c];
                 for dest in offsets[c]..offsets[c + 1] {
@@ -1216,6 +1352,18 @@ impl Grid {
                     };
                     max_abs = max_abs.max(a);
                     max_rel = max_rel.max(r);
+                }
+                if cull {
+                    // Safety: one thread, and bin `c` is written.
+                    unsafe {
+                        bp.fill(
+                            slots,
+                            offsets[c],
+                            offsets[c + 1],
+                            boxes.vstart[c],
+                            boxes.gstart[c],
+                        )
+                    };
                 }
             }
         }
@@ -1232,6 +1380,7 @@ impl Grid {
             fold,
             tally,
             order,
+            boxes,
         }
     }
 
@@ -1252,6 +1401,11 @@ impl Grid {
             fold: FoldCols::default(),
             tally: Vec::new(),
             order: Vec::new(),
+            boxes: Boxes {
+                vstart: vec![0],
+                gstart: vec![0],
+                ..Boxes::default()
+            },
         }
     }
 }
@@ -1362,6 +1516,12 @@ struct Block {
     delta: [f64; 3],
     /// Home cell: source `s` only sees occupants `s + 1 ..`.
     tri: bool,
+    /// [`Boxes`] of the target bin's first run of eight and the source
+    /// bin's first run of four.
+    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
+    jv: usize,
+    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
+    ig: usize,
 }
 
 /// Expected pairs where the walk splits across threads. On this 8-core
@@ -2141,6 +2301,90 @@ unsafe fn write_columns_avx512(
     }
 }
 
+/// Target runs of eight a bin needs before the tile kernel tests boxes:
+/// with fewer, the bin stencil has already done most of the culling and
+/// the box test costs more than it skips.
+const CULL_RUNS: usize = 4;
+
+/// Tests turn the box test off to compare against it, and count the
+/// target runs it skips.
+#[cfg(test)]
+static NO_CULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static CULL_SKIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn no_cull() -> bool {
+    #[cfg(test)]
+    return NO_CULL.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    false
+}
+
+/// Run `$body` with `$slot` at the first slot of every target run of
+/// eight in `$block` whose [`Boxes`] entry comes within `$cut` (squared)
+/// of the box of the source run of four holding slot `$s`, moved by
+/// `($ox, $oy, $oz)`; in slot order. Eight target boxes are tested at a
+/// time.
+///
+/// A source in the run, moved, lies inside the moved box (rounding is
+/// monotonic), and each target lies inside its own box, so a pair's
+/// relative distance is at least the box gap. `$cut` is the cutoff plus
+/// twice the expansion margin, so a skipped run holds no lane the tile
+/// kernel would keep, and the rows and their order are unchanged.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+macro_rules! near_runs {
+    ($c:expr, $block:expr, $nvec:expr, $ox:expr, $oy:expr, $oz:expr, $cut:expr, $zero:expr,
+     $s:expr, $slot:ident, $body:block) => {{
+        use std::arch::x86_64::{
+            _mm512_fmadd_pd, _mm512_loadu_pd, _mm512_mask_cmp_pd_mask, _mm512_max_pd,
+            _mm512_set1_pd, _mm512_sub_pd, _CMP_LT_OQ,
+        };
+        let g = $block.ig + ($s - $block.i_lo) / 4;
+        let lo = [
+            _mm512_set1_pd(*$c.gb[0].add(g) + $ox),
+            _mm512_set1_pd(*$c.gb[1].add(g) + $oy),
+            _mm512_set1_pd(*$c.gb[2].add(g) + $oz),
+        ];
+        let hi = [
+            _mm512_set1_pd(*$c.gb[3].add(g) + $ox),
+            _mm512_set1_pd(*$c.gb[4].add(g) + $oy),
+            _mm512_set1_pd(*$c.gb[5].add(g) + $oz),
+        ];
+        let mut m0 = 0usize;
+        while m0 < $nvec {
+            let v = $block.jv + m0;
+            let mut d2 = $zero;
+            for ax in 0..3 {
+                let gap = _mm512_max_pd(
+                    _mm512_max_pd(
+                        _mm512_sub_pd(_mm512_loadu_pd($c.vb[ax].add(v)), hi[ax]),
+                        _mm512_sub_pd(lo[ax], _mm512_loadu_pd($c.vb[3 + ax].add(v))),
+                    ),
+                    $zero,
+                );
+                d2 = _mm512_fmadd_pd(gap, gap, d2);
+            }
+            let valid: u8 = if $nvec - m0 >= 8 {
+                0xff
+            } else {
+                ((1u32 << ($nvec - m0)) - 1) as u8
+            };
+            let mut near: u8 = _mm512_mask_cmp_pd_mask(valid, d2, $cut, _CMP_LT_OQ);
+            #[cfg(test)]
+            CULL_SKIPS.fetch_add(
+                (valid & !near).count_ones() as usize,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            while near != 0 {
+                let $slot = $block.j_lo + 8 * (m0 + near.trailing_zeros() as usize);
+                near &= near - 1;
+                $body
+            }
+            m0 += 8;
+        }
+    }};
+}
+
 /// Where the fused kernel writes: `Pair` rows as words, or four columns.
 /// `n` is the row count so far. Each hit vector writes whole registers
 /// past its last kept row; the next vector overwrites them, so every
@@ -2423,7 +2667,34 @@ unsafe fn avx512_fused<const COLS: bool>(
         }};
     }
     let j_hi = block.j_hi;
-    if !block.tri {
+    let nvec = (j_hi - block.j_lo + 7) / 8;
+    if !block.tri && c.cull && nvec >= CULL_RUNS {
+        let cut_box = _mm512_set1_pd(cut2 + 2.0 * margin);
+        let zero = std::arch::x86_64::_mm512_setzero_pd();
+        let mut s = block.i_lo;
+        while s + 4 <= block.i_hi {
+            let s0 = source!(s);
+            let s1 = source!(s + 1);
+            let s2 = source!(s + 2);
+            let s3 = source!(s + 3);
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                lanes!(s + 1, slot, tm, s1, jx, jy, jz, jr, jids);
+                lanes!(s + 2, slot, tm, s2, jx, jy, jz, jr, jids);
+                lanes!(s + 3, slot, tm, s3, jx, jy, jz, jr, jids);
+            });
+            s += 4;
+        }
+        while s < block.i_hi {
+            let s0 = source!(s);
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+            });
+            s += 1;
+        }
+    } else if !block.tri {
         let mut s = block.i_lo;
         while s + 4 <= block.i_hi {
             let s0 = source!(s);
@@ -2468,17 +2739,7 @@ unsafe fn avx512_fused<const COLS: bool>(
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 impl Plan {
     fn tile_cols(&self) -> TileCols {
-        let c = &self.grid.coords;
-        TileCols {
-            x: c.x.as_ptr(),
-            y: c.y.as_ptr(),
-            z: c.z.as_ptr(),
-            rx: c.rx.as_ptr(),
-            ry: c.ry.as_ptr(),
-            rz: c.rz.as_ptr(),
-            r2: c.r2.as_ptr(),
-            id: c.id.as_ptr(),
-        }
+        TileCols::of(&self.grid)
     }
 
     /// `visit(block)` for the home block and every partner of each bin,
@@ -2501,6 +2762,8 @@ impl Plan {
                     shift: [0.0; 3],
                     delta: [0.0; 3],
                     tri: true,
+                    jv: self.grid.boxes.vstart[cell],
+                    ig: self.grid.boxes.gstart[cell],
                 });
             }
             let (p0, p1) = (self.partners.off[cell], self.partners.off[cell + 1]);
@@ -2518,6 +2781,8 @@ impl Plan {
                     shift: p.shift,
                     delta: p.delta,
                     tri: false,
+                    jv: self.grid.boxes.vstart[p.jc],
+                    ig: self.grid.boxes.gstart[cell],
                 });
             }
         }
@@ -2643,17 +2908,7 @@ impl Walk<'_> {
             scratch.reserve_more(ns * span + STORE_SLACK);
             #[cfg(linkcell_avx512)]
             if self.simd == 2 {
-                let c = &self.grid.coords;
-                let cols = TileCols {
-                    x: c.x.as_ptr(),
-                    y: c.y.as_ptr(),
-                    z: c.z.as_ptr(),
-                    rx: c.rx.as_ptr(),
-                    ry: c.ry.as_ptr(),
-                    rz: c.rz.as_ptr(),
-                    r2: c.r2.as_ptr(),
-                    id: c.id.as_ptr(),
-                };
+                let cols = TileCols::of(self.grid);
                 unsafe {
                     avx512_scan(cols, self.cut2, self.margin, block, scratch);
                 }
@@ -2729,6 +2984,8 @@ impl Walk<'_> {
                     shift: [0.0; 3],
                     delta: [0.0; 3],
                     tri: true,
+                    jv: self.grid.boxes.vstart[cell],
+                    ig: self.grid.boxes.gstart[cell],
                 },
             );
         }
@@ -2753,6 +3010,8 @@ impl Walk<'_> {
                     shift: partner.shift,
                     delta: partner.delta,
                     tri: false,
+                    jv: self.grid.boxes.vstart[partner.jc],
+                    ig: self.grid.boxes.gstart[cell],
                 },
             );
         }
@@ -2846,7 +3105,7 @@ fn cell_ranges(offsets: &[usize], threads: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Slot columns one AVX-512 tile reads.
+/// Slot columns one AVX-512 tile reads, and the [`Boxes`] of its runs.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 #[derive(Clone, Copy)]
 struct TileCols {
@@ -2858,6 +3117,30 @@ struct TileCols {
     rz: *const f64,
     r2: *const f64,
     id: *const u32,
+    cull: bool,
+    vb: [*const f64; 6],
+    gb: [*const f64; 6],
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+impl TileCols {
+    fn of(grid: &Grid) -> Self {
+        let c = &grid.coords;
+        let b = &grid.boxes;
+        TileCols {
+            x: c.x.as_ptr(),
+            y: c.y.as_ptr(),
+            z: c.z.as_ptr(),
+            rx: c.rx.as_ptr(),
+            ry: c.ry.as_ptr(),
+            rz: c.rz.as_ptr(),
+            r2: c.r2.as_ptr(),
+            id: c.id.as_ptr(),
+            cull: b.on,
+            vb: std::array::from_fn(|k| b.v[k].as_ptr()),
+            gb: std::array::from_fn(|k| b.g[k].as_ptr()),
+        }
+    }
 }
 
 /// # Safety
@@ -2992,7 +3275,34 @@ unsafe fn avx512_scan(c: TileCols, cut2: f64, margin: f64, block: &Block, scratc
     }
 
     let j_hi = block.j_hi;
-    if !block.tri {
+    let nvec = (j_hi - block.j_lo + 7) / 8;
+    if !block.tri && c.cull && nvec >= CULL_RUNS {
+        let cut_box = _mm512_set1_pd(cut2 + 2.0 * margin);
+        let zero = std::arch::x86_64::_mm512_setzero_pd();
+        let mut s = block.i_lo;
+        while s + 4 <= block.i_hi {
+            let s0 = source!(s);
+            let s1 = source!(s + 1);
+            let s2 = source!(s + 2);
+            let s3 = source!(s + 3);
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                lanes!(s + 1, slot, tm, s1, jx, jy, jz, jr, jids);
+                lanes!(s + 2, slot, tm, s2, jx, jy, jz, jr, jids);
+                lanes!(s + 3, slot, tm, s3, jx, jy, jz, jr, jids);
+            });
+            s += 4;
+        }
+        while s < block.i_hi {
+            let s0 = source!(s);
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+            });
+            s += 1;
+        }
+    } else if !block.tri {
         let mut s = block.i_lo;
         while s + 4 <= block.i_hi {
             let s0 = source!(s);
@@ -3444,6 +3754,72 @@ mod tests {
             });
             assert_eq!(one.len(), eight.len(), "half={half}");
             assert!(one == eight, "half={half}: rows differ in content or order");
+        }
+    }
+
+    #[test]
+    fn box_culling_keeps_every_row_in_order() {
+        // 1100 random points in boxes three bins a side at a 3 Å cutoff:
+        // about 40 atoms per bin, so the tile kernel tests run boxes, on
+        // the threaded bins too. Distances take every value, so some pairs
+        // sit near the cutoff, where the margin matters.
+        let cells = [
+            Cell::ortho(9.3, 9.6, 9.9).unwrap(),
+            Cell::from_vectors(
+                [9.6, 0.0, 0.0],
+                [1.2, 9.5, 0.0],
+                [-0.8, 0.9, 9.7],
+                [0.5, -0.3, 0.2],
+            )
+            .unwrap(),
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let before = CULL_SKIPS.load(std::sync::atomic::Ordering::Relaxed);
+        for sim in &cells {
+            let xyz: Vec<[f64; 3]> = (0..1100)
+                .map(|_| sim.cartesian([1.2 * next() - 0.1, next(), 1.1 * next() - 0.05]))
+                .collect();
+            let mask: Vec<bool> = (0..xyz.len()).map(|k| k % 9 != 4).collect();
+            for threads in [1, 8] {
+                for half in [false, true] {
+                    for mask in [None, Some(mask.as_slice())] {
+                        let run = |cull: bool| {
+                            NO_CULL.store(!cull, std::sync::atomic::Ordering::Relaxed);
+                            let (rows, cols) = on_threads(threads, || {
+                                let rows = pairs_within(&xyz, sim, 3.0, mask, None, half).unwrap();
+                                let mut cols = PairColumns::default();
+                                pairs_within_columns(&xyz, sim, 3.0, mask, None, half, &mut cols)
+                                    .unwrap();
+                                (rows, cols)
+                            });
+                            NO_CULL.store(false, std::sync::atomic::Ordering::Relaxed);
+                            (rows, cols)
+                        };
+                        let (culled, culled_cols) = run(true);
+                        let (plain, plain_cols) = run(false);
+                        let what = format!("threads={threads} half={half} mask={}", mask.is_some());
+                        assert!(culled.len() > 1000, "{what}");
+                        assert!(culled == plain, "{what}: rows differ in content or order");
+                        assert_eq!(culled_cols.i, plain_cols.i, "{what}");
+                        assert_eq!(culled_cols.j, plain_cols.j, "{what}");
+                        assert_eq!(culled_cols.shift, plain_cols.shift, "{what}");
+                        let bits = |c: &PairColumns| -> Vec<u64> {
+                            c.dist2.iter().map(|d| d.to_bits()).collect()
+                        };
+                        assert_eq!(bits(&culled_cols), bits(&plain_cols), "{what}");
+                    }
+                }
+            }
+        }
+        if cfg!(all(target_arch = "x86_64", linkcell_avx512)) && simd_mode() == 2 {
+            let skipped = CULL_SKIPS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert!(skipped > 0, "no target run was skipped");
         }
     }
 
