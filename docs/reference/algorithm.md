@@ -148,7 +148,15 @@ atoms take 0.97 to 1.08 ms on this host to store in a store-only probe
 also reads the hits back, 1.1 to 1.2 ms, aligned to cache lines or
 not), which is most of a one-thread call: the tile's own work is about
 0.7 ms, of which about 0.3 ms runs behind the stores, and the call
-1.4 ms. On Linux the `Pair`
+1.4 ms. A probe of those stores with work between them bounds what any
+arrangement of this tile can reach: work spread evenly between the
+stores hides almost entirely (0.57 ms of it adds 0.04 ms), the same
+work bunched every 16 stores adds 0.22 ms, and any loads between the
+stores slow them (one load per store burst adds 0.1 ms, four add
+0.2 ms). With stores of whole aligned lines, half a millisecond of
+evenly spread work, and only two or three loads per hit vector, the
+probe takes 1.25 to 1.29 ms; the tile reads its targets, sources, and
+boxes, about six loads per hit vector. On Linux the `Pair`
 vector and the columns of at least 4 MB that a call allocates are
 advised to use transparent huge pages on their 2 MB-aligned interior,
 so those stores walk the page tables once per 2 MB; buffers a caller
