@@ -138,7 +138,11 @@ tile: hit lanes are compressed, and four hits become eight 40-byte
 rows (or sixteen column entries) in five registers. The rows are dword
 permutes of two registers, one holding the eight compressed targets,
 the source, and both shifts, the other the eight compressed distances,
-so the second four hits of a vector permute from the same pair.
+so the second four hits of a vector permute from the same pair. When
+bins hold under eight atoms on average the block loop runs as a twin
+compiled with the tile's target features and the tile inlines into it,
+since with a few atoms a block the call into the tile is most of the
+block (256 atoms in the 18 Å cube: 0.020 to 0.017 ms).
 Otherwise each thread buffers the hits of its range of bins, then
 writes them into the caller's layout: `Pair` rows, four columns, or
 `lc_pair` rows. Thread `k` searches and writes range `k`, so the writer
