@@ -143,10 +143,12 @@ Otherwise each thread buffers the hits of its range of bins, then
 writes them into the caller's layout: `Pair` rows, four columns, or
 `lc_pair` rows. Thread `k` searches and writes range `k`, so the writer
 reads its own cache. On one core the 29 MB of 40-byte rows for 4096
-atoms take 1.1 to 1.2 ms on this host to write from buffered hits,
-with the stores aligned to cache lines or not (a memset of the same
-bytes takes 0.85 ms), which is most of a one-thread call: the tile's
-own work is about 0.7 ms, and the call 1.4 ms. On Linux the `Pair`
+atoms take 0.97 to 1.08 ms on this host to store in a store-only probe
+(a memset of the same bytes 0.85 ms; written from buffered hits, which
+also reads the hits back, 1.1 to 1.2 ms, aligned to cache lines or
+not), which is most of a one-thread call: the tile's own work is about
+0.7 ms, of which about 0.3 ms runs behind the stores, and the call
+1.4 ms. On Linux the `Pair`
 vector and the columns of at least 4 MB that a call allocates are
 advised to use transparent huge pages on their 2 MB-aligned interior,
 so those stores walk the page tables once per 2 MB; buffers a caller
