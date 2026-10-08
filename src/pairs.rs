@@ -3762,9 +3762,19 @@ mod tests {
     fn box_culling_keeps_every_row_in_order() {
         // 1100 random points in boxes three bins a side at a 3 Å cutoff:
         // about 40 atoms per bin, so the tile kernel tests run boxes, on
-        // the threaded bins too. Distances take every value, so some pairs
-        // sit near the cutoff, where the margin matters.
-        let cells = [
+        // the threaded bins too. Then a 1 Å cubic lattice with the cutoff
+        // on its sqrt(11) shell and every coordinate a few ulps off, so
+        // thousands of pairs sit within the margin of the cutoff.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut unit = || (next() >> 11) as f64 / (1u64 << 53) as f64;
+        let mut systems = Vec::new();
+        for sim in [
             Cell::ortho(9.3, 9.6, 9.9).unwrap(),
             Cell::from_vectors(
                 [9.6, 0.0, 0.0],
@@ -3773,29 +3783,49 @@ mod tests {
                 [0.5, -0.3, 0.2],
             )
             .unwrap(),
-        ];
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 11) as f64 / (1u64 << 53) as f64
-        };
-        let before = CULL_SKIPS.load(std::sync::atomic::Ordering::Relaxed);
-        for sim in &cells {
+        ] {
             let xyz: Vec<[f64; 3]> = (0..1100)
-                .map(|_| sim.cartesian([1.2 * next() - 0.1, next(), 1.1 * next() - 0.05]))
+                .map(|_| sim.cartesian([1.2 * unit() - 0.1, unit(), 1.1 * unit() - 0.05]))
                 .collect();
+            systems.push((sim, xyz, 3.0));
+        }
+        let mut lattice = Vec::new();
+        for iz in 0..10 {
+            for iy in 0..10 {
+                for ix in 0..10 {
+                    let mut p = [ix as f64 + 0.5, iy as f64 + 0.5, iz as f64 + 0.5];
+                    for v in p.iter_mut() {
+                        let ulps = (next() % 13) as i64 - 6;
+                        *v = f64::from_bits((v.to_bits() as i64 + ulps) as u64);
+                    }
+                    lattice.push(p);
+                }
+            }
+        }
+        let shell = 11.0f64.sqrt();
+        systems.push((Cell::ortho(10.0, 10.0, 10.0).unwrap(), lattice, shell));
+        let before = CULL_SKIPS.load(std::sync::atomic::Ordering::Relaxed);
+        for (sim, xyz, cutoff) in &systems {
+            let (sim, cutoff) = (sim, *cutoff);
             let mask: Vec<bool> = (0..xyz.len()).map(|k| k % 9 != 4).collect();
+            if cutoff == shell {
+                let rows = pairs_within(xyz, sim, cutoff, None, None, false).unwrap();
+                let near = rows
+                    .iter()
+                    .filter(|p| (p.dist2 - cutoff * cutoff).abs() < 1e-12)
+                    .count();
+                assert!(near > 1000, "only {near} rows near the cutoff");
+            }
             for threads in [1, 8] {
                 for half in [false, true] {
                     for mask in [None, Some(mask.as_slice())] {
                         let run = |cull: bool| {
                             NO_CULL.store(!cull, std::sync::atomic::Ordering::Relaxed);
                             let (rows, cols) = on_threads(threads, || {
-                                let rows = pairs_within(&xyz, sim, 3.0, mask, None, half).unwrap();
+                                let rows =
+                                    pairs_within(xyz, sim, cutoff, mask, None, half).unwrap();
                                 let mut cols = PairColumns::default();
-                                pairs_within_columns(&xyz, sim, 3.0, mask, None, half, &mut cols)
+                                pairs_within_columns(xyz, sim, cutoff, mask, None, half, &mut cols)
                                     .unwrap();
                                 (rows, cols)
                             });
