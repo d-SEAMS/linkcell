@@ -682,3 +682,43 @@ fn a_parked_query_is_not_reused_for_other_points() {
     got.sort();
     assert_eq!(got, [(0, 1), (1, 0)]);
 }
+
+#[test]
+fn c_pair_layouts_keep_the_input_image_shift() {
+    let cell = ortho_c(10.0, 10.0, 10.0);
+    let xyz = [0.2, 0.0, 0.0, 29.4, 0.0, 0.0];
+    for half in [0, 1] {
+        let columns = c_rows(&xyz, &cell, 1.0, half);
+        let mut count = 0;
+        let mut rows = [linkcell::lc_pair::default(); 2];
+        let rc = unsafe {
+            lc_pairs_within_rows(
+                xyz.as_ptr(),
+                2,
+                &cell,
+                1.0,
+                std::ptr::null(),
+                0.0,
+                half,
+                rows.as_mut_ptr(),
+                rows.len(),
+                &mut count,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(count, if half == 0 { 2 } else { 1 });
+        let mut got: Vec<_> = rows[..count]
+            .iter()
+            .map(|r| (r.i, r.j, r.shift, r.dist2.to_bits()))
+            .collect();
+        got.sort();
+        assert_eq!(got, columns);
+        assert_eq!((got[0].0, got[0].1, got[0].2), (0, 1, [-3, 0, 0]));
+        if half == 0 {
+            assert_eq!((got[1].0, got[1].1, got[1].2), (1, 0, [3, 0, 0]));
+        }
+        for r in &got {
+            assert!((f64::from_bits(r.3) - 0.64).abs() < 1e-12);
+        }
+    }
+}
