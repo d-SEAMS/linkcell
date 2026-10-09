@@ -74,7 +74,7 @@ As a wrap, Meson exposes `linkcell_dep`:
 ```
 [wrap-git]
 url = https://github.com/d-SEAMS/linkcell.git
-revision = v0.3.8
+revision = v0.3.9
 depth = 1
 
 [provide]

@@ -10,6 +10,13 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.9] - 2026-10-09
+
+### Changed
+
+- The mesh build and the cutoff list run on more than one thread. One thread and eight threads write the same rows, in the same order, after each bin is sorted.
+- `src/kokkos` builds the bench executable `lc_kokkos_bench` and is not linked into the library.
+
 ## [0.3.8] - 2026-10-04
 
 ### Fixed
