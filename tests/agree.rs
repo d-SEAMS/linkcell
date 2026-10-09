@@ -811,8 +811,9 @@ fn skewed_triclinic_matches_lattice_scan() {
 }
 
 #[test]
-fn equal_corner_distances_keep_the_smaller_index() {
-    let cell = triclinic();
+fn exact_distance_ties_keep_the_smaller_index() {
+    let cell =
+        Cell::from_vectors([8.0, 0.0, 0.0], [2.0, 8.0, 0.0], [0.0, 0.0, 8.0], [0.0; 3]).unwrap();
     let xyz = [[1.0, 1.0, 1.0], [3.0, 1.0, 1.0], [2.0, 1.0, 1.0]];
     for hint in [0.5, 2.0, 5.0] {
         let linked = knearest(&xyz, &cell, 1, None, Some(hint)).unwrap();
