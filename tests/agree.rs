@@ -390,7 +390,8 @@ fn wrap_around_sources_near_faces_and_corners() {
         (
             "triclinic-corner k=1",
             &tri,
-            &[[0.20, 0.20, 0.20], [13.80, 10.80, 7.80], [7.0, 5.5, 4.0]],
+            // The third source has distinct corner distances at binary64 precision.
+            &[[0.20, 0.20, 0.20], [13.80, 10.80, 7.80], [7.0, 5.5, 4.25]],
             1,
         ),
         (
@@ -806,5 +807,19 @@ fn skewed_triclinic_matches_lattice_scan() {
     for hint in [Some(0.4), None, Some(2.5)] {
         let linked = knearest(&xyz, &b, 3, Some(&mask), hint).unwrap();
         assert_rows_match(&format!("skew hint={hint:?}"), &linked, &oracle);
+    }
+}
+
+#[test]
+fn equal_corner_distances_keep_the_smaller_index() {
+    let cell = triclinic();
+    let xyz = [[1.0, 1.0, 1.0], [3.0, 1.0, 1.0], [2.0, 1.0, 1.0]];
+    for hint in [0.5, 2.0, 5.0] {
+        let linked = knearest(&xyz, &cell, 1, None, Some(hint)).unwrap();
+        let brute = knearest_brute(&xyz, &cell, 1, None).unwrap();
+        assert_eq!(linked[2].indices, vec![0]);
+        assert_eq!(brute[2].indices, vec![0]);
+        assert_eq!(linked[2].dist2, vec![1.0]);
+        assert_eq!(brute[2].dist2, vec![1.0]);
     }
 }
