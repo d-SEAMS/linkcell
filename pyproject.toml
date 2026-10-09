@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "linkcell"
-version = "0.3.10"
+version = "0.3.11"
 description = "Periodic linked-cell cutoff pairs and k-nearest neighbour search"
 readme = "README.md"
 license = { text = "MIT" }

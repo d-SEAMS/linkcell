@@ -10,6 +10,13 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.11] - 2026-10-09
+
+### Fixed
+
+- Preserve integer cell shifts relative to unwrapped input positions in Rust, C and Python cutoff pair lists.
+- Verify the registry package during publication.
+
 ## [0.3.10] - 2026-10-09
 
 ### Fixed
