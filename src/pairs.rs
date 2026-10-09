@@ -294,8 +294,70 @@ impl PairColumns {
     }
 }
 
+/// Integer images removed when positions are wrapped into the search cell.
+/// Only relative images matter, so a common translation needs no storage.
+#[derive(Clone, Default)]
+struct ImageOffsets(Option<std::sync::Arc<Vec<[i64; 3]>>>);
+
+impl ImageOffsets {
+    fn new(
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+        active: Option<&[usize]>,
+        repeats: [i32; 3],
+    ) -> Result<Self, Error> {
+        let inverse = cell.hinv();
+        let mut reference = None;
+        let mut images = Vec::new();
+        let mut low = [0i64; 3];
+        let mut high = [0i64; 3];
+        let count = active.map_or(xyz.len(), |indices| indices.len());
+        for at in 0..count {
+            let i = active.map_or(at, |indices| indices[at]);
+            let wrapped = cell.cartesian(cell.fractional(xyz[i]));
+            let delta = [xyz[i][0] - wrapped[0], xyz[i][1] - wrapped[1], xyz[i][2] - wrapped[2]];
+            let image: [f64; 3] = std::array::from_fn(|a| {
+                (inverse[0][a] * delta[0] + inverse[1][a] * delta[1]
+                    + inverse[2][a] * delta[2]).round()
+            });
+            let base = reference.get_or_insert(image);
+            let mut relative = [0i64; 3];
+            for a in 0..3 {
+                let value = image[a] - base[a];
+                if !value.is_finite() || value.abs() > i32::MAX as f64 {
+                    return Err(Error::Overflow);
+                }
+                relative[a] = value as i64;
+                low[a] = low[a].min(relative[a]);
+                high[a] = high[a].max(relative[a]);
+                if high[a] - low[a] + i64::from(repeats[a]) > i64::from(i32::MAX) {
+                    return Err(Error::Overflow);
+                }
+            }
+            if images.is_empty() && relative != [0; 3] {
+                images.resize(xyz.len(), [0; 3]);
+            }
+            if !images.is_empty() {
+                images[i] = relative;
+            }
+        }
+        Ok(Self((!images.is_empty()).then(|| std::sync::Arc::new(images))))
+    }
+
+    fn shift(&self, i: usize, j: usize, wrapped: [i32; 3]) -> [i32; 3] {
+        match &self.0 {
+            None => wrapped,
+            Some(images) => std::array::from_fn(|a| {
+                // The image span plus the stencil radius fits i32 in new().
+                (i64::from(wrapped[a]) + images[i][a] - images[j][a]) as i32
+            }),
+        }
+    }
+}
+
 /// The grid, stencil, and bounds of one cutoff search.
 pub(crate) struct Plan {
+    images: ImageOffsets,
     grid: Grid,
     partners: std::sync::Arc<PartnerList>,
     cut2: f64,
@@ -319,6 +381,7 @@ impl Plan {
     /// Every hit, by cell range.
     pub(crate) fn search(&self) -> Found {
         Found {
+            images: self.images.clone(),
             chunks: self.walk().collect(self.threads),
             half: self.half,
             simd: self.simd,
@@ -329,7 +392,7 @@ impl Plan {
     /// from the tile kernel in one pass.
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     fn fused(&self) -> Option<RowWords> {
-        if self.threads == 1 && self.simd == 2 {
+        if self.threads == 1 && self.simd == 2 && self.images.0.is_none() {
             RowWords::of_pair()
         } else {
             None
@@ -377,6 +440,7 @@ pub(crate) fn plan(
     let n_act = active.as_ref().map_or(n, |a| a.len());
     if n_act == 0 {
         return Ok(Plan {
+            images: ImageOffsets::default(),
             grid: Grid::empty(),
             partners: std::sync::Arc::new(PartnerList {
                 key: ([0; 12], [1, 1, 1], [0; 3], 0),
@@ -439,6 +503,7 @@ pub(crate) fn plan(
     let partners = partners_for(&grid, simbox, reach, cut2);
     let margin = expanded_margin(&grid, &partners, cutoff);
     Ok(Plan {
+        images: ImageOffsets::new(xyz, simbox, active.as_deref(), repeats)?,
         grid,
         partners,
         cut2,
@@ -1750,6 +1815,7 @@ impl Scratch {
 /// Every hit of one search, by cell range. Nothing is a row yet: each
 /// caller expands these once into its own layout.
 pub(crate) struct Found {
+    images: ImageOffsets,
     chunks: Vec<Scratch>,
     half: bool,
     /// [`simd_mode`] of the search; the writers use the same level.
@@ -1796,6 +1862,14 @@ impl Found {
     /// # Safety
     /// `out` has room for [`Found::rows`] rows.
     unsafe fn write_pairs(&self, out: *mut Pair) {
+        if self.images.0.is_some() {
+            unsafe {
+                self.write_rows(out, |i, j, shift, dist2| Pair {
+                    i: i as usize, j: j as usize, shift, dist2,
+                });
+            }
+            return;
+        }
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
         let words = if self.simd == 2 {
             RowWords::of_pair()
@@ -1926,6 +2000,18 @@ impl Found {
             }
             write_columns(ci, cj, cs, cd, chunk, self.half, ahead);
         });
+        if self.images.0.is_some() {
+            for at in 0..self.rows() {
+                // Every output entry is initialized by the completed chunk writes.
+                unsafe {
+                    let old = [*shift.add(3 * at), *shift.add(3 * at + 1), *shift.add(3 * at + 2)];
+                    let corrected = self.images.shift(*i.add(at) as usize, *j.add(at) as usize, old);
+                    for (a, value) in corrected.into_iter().enumerate() {
+                        *shift.add(3 * at + a) = value;
+                    }
+                }
+            }
+        }
     }
 
     /// `out[t] = row(i, j, shift, dist2)` for every row `t`.
@@ -1949,11 +2035,11 @@ impl Found {
             let mut at = 0usize;
             let mut lo = 0usize;
             for (r, &hi) in chunk.run_end.iter().enumerate() {
-                let shift = chunk.run_shift[r];
-                let neg = [-shift[0], -shift[1], -shift[2]];
                 for k in lo..hi {
                     let a = chunk.atom[k] as i32;
                     let b = chunk.js[k] as i32;
+                    let shift = self.images.shift(a as usize, b as usize, chunk.run_shift[r]);
+                    let neg = [-shift[0], -shift[1], -shift[2]];
                     let d = chunk.d2[k];
                     if ahead {
                         prefetch(dst.as_ptr().wrapping_add(at + AHEAD_ROWS));
@@ -3813,7 +3899,7 @@ impl Plan {
     /// rows of its bins, then writes them from the tile kernel in place.
     #[cfg(feature = "parallel")]
     fn fused_split(&self) -> Option<RowWords> {
-        if self.threads > 1 && !self.half && self.simd == 2 {
+        if self.threads > 1 && !self.half && self.simd == 2 && self.images.0.is_none() {
             RowWords::of_pair()
         } else {
             None
