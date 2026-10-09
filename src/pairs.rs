@@ -315,10 +315,14 @@ impl ImageOffsets {
         for at in 0..count {
             let i = active.map_or(at, |indices| indices[at]);
             let wrapped = cell.cartesian(cell.fractional(xyz[i]));
-            let delta = [xyz[i][0] - wrapped[0], xyz[i][1] - wrapped[1], xyz[i][2] - wrapped[2]];
+            let delta = [
+                xyz[i][0] - wrapped[0],
+                xyz[i][1] - wrapped[1],
+                xyz[i][2] - wrapped[2],
+            ];
             let image: [f64; 3] = std::array::from_fn(|a| {
-                (inverse[0][a] * delta[0] + inverse[1][a] * delta[1]
-                    + inverse[2][a] * delta[2]).round()
+                (inverse[0][a] * delta[0] + inverse[1][a] * delta[1] + inverse[2][a] * delta[2])
+                    .round()
             });
             let base = reference.get_or_insert(image);
             let mut relative = [0i64; 3];
@@ -341,7 +345,9 @@ impl ImageOffsets {
                 images[i] = relative;
             }
         }
-        Ok(Self((!images.is_empty()).then(|| std::sync::Arc::new(images))))
+        Ok(Self(
+            (!images.is_empty()).then(|| std::sync::Arc::new(images)),
+        ))
     }
 
     fn shift(&self, i: usize, j: usize, wrapped: [i32; 3]) -> [i32; 3] {
@@ -1865,7 +1871,10 @@ impl Found {
         if self.images.0.is_some() {
             unsafe {
                 self.write_rows(out, |i, j, shift, dist2| Pair {
-                    i: i as usize, j: j as usize, shift, dist2,
+                    i: i as usize,
+                    j: j as usize,
+                    shift,
+                    dist2,
                 });
             }
             return;
@@ -2004,8 +2013,14 @@ impl Found {
             for at in 0..self.rows() {
                 // Every output entry is initialized by the completed chunk writes.
                 unsafe {
-                    let old = [*shift.add(3 * at), *shift.add(3 * at + 1), *shift.add(3 * at + 2)];
-                    let corrected = self.images.shift(*i.add(at) as usize, *j.add(at) as usize, old);
+                    let old = [
+                        *shift.add(3 * at),
+                        *shift.add(3 * at + 1),
+                        *shift.add(3 * at + 2),
+                    ];
+                    let corrected =
+                        self.images
+                            .shift(*i.add(at) as usize, *j.add(at) as usize, old);
                     for (a, value) in corrected.into_iter().enumerate() {
                         *shift.add(3 * at + a) = value;
                     }
@@ -2038,7 +2053,9 @@ impl Found {
                 for k in lo..hi {
                     let a = chunk.atom[k] as i32;
                     let b = chunk.js[k] as i32;
-                    let shift = self.images.shift(a as usize, b as usize, chunk.run_shift[r]);
+                    let shift = self
+                        .images
+                        .shift(a as usize, b as usize, chunk.run_shift[r]);
                     let neg = [-shift[0], -shift[1], -shift[2]];
                     let d = chunk.d2[k];
                     if ahead {
