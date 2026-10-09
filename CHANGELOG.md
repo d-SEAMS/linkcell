@@ -10,6 +10,13 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.10] - 2026-10-09
+
+### Fixed
+
+- Use minimage 0.1.4 without its optional C exports so applications can link both static libraries. Test both APIs together across translated periodic images.
+
+
 ## [0.3.9] - 2026-10-09
 
 ### Changed
