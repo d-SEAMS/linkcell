@@ -228,3 +228,17 @@ jobs:
           export PKG_CONFIG_PATH="$PWD/prefix/lib/pkgconfig"
           pkg-config --exists --print-errors linkcell
           pkg-config --modversion linkcell
+
+  static-minimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lode-org/minimage
+          ref: ce6dfb175f32459de1ee06dfeb70e8a718f61876
+          path: build/minimage-source
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - run: cmake -S tests/static-minimage -B build/static-minimage -DMINIMAGE_SOURCE="$PWD/build/minimage-source"
+      - run: cmake --build build/static-minimage --target static_minimage --parallel 2
+      - run: ctest --test-dir build/static-minimage --output-on-failure
