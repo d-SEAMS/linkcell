@@ -22,6 +22,20 @@ Orthorhombic boxes skip the two 3x3 matvecs everywhere they can:
 `fractional` divides by the three widths, `lattice_shift` multiplies
 those widths, and brute `dist2` is three independent wraps.
 
+## Highway batch
+
+`dist2_ortho_diffs` is minimage's orthorhombic minimum-image kernel,
+the same arithmetic as Highway `BatchPeriodicDistSq`. Differences
+are packed `dx, dy, dz`. One reciprocal per axis is hoisted, then
+`dr = abs(dr)` and `dr -= L * round(dr / L)`. `knearest_brute` calls
+that on a rectangular box. `pairs_within` does not. Its rows are one
+chosen image `S`, and the distance is `dist2_shifted`. Feeding that
+shifted delta through the round pulls a far image back inside the
+cutoff and stores it under the stencil's `S`, which is a different
+image. `reduce_pairs` is the other minimage helper: it collapses a
+vesin list to one pair and drops the self image. The cutoff list
+keeps every in-range image, so it does not call that reduction.
+
 ## One shift per cell is wrong
 
 The bins live in the primary cell. Cell `(ix + nx, iy, iz)` is the
@@ -53,10 +67,11 @@ frontier plane, or until the shell covers a space diagonal.
 vesin answers "who is inside radius r". This crate answers "who are
 the k nearest, with the periodic image". The search takes no
 cutoff. `cell_hint` only sizes the bins. Shells grow until the
-k-th neighbour is certified against the frontier plane. The device
-walk still stops on the looser `reach * cell_min` bound, which is
-that plane distance when the source sits on the outer face of its
-cell.
+k-th neighbour is certified against the frontier plane. The gpulite
+device walk still stops on the looser `reach * cell_min` bound, which
+is that plane distance when the source sits on the outer face of its
+cell. The Kokkos walk in `src/kokkos/` uses the host plane stop on
+whatever execution space Kokkos was built with.
 
 nanoflann answers the same k question in Euclidean space without a
 minimum-image convention. A periodic dump still needs the fold and

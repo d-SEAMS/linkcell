@@ -261,11 +261,19 @@ pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
   if (n == 0 || xyz == nullptr) {
     throw Error("no points");
   }
+  static_assert(sizeof(ShiftedPair) == sizeof(lc_pair) &&
+                    alignof(ShiftedPair) == alignof(lc_pair) &&
+                    offsetof(ShiftedPair, j) == offsetof(lc_pair, j) &&
+                    offsetof(ShiftedPair, shift) == offsetof(lc_pair, shift) &&
+                    offsetof(ShiftedPair, dist2) == offsetof(lc_pair, dist2),
+                "ShiftedPair must match lc_pair");
   const lc_cell raw = cell.raw();
   std::size_t count = 0;
-  const int status = lc_pairs_within(
+  // The query keeps its search on this thread; the fill below writes
+  // the rows from it.
+  const int status = lc_pairs_within_rows(
       xyz, detail::to_c_count(n, "n"), &raw, cutoff, mask, cell_hint,
-      half ? 1 : 0, nullptr, nullptr, nullptr, nullptr, 0, &count);
+      half ? 1 : 0, nullptr, 0, &count);
   if (status != 0) {
     const char *msg = lc_last_error();
     throw Error(status, msg ? std::string(msg)
@@ -274,27 +282,17 @@ pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
   if (count == 0) {
     return {};
   }
-  std::vector<int> ii(count);
-  std::vector<int> jj(count);
-  std::vector<int> shift(count * 3);
-  std::vector<double> d2(count);
+  std::vector<ShiftedPair> out(count);
   std::size_t wrote = 0;
-  const int fill = lc_pairs_within(
+  const int fill = lc_pairs_within_rows(
       xyz, detail::to_c_count(n, "n"), &raw, cutoff, mask, cell_hint,
-      half ? 1 : 0, ii.data(), jj.data(), shift.data(), d2.data(), count,
-      &wrote);
+      half ? 1 : 0, reinterpret_cast<lc_pair *>(out.data()), count, &wrote);
   if (fill != 0) {
     const char *msg = lc_last_error();
     throw Error(fill, msg ? std::string(msg)
                           : std::string("linkcell: pairs_within failed"));
   }
-  std::vector<ShiftedPair> out(wrote);
-  for (std::size_t t = 0; t < wrote; ++t) {
-    out[t].i = ii[t];
-    out[t].j = jj[t];
-    out[t].shift = {shift[3 * t], shift[3 * t + 1], shift[3 * t + 2]};
-    out[t].dist2 = d2[t];
-  }
+  out.resize(wrote);
   return out;
 }
 

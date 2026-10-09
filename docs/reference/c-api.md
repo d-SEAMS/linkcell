@@ -65,6 +65,24 @@ A cutoff list is `lc_pairs_within`. Each row is one atom-image.
 Null `out_i`, `out_j`, `out_shift`, and `out_d2` query `*out_count`.
 A short `cap` writes that count and returns nonzero.
 
+```c
+typedef struct lc_pair { int i; int j; int shift[3]; double dist2; } lc_pair;
+
+int lc_pairs_within_rows(const double *xyz, size_t n, const lc_cell *simbox,
+                         double cutoff, const int *mask, double cell_hint,
+                         int half, lc_pair *out, size_t cap,
+                         size_t *out_count);
+```
+
+`lc_pairs_within_rows` is the same list as one array of `lc_pair`
+rows. Null `out` queries `*out_count`.
+
+A query, or a short buffer, keeps its search on the calling thread.
+The next call on that thread with the same inputs bit for bit (`xyz`,
+the box, `cutoff`, `mask`, `cell_hint`, `half`) writes the rows from
+it without searching again; any other call drops it. A fill that
+writes keeps nothing, so a count-then-fill pair is one search.
+
 ## Errors and version
 
 ```c
@@ -131,6 +149,10 @@ std::vector<ShiftedPair> pairs_within(const double *xyz, std::size_t n,
 `knearest_into` writes a caller buffer and requires `out_len == n * k`.
 Neither returns `std::vector<std::vector<int>>`. Failure throws
 `linkcell::Error`. Requires C++17.
+
+`ShiftedPair` has the layout of `lc_pair`. `pairs_within` queries the
+count, then `lc_pairs_within_rows` writes the returned vector from that
+same search.
 
 ## Rust errors (same crate)
 

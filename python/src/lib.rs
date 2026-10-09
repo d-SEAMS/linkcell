@@ -10,7 +10,9 @@ use dlpk::sys::{
     DLDataTypeCode, DLDeviceType, DLManagedTensor, DLManagedTensorVersioned, DLTensor,
 };
 use dlpk::DLPackTensor;
-use linkcell::{knearest_into_d2, knearest_into_many, lc_cell, pairs_within, Cell};
+use linkcell::{
+    knearest_into_d2, knearest_into_many, lc_cell, pairs_within_columns, Cell, PairColumns,
+};
 use ndarray::{Array1, Array2, Array3};
 
 mod gpu;
@@ -448,25 +450,37 @@ fn pairs_within_py<'py>(
         Some(m) => Some(take_mask(m, n)?),
     };
     let hint = cell_hint.filter(|h| *h > 0.0);
-    let pairs = py
-        .detach(|| pairs_within(&pts, &sim, cutoff, mask_vec.as_deref(), hint, half))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mut ii = Vec::with_capacity(pairs.len());
-    let mut jj = Vec::with_capacity(pairs.len());
-    let mut shift = Vec::with_capacity(pairs.len() * 3);
-    let mut d2 = Vec::with_capacity(pairs.len());
-    for pair in pairs {
-        ii.push(pair.i as i32);
-        jj.push(pair.j as i32);
-        shift.extend_from_slice(&pair.shift);
-        d2.push(pair.dist2);
-    }
-    let n_pairs = ii.len();
-    let i_a = Array1::from_vec(ii);
-    let j_a = Array1::from_vec(jj);
+    let mut cols = PairColumns::default();
+    py.detach(|| {
+        pairs_within_columns(
+            &pts,
+            &sim,
+            cutoff,
+            mask_vec.as_deref(),
+            hint,
+            half,
+            &mut cols,
+        )
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let n_pairs = cols.len();
+    // Same allocation read as flat int32: `[i32; 3]` and `i32` share an
+    // alignment, and three times the capacity is the same byte count.
+    let shift = {
+        let mut rows = std::mem::ManuallyDrop::new(cols.shift);
+        unsafe {
+            Vec::from_raw_parts(
+                rows.as_mut_ptr().cast::<i32>(),
+                rows.len() * 3,
+                rows.capacity() * 3,
+            )
+        }
+    };
+    let i_a = Array1::from_vec(cols.i);
+    let j_a = Array1::from_vec(cols.j);
     let s_a = Array2::from_shape_vec((n_pairs, 3), shift)
         .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
-    let d_a = Array1::from_vec(d2);
+    let d_a = Array1::from_vec(cols.dist2);
     Ok((
         to_pydlpack(py, i_a)?,
         to_pydlpack(py, j_a)?,

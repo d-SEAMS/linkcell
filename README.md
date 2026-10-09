@@ -12,8 +12,10 @@ shift `S`, and a squared distance strictly below the cutoff squared.
 without a minimum-image convention. The walk is the linked-cell method
 of Allen and Tildesley (*Computer Simulation of Liquids*). k-nearest
 shells stop when the k-th neighbour reaches the unvisited plane. The
-optional gpulite path runs that k-nearest walk on a CUDA device
-(`linkcell::gpu::Workspace`).
+optional gpulite path runs that k-nearest walk on a CUDA device and
+still stops on the looser `reach * cell_min` bound
+(`linkcell::gpu::Workspace`). `src/kokkos/` is the certified walk on
+a Kokkos execution space. Pair lists stay on the host.
 
 It is a LODE library. The Rust crate is the implementation. The C ABI
 (`lc_*`) is the hourglass waist, the same shape as
@@ -72,7 +74,7 @@ As a wrap, Meson exposes `linkcell_dep`:
 ```
 [wrap-git]
 url = https://github.com/d-SEAMS/linkcell.git
-revision = v0.3.5
+revision = v0.3.8
 depth = 1
 
 [provide]
@@ -199,7 +201,11 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   distances are a Cartesian subtract plus that cell's lattice
   translation (`dist2_shifted` and `lattice_shift`), the vesin /
   LAMMPS ghost construction. Orthorhombic boxes use three independent
-  wraps and skip the two Hinv matvecs. A restricted triclinic box is
+  wraps and skip the two Hinv matvecs. The batched form of that wrap
+  is minimage's Highway kernel, `dist2_ortho_diffs`, re-exported here
+  and used by the orthorhombic brute-force check. A cutoff row keeps
+  the stencil image, so `pairs_within` does not run that round on an
+  already shifted difference. A restricted triclinic box is
   tilt-reduced and uses a triangular shift.
 - One lattice shift per unique cell is wrong unless every wrap of that
   cell is visited. The walk visits integer cell offsets, so each wrap
@@ -212,7 +218,10 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   nearest unvisited face.
 - A cutoff pair list is `pairs_within` / `lc_pairs_within` /
   `linkcell.pairs_within`: atom-image rows with the caller's shift
-  `S`. `knearest` is the k-nearest list.
+  `S`. `knearest` is the k-nearest list. `pairs_within_columns`,
+  `lc_pairs_within_rows`, and the Python call write the `ijS` columns
+  or `lc_pair` rows straight from the search, and a C count query
+  keeps its search for the fill that follows on the same thread.
 
 ## License
 

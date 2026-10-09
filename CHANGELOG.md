@@ -10,6 +10,33 @@ by [towncrier](https://towncrier.readthedocs.io/).
 
 <!-- towncrier release notes start -->
 
+## [0.3.8] - 2026-10-04
+
+### Fixed
+
+- The dense-shell regression test sorts pair rows by index.
+
+## [0.3.7] - 2026-10-04
+
+### Fixed
+
+- The cutoff list sizes its row buffer from the pairs it found. A shell denser than the ideal-gas estimate no longer writes past that buffer.
+
+## [0.3.6] - 2026-10-04
+
+### Changed
+
+- Orthorhombic brute-force neighbours call minimage's Highway kernel (`dist2_ortho_diffs`). `pairs_within` still records the stencil shift and does not wrap that difference a second time. The batch helpers are re-exported.
+- Scale probes always record the POP3 hierarchy: load balance, communication efficiency, parallel efficiency, then computation scaling and global efficiency against the 1-thread run. `scripts/bench-pairs.sh` prints that table for the cutoff list.
+- The crate depends on minimage 0.1.3.
+- The mesh build is parallel from 8192 active points, and `src/kokkos` runs the certified walk on a Kokkos execution space. Scaling runs report the POP hierarchy: load balance, communication efficiency, parallel efficiency, computation scaling, and global efficiency. On this 8-core host a cubic 262144-point, k=4 search has global efficiency 0.74 at 8 threads (10.7 ms); the Kokkos OpenMP backend has global efficiency 0.56 at 8 threads (14.5 ms). This host has no PMU and no CUDA device.
+- `pairs_within` buffers cutoff hits and, with more than one thread and at least 512 atoms, writes disjoint ranges of one pair buffer. A full list still has both shifts. On Linux that buffer stays on the heap so a repeated call does not fault those pages again. On this host a periodic 18 Å cube, 4 Å cutoff, and 4096 atoms is 0.8 ms once the buffer is warm on 8 threads, and the first call is about 4 ms. vesin's cell list tests twice as many distances on that grid; `scripts/cutoff_work.py` reduces the ratio to 2.
+
+### Fixed
+
+- The Meson project version matches the crate version.
+
+
 ## [0.3.5] - 2026-10-04
 
 ### Changed
