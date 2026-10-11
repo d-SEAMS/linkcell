@@ -1,29 +1,31 @@
-//! Runtime SIMD path for the mesh fold and the k-nearest scan.
+//! Runtime SIMD path for the mesh fold, the k-nearest scan, and cutoff pairs.
 //!
 //! `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or `neon`.
 //! An unknown name is ignored. A name this CPU cannot run selects
-//! the scalar path. Unset, the widest usable path is used: AVX-512F,
+//! the scalar path. Unset, the widest usable path is used: AVX-512,
 //! then AVX2 with FMA, then NEON, then scalar.
 //!
-//! AVX2 is taken only when FMA is present too, so Zen 2/3 and Haswell
-//! use it and Sandy Bridge stays on the scalar path. FMA is a selection
-//! gate only: the kernels do not enable it, and they multiply and add
-//! separately. A fused multiply-add would not match
-//! [`crate::Cell::fractional`] bit for bit. The floor in the fold is
+//! AVX-512 is taken only when AVX-512F, AVX-512VL, POPCNT, and FMA are
+//! all present. A CPU with AVX-512F but not VL uses AVX2. AVX2 is taken
+//! only when FMA is present too, so Zen 2/3 and Haswell use it and
+//! Sandy Bridge stays on the scalar path. FMA is a selection gate for
+//! the fold and the scan: those kernels multiply and add separately.
+//! Pair screening may use FMA inside the margin test. No fused
+//! multiply-add reaches a stored value. The floor in the fold is
 //! minimage's `floor_fast` for this architecture: truncation on x86_64,
 //! `f64::floor` elsewhere.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-/// Width of the mesh fold and of the SoA distance scan.
+/// Width of the mesh fold, the SoA distance scan, and the pair tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Path {
     /// One point at a time.
     Scalar,
     /// Four f64 lanes. Requires AVX2 and FMA.
     Avx2,
-    /// Eight f64 lanes. Requires AVX-512F.
+    /// Eight f64 lanes. Requires AVX-512F, AVX-512VL, POPCNT, and FMA.
     Avx512,
     /// Two f64 lanes. Requires NEON.
     Neon,
@@ -116,7 +118,12 @@ fn avx2_ready() -> bool {
 fn avx512_ready() -> bool {
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     {
+        // Pair kernels enable every one of these. Fold and scan need
+        // only AVX-512F, and they follow this gate so one path is shared.
         std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512vl")
+            && std::is_x86_feature_detected!("popcnt")
+            && std::is_x86_feature_detected!("fma")
     }
     #[cfg(not(all(target_arch = "x86_64", linkcell_avx512)))]
     {

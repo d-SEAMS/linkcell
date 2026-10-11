@@ -105,7 +105,9 @@ this architecture: truncation toward zero on x86_64, and `f64::floor`
 elsewhere. On x86_64 an input of -0 stays -0 in the fraction. The
 previous AVX-512 round toward -inf mapped that input to +0.
 `LINKCELL_SIMD` (`scalar`, `avx2`, `avx512`, `neon`) forces
-a path the CPU can run. `simd_path` reports that path. The k-nearest mesh uses the same fold, and its
+a path the CPU can run. `simd_path` reports that path for the fold,
+the k-nearest scan, and cutoff pairs. AVX-512 is selected only when
+AVX-512F, AVX-512VL, POPCNT, and FMA are all present. The k-nearest mesh uses the same fold, and its
 candidate scan uses the same width on the SoA `x`, `y`, `z` columns.
 The fold and the neighbour rows are bitwise and ordering identical
 for one thread and for several. When the walk
@@ -137,12 +139,13 @@ is allocated where the caller runs.
 The distance tile is four sources against eight targets. A source
 `p`, moved into the target bin's frame, is `p'`; each lane forms
 `|r_q|^2 - 2 r_q . p'` with three fused multiply-adds, and adding
-`|p'|^2` gives the squared distance. A lane within a rounding bound of
-`cutoff^2` is decided by the direct `|q - (p - S)|^2`, so the rows are
-exactly the rows of the direct formula; the bound is a short sum of
-`2^-53` times the squares of the largest coordinates, shifts, and bin
-offsets, about `2e-10` Å² on an 18 Å cube. `dist2` of a row agrees
-with the direct value to within that bound.
+`|p'|^2` screens the lane. A lane within a rounding bound of
+`cutoff^2` is decided by the direct `|q - (p - S)|^2`. Every stored
+`dist2` is that direct sum, `(dx * dx + dy * dy) + dz * dz`, so the
+bits match the scalar path. The bound is a short sum of `2^-53` times
+the squares of the largest coordinates, shifts, and bin offsets, about
+`2e-10` Å² on an 18 Å cube. AVX2 uses two vectors for the same eight
+targets, and NEON uses four.
 
 On one thread, a full list on AVX-512 is written straight from the
 tile: hit lanes are compressed, and four hits become eight 40-byte

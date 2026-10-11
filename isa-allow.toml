@@ -1,0 +1,83 @@
+# Dispatched linkcell kernels. Patterns match the demangled symbol.
+# Feature names are the auditor's CPUID names.
+baseline = "x86-64"
+
+[[allow]]
+symbol = 'linkcell::bins::fold8(_regs)?$'
+features = ["avx512f", "avx512vl", "avx2", "avx"]
+reason = "Eight-lane mesh fold. The object symbol is fold8."
+
+[[allow]]
+symbol = 'core::core_arch::x86::xsave::_xgetbv'
+features = ["xsave"]
+reason = "std::is_x86_feature_detected reads XCR0 before any wide kernel."
+
+[[allow]]
+symbol = 'linkcell::.*fold_mesh_avx512.*'
+features = ["avx512f", "avx2", "avx"]
+reason = "AVX-512 mesh fold."
+
+[[allow]]
+symbol = 'linkcell::.*fold_avx512.*'
+features = ["avx512f", "avx2", "avx"]
+reason = "AVX-512 pair-list fold."
+
+[[allow]]
+symbol = 'linkcell::.*scan_avx512.*'
+features = ["avx512f", "avx2", "avx"]
+reason = "AVX-512 k-nearest scan."
+
+[[allow]]
+symbol = 'linkcell::.*avx512_scan.*'
+features = ["avx512f", "avx512vl", "avx2", "avx", "fma", "popcnt"]
+reason = "AVX-512 pair tile. FMA screens. Stored distances are separate multiply and add."
+
+[[allow]]
+symbol = 'linkcell::.*avx512_fused.*'
+features = ["avx512f", "avx512vl", "avx2", "avx", "fma", "popcnt"]
+reason = "AVX-512 fused pair writer. FMA screens. Stored distances are separate multiply and add."
+
+[[allow]]
+symbol = 'linkcell::.*fused_into.*'
+features = ["avx512f", "avx512vl", "avx2", "avx", "fma", "popcnt"]
+reason = "Inlined AVX-512 pair tile."
+
+[[allow]]
+symbol = 'linkcell::.*write_.*avx512.*'
+features = ["avx512f", "avx512vl", "avx2", "avx", "fma", "popcnt"]
+reason = "AVX-512 pair row writers."
+
+[[allow]]
+symbol = 'linkcell::.*avx2_scan.*'
+features = ["avx2", "avx", "fma"]
+reason = "AVX2 pair tile. Two vectors cover each 8-wide block. FMA screens only."
+
+[[allow]]
+symbol = 'linkcell::.*cull_avx2.*'
+features = ["avx2", "avx", "fma"]
+reason = "AVX2 pair box cull. FMA is the screening sum."
+
+[[allow]]
+symbol = 'linkcell::.*scan_avx2.*'
+features = ["avx2", "avx", "fma"]
+reason = "AVX2 k-nearest scan. FMA is a selection gate and is not enabled here."
+
+[[allow]]
+symbol = 'linkcell::.*fold_mesh_avx2.*'
+features = ["avx2", "avx"]
+reason = "AVX2 mesh fold."
+
+[[allow]]
+symbol = 'linkcell::.*fold4.*'
+features = ["avx2", "avx"]
+reason = "AVX2 mesh fold registers."
+
+[[allow]]
+symbol = 'linkcell::.*_neon.*'
+features = ["neon", "asimd"]
+reason = "NEON fold, scan, and pair tile."
+
+[[allow]]
+symbol = 'linkcell::.*fold2.*'
+features = ["neon", "asimd"]
+reason = "NEON mesh fold registers."
