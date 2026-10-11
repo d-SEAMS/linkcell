@@ -94,10 +94,14 @@ in a row, one vector of targets, are then a compact block of the bin
 whatever order the caller's atoms come in; with the atoms of a lattice
 shuffled, the one-thread 4096-atom call took 1.67 ms with that order
 and 2.21 ms in atom order when the order was added. The fold takes eight points at a time on
-AVX-512 with minimage's own operations in its order (the division or
-the `Hinv` product, `wrap01`, the bin truncation, and `H`), so every
-position and bin is the same bits as `Cell::fractional` and
-`Cell::cartesian`; the k-nearest mesh uses the same fold. When the walk
+AVX-512, four on AVX2 with FMA, or two on NEON, with minimage's own
+operations in its order (the division or the `Hinv` product, `wrap01`,
+the bin truncation, and `H`), so every position and bin is the same
+bits as `Cell::fractional` and `Cell::cartesian`. The sums are separate
+multiplies and adds: a fused multiply-add would round once and would
+not match. `LINKCELL_SIMD` (`scalar`, `avx2`, `avx512`, `neon`) forces
+a path the CPU can run. The k-nearest mesh uses the same fold, and its
+candidate scan uses the same width on the SoA `x`, `y`, `z` columns. When the walk
 splits across threads, from 1024 atoms each thread folds one block of
 atoms and groups it by bin in its own staging area. Each thread then
 owns a run of bins, balanced by atoms, reads their atoms from every

@@ -66,6 +66,13 @@
 //! (`KHeap`) stays on the stack for `k <= 16`; larger `k` spills to the
 //! heap.
 //!
+//! The mesh fold and the k-nearest SoA scan use AVX-512F (eight lanes),
+//! AVX2 with FMA (four lanes), or NEON (two lanes) when the CPU has
+//! that path. Sums stay separate multiplies and adds, in the scalar
+//! order, so every stored value matches the scalar path bit for bit.
+//! `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or `neon`.
+//! [`simd_path`] reports the path in use.
+//!
 //! # Examples
 //!
 //! Periodic image, not the raw Cartesian vector:
@@ -129,6 +136,7 @@ mod error;
 mod knearest;
 mod pairs;
 mod pop;
+mod simd;
 
 pub use cell::{
     dist2_many, dist2_ortho_diffs, dist2_pairs, reduce_pairs, reduce_pairs_packed, wrap_many, Cell,
@@ -142,6 +150,7 @@ pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
     reset as pop_reset, snapshot as pop_snapshot,
 };
+pub use simd::simd_path;
 
 #[cfg(feature = "capi")]
 mod capi;
