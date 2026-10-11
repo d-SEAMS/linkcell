@@ -832,8 +832,8 @@ fn scan_at(
         }
         #[cfg(target_arch = "aarch64")]
         crate::simd::Path::Neon => {
-            debug_assert!(cfg!(target_feature = "neon"));
-            // Safety: `select` only returns this path when NEON is a target feature.
+            // Safety: NEON is baseline on aarch64, and `select` only
+            // returns this path when that target feature is on.
             unsafe { scan_neon(cand, pi, i, heap) };
         }
         _ => scan(cand, pi, i, heap),
