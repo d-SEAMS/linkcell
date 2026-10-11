@@ -194,7 +194,7 @@ impl Mesh {
             }
             for slot in start..n_active {
                 let i = ids.get(slot);
-                let s = simbox.fractional(xyz[i]);
+                let s = canonical_fraction(simbox.fractional(xyz[i]));
                 let b = [
                     bin_coord(s[0], nx),
                     bin_coord(s[1], ny),
@@ -478,7 +478,7 @@ fn bin_parallel(
                         },
                     );
                     for t in start..len {
-                        let s = simbox.fractional(p[t]);
+                        let s = canonical_fraction(simbox.fractional(p[t]));
                         let c = flat_cell(
                             [
                                 bin_coord(s[0], nx),
@@ -505,7 +505,7 @@ fn bin_parallel(
                 crate::pop::JobTimer::new,
                 |_timer, slot| {
                     let i = ids.get(slot);
-                    let s = simbox.fractional(xyz[i]);
+                    let s = canonical_fraction(simbox.fractional(xyz[i]));
                     let c = flat_cell(
                         [
                             bin_coord(s[0], nx),
@@ -617,7 +617,8 @@ impl Fold8 {
 /// packed `x y z` rows at `base`, with [`Cell::fractional`],
 /// [`Cell::cartesian`], and the bin truncation of [`Mesh::build`] done
 /// lane by lane in the same order (a division, or the `Hinv` product,
-/// then `wrap01`; `H` then the origin), so every value is the same bits.
+/// then `wrap01`; `H` then the origin). `wrap01` ends with `s + 0.0`,
+/// so a fraction of `-0` is stored as `+0`.
 ///
 /// # Safety
 /// AVX-512F is available and `base` is readable for 24 doubles.
@@ -669,10 +670,9 @@ pub(crate) unsafe fn fold8_regs(
     let one = bc(1.0);
     let (o, w, h, hinv, n) = (f.origin, f.widths, f.h, f.hinv, f.n);
     // `wrap01` follows minimage `floor_fast` on x86_64: trunc toward
-    // zero, `-0` becomes `+0`, then one less when that trunc is above
-    // the input. A result that rounds to one is zero. The previous
-    // round-toward-minus-infinity floor mapped an input of `-0` to a
-    // fraction of `+0`. Scalar `floor_fast` keeps that input as `-0`.
+    // zero, then one less when that trunc is above the input. A result
+    // that rounds to one is zero. The last add is `s + 0.0`, so `-0`
+    // is stored as `+0` on this path and on the scalar mesh.
     let wrap01 = |s: __m512d| {
         let zero = _mm512_setzero_pd();
         let trunc = _mm512_roundscale_pd::<0x0b>(s);
@@ -684,7 +684,9 @@ pub(crate) unsafe fn fold8_regs(
             _mm512_sub_pd(trunc, one),
         );
         let t = _mm512_sub_pd(s, floor);
-        _mm512_mask_blend_pd(_mm512_cmp_pd_mask::<_CMP_GE_OQ>(t, one), t, zero)
+        let t = _mm512_mask_blend_pd(_mm512_cmp_pd_mask::<_CMP_GE_OQ>(t, one), t, zero);
+        // `-0 + 0` is `+0`. x86 scalar and aarch64 then store the same fraction.
+        _mm512_add_pd(t, zero)
     };
     let a = _mm512_loadu_pd(base);
     let b = _mm512_loadu_pd(base.add(8));
@@ -855,7 +857,8 @@ unsafe fn fold4(f: &Fold8, base: *const f64) -> ([[f64; 4]; 3], [[f64; 4]; 3], [
             _mm256_cmp_pd::<_CMP_GT_OQ>(trunc, s),
         );
         let t = _mm256_sub_pd(s, floor);
-        _mm256_blendv_pd(t, zero, _mm256_cmp_pd::<_CMP_GE_OQ>(t, one))
+        let t = _mm256_blendv_pd(t, zero, _mm256_cmp_pd::<_CMP_GE_OQ>(t, one));
+        _mm256_add_pd(t, zero)
     };
     let a = _mm256_loadu_pd(base);
     let b = _mm256_loadu_pd(base.add(4));
@@ -1002,7 +1005,8 @@ unsafe fn fold2(f: &Fold8, base: *const f64) -> ([[f64; 2]; 3], [[f64; 2]; 3], [
     // A result that rounds to one is zero.
     let wrap01 = |s: float64x2_t| {
         let t = vsubq_f64(s, vrndmq_f64(s));
-        vbslq_f64(vcgeq_f64(t, one), zero, t)
+        let t = vbslq_f64(vcgeq_f64(t, one), zero, t);
+        vaddq_f64(t, zero)
     };
     let d = [
         vsubq_f64(x, bc(o[0])),
@@ -1120,11 +1124,17 @@ pub(crate) fn grid_dims(simbox: &Cell, edge: f64) -> Result<[i32; 3], Error> {
     Ok(n)
 }
 
+/// `s + 0.0` on each component. `-0` becomes `+0`. Every other value keeps its bits.
+#[inline(always)]
+fn canonical_fraction(s: [f64; 3]) -> [f64; 3] {
+    [s[0] + 0.0, s[1] + 0.0, s[2] + 0.0]
+}
+
 /// Folded Cartesian position and bin of `r`, the values [`Mesh::build`]
 /// stores, so a cutoff row sees the same coordinates.
 #[inline]
 pub(crate) fn fold_point(simbox: &Cell, r: [f64; 3], n: [i32; 3]) -> ([f64; 3], [i32; 3]) {
-    let s = simbox.fractional(r);
+    let s = canonical_fraction(simbox.fractional(r));
     let b = [
         bin_coord(s[0], n[0]),
         bin_coord(s[1], n[1]),
@@ -1345,6 +1355,138 @@ mod tests {
         let edges = [neg0, tiny, below1, big, nan, 0.25, neg0, below1];
         let xyz: Vec<[f64; 3]> = edges.iter().map(|&s| [s, 0.5, s]).collect();
         compare_mesh(&cell, &xyz);
+    }
+
+    /// The mesh stores `s + 0.0`. An input of `-0` is `+0` on every path,
+    /// and the SHA-256 of the raw fraction and folded bytes matches.
+    #[test]
+    fn signed_zero_fold_hashes_match_across_paths() {
+        let cell = crate::Cell::ortho(10.0, 12.0, 8.0).unwrap();
+        let xyz = [
+            [-0.0, -0.0, -0.0],
+            [0.0, -0.0, 1.0],
+            [-0.0, 5.0, 1.0e-320],
+            [10.0, -0.0, 0.0],
+            [-1.0e-20, 0.25, -0.0],
+        ];
+        let mut digest = None;
+        for path in crate::simd::paths_to_compare() {
+            let mesh = {
+                let _guard = crate::simd::force(path);
+                Mesh::build(&xyz, &cell, None, 3.0).unwrap()
+            };
+            assert_eq!(mesh.frac[0][0].to_bits(), 0, "{path:?}");
+            assert_eq!(mesh.frac[0][1].to_bits(), 0, "{path:?}");
+            assert_eq!(mesh.frac[0][2].to_bits(), 0, "{path:?}");
+            for point in &mesh.frac {
+                for component in point {
+                    if *component == 0.0 {
+                        assert_eq!(component.to_bits(), 0, "{path:?} stored -0");
+                    }
+                }
+            }
+            let mut bytes = Vec::new();
+            for point in mesh.frac.iter().chain(mesh.folded.iter()) {
+                for component in point {
+                    bytes.extend_from_slice(&component.to_bits().to_le_bytes());
+                }
+            }
+            let got = sha256(&bytes);
+            match digest {
+                None => digest = Some(got),
+                Some(want) => assert_eq!(got, want, "{path:?}"),
+            }
+        }
+        let empty = sha256(b"");
+        assert_eq!(
+            empty,
+            [
+                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+                0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+                0x78, 0x52, 0xb8, 0x55,
+            ]
+        );
+    }
+
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut h = [
+            0x6a09e667u32,
+            0xbb67ae85,
+            0x3c6ef372,
+            0xa54ff53a,
+            0x510e527f,
+            0x9b05688c,
+            0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        let mut msg = data.to_vec();
+        msg.push(0x80);
+        while (msg.len() % 64) != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in msg.chunks_exact(64) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+                (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ (!e & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+            h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g);
+            h[7] = h[7].wrapping_add(hh);
+        }
+        let mut out = [0u8; 32];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
     }
 
     #[test]

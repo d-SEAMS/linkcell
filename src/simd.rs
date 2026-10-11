@@ -11,7 +11,7 @@
 //! separately. A fused multiply-add would not match
 //! [`crate::Cell::fractional`] bit for bit. The floor in the fold is
 //! minimage's `floor_fast` for this architecture: truncation on x86_64,
-//! `f64::floor` elsewhere.
+//! `f64::floor` elsewhere. The stored fraction adds `0.0`, so `-0` is `+0`.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
