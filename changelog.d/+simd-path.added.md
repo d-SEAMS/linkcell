@@ -1,2 +1,3 @@
 `simd_path` reports the SIMD path selected for the mesh fold and the k-nearest scan.
-`simd_timing` reports scan, search, and mesh-build nanoseconds when `LINKCELL_SCAN_TIME` or `LINKCELL_COARSE_TIME` is set.
+The `timing` feature exports `SimdTiming` with `mesh_ns`, `scan_ns`, and `knn_ns`.
+`LINKCELL_SCAN_TIME` counts the scan. `LINKCELL_COARSE_TIME` counts the search and the mesh build.

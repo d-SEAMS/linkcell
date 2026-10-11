@@ -134,13 +134,17 @@ pub fn simd_path() -> &'static str {
     select().name()
 }
 
+#[cfg(feature = "timing")]
 static SCAN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static KNN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static BIN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "timing")]
+static MESH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `LINKCELL_SCAN_TIME` is set. Read once.
 ///
 /// This arms a timer around each source's SoA scan.
+#[cfg(feature = "timing")]
 pub(crate) fn scan_timing_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LINKCELL_SCAN_TIME").is_some())
@@ -150,38 +154,58 @@ pub(crate) fn scan_timing_enabled() -> bool {
 ///
 /// This arms one timer around [`crate::knearest_into`] and one around
 /// the mesh build. It does not time each source.
+#[cfg(feature = "timing")]
 pub(crate) fn coarse_timing_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LINKCELL_COARSE_TIME").is_some())
 }
 
+#[cfg(feature = "timing")]
 pub(crate) fn add_scan_ns(ns: u128) {
     SCAN_NS.fetch_add(ns as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(feature = "timing")]
 pub(crate) fn add_knn_ns(ns: u128) {
     KNN_NS.fetch_add(ns as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub(crate) fn add_bin_ns(ns: u128) {
-    BIN_NS.fetch_add(ns as u64, std::sync::atomic::Ordering::Relaxed);
+#[cfg(feature = "timing")]
+pub(crate) fn add_mesh_ns(ns: u128) {
+    MESH_NS.fetch_add(ns as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Nanoseconds since startup in the SoA distance scan, in
-/// [`crate::knearest_into`], and in the mesh build inside that search.
+/// Nanoseconds accumulated since process start.
+///
+/// `mesh_ns` is the calling thread's wait for the mesh build inside
+/// [`crate::knearest_into`]. `knn_ns` is that search after the output
+/// buffers are filled, on the calling thread. `scan_ns` is the SoA
+/// distance scan. With one thread the scan total is a slice of the
+/// search total. With more threads the scan total sums every worker,
+/// so it can exceed the wall time.
 ///
 /// All three stay zero unless the matching variable is set before the
 /// first search. `LINKCELL_SCAN_TIME` counts the scan.
-/// `LINKCELL_COARSE_TIME` counts the search and the mesh build. With one
-/// thread the scan total is a slice of the search total. With more
-/// threads the scan total sums every worker, so it can exceed the wall
-/// time. The mesh total is the calling thread's wait for the build.
-pub fn simd_timing() -> (u64, u64, u64) {
-    (
-        SCAN_NS.load(std::sync::atomic::Ordering::Relaxed),
-        KNN_NS.load(std::sync::atomic::Ordering::Relaxed),
-        BIN_NS.load(std::sync::atomic::Ordering::Relaxed),
-    )
+/// `LINKCELL_COARSE_TIME` counts the search and the mesh build.
+#[cfg(feature = "timing")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimdTiming {
+    /// Mesh build inside [`crate::knearest_into`], on the calling thread.
+    pub mesh_ns: u64,
+    /// SoA distance scan. Sums every worker when the search is parallel.
+    pub scan_ns: u64,
+    /// [`crate::knearest_into`] after the output buffers are filled.
+    pub knn_ns: u64,
+}
+
+/// Current [`SimdTiming`] counters.
+#[cfg(feature = "timing")]
+pub fn simd_timing() -> SimdTiming {
+    SimdTiming {
+        mesh_ns: MESH_NS.load(std::sync::atomic::Ordering::Relaxed),
+        scan_ns: SCAN_NS.load(std::sync::atomic::Ordering::Relaxed),
+        knn_ns: KNN_NS.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// Restores the previous test override, including on panic.
@@ -242,5 +266,21 @@ mod tests {
         let path = native();
         assert!(path.usable());
         assert_eq!(path.name(), simd_path());
+    }
+
+    #[cfg(feature = "timing")]
+    #[test]
+    fn simd_timing_names_mesh_scan_and_search() {
+        assert!(std::env::var_os("LINKCELL_SCAN_TIME").is_none());
+        assert!(std::env::var_os("LINKCELL_COARSE_TIME").is_none());
+        let t = simd_timing();
+        assert_eq!(
+            t,
+            SimdTiming {
+                mesh_ns: 0,
+                scan_ns: 0,
+                knn_ns: 0,
+            }
+        );
     }
 }

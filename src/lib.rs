@@ -74,7 +74,8 @@
 //! The fold floor is minimage `floor_fast` for this architecture.
 //! `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or `neon`.
 //! [`simd_path`] reports the path in use. Neighbour rows and the fold
-//! are bitwise identical across thread counts.
+//! are bitwise identical across thread counts. The `timing` feature
+//! exports `SimdTiming` for benchmark counters.
 //!
 //! # Examples
 //!
@@ -153,7 +154,9 @@ pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
     reset as pop_reset, snapshot as pop_snapshot,
 };
-pub use simd::{simd_path, simd_timing};
+pub use simd::simd_path;
+#[cfg(feature = "timing")]
+pub use simd::{simd_timing, SimdTiming};
 
 #[cfg(feature = "capi")]
 mod capi;

@@ -5,9 +5,9 @@
 //! `jitter`). `LINKCELL_SIMD` forces the path (`scalar`, `avx2`,
 //! `avx512`, `neon`). `RAYON_NUM_THREADS` is the caller's.
 //!
-//! `LINKCELL_SCAN_TIME` adds the SoA scan to [`linkcell::simd_timing`].
-//! `LINKCELL_COARSE_TIME` adds the search and the mesh build. Neither
-//! is read on the untuned path.
+//! Build with `--features timing`. `LINKCELL_SCAN_TIME` fills
+//! [`linkcell::SimdTiming::scan_ns`]. `LINKCELL_COARSE_TIME` fills
+//! `mesh_ns` and `knn_ns`.
 
 use std::time::Instant;
 
@@ -89,7 +89,7 @@ fn main() {
     }
     let mut out = vec![-1i32; n * k];
     knearest_into(&xyz, &cell, k, None, Some(3.0), &mut out).expect("warmup");
-    let (scan0, knn0, bin0) = simd_timing();
+    let before = simd_timing();
     let started = Instant::now();
     let mut acc = 0i32;
     for _ in 0..reps {
@@ -98,14 +98,14 @@ fn main() {
     }
     std::hint::black_box(acc);
     let ms = started.elapsed().as_secs_f64() * 1e3;
-    let (scan1, knn1, bin1) = simd_timing();
+    let after = simd_timing();
     println!(
-        "cpu={} path={} shape={shape} n={n} k={k} threads={threads} reps={reps} ms={ms:.3} ms_per={:.3} scan_ns={} knn_ns={} bin_ns={}",
+        "cpu={} path={} shape={shape} n={n} k={k} threads={threads} reps={reps} ms={ms:.3} ms_per={:.3} mesh_ns={} scan_ns={} knn_ns={}",
         cpu_model(),
         simd_path(),
         ms / reps as f64,
-        scan1.saturating_sub(scan0),
-        knn1.saturating_sub(knn0),
-        bin1.saturating_sub(bin0),
+        after.mesh_ns.saturating_sub(before.mesh_ns),
+        after.scan_ns.saturating_sub(before.scan_ns),
+        after.knn_ns.saturating_sub(before.knn_ns),
     );
 }

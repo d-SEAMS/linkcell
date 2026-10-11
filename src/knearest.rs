@@ -376,14 +376,14 @@ fn write_one(
     if let Some(d2) = out_d2.as_mut() {
         d2.fill(f64::NAN);
     }
+    #[cfg(feature = "timing")]
     if crate::simd::coarse_timing_enabled() {
         let started = std::time::Instant::now();
         let result = execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2);
         crate::simd::add_knn_ns(started.elapsed().as_nanos());
-        result
-    } else {
-        execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
+        return result;
     }
+    execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
@@ -492,13 +492,22 @@ fn execute(
     };
     let edge = bins::target_edge(&walk, cell_hint, 3.0);
     let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
-    let mesh = if crate::simd::coarse_timing_enabled() {
-        let started = std::time::Instant::now();
-        let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
-        crate::simd::add_bin_ns(started.elapsed().as_nanos());
-        mesh
-    } else {
-        Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
+    let mesh = {
+        #[cfg(feature = "timing")]
+        {
+            if crate::simd::coarse_timing_enabled() {
+                let started = std::time::Instant::now();
+                let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
+                crate::simd::add_mesh_ns(started.elapsed().as_nanos());
+                mesh
+            } else {
+                Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
+            }
+        }
+        #[cfg(not(feature = "timing"))]
+        {
+            Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
+        }
     };
     let nbin = [mesh.nx, mesh.ny, mesh.nz];
     let widths = mesh.widths;
@@ -653,6 +662,7 @@ fn dispatch_blocks<const MODE: u8>(
     ];
     let nblock = (blocks[0] * blocks[1] * blocks[2]) as usize;
     let path = crate::simd::select();
+    #[cfg(feature = "timing")]
     let time_scan = crate::simd::scan_timing_enabled();
     let job = move |cand: &mut Candidates, heap: &mut KHeap, blk: usize| {
         let blk = blk as i32;
@@ -709,6 +719,7 @@ fn dispatch_blocks<const MODE: u8>(
                         let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
                         heap.clear();
                         let pi = mesh.slot_folded[slot];
+                        #[cfg(feature = "timing")]
                         if time_scan {
                             let started = std::time::Instant::now();
                             scan_at(path, cand, pi, i, heap);
@@ -716,6 +727,8 @@ fn dispatch_blocks<const MODE: u8>(
                         } else {
                             scan_at(path, cand, pi, i, heap);
                         }
+                        #[cfg(not(feature = "timing"))]
+                        scan_at(path, cand, pi, i, heap);
                         let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
                         if heap.full() && heap.worst() <= bound {
                             heap.write_sorted(row, row_d2);
