@@ -668,9 +668,11 @@ pub(crate) unsafe fn fold8_regs(
     let bc = |v: f64| _mm512_set1_pd(v);
     let one = bc(1.0);
     let (o, w, h, hinv, n) = (f.origin, f.widths, f.h, f.hinv, f.n);
-    // `wrap01`: minimage `floor_fast` (trunc toward zero, `-0` becomes
-    // `+0`, then one less when that trunc is above the input), then a
-    // value that rounds to one is zero.
+    // `wrap01` follows minimage `floor_fast` on x86_64: trunc toward
+    // zero, `-0` becomes `+0`, then one less when that trunc is above
+    // the input. A result that rounds to one is zero. The previous
+    // round-toward-minus-infinity floor mapped an input of `-0` to a
+    // fraction of `+0`. Scalar `floor_fast` keeps that input as `-0`.
     let wrap01 = |s: __m512d| {
         let zero = _mm512_setzero_pd();
         let trunc = _mm512_roundscale_pd::<0x0b>(s);
@@ -823,10 +825,11 @@ fn fold_mesh_avx512(
 /// `(a2, b1, c0, c3)`, with `a` the first four doubles.
 ///
 /// # Safety
-/// AVX2 and FMA are available and `base` is readable for 12 doubles.
+/// AVX2 is available and `base` is readable for 12 doubles.
+/// FMA is a selection gate in [`crate::simd`] and is not enabled here.
 #[allow(clippy::incompatible_msrv, clippy::type_complexity)]
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx,avx2,fma")]
+#[target_feature(enable = "avx,avx2")]
 #[inline]
 unsafe fn fold4(f: &Fold8, base: *const f64) -> ([[f64; 4]; 3], [[f64; 4]; 3], [[i32; 4]; 3]) {
     use std::arch::x86_64::{
@@ -839,8 +842,9 @@ unsafe fn fold4(f: &Fold8, base: *const f64) -> ([[f64; 4]; 3], [[f64; 4]; 3], [
     let bc = |v: f64| _mm256_set1_pd(v);
     let one = bc(1.0);
     let (o, w, h, hinv, n) = (f.origin, f.widths, f.h, f.hinv, f.n);
-    // `floor_fast`: trunc toward zero, `-0` becomes `+0`, then one less
-    // when that trunc is above the input. A result that rounds to one is zero.
+    // `wrap01` follows minimage `floor_fast` on x86_64: trunc toward
+    // zero, `-0` becomes `+0`, then one less when that trunc is above
+    // the input. A result that rounds to one is zero.
     let wrap01 = |s: __m256d| {
         let zero = _mm256_setzero_pd();
         let trunc = _mm256_round_pd::<0x0b>(s);
@@ -952,7 +956,8 @@ fn fold_mesh_avx2(
     let flat = xyz.as_ptr() as *const f64;
     let mut k = lo;
     while k + 4 <= hi {
-        // Safety: AVX2 and FMA were detected and rows `k..k + 4` are in `xyz`.
+        // Safety: AVX2 was detected and rows `k..k + 4` are in `xyz`.
+        // FMA gates selection only. It is not enabled on `fold4`.
         let (s, p, b) = unsafe { fold4(&f, flat.add(3 * k)) };
         for l in 0..4 {
             let i = k + l;
@@ -977,9 +982,9 @@ fn fold_mesh_avx2(
 #[inline]
 unsafe fn fold2(f: &Fold8, base: *const f64) -> ([[f64; 2]; 3], [[f64; 2]; 3], [[i32; 2]; 3]) {
     use std::arch::aarch64::{
-        float64x2_t, vaddq_f64, vbslq_f64, vceqq_f64, vcgeq_f64, vcgtq_f64, vcombine_f64,
-        vcvtq_s64_f64, vdivq_f64, vdupq_n_f64, vget_high_f64, vget_low_f64, vgetq_lane_s64,
-        vld1q_f64, vmulq_f64, vrndq_f64, vst1q_f64, vsubq_f64,
+        float64x2_t, vaddq_f64, vbslq_f64, vcgeq_f64, vcombine_f64, vcvtq_s64_f64, vdivq_f64,
+        vdupq_n_f64, vget_high_f64, vget_low_f64, vgetq_lane_s64, vld1q_f64, vmulq_f64, vrndmq_f64,
+        vst1q_f64, vsubq_f64,
     };
     let a = vld1q_f64(base);
     let b = vld1q_f64(base.add(2));
@@ -991,13 +996,12 @@ unsafe fn fold2(f: &Fold8, base: *const f64) -> ([[f64; 2]; 3], [[f64; 2]; 3], [
     let one = bc(1.0);
     let zero = vdupq_n_f64(0.0);
     let (o, w, h, hinv, nbin) = (f.origin, f.widths, f.h, f.hinv, f.n);
-    // `floor_fast`: trunc toward zero, `-0` becomes `+0`, then one less
-    // when that trunc is above the input. A result that rounds to one is zero.
+    // `wrap01` follows minimage `floor_fast` off x86_64, which is
+    // `f64::floor` (toward -inf, `vrndmq`). Truncation would keep an
+    // input of `-0` in the fraction. Scalar on this arch produces `+0`.
+    // A result that rounds to one is zero.
     let wrap01 = |s: float64x2_t| {
-        let trunc = vrndq_f64(s);
-        let trunc = vbslq_f64(vceqq_f64(trunc, zero), zero, trunc);
-        let floor = vbslq_f64(vcgtq_f64(trunc, s), vsubq_f64(trunc, one), trunc);
-        let t = vsubq_f64(s, floor);
+        let t = vsubq_f64(s, vrndmq_f64(s));
         vbslq_f64(vcgeq_f64(t, one), zero, t)
     };
     let d = [
@@ -1076,7 +1080,8 @@ fn fold_mesh_neon(
     out: MeshOut<'_>,
     mut count: impl FnMut(usize),
 ) -> usize {
-    if !std::arch::is_aarch64_feature_detected!("neon") {
+    // NEON is baseline on aarch64. A runtime check would not change this.
+    if !cfg!(target_feature = "neon") {
         return lo;
     }
     let (frac, folded, key) = out;
@@ -1084,7 +1089,7 @@ fn fold_mesh_neon(
     let flat = xyz.as_ptr() as *const f64;
     let mut k = lo;
     while k + 2 <= hi {
-        // Safety: NEON was detected and rows `k..k + 2` are in `xyz`.
+        // Safety: NEON is a target feature and rows `k..k + 2` are in `xyz`.
         let (s, p, b) = unsafe { fold2(&f, flat.add(3 * k)) };
         for l in 0..2 {
             let i = k + l;
@@ -1318,6 +1323,28 @@ mod tests {
             assert_eq!(got.offsets, scalar.offsets, "{path:?} offsets");
             assert_eq!(got.occupants, scalar.occupants, "{path:?} occupants");
         }
+    }
+
+    /// `s = -0`, a tiny negative, one ulp below 1, `2^52`, and NaN.
+    /// Each wide path must match scalar `floor_fast` on this arch.
+    #[test]
+    fn fold_edges_match_scalar_on_every_path() {
+        let cell = crate::Cell::ortho(1.0, 1.0, 1.0).unwrap();
+        let neg0 = -0.0f64;
+        let frac = cell.fractional([neg0, 0.0, 0.0]);
+        let expect_neg0 = if cfg!(target_arch = "x86_64") {
+            neg0.to_bits()
+        } else {
+            0.0f64.to_bits()
+        };
+        assert_eq!(frac[0].to_bits(), expect_neg0);
+        let tiny = -1.0e-20;
+        let below1 = f64::from_bits(1.0f64.to_bits() - 1);
+        let big = 4_503_599_627_370_496.0;
+        let nan = f64::NAN;
+        let edges = [neg0, tiny, below1, big, nan, 0.25, neg0, below1];
+        let xyz: Vec<[f64; 3]> = edges.iter().map(|&s| [s, 0.5, s]).collect();
+        compare_mesh(&cell, &xyz);
     }
 
     #[test]

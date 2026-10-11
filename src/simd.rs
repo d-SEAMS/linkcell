@@ -6,9 +6,12 @@
 //! then AVX2 with FMA, then NEON, then scalar.
 //!
 //! AVX2 is taken only when FMA is present too, so Zen 2/3 and Haswell
-//! use it and Sandy Bridge stays on the scalar path. The kernels still
-//! multiply and add separately. A fused multiply-add would not match
-//! [`crate::Cell::fractional`] bit for bit.
+//! use it and Sandy Bridge stays on the scalar path. FMA is a selection
+//! gate only: the kernels do not enable it, and they multiply and add
+//! separately. A fused multiply-add would not match
+//! [`crate::Cell::fractional`] bit for bit. The floor in the fold is
+//! minimage's `floor_fast` for this architecture: truncation on x86_64,
+//! `f64::floor` elsewhere.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -122,19 +125,63 @@ fn avx512_ready() -> bool {
 }
 
 fn neon_ready() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        std::arch::is_aarch64_feature_detected!("neon")
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+    // NEON is baseline on aarch64. A runtime check would not change the answer.
+    cfg!(target_feature = "neon")
 }
 
 /// Name of the path [`select`] would use.
 pub fn simd_path() -> &'static str {
     select().name()
+}
+
+static SCAN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KNN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BIN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `LINKCELL_SCAN_TIME` is set. Read once.
+///
+/// This arms a timer around each source's SoA scan.
+pub(crate) fn scan_timing_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LINKCELL_SCAN_TIME").is_some())
+}
+
+/// `LINKCELL_COARSE_TIME` is set. Read once.
+///
+/// This arms one timer around [`crate::knearest_into`] and one around
+/// the mesh build. It does not time each source.
+pub(crate) fn coarse_timing_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LINKCELL_COARSE_TIME").is_some())
+}
+
+pub(crate) fn add_scan_ns(ns: u128) {
+    SCAN_NS.fetch_add(ns as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn add_knn_ns(ns: u128) {
+    KNN_NS.fetch_add(ns as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn add_bin_ns(ns: u128) {
+    BIN_NS.fetch_add(ns as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Nanoseconds since startup in the SoA distance scan, in
+/// [`crate::knearest_into`], and in the mesh build inside that search.
+///
+/// All three stay zero unless the matching variable is set before the
+/// first search. `LINKCELL_SCAN_TIME` counts the scan.
+/// `LINKCELL_COARSE_TIME` counts the search and the mesh build. With one
+/// thread the scan total is a slice of the search total. With more
+/// threads the scan total sums every worker, so it can exceed the wall
+/// time. The mesh total is the calling thread's wait for the build.
+pub fn simd_timing() -> (u64, u64, u64) {
+    (
+        SCAN_NS.load(std::sync::atomic::Ordering::Relaxed),
+        KNN_NS.load(std::sync::atomic::Ordering::Relaxed),
+        BIN_NS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// Restores the previous test override, including on panic.

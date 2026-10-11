@@ -67,11 +67,14 @@
 //! heap.
 //!
 //! The mesh fold and the k-nearest SoA scan use AVX-512F (eight lanes),
-//! AVX2 with FMA (four lanes), or NEON (two lanes) when the CPU has
-//! that path. Sums stay separate multiplies and adds, in the scalar
+//! AVX2 (four lanes), or NEON (two lanes) when the CPU has that path.
+//! AVX2 is selected only when FMA is present too. The kernels do not
+//! enable FMA. Sums stay separate multiplies and adds, in the scalar
 //! order, so every stored value matches the scalar path bit for bit.
+//! The fold floor is minimage `floor_fast` for this architecture.
 //! `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or `neon`.
-//! [`simd_path`] reports the path in use.
+//! [`simd_path`] reports the path in use. Neighbour rows and the fold
+//! are bitwise identical across thread counts.
 //!
 //! # Examples
 //!
@@ -150,7 +153,7 @@ pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
     reset as pop_reset, snapshot as pop_snapshot,
 };
-pub use simd::simd_path;
+pub use simd::{simd_path, simd_timing};
 
 #[cfg(feature = "capi")]
 mod capi;

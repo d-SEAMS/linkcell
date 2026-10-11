@@ -376,7 +376,14 @@ fn write_one(
     if let Some(d2) = out_d2.as_mut() {
         d2.fill(f64::NAN);
     }
-    execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
+    if crate::simd::coarse_timing_enabled() {
+        let started = std::time::Instant::now();
+        let result = execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2);
+        crate::simd::add_knn_ns(started.elapsed().as_nanos());
+        result
+    } else {
+        execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
+    }
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
@@ -485,7 +492,14 @@ fn execute(
     };
     let edge = bins::target_edge(&walk, cell_hint, 3.0);
     let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
-    let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
+    let mesh = if crate::simd::coarse_timing_enabled() {
+        let started = std::time::Instant::now();
+        let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
+        crate::simd::add_bin_ns(started.elapsed().as_nanos());
+        mesh
+    } else {
+        Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
+    };
     let nbin = [mesh.nx, mesh.ny, mesh.nz];
     let widths = mesh.widths;
     let cell_min = (widths[0] / f64::from(mesh.nx))
@@ -639,6 +653,7 @@ fn dispatch_blocks<const MODE: u8>(
     ];
     let nblock = (blocks[0] * blocks[1] * blocks[2]) as usize;
     let path = crate::simd::select();
+    let time_scan = crate::simd::scan_timing_enabled();
     let job = move |cand: &mut Candidates, heap: &mut KHeap, blk: usize| {
         let blk = blk as i32;
         let x0 = side * (blk % blocks[0]);
@@ -694,7 +709,13 @@ fn dispatch_blocks<const MODE: u8>(
                         let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
                         heap.clear();
                         let pi = mesh.slot_folded[slot];
-                        scan_at(path, cand, pi, i, heap);
+                        if time_scan {
+                            let started = std::time::Instant::now();
+                            scan_at(path, cand, pi, i, heap);
+                            crate::simd::add_scan_ns(started.elapsed().as_nanos());
+                        } else {
+                            scan_at(path, cand, pi, i, heap);
+                        }
                         let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
                         if heap.full() && heap.worst() <= bound {
                             heap.write_sorted(row, row_d2);
@@ -771,7 +792,8 @@ fn box_bound(origin: [f64; 3], planes: &[[f64; 2]; 3], geom: &Geom) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-/// [`scan`] on `path`. A path this CPU cannot run falls through to [`scan`].
+/// [`scan`] on `path`. [`crate::simd::select`] already rejected a path
+/// this CPU cannot run. A stale path falls through to [`scan`].
 fn scan_at(
     path: crate::simd::Path,
     cand: &mut Candidates,
@@ -781,20 +803,24 @@ fn scan_at(
 ) {
     match path {
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-        crate::simd::Path::Avx512 if std::is_x86_feature_detected!("avx512f") => {
-            // Safety: AVX-512F was detected.
+        crate::simd::Path::Avx512 => {
+            debug_assert!(std::is_x86_feature_detected!("avx512f"));
+            // Safety: `select` only returns this path when AVX-512F is available.
             unsafe { scan_avx512(cand, pi, i, heap) };
         }
         #[cfg(target_arch = "x86_64")]
-        crate::simd::Path::Avx2
-            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") =>
-        {
-            // Safety: AVX2 and FMA were detected.
+        crate::simd::Path::Avx2 => {
+            debug_assert!(
+                std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+            );
+            // Safety: `select` only returns this path when AVX2 and FMA are available.
+            // FMA is not enabled on the kernel.
             unsafe { scan_avx2(cand, pi, i, heap) };
         }
         #[cfg(target_arch = "aarch64")]
-        crate::simd::Path::Neon if std::arch::is_aarch64_feature_detected!("neon") => {
-            // Safety: NEON was detected.
+        crate::simd::Path::Neon => {
+            debug_assert!(cfg!(target_feature = "neon"));
+            // Safety: `select` only returns this path when NEON is a target feature.
             unsafe { scan_neon(cand, pi, i, heap) };
         }
         _ => scan(cand, pi, i, heap),
@@ -899,10 +925,10 @@ unsafe fn scan_avx512(cand: &mut Candidates, pi: [f64; 3], i: usize, heap: &mut 
 /// The lane-wise minimums bound the push when `k` fits in four lanes.
 ///
 /// # Safety
-/// AVX2 and FMA are available.
+/// AVX2 is available. FMA is a selection gate and is not enabled here.
 #[allow(clippy::incompatible_msrv)]
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx,avx2,fma")]
+#[target_feature(enable = "avx,avx2")]
 unsafe fn scan_avx2(cand: &mut Candidates, pi: [f64; 3], i: usize, heap: &mut KHeap) {
     use std::arch::x86_64::{
         _mm256_add_pd, _mm256_and_pd, _mm256_blendv_pd, _mm256_castsi256_pd, _mm256_cmp_pd,
@@ -1638,5 +1664,80 @@ mod scale_mesh_tests {
         let mut d2 = vec![f64::NAN; k];
         heap.write_sorted(&mut nn, Some(&mut d2));
         (nn, d2.iter().map(|v| v.to_bits()).collect())
+    }
+
+    /// Fold columns and neighbour rows stay bitwise and ordering identical
+    /// at 1 thread, 2 threads, and every core, on every SIMD path.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn rank_invariant_across_threads_and_simd_paths() {
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let mut counts = vec![1usize, 2, n_threads];
+        counts.sort_unstable();
+        counts.dedup();
+        let (mut xyz, cell) = ortho_lattice(21);
+        xyz[0][0] = -0.0;
+        xyz[1][1] = f64::from_bits(xyz[1][1].to_bits() + 1);
+        let reference = rank_snapshot(1, crate::simd::Path::Scalar, &xyz, &cell);
+        for &threads in &counts {
+            for path in crate::simd::paths_to_compare() {
+                let got = rank_snapshot(threads, path, &xyz, &cell);
+                let tag = format!("threads={threads} path={path:?}");
+                assert_eq!(got.frac.len(), reference.frac.len(), "{tag}");
+                for i in 0..got.frac.len() {
+                    assert_eq!(got.frac[i], reference.frac[i], "{tag} frac {i}");
+                    assert_eq!(got.folded[i], reference.folded[i], "{tag} folded {i}");
+                }
+                assert_eq!(got.offsets, reference.offsets, "{tag} offsets");
+                assert_eq!(got.occupants, reference.occupants, "{tag} occupants");
+                assert_eq!(got.nn.len(), reference.nn.len(), "{tag}");
+                for i in 0..got.nn.len() {
+                    assert_eq!(got.nn[i], reference.nn[i], "{tag} nn {i}");
+                    assert_eq!(got.d2[i], reference.d2[i], "{tag} d2 {i}");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    struct RankSnap {
+        frac: Vec<[u64; 3]>,
+        folded: Vec<[u64; 3]>,
+        offsets: Vec<usize>,
+        occupants: Vec<usize>,
+        nn: Vec<Vec<usize>>,
+        d2: Vec<Vec<u64>>,
+    }
+
+    #[cfg(feature = "parallel")]
+    fn rank_snapshot(
+        threads: usize,
+        path: crate::simd::Path,
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+    ) -> RankSnap {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(move || {
+            let _guard = crate::simd::force(path);
+            let mesh = Mesh::build(xyz, cell, None, 3.0).unwrap();
+            let rows = knearest(xyz, cell, 4, None, Some(3.0)).unwrap();
+            let bits = |v: [f64; 3]| [v[0].to_bits(), v[1].to_bits(), v[2].to_bits()];
+            RankSnap {
+                frac: mesh.frac.iter().copied().map(bits).collect(),
+                folded: mesh.folded.iter().copied().map(bits).collect(),
+                offsets: mesh.offsets.clone(),
+                occupants: mesh.occupants.clone(),
+                nn: rows.iter().map(|r| r.indices.clone()).collect(),
+                d2: rows
+                    .iter()
+                    .map(|r| r.dist2.iter().map(|d| d.to_bits()).collect())
+                    .collect(),
+            }
+        })
     }
 }
