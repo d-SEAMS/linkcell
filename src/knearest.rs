@@ -1687,12 +1687,13 @@ mod scale_mesh_tests {
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let mut counts = vec![1usize, 2, n_threads];
+        let mut counts = vec![1usize, 2, 3, 8, n_threads];
         counts.sort_unstable();
         counts.dedup();
         let (mut xyz, cell) = ortho_lattice(21);
         xyz[0][0] = -0.0;
         xyz[1][1] = f64::from_bits(xyz[1][1].to_bits() + 1);
+        xyz[2][2] = 1.0e-320;
         let reference = rank_snapshot(1, crate::simd::Path::Scalar, &xyz, &cell);
         for &threads in &counts {
             for path in crate::simd::paths_to_compare() {
@@ -1710,6 +1711,7 @@ mod scale_mesh_tests {
                     assert_eq!(got.nn[i], reference.nn[i], "{tag} nn {i}");
                     assert_eq!(got.d2[i], reference.d2[i], "{tag} d2 {i}");
                 }
+                assert_eq!(got.pairs, reference.pairs, "{tag} pairs");
             }
         }
     }
@@ -1722,6 +1724,7 @@ mod scale_mesh_tests {
         occupants: Vec<usize>,
         nn: Vec<Vec<usize>>,
         d2: Vec<Vec<u64>>,
+        pairs: Vec<(usize, usize, [i32; 3], u64)>,
     }
 
     #[cfg(feature = "parallel")]
@@ -1739,6 +1742,24 @@ mod scale_mesh_tests {
             let _guard = crate::simd::force(path);
             let mesh = Mesh::build(xyz, cell, None, 3.0).unwrap();
             let rows = knearest(xyz, cell, 4, None, Some(3.0)).unwrap();
+            let pairs = crate::pairs_within(xyz, cell, 4.5, None, None, false).unwrap();
+            let mut cols = crate::PairColumns::default();
+            crate::pairs_within_columns(xyz, cell, 4.5, None, None, false, &mut cols).unwrap();
+            let pair_rows: Vec<_> = pairs
+                .iter()
+                .map(|p| (p.i, p.j, p.shift, p.dist2.to_bits()))
+                .collect();
+            let col_rows: Vec<_> = (0..cols.len())
+                .map(|t| {
+                    (
+                        cols.i[t] as usize,
+                        cols.j[t] as usize,
+                        cols.shift[t],
+                        cols.dist2[t].to_bits(),
+                    )
+                })
+                .collect();
+            assert_eq!(pair_rows, col_rows, "columns differ from rows");
             let bits = |v: [f64; 3]| [v[0].to_bits(), v[1].to_bits(), v[2].to_bits()];
             RankSnap {
                 frac: mesh.frac.iter().copied().map(bits).collect(),
@@ -1750,6 +1771,7 @@ mod scale_mesh_tests {
                     .iter()
                     .map(|r| r.dist2.iter().map(|d| d.to_bits()).collect())
                     .collect(),
+                pairs: pair_rows,
             }
         })
     }

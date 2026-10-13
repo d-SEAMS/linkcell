@@ -66,16 +66,18 @@
 //! (`KHeap`) stays on the stack for `k <= 16`; larger `k` spills to the
 //! heap.
 //!
-//! The mesh fold and the k-nearest SoA scan use AVX-512F (eight lanes),
-//! AVX2 (four lanes), or NEON (two lanes) when the CPU has that path.
-//! AVX2 is selected only when FMA is present too. The kernels do not
-//! enable FMA. Sums stay separate multiplies and adds, in the scalar
-//! order, so every stored value matches the scalar path bit for bit.
-//! The fold floor is minimage `floor_fast` for this architecture.
-//! `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or `neon`.
-//! [`simd_path`] reports the path in use. Neighbour rows and the fold
-//! are bitwise identical across thread counts. The `timing` feature
-//! exports `SimdTiming` for benchmark counters.
+//! The mesh fold, the k-nearest SoA scan, and cutoff pairs use AVX-512
+//! (eight lanes), AVX2 (four lanes), or NEON (two lanes) when the CPU
+//! has that path. AVX-512 also requires AVX-512VL, POPCNT, and FMA.
+//! AVX2 is selected only when FMA is present too. Stored sums are
+//! separate multiplies and adds, in the scalar order, so every stored
+//! value matches the scalar path bit for bit. Pair screening may use
+//! FMA inside its margin test. The value it stores is the direct sum
+//! of squares. The fold floor is minimage `floor_fast` for this
+//! architecture. `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or
+//! `neon`. [`simd_path`] reports the path in use. Neighbour rows, pair
+//! rows, and the fold are bitwise identical across thread counts. The
+//! `timing` feature exports `SimdTiming` for benchmark counters.
 //!
 //! # Examples
 //!

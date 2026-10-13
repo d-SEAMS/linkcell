@@ -1,0 +1,7 @@
+# SHA-256 of the little-endian f64 dist2 bytes from pairs_within.
+# Recipe: 5^3 orthorhombic lattice, spacing 2.5, box 12.5, cutoff 4.0.
+# Point 0 x is -0. Point 1 y is one ulp above the lattice value.
+# Point 2 z is the subnormal 1e-320. Half lists are off.
+# The hash is the scalar path. Every other path on the same machine matches it.
+recipe = "lattice5-spacing2.5-cutoff4"
+sha256 = "24863ad9397d1e93c9d0fca39b1a071375faf508887c1b2ca4e295308b237637"
