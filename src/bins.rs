@@ -177,12 +177,12 @@ impl Mesh {
             buf.counts.clear();
             buf.counts.resize(ncell, 0);
             let _pop = crate::pop::JobTimer::new();
-            #[allow(unused_mut)]
             let mut start = 0usize;
-            #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
             if let Active::All(len) = ids {
+                let path = crate::simd::select();
                 let counts = &mut buf.counts;
-                start = fold_mesh_avx512(
+                start = fold_mesh_at(
+                    path,
                     simbox,
                     xyz,
                     [nx, ny, nz],
@@ -456,6 +456,7 @@ fn bin_parallel(
     match ids {
         Active::All(_) => {
             const CHUNK: usize = 4096;
+            let path = crate::simd::select();
             scratch
                 .frac
                 .par_chunks_mut(CHUNK)
@@ -464,8 +465,8 @@ fn bin_parallel(
                 .zip(xyz.par_chunks(CHUNK))
                 .for_each_init(crate::pop::JobTimer::new, |_timer, (((f, fold), b), p)| {
                     let len = p.len();
-                    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-                    let start = fold_mesh_avx512(
+                    let start = fold_mesh_at(
+                        path,
                         simbox,
                         p,
                         nbin,
@@ -476,8 +477,6 @@ fn bin_parallel(
                             hist[c].fetch_add(1, Ordering::Relaxed);
                         },
                     );
-                    #[cfg(not(all(target_arch = "x86_64", linkcell_avx512)))]
-                    let start = 0usize;
                     for t in start..len {
                         let s = simbox.fractional(p[t]);
                         let c = flat_cell(
@@ -588,8 +587,9 @@ fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
     Ok(n as i32)
 }
 
-/// Box constants of the eight-wide fold.
-#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+/// Box constants of the wide fold. AVX-512 uses eight lanes, AVX2 four,
+/// NEON two. The values are the scalar cell's.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) struct Fold8 {
     origin: [f64; 3],
     widths: [f64; 3],
@@ -599,7 +599,7 @@ pub(crate) struct Fold8 {
     n: [i32; 3],
 }
 
-#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl Fold8 {
     pub(crate) fn new(simbox: &Cell, n: [i32; 3]) -> Self {
         Fold8 {
@@ -663,19 +663,28 @@ pub(crate) unsafe fn fold8_regs(
         _mm512_add_pd, _mm512_cmp_pd_mask, _mm512_cvttpd_epi32, _mm512_div_pd, _mm512_loadu_pd,
         _mm512_mask_blend_pd, _mm512_mask_permutex2var_pd, _mm512_mul_pd, _mm512_permutex2var_pd,
         _mm512_roundscale_pd, _mm512_set1_pd, _mm512_setr_epi64, _mm512_setzero_pd, _mm512_sub_pd,
-        _CMP_GE_OQ,
+        _CMP_EQ_OQ, _CMP_GE_OQ, _CMP_GT_OQ,
     };
     let bc = |v: f64| _mm512_set1_pd(v);
     let one = bc(1.0);
     let (o, w, h, hinv, n) = (f.origin, f.widths, f.h, f.hinv, f.n);
-    // `wrap01`: subtract the floor, and a value that rounds to one is zero.
+    // `wrap01` follows minimage `floor_fast` on x86_64: trunc toward
+    // zero, `-0` becomes `+0`, then one less when that trunc is above
+    // the input. A result that rounds to one is zero. The previous
+    // round-toward-minus-infinity floor mapped an input of `-0` to a
+    // fraction of `+0`. Scalar `floor_fast` keeps that input as `-0`.
     let wrap01 = |s: __m512d| {
-        let t = _mm512_sub_pd(s, _mm512_roundscale_pd::<0x09>(s));
-        _mm512_mask_blend_pd(
-            _mm512_cmp_pd_mask::<_CMP_GE_OQ>(t, one),
-            t,
-            _mm512_setzero_pd(),
-        )
+        let zero = _mm512_setzero_pd();
+        let trunc = _mm512_roundscale_pd::<0x0b>(s);
+        let trunc =
+            _mm512_mask_blend_pd(_mm512_cmp_pd_mask::<_CMP_EQ_OQ>(trunc, zero), trunc, zero);
+        let floor = _mm512_mask_blend_pd(
+            _mm512_cmp_pd_mask::<_CMP_GT_OQ>(trunc, s),
+            trunc,
+            _mm512_sub_pd(trunc, one),
+        );
+        let t = _mm512_sub_pd(s, floor);
+        _mm512_mask_blend_pd(_mm512_cmp_pd_mask::<_CMP_GE_OQ>(t, one), t, zero)
     };
     let a = _mm512_loadu_pd(base);
     let b = _mm512_loadu_pd(base.add(8));
@@ -744,8 +753,31 @@ pub(crate) unsafe fn fold8_regs(
 }
 
 /// The three per-point arrays of a mesh: fractional, folded, flat bin.
-#[cfg(all(target_arch = "x86_64", linkcell_avx512))]
 type MeshOut<'a> = (&'a mut [[f64; 3]], &'a mut [[f64; 3]], &'a mut [u32]);
+
+/// Fold `xyz[lo..hi]` with `path`, and add each bin to `count`.
+/// Returns the first index left for the scalar fold.
+#[allow(clippy::too_many_arguments)]
+fn fold_mesh_at(
+    path: crate::simd::Path,
+    simbox: &Cell,
+    xyz: &[[f64; 3]],
+    n: [i32; 3],
+    lo: usize,
+    hi: usize,
+    out: MeshOut<'_>,
+    count: impl FnMut(usize),
+) -> usize {
+    match path {
+        #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+        crate::simd::Path::Avx512 => fold_mesh_avx512(simbox, xyz, n, lo, hi, out, count),
+        #[cfg(target_arch = "x86_64")]
+        crate::simd::Path::Avx2 => fold_mesh_avx2(simbox, xyz, n, lo, hi, out, count),
+        #[cfg(target_arch = "aarch64")]
+        crate::simd::Path::Neon => fold_mesh_neon(simbox, xyz, n, lo, hi, out, count),
+        _ => lo,
+    }
+}
 
 /// Fold `xyz[lo..hi]` into `frac`, `folded`, and `key` at the same
 /// indices, eight at a time on AVX-512, and add each to `counts`;
@@ -779,6 +811,295 @@ fn fold_mesh_avx512(
             count(c);
         }
         k += 8;
+    }
+    k
+}
+
+/// Fractional coordinates, folded positions, and bins of the four
+/// packed `x y z` rows at `base`. Lane order matches [`fold8`]: a
+/// division, or the `Hinv` product, then `wrap01`; `H` then the origin.
+/// Sums are separate multiplies and adds.
+///
+/// The shuffle control is lane sources, low lane in the low bits:
+/// `x` is `(a0, a3, b2, c1)`, `y` is `(a1, b0, b3, c2)`, `z` is
+/// `(a2, b1, c0, c3)`, with `a` the first four doubles.
+///
+/// # Safety
+/// AVX2 is available and `base` is readable for 12 doubles.
+/// FMA is a selection gate in [`crate::simd`] and is not enabled here.
+#[allow(clippy::incompatible_msrv, clippy::type_complexity)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,avx2")]
+#[inline]
+unsafe fn fold4(f: &Fold8, base: *const f64) -> ([[f64; 4]; 3], [[f64; 4]; 3], [[i32; 4]; 3]) {
+    use std::arch::x86_64::{
+        __m256d, _mm256_add_pd, _mm256_blend_pd, _mm256_blendv_pd, _mm256_cmp_pd,
+        _mm256_cvttpd_epi32, _mm256_div_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_permute4x64_pd,
+        _mm256_round_pd, _mm256_set1_pd, _mm256_setzero_pd, _mm256_storeu_pd, _mm256_sub_pd,
+        _mm_max_epi32, _mm_min_epi32, _mm_set1_epi32, _mm_setzero_si128, _mm_storeu_si128,
+        _CMP_EQ_OQ, _CMP_GE_OQ, _CMP_GT_OQ,
+    };
+    let bc = |v: f64| _mm256_set1_pd(v);
+    let one = bc(1.0);
+    let (o, w, h, hinv, n) = (f.origin, f.widths, f.h, f.hinv, f.n);
+    // `wrap01` follows minimage `floor_fast` on x86_64: trunc toward
+    // zero, `-0` becomes `+0`, then one less when that trunc is above
+    // the input. A result that rounds to one is zero.
+    let wrap01 = |s: __m256d| {
+        let zero = _mm256_setzero_pd();
+        let trunc = _mm256_round_pd::<0x0b>(s);
+        let trunc = _mm256_blendv_pd(trunc, zero, _mm256_cmp_pd::<_CMP_EQ_OQ>(trunc, zero));
+        let floor = _mm256_blendv_pd(
+            trunc,
+            _mm256_sub_pd(trunc, one),
+            _mm256_cmp_pd::<_CMP_GT_OQ>(trunc, s),
+        );
+        let t = _mm256_sub_pd(s, floor);
+        _mm256_blendv_pd(t, zero, _mm256_cmp_pd::<_CMP_GE_OQ>(t, one))
+    };
+    let a = _mm256_loadu_pd(base);
+    let b = _mm256_loadu_pd(base.add(4));
+    let c = _mm256_loadu_pd(base.add(8));
+    // a = x0 y0 z0 x1, b = y1 z1 x2 y2, c = z2 x3 y3 z3.
+    let x = _mm256_blend_pd::<0b1000>(
+        _mm256_blend_pd::<0b0100>(
+            _mm256_permute4x64_pd::<0x0c>(a),
+            _mm256_permute4x64_pd::<0x20>(b),
+        ),
+        _mm256_permute4x64_pd::<0x40>(c),
+    );
+    let y = _mm256_blend_pd::<0b1000>(
+        _mm256_blend_pd::<0b0110>(
+            _mm256_permute4x64_pd::<0x01>(a),
+            _mm256_permute4x64_pd::<0x30>(b),
+        ),
+        _mm256_permute4x64_pd::<0x80>(c),
+    );
+    let z = _mm256_blend_pd::<0b1100>(
+        _mm256_blend_pd::<0b0010>(
+            _mm256_permute4x64_pd::<0x02>(a),
+            _mm256_permute4x64_pd::<0x04>(b),
+        ),
+        _mm256_permute4x64_pd::<0xc5>(c),
+    );
+    let d = [
+        _mm256_sub_pd(x, bc(o[0])),
+        _mm256_sub_pd(y, bc(o[1])),
+        _mm256_sub_pd(z, bc(o[2])),
+    ];
+    let s = if f.ortho {
+        [
+            wrap01(_mm256_div_pd(d[0], bc(w[0]))),
+            wrap01(_mm256_div_pd(d[1], bc(w[1]))),
+            wrap01(_mm256_div_pd(d[2], bc(w[2]))),
+        ]
+    } else {
+        let row = |r: usize| {
+            _mm256_add_pd(
+                _mm256_add_pd(
+                    _mm256_mul_pd(bc(hinv[0][r]), d[0]),
+                    _mm256_mul_pd(bc(hinv[1][r]), d[1]),
+                ),
+                _mm256_mul_pd(bc(hinv[2][r]), d[2]),
+            )
+        };
+        [wrap01(row(0)), wrap01(row(1)), wrap01(row(2))]
+    };
+    let cart = |r: usize| {
+        _mm256_add_pd(
+            _mm256_add_pd(
+                _mm256_add_pd(
+                    _mm256_mul_pd(bc(h[0][r]), s[0]),
+                    _mm256_mul_pd(bc(h[1][r]), s[1]),
+                ),
+                _mm256_mul_pd(bc(h[2][r]), s[2]),
+            ),
+            bc(o[r]),
+        )
+    };
+    let bin = |ax: usize| {
+        let t = _mm256_cvttpd_epi32(_mm256_mul_pd(s[ax], bc(f64::from(n[ax]))));
+        _mm_min_epi32(
+            _mm_max_epi32(t, _mm_setzero_si128()),
+            _mm_set1_epi32(n[ax] - 1),
+        )
+    };
+    let mut so = [[0.0f64; 4]; 3];
+    let mut po = [[0.0f64; 4]; 3];
+    let mut bo = [[0i32; 4]; 3];
+    let p = [cart(0), cart(1), cart(2)];
+    let bins = [bin(0), bin(1), bin(2)];
+    for ax in 0..3 {
+        _mm256_storeu_pd(so[ax].as_mut_ptr(), s[ax]);
+        _mm256_storeu_pd(po[ax].as_mut_ptr(), p[ax]);
+        _mm_storeu_si128(bo[ax].as_mut_ptr().cast(), bins[ax]);
+    }
+    (so, po, bo)
+}
+
+/// [`fold_mesh_avx512`] four points at a time.
+#[cfg(target_arch = "x86_64")]
+fn fold_mesh_avx2(
+    simbox: &Cell,
+    xyz: &[[f64; 3]],
+    n: [i32; 3],
+    lo: usize,
+    hi: usize,
+    out: MeshOut<'_>,
+    mut count: impl FnMut(usize),
+) -> usize {
+    if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+        return lo;
+    }
+    let (frac, folded, key) = out;
+    let f = Fold8::new(simbox, n);
+    let flat = xyz.as_ptr() as *const f64;
+    let mut k = lo;
+    while k + 4 <= hi {
+        // Safety: AVX2 was detected and rows `k..k + 4` are in `xyz`.
+        // FMA gates selection only. It is not enabled on `fold4`.
+        let (s, p, b) = unsafe { fold4(&f, flat.add(3 * k)) };
+        for l in 0..4 {
+            let i = k + l;
+            frac[i] = [s[0][l], s[1][l], s[2][l]];
+            folded[i] = [p[0][l], p[1][l], p[2][l]];
+            let c = flat_cell([b[0][l], b[1][l], b[2][l]], n);
+            key[i] = c as u32;
+            count(c);
+        }
+        k += 4;
+    }
+    k
+}
+
+/// [`fold4`] for two points. `a` is `x0 y0`, `b` is `z0 x1`, `c` is `y1 z1`.
+///
+/// # Safety
+/// NEON is available and `base` is readable for 6 doubles.
+#[allow(clippy::type_complexity)]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn fold2(f: &Fold8, base: *const f64) -> ([[f64; 2]; 3], [[f64; 2]; 3], [[i32; 2]; 3]) {
+    use std::arch::aarch64::{
+        float64x2_t, vaddq_f64, vbslq_f64, vcgeq_f64, vcombine_f64, vcvtq_s64_f64, vdivq_f64,
+        vdupq_n_f64, vget_high_f64, vget_low_f64, vgetq_lane_s64, vld1q_f64, vmulq_f64, vrndmq_f64,
+        vst1q_f64, vsubq_f64,
+    };
+    let a = vld1q_f64(base);
+    let b = vld1q_f64(base.add(2));
+    let c = vld1q_f64(base.add(4));
+    let x = vcombine_f64(vget_low_f64(a), vget_high_f64(b));
+    let y = vcombine_f64(vget_high_f64(a), vget_low_f64(c));
+    let z = vcombine_f64(vget_low_f64(b), vget_high_f64(c));
+    let bc = |v: f64| vdupq_n_f64(v);
+    let one = bc(1.0);
+    let zero = vdupq_n_f64(0.0);
+    let (o, w, h, hinv, nbin) = (f.origin, f.widths, f.h, f.hinv, f.n);
+    // `wrap01` follows minimage `floor_fast` off x86_64, which is
+    // `f64::floor` (toward -inf, `vrndmq`). Truncation would keep an
+    // input of `-0` in the fraction. Scalar on this arch produces `+0`.
+    // A result that rounds to one is zero.
+    let wrap01 = |s: float64x2_t| {
+        let t = vsubq_f64(s, vrndmq_f64(s));
+        vbslq_f64(vcgeq_f64(t, one), zero, t)
+    };
+    let d = [
+        vsubq_f64(x, bc(o[0])),
+        vsubq_f64(y, bc(o[1])),
+        vsubq_f64(z, bc(o[2])),
+    ];
+    let s = if f.ortho {
+        [
+            wrap01(vdivq_f64(d[0], bc(w[0]))),
+            wrap01(vdivq_f64(d[1], bc(w[1]))),
+            wrap01(vdivq_f64(d[2], bc(w[2]))),
+        ]
+    } else {
+        let row = |r: usize| {
+            vaddq_f64(
+                vaddq_f64(
+                    vmulq_f64(bc(hinv[0][r]), d[0]),
+                    vmulq_f64(bc(hinv[1][r]), d[1]),
+                ),
+                vmulq_f64(bc(hinv[2][r]), d[2]),
+            )
+        };
+        [wrap01(row(0)), wrap01(row(1)), wrap01(row(2))]
+    };
+    let cart = |r: usize| {
+        vaddq_f64(
+            vaddq_f64(
+                vaddq_f64(vmulq_f64(bc(h[0][r]), s[0]), vmulq_f64(bc(h[1][r]), s[1])),
+                vmulq_f64(bc(h[2][r]), s[2]),
+            ),
+            bc(o[r]),
+        )
+    };
+    let mut so = [[0.0f64; 2]; 3];
+    let mut po = [[0.0f64; 2]; 3];
+    let mut bo = [[0i32; 2]; 3];
+    let p = [cart(0), cart(1), cart(2)];
+    for ax in 0..3 {
+        vst1q_f64(so[ax].as_mut_ptr(), s[ax]);
+        vst1q_f64(po[ax].as_mut_ptr(), p[ax]);
+        let raw = vcvtq_s64_f64(vmulq_f64(s[ax], bc(f64::from(nbin[ax]))));
+        bo[ax][0] = bin_i64(vgetq_lane_s64::<0>(raw), nbin[ax]);
+        bo[ax][1] = bin_i64(vgetq_lane_s64::<1>(raw), nbin[ax]);
+    }
+    (so, po, bo)
+}
+
+/// `(s * n) as i32` for a truncated lane, then the [`bin_coord`] clamp.
+#[cfg(target_arch = "aarch64")]
+fn bin_i64(v: i64, n: i32) -> i32 {
+    let mut c = if v > i64::from(i32::MAX) {
+        i32::MAX
+    } else if v < i64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        v as i32
+    };
+    if c < 0 {
+        c = 0;
+    }
+    if c >= n {
+        c = n - 1;
+    }
+    c
+}
+
+/// [`fold_mesh_avx512`] two points at a time.
+#[cfg(target_arch = "aarch64")]
+fn fold_mesh_neon(
+    simbox: &Cell,
+    xyz: &[[f64; 3]],
+    n: [i32; 3],
+    lo: usize,
+    hi: usize,
+    out: MeshOut<'_>,
+    mut count: impl FnMut(usize),
+) -> usize {
+    // NEON is baseline on aarch64. A runtime check would not change this.
+    if !cfg!(target_feature = "neon") {
+        return lo;
+    }
+    let (frac, folded, key) = out;
+    let f = Fold8::new(simbox, n);
+    let flat = xyz.as_ptr() as *const f64;
+    let mut k = lo;
+    while k + 2 <= hi {
+        // Safety: NEON is a target feature and rows `k..k + 2` are in `xyz`.
+        let (s, p, b) = unsafe { fold2(&f, flat.add(3 * k)) };
+        for l in 0..2 {
+            let i = k + l;
+            frac[i] = [s[0][l], s[1][l], s[2][l]];
+            folded[i] = [p[0][l], p[1][l], p[2][l]];
+            let c = flat_cell([b[0][l], b[1][l], b[2][l]], n);
+            key[i] = c as u32;
+            count(c);
+        }
+        k += 2;
     }
     k
 }
@@ -906,6 +1227,124 @@ mod tests {
         });
         assert_eq!(grown.len(), 2 * 3 * 3);
         assert!(grown.iter().all(|(_, y, _)| y.abs() == 2));
+    }
+
+    fn bits3(v: [f64; 3]) -> [u64; 3] {
+        [v[0].to_bits(), v[1].to_bits(), v[2].to_bits()]
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut s = *state;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *state = s;
+        s
+    }
+
+    fn sample_points(cell: &crate::Cell, n: usize, state: &mut u64) -> Vec<[f64; 3]> {
+        let mut xyz = Vec::with_capacity(n);
+        for i in 0..n {
+            let unit = |state: &mut u64| (xorshift(state) >> 11) as f64 / (1u64 << 53) as f64;
+            let s = [unit(state), unit(state), unit(state)];
+            let mut p = cell.cartesian(s);
+            if i % 11 == 0 {
+                p[0] -= cell.widths()[0];
+            }
+            if i % 13 == 0 {
+                p[1] += 2.0 * cell.widths()[1];
+            }
+            if i % 17 == 0 {
+                p[2] = -0.0;
+            }
+            xyz.push(p);
+        }
+        if n > 0 {
+            xyz[0] = [0.0, 0.0, 0.0];
+        }
+        xyz
+    }
+
+    #[test]
+    fn every_simd_path_folds_like_scalar() {
+        let cells = [
+            crate::Cell::ortho(25.0, 18.0, 30.0).unwrap(),
+            crate::Cell::ortho_origin(25.0, 18.0, 30.0, [1.5, -2.0, 0.25]).unwrap(),
+            crate::Cell::from_vectors(
+                [25.0, 0.0, 0.0],
+                [4.0, 24.0, 0.0],
+                [-3.0, 2.0, 24.5],
+                [0.5, -0.5, 1.0],
+            )
+            .unwrap(),
+            crate::Cell::from_vectors(
+                [24.0, 3.0, -2.0],
+                [2.5, 23.5, 3.0],
+                [-1.5, 2.0, 24.0],
+                [0.0; 3],
+            )
+            .unwrap(),
+        ];
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        for cell in &cells {
+            for &n in &[1usize, 3, 7, 8, 17, 64, 257] {
+                let xyz = sample_points(cell, n, &mut state);
+                compare_mesh(cell, &xyz);
+            }
+        }
+        let big = sample_points(&cells[0], 9_000, &mut state);
+        compare_mesh(&cells[0], &big);
+    }
+
+    fn compare_mesh(cell: &crate::Cell, xyz: &[[f64; 3]]) {
+        let scalar = {
+            let _guard = crate::simd::force(crate::simd::Path::Scalar);
+            Mesh::build(xyz, cell, None, 3.0).unwrap()
+        };
+        for path in crate::simd::paths_to_compare() {
+            let got = {
+                let _guard = crate::simd::force(path);
+                Mesh::build(xyz, cell, None, 3.0).unwrap()
+            };
+            assert_eq!((got.nx, got.ny, got.nz), (scalar.nx, scalar.ny, scalar.nz));
+            for i in 0..xyz.len() {
+                assert_eq!(
+                    bits3(got.frac[i]),
+                    bits3(scalar.frac[i]),
+                    "{path:?} frac {i}"
+                );
+                assert_eq!(
+                    bits3(got.folded[i]),
+                    bits3(scalar.folded[i]),
+                    "{path:?} folded {i}"
+                );
+                assert_eq!(got.key[i], scalar.key[i], "{path:?} key {i}");
+            }
+            assert_eq!(got.offsets, scalar.offsets, "{path:?} offsets");
+            assert_eq!(got.occupants, scalar.occupants, "{path:?} occupants");
+        }
+    }
+
+    /// `s = -0`, a tiny negative, one ulp below 1, `2^52`, and NaN.
+    /// Each wide path must match scalar `floor_fast` on this arch.
+    #[test]
+    fn fold_edges_match_scalar_on_every_path() {
+        let cell = crate::Cell::ortho(1.0, 1.0, 1.0).unwrap();
+        let neg0 = -0.0f64;
+        let frac = cell.fractional([neg0, 0.0, 0.0]);
+        let expect_neg0 = if cfg!(target_arch = "x86_64") {
+            neg0.to_bits()
+        } else {
+            0.0f64.to_bits()
+        };
+        assert_eq!(frac[0].to_bits(), expect_neg0);
+        let tiny = -1.0e-20;
+        let below1 = f64::from_bits(1.0f64.to_bits() - 1);
+        let big = 4_503_599_627_370_496.0;
+        let nan = f64::NAN;
+        let edges = [neg0, tiny, below1, big, nan, 0.25, neg0, below1];
+        let xyz: Vec<[f64; 3]> = edges.iter().map(|&s| [s, 0.5, s]).collect();
+        compare_mesh(&cell, &xyz);
     }
 
     #[test]

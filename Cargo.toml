@@ -26,6 +26,8 @@ capi = []
 parallel = ["dep:rayon"]
 # Autotuner hooks (`lc_tune_set`, `lc_tune_pairs`) for scripts/tune-pairs.py.
 tune = ["capi"]
+# Benchmark counters (`SimdTiming`). Off by default.
+timing = []
 
 [dependencies]
 minimage = { version = "0.1.4", default-features = false }
@@ -34,6 +36,10 @@ rayon = { version = "1.10", optional = true }
 [[test]]
 name = "abi"
 required-features = ["capi"]
+
+[[example]]
+name = "simd_bench"
+required-features = ["timing"]
 
 [profile.release]
 lto = true
