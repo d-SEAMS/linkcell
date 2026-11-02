@@ -213,7 +213,33 @@ pub fn pairs_within_columns(
         d2: RowPtr(out.dist2.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>),
     };
     let (rows, rest) = in_pool(est, || -> Result<(usize, Option<Found>), Error> {
-        let found = plan(xyz, simbox, cutoff, mask, cell_hint, half)?.search();
+        let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+        // Half lists buffer every hit and then copy it into the columns.
+        // Past L2 that copy is the slow part: count the rows of each bin
+        // range and write them from the tile kernel at their own offset.
+        #[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+        if let Some(words) = plan.fused_split_columns().filter(|_| knobs::fused()) {
+            let ranges = cell_ranges(&plan.grid.offsets, plan.threads);
+            let per = rows_guess / ranges.len().max(1);
+            // A second walk pays when each atom has many neighbours and the
+            // buffered copy is the large traffic. A sparse list is faster
+            // written once.
+            let dense = est / xyz.len().max(1) >= 64;
+            if dense
+                && ranges.len() > 1
+                && ranges.len() <= rayon::current_num_threads()
+                && ahead(per, COLUMN_BYTES)
+            {
+                let off = plan.fused_offsets(&words, &ranges);
+                let rows = off[ranges.len()];
+                if rows <= rows_guess {
+                    // Safety: every column holds `rows_guess >= rows` rows.
+                    unsafe { plan.fused_fill_columns(&words, ptrs, &ranges, &off) };
+                    return Ok((rows, None));
+                }
+            }
+        }
+        let found = plan.search();
         let rows = found.rows();
         if rows > rows_guess {
             return Ok((rows, Some(found)));
@@ -250,6 +276,37 @@ pub(crate) fn in_pool<R: Send>(hits: usize, work: impl FnOnce() -> R + Send) -> 
     }
     let _ = hits;
     work()
+}
+
+/// Bin edge when the caller did not pass one.
+///
+/// One cell per cutoff sweeps a cube `6.4` times the cutoff ball. Splitting
+/// the cutoff into `k` cells, with `k` chosen the way vesin does,
+///
+/// `k = round((atoms_per_cell / (2 * 8))^(1/4))` clamped to `1..=6`,
+///
+/// cuts that volume when a cell would otherwise hold many atoms. `8` is
+/// the cell-visit cost in units of one candidate check. A caller `cell_hint`
+/// still wins: [`bins::target_edge`] uses the hint whenever it is positive.
+fn default_edge(simbox: &Cell, n: usize, cutoff: f64) -> f64 {
+    const VISIT_COST: f64 = 8.0;
+    let mut per = n as f64;
+    for width in simbox.widths() {
+        let cells = (width / cutoff).floor().clamp(1.0, 1.0e7);
+        per /= cells;
+    }
+    let k = (per / (2.0 * VISIT_COST)).powf(0.25);
+    let k = if k.is_finite() {
+        k.round().clamp(1.0, 6.0)
+    } else {
+        1.0
+    };
+    let edge = cutoff / k;
+    if edge.is_finite() && edge > 0.0 {
+        edge
+    } else {
+        cutoff
+    }
 }
 
 /// Ideal-gas count of unordered pairs within `cutoff` for `n` points.
@@ -485,7 +542,7 @@ pub(crate) fn plan(
         image_count *= factor;
     }
 
-    let edge = bins::target_edge(simbox, cell_hint, cutoff);
+    let edge = bins::target_edge(simbox, cell_hint, default_edge(simbox, n_act, cutoff));
     let dims = bins::grid_dims(simbox, edge)?;
     let cell_min = (w[0] / f64::from(dims[0]))
         .min(w[1] / f64::from(dims[1]))
@@ -3109,6 +3166,32 @@ impl FusedSink for Counter {
     }
 }
 
+/// Column slots below `limit`. Rows at `limit` and after belong to the
+/// next thread, and a half-list tile must not store into them.
+#[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+struct FixedCols {
+    ci: *mut i32,
+    cj: *mut i32,
+    cs: *mut i32,
+    cd: *mut f64,
+    limit: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+impl FusedSink for FixedCols {
+    fn room(&mut self, n: usize, _room: usize) -> FusedOut {
+        FusedOut {
+            rows: std::ptr::null_mut(),
+            ci: self.ci,
+            cj: self.cj,
+            cs: self.cs,
+            cd: self.cd,
+            n,
+            limit: self.limit,
+        }
+    }
+}
+
 /// The rows below `limit` of a buffer whose rows from `limit` on another
 /// thread writes.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
@@ -3384,24 +3467,42 @@ unsafe fn avx512_fused<
                             prefetch(out.cd.wrapping_add(at));
                             prefetch(out.cs.wrapping_add(3 * at));
                         }
-                        _mm256_storeu_si256(
-                            out.ci.add(n) as *mut _,
-                            _mm256_mask_blend_epi32(fwd, jc, iv8),
-                        );
-                        _mm256_storeu_si256(
-                            out.cj.add(n) as *mut _,
-                            _mm256_mask_blend_epi32(fwd, iv8, jc),
-                        );
-                        _mm512_storeu_pd(out.cd.add(n), dc);
+                        let bi = _mm256_mask_blend_epi32(fwd, jc, iv8);
+                        let bj = _mm256_mask_blend_epi32(fwd, iv8, jc);
                         let m3 = MIRROR3[mir as usize];
-                        _mm512_storeu_si512(
-                            out.cs.add(3 * n) as *mut _,
-                            _mm512_mask_blend_epi32(m3 as u16, s_lo, n_lo),
-                        );
-                        _mm256_storeu_si256(
-                            out.cs.add(3 * n + 16) as *mut _,
-                            _mm256_mask_blend_epi32((m3 >> 16) as u8, s_hi, n_hi),
-                        );
+                        let slo = _mm512_mask_blend_epi32(m3 as u16, s_lo, n_lo);
+                        let shi = _mm256_mask_blend_epi32((m3 >> 16) as u8, s_hi, n_hi);
+                        // Eight-wide stores run past a short tail. Inside one
+                        // thread the next tile overwrites that slack. On a
+                        // split list the slack would land in the next thread's
+                        // rows, so the last tiles copy only the `k` hits.
+                        if MODE == BOUNDED && n + 8 > out.limit {
+                            let mut ii = [0i32; 8];
+                            let mut jj = [0i32; 8];
+                            let mut dd = [0f64; 8];
+                            let mut ss = [0i32; 24];
+                            _mm256_storeu_si256(ii.as_mut_ptr() as *mut _, bi);
+                            _mm256_storeu_si256(jj.as_mut_ptr() as *mut _, bj);
+                            _mm512_storeu_pd(dd.as_mut_ptr(), dc);
+                            _mm512_storeu_si512(ss.as_mut_ptr() as *mut _, slo);
+                            _mm256_storeu_si256(ss.as_mut_ptr().add(16) as *mut _, shi);
+                            let keep = k.min(out.limit.saturating_sub(n));
+                            for h in 0..keep {
+                                *out.ci.add(n + h) = ii[h];
+                                *out.cj.add(n + h) = jj[h];
+                                *out.cd.add(n + h) = dd[h];
+                                let dst = out.cs.add(3 * (n + h));
+                                *dst = ss[3 * h];
+                                *dst.add(1) = ss[3 * h + 1];
+                                *dst.add(2) = ss[3 * h + 2];
+                            }
+                        } else {
+                            _mm256_storeu_si256(out.ci.add(n) as *mut _, bi);
+                            _mm256_storeu_si256(out.cj.add(n) as *mut _, bj);
+                            _mm512_storeu_pd(out.cd.add(n), dc);
+                            _mm512_storeu_si512(out.cs.add(3 * n) as *mut _, slo);
+                            _mm256_storeu_si256(out.cs.add(3 * n + 16) as *mut _, shi);
+                        }
                     } else {
                         let at = out.rows.add(5 * n);
                         let a = _mm512_mask_blend_epi32(
@@ -3908,6 +4009,17 @@ impl Plan {
         n
     }
 
+    /// Several threads and a half list of columns. The tile writes eight
+    /// rows even when fewer hits remain, so the fill uses [`BOUNDED`].
+    #[cfg(feature = "parallel")]
+    fn fused_split_columns(&self) -> Option<RowWords> {
+        if self.threads > 1 && self.half && self.path == Path::Avx512 && self.images.0.is_none() {
+            RowWords::of_pair()
+        } else {
+            None
+        }
+    }
+
     /// Several threads, a full list, and AVX-512: each thread counts the
     /// rows of its bins, then writes them from the tile kernel in place.
     #[cfg(feature = "parallel")]
@@ -3926,7 +4038,21 @@ impl Plan {
         let counts: Vec<usize> = rayon::broadcast(|ctx| {
             ranges.get(ctx.index()).map_or(0, |&(lo, hi)| {
                 let _timer = crate::pop::JobTimer::new();
-                self.fused_side::<false, false, COUNT, _>(words, &mut Counter, false, (lo, hi, 0))
+                if self.half {
+                    self.fused_side::<false, true, COUNT, _>(
+                        words,
+                        &mut Counter,
+                        false,
+                        (lo, hi, 0),
+                    )
+                } else {
+                    self.fused_side::<false, false, COUNT, _>(
+                        words,
+                        &mut Counter,
+                        false,
+                        (lo, hi, 0),
+                    )
+                }
             })
         });
         let mut off = Vec::with_capacity(ranges.len() + 1);
@@ -3962,6 +4088,45 @@ impl Plan {
                 };
                 let ahead = ahead(off[t + 1] - off[t], std::mem::size_of::<Pair>());
                 let n = self.fused_side::<false, false, BOUNDED, _>(
+                    words,
+                    &mut sink,
+                    ahead,
+                    (lo, hi, off[t]),
+                );
+                debug_assert_eq!(n, off[t + 1]);
+            }
+        });
+    }
+
+    /// Half-list columns, several threads: count each bin range, then write
+    /// it from the tile kernel. The last tiles of a range store only the
+    /// hits that belong to that range.
+    ///
+    /// # Safety
+    /// Every column of `cols` holds `off[ranges.len()]` rows.
+    #[cfg(feature = "parallel")]
+    unsafe fn fused_fill_columns(
+        &self,
+        words: &RowWords,
+        cols: ColumnPtrs,
+        ranges: &[(usize, usize)],
+        off: &[usize],
+    ) {
+        #[cfg(test)]
+        FUSED_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rayon::broadcast(|ctx| {
+            let t = ctx.index();
+            if let Some(&(lo, hi)) = ranges.get(t) {
+                let _timer = crate::pop::JobTimer::new();
+                let mut sink = FixedCols {
+                    ci: cols.i.ptr(),
+                    cj: cols.j.ptr(),
+                    cs: cols.shift.ptr(),
+                    cd: cols.d2.ptr(),
+                    limit: off[t + 1],
+                };
+                let ahead = ahead(off[t + 1] - off[t], COLUMN_BYTES);
+                let n = self.fused_side::<true, true, BOUNDED, _>(
                     words,
                     &mut sink,
                     ahead,

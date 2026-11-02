@@ -142,7 +142,14 @@ mod error;
 mod knearest;
 mod pairs;
 mod pop;
+mod replica;
 mod simd;
+mod skin;
+mod skin_simd;
+#[cfg(feature = "capi")]
+mod vesin_abi;
+#[cfg(feature = "capi")]
+pub use vesin_abi::{NeighborCalc, VesinOptions};
 
 pub use cell::{
     dist2_many, dist2_ortho_diffs, dist2_pairs, reduce_pairs, reduce_pairs_packed, wrap_many, Cell,
@@ -156,9 +163,11 @@ pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
     reset as pop_reset, snapshot as pop_snapshot,
 };
+pub use replica::ReplicaList;
 pub use simd::simd_path;
 #[cfg(feature = "timing")]
 pub use simd::{simd_timing, SimdTiming};
+pub use skin::SkinList;
 
 #[cfg(feature = "capi")]
 mod capi;

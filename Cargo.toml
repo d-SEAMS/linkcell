@@ -30,7 +30,9 @@ tune = ["capi"]
 timing = []
 
 [dependencies]
-minimage = { version = "0.1.4", default-features = false }
+# minimage 0.2 is not on crates.io yet. After it is published, replace the
+# git pin below with `minimage = { version = "0.2", default-features = false }`.
+minimage = { git = "https://github.com/lode-org/minimage.git", rev = "3abded515f2e3d0af40d8816a533a2941b1a36cf", default-features = false }
 rayon = { version = "1.10", optional = true }
 
 [[test]]

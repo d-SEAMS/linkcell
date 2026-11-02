@@ -23,6 +23,14 @@ pub enum Error {
     BadCutoff,
     /// Periodic image stencil exceeds the 2^24 resource cap.
     TooManyImages,
+    /// An axis is not periodic and `libvesin.so` is not loaded.
+    Partial,
+    /// The device is not the CPU and `libvesin.so` is not loaded.
+    Device,
+    /// A point has more neighbours than the requested pad.
+    Padded,
+    /// A coordinate is not finite.
+    NonFinite,
 }
 
 impl fmt::Display for Error {
@@ -37,6 +45,13 @@ impl fmt::Display for Error {
             Error::TooManyCells => write!(f, "linked-cell mesh is too fine"),
             Error::BadCutoff => write!(f, "cutoff must be finite and positive"),
             Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
+            Error::Partial => write!(
+                f,
+                "partial periodicity needs libvesin.so on the loader path"
+            ),
+            Error::Device => write!(f, "this device needs libvesin.so on the loader path"),
+            Error::Padded => write!(f, "a point has more neighbours than padded_to"),
+            Error::NonFinite => write!(f, "a coordinate is not finite"),
         }
     }
 }

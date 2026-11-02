@@ -11,7 +11,8 @@ use dlpk::sys::{
 };
 use dlpk::DLPackTensor;
 use linkcell::{
-    knearest_into_d2, knearest_into_many, lc_cell, pairs_within_columns, Cell, PairColumns,
+    knearest_into_d2, knearest_into_many, lc_cell, pairs_within_columns, Cell, NeighborCalc,
+    PairColumns, VesinOptions,
 };
 use ndarray::{Array1, Array2, Array3};
 
@@ -494,11 +495,176 @@ fn gpu_available() -> bool {
     gpu::available()
 }
 
+fn periodic_flags(obj: &Bound<'_, PyAny>) -> PyResult<[bool; 3]> {
+    if let Ok(flag) = obj.extract::<bool>() {
+        return Ok([flag, flag, flag]);
+    }
+    let flags: Vec<bool> = obj
+        .extract()
+        .map_err(|_| PyValueError::new_err("periodic must be a bool or three bools"))?;
+    if flags.len() != 3 {
+        return Err(PyValueError::new_err(
+            "periodic must be a bool or three bools",
+        ));
+    }
+    Ok([flags[0], flags[1], flags[2]])
+}
+
+/// vesin-compatible calculator. `compute` returns one DLPack tensor per
+/// letter of `quantities` (`i`, `j`, `P`, `S`, `d`, `D`).
+#[pyclass(name = "NeighborList")]
+struct PyNeighborList {
+    cutoff: f64,
+    full: bool,
+    sorted: bool,
+    skin: f64,
+    threads: i32,
+    calc: NeighborCalc,
+}
+
+#[pymethods]
+impl PyNeighborList {
+    #[new]
+    #[pyo3(signature = (cutoff, full_list, sorted=false, skin=0.0, n_threads=0))]
+    fn new(
+        cutoff: f64,
+        full_list: bool,
+        sorted: bool,
+        skin: f64,
+        n_threads: i32,
+    ) -> PyResult<Self> {
+        if !cutoff.is_finite() || cutoff <= 0.0 {
+            return Err(PyValueError::new_err("cutoff must be finite and positive"));
+        }
+        if !skin.is_finite() {
+            return Err(PyValueError::new_err("skin must be finite"));
+        }
+        if n_threads < 0 {
+            return Err(PyValueError::new_err("n_threads must be zero or positive"));
+        }
+        Ok(Self {
+            cutoff,
+            full: full_list,
+            sorted,
+            skin,
+            threads: n_threads,
+            calc: NeighborCalc::default(),
+        })
+    }
+
+    /// Rows for `quantities`, in that letter order.
+    #[pyo3(signature = (points, cell, periodic=None, quantities="ij"))]
+    fn compute<'py>(
+        &mut self,
+        py: Python<'py>,
+        points: &Bound<'py, PyAny>,
+        cell: &Bound<'py, PyAny>,
+        periodic: Option<&Bound<'py, PyAny>>,
+        quantities: &str,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let periodic = match periodic {
+            None => [true, true, true],
+            Some(flag) => periodic_flags(flag)?,
+        };
+        let xyz_buf = take_f64(points)?;
+        let (pts, _n, frames) = parse_xyz(&xyz_buf)?;
+        if frames != 1 {
+            return Err(PyValueError::new_err(
+                "points must be one frame of shape (n, 3)",
+            ));
+        }
+        let cell_buf = take_f64(cell)?;
+        let (cell, _) = parse_cell(&cell_buf)?;
+        let opt = VesinOptions::cpu(
+            self.cutoff,
+            self.full,
+            self.skin,
+            self.threads,
+            quantities.contains('S'),
+            quantities.contains('d'),
+            quantities.contains('D'),
+        )
+        .sorted(self.sorted);
+        py.detach(|| self.calc.compute(&pts, &cell, periodic, opt))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut out = Vec::new();
+        for letter in quantities.chars() {
+            let tensor = match letter {
+                'i' => to_pydlpack(
+                    py,
+                    Array1::from_vec(
+                        self.calc
+                            .pairs()
+                            .iter()
+                            .map(|p| p[0] as u64)
+                            .collect::<Vec<_>>(),
+                    ),
+                )?,
+                'j' => to_pydlpack(
+                    py,
+                    Array1::from_vec(
+                        self.calc
+                            .pairs()
+                            .iter()
+                            .map(|p| p[1] as u64)
+                            .collect::<Vec<_>>(),
+                    ),
+                )?,
+                'P' => {
+                    let n = self.calc.pairs().len();
+                    let flat: Vec<u64> = self
+                        .calc
+                        .pairs()
+                        .iter()
+                        .flat_map(|p| [p[0] as u64, p[1] as u64])
+                        .collect();
+                    let arr = Array2::from_shape_vec((n, 2), flat)
+                        .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
+                    to_pydlpack(py, arr)?
+                }
+                'S' => {
+                    let n = self.calc.shifts().len();
+                    let flat: Vec<i32> = self
+                        .calc
+                        .shifts()
+                        .iter()
+                        .flat_map(|s| [s[0], s[1], s[2]])
+                        .collect();
+                    let arr = Array2::from_shape_vec((n, 3), flat)
+                        .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
+                    to_pydlpack(py, arr)?
+                }
+                'd' => to_pydlpack(py, Array1::from_vec(self.calc.distances().to_vec()))?,
+                'D' => {
+                    let n = self.calc.vectors().len();
+                    let flat: Vec<f64> = self
+                        .calc
+                        .vectors()
+                        .iter()
+                        .flat_map(|v| [v[0], v[1], v[2]])
+                        .collect();
+                    let arr = Array2::from_shape_vec((n, 3), flat)
+                        .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
+                    to_pydlpack(py, arr)?
+                }
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown quantity '{letter}', expected i, j, P, S, d, or D"
+                    )))
+                }
+            };
+            out.push(tensor);
+        }
+        Ok(out)
+    }
+}
+
 #[pymodule]
 fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(knearest, m)?)?;
     m.add_function(wrap_pyfunction!(pairs_within_py, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
+    m.add_class::<PyNeighborList>()?;
     m.add_class::<PyDLPack>()?;
     m.add_class::<gpu::StreamDlpack>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
