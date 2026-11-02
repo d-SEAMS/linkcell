@@ -1720,11 +1720,15 @@ struct Block {
     ig: usize,
 }
 
-/// Expected pairs where the walk splits across threads. On this 8-core
-/// host one thread is faster at 512 atoms in an 18 Å cube at a 4 Å
-/// cutoff (6 thousand pairs) and slower from 768 (14 thousand).
+/// Expected pairs where the walk splits across threads.
+///
+/// On this 8-core host, with the AVX-512 tile, one thread is faster at
+/// about 1 thousand pairs (216 atoms, 3.5 Å) and eight threads are faster
+/// from about 2 thousand pairs (512 atoms, 2.4 thousand pairs). Waking
+/// the pool below that loses to a serial cell list, and on the smallest
+/// cells it also loses to vesin.
 #[cfg(feature = "parallel")]
-const PARALLEL_PAIRS: usize = 10_000;
+const PARALLEL_PAIRS: usize = 2_000;
 
 /// Active atoms from which a split walk also builds its bins on several
 /// threads. The fold then wakes the workers the search uses next; at 1024
