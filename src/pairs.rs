@@ -4176,7 +4176,10 @@ impl Walk<'_> {
         }
         let ns = block.i_hi - block.i_lo;
         let span = block.j_hi - block.j_lo;
-        if span == 0 || ns > MAX_SCRATCH / span {
+        // A tile of four by eight is slower than the scalar loop when the
+        // bin holds one or two atoms. Ice at 3.5 Å and the 4096-atom water
+        // cell are in that regime; the wide tile stays for fuller bins.
+        if span < 8 || ns < 4 || ns > MAX_SCRATCH / span {
             self.scan_scalar(scratch, block);
             return;
         }
