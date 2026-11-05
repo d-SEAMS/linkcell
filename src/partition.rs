@@ -275,25 +275,15 @@ pub fn partition(
 /// returns [`Error::NoDevice`] here. Build the assignment from points
 /// with [`partition`] when the device path is required.
 pub fn partition_graph(graph: &CellGraph, request: PartRequest) -> Result<Vec<u32>, Error> {
-    let t_all = Instant::now();
-    let start = profile_sum();
-    let result = partition_graph_timed(graph, request);
-    let elapsed = t_all.elapsed().as_nanos() as u64;
-    let used = profile_sum().saturating_sub(start);
-    if elapsed > used {
-        PACK_NS.fetch_add(elapsed - used, AtomicOrdering::Relaxed);
-    }
-    result
-}
-
-fn partition_graph_timed(graph: &CellGraph, request: PartRequest) -> Result<Vec<u32>, Error> {
     if request.device {
         return Err(Error::NoDevice);
     }
     let t_check = Instant::now();
     check_graph(graph)?;
     CHECK_NS.fetch_add(t_check.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    let t_ratio = Instant::now();
     let ratio = balance_ratio(request.balance, &graph.grid.weight, request.parts)?;
+    PACK_NS.fetch_add(t_ratio.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     if request.parts == 0 {
         return Err(Error::BadPartition);
     }
@@ -539,21 +529,28 @@ fn cluster_cap(total: u64, parts: u32, w_max: u64, ratio: (u64, u64)) -> u64 {
 
 fn multi_assign(graph: &CellGraph, parts: u32, ratio: (u64, u64)) -> Vec<u32> {
     let n = graph.grid.ncell();
+    let t_pack = Instant::now();
     let mut coords = Vec::with_capacity(n);
     for c in 0..n {
         let (ix, iy, iz) = unravel(c, graph.grid.nx, graph.grid.ny);
         coords.push((f64::from(ix), f64::from(iy), f64::from(iz)));
     }
+    PACK_NS.fetch_add(t_pack.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     // Geometric bisection is the incumbent. A later cycle replaces it
     // only when the integer cut falls and every part stays inside the
     // balance bound. The cut cannot fall forever, so the loop ends when
     // a cycle brings no gain.
     let mut best = rcb_assign(graph, parts, true, ratio);
+    let t_cut = Instant::now();
     let mut best_cut = edge_cut(graph, &best);
+    COARSE_NS.fetch_add(t_cut.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     loop {
         let next = v_cycle(graph, &coords, &best, parts, ratio);
+        let t_cut = Instant::now();
         let next_cut = edge_cut(graph, &next);
-        if next_cut < best_cut && holds_balance(&graph.grid.weight, &next, parts, ratio) {
+        let keep = next_cut < best_cut && holds_balance(&graph.grid.weight, &next, parts, ratio);
+        COARSE_NS.fetch_add(t_cut.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        if keep {
             best = next;
             best_cut = next_cut;
         } else {
@@ -591,9 +588,11 @@ fn v_cycle(
     ratio: (u64, u64),
 ) -> Vec<u32> {
     let n = graph.grid.ncell();
+    let t_prep = Instant::now();
     let total: u64 = graph.grid.weight.iter().copied().sum();
     let w_max = graph.grid.weight.iter().copied().max().unwrap_or(0);
     let cap = cluster_cap(total, parts, w_max, ratio);
+    COARSE_NS.fetch_add(t_prep.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     // One vertex per part is already a legal assignment. A vertex above
     // the cap cannot be paired without producing an unsplittable part.
     if n <= parts as usize || graph.grid.weight.iter().any(|&w| w > cap) {
@@ -617,10 +616,12 @@ fn v_cycle(
         up[cell as usize] = assign[fine];
     }
     let up = v_cycle(&coarse, &coarse_coords, &up, parts, ratio);
+    let t_down = Instant::now();
     let mut out = vec![0u32; n];
     for (fine, &cell) in owner.iter().enumerate() {
         out[fine] = up[cell as usize];
     }
+    COARSE_NS.fetch_add(t_down.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     refine(&mut out, graph, parts, ratio);
     out
 }
@@ -1139,6 +1140,7 @@ static COARSE_NS: AtomicU64 = AtomicU64::new(0);
 static PACK_NS: AtomicU64 = AtomicU64::new(0);
 static REPAIR_NS: AtomicU64 = AtomicU64::new(0);
 static CHECK_NS: AtomicU64 = AtomicU64::new(0);
+static SCHEDULE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Zero the phase counters used by the next partition.
 pub fn profile_reset() {
@@ -1148,18 +1150,18 @@ pub fn profile_reset() {
     PACK_NS.store(0, AtomicOrdering::Relaxed);
     REPAIR_NS.store(0, AtomicOrdering::Relaxed);
     CHECK_NS.store(0, AtomicOrdering::Relaxed);
+    SCHEDULE_NS.store(0, AtomicOrdering::Relaxed);
 }
 
 /// Critical-path wall time, in nanoseconds.
 ///
 /// The fields are the weighted median, boundary refinement, coarsening,
-/// packing, the balance repair, and the graph check. Packing fills
-/// coordinates, measures the span, and splits cell ids. Each value is
-/// the sum over the calls since [`profile_reset`]. Inside a parallel
-/// bisection the recorded time is the slower child, then the serial work
-/// on that path. One thread adds the children, because the join runs
-/// them in order.
-pub fn profile_ns() -> (u64, u64, u64, u64, u64, u64) {
+/// packing, the balance repair, the graph check, and join scheduling.
+/// Packing fills coordinates, measures the span, and splits cell ids.
+/// Scheduling is the join wall beyond the child that ran. Each value is
+/// the sum over the calls since [`profile_reset`]. One thread adds the
+/// children, because the join runs them in order.
+pub fn profile_ns() -> (u64, u64, u64, u64, u64, u64, u64) {
     (
         SELECT_NS.load(AtomicOrdering::Relaxed),
         FM_NS.load(AtomicOrdering::Relaxed),
@@ -1167,16 +1169,8 @@ pub fn profile_ns() -> (u64, u64, u64, u64, u64, u64) {
         PACK_NS.load(AtomicOrdering::Relaxed),
         REPAIR_NS.load(AtomicOrdering::Relaxed),
         CHECK_NS.load(AtomicOrdering::Relaxed),
+        SCHEDULE_NS.load(AtomicOrdering::Relaxed),
     )
-}
-
-fn profile_sum() -> u64 {
-    let (sel, fm, coarse, pack, repair, check) = profile_ns();
-    sel.saturating_add(fm)
-        .saturating_add(coarse)
-        .saturating_add(pack)
-        .saturating_add(repair)
-        .saturating_add(check)
 }
 
 fn axis_coord(geom: &RcbGeom, axis: usize, id: u32) -> f64 {
@@ -1247,8 +1241,25 @@ fn subset_cut(ids: &[u32], cut: usize, graph: &CellGraph, side: &mut [u8]) -> u6
     for &id in &ids[cut..] {
         side[id as usize] = 2;
     }
+    let side_ref: &[u8] = side;
+    let left = &ids[..cut];
+    #[cfg(feature = "parallel")]
+    {
+        if rayon::current_num_threads() > 1 && left.len() > 1 {
+            use rayon::prelude::*;
+            let chunk = work_chunk(left.len());
+            return left
+                .par_chunks(chunk)
+                .map(|group| crossing_weight(group, graph, side_ref))
+                .sum();
+        }
+    }
+    crossing_weight(left, graph, side_ref)
+}
+
+fn crossing_weight(group: &[u32], graph: &CellGraph, side: &[u8]) -> u64 {
     let mut crossed = 0u64;
-    for &id in &ids[..cut] {
+    for &id in group {
         let lo = graph.offsets[id as usize] as usize;
         let hi = graph.offsets[id as usize + 1] as usize;
         for e in lo..hi {
@@ -1259,6 +1270,20 @@ fn subset_cut(ids: &[u32], cut: usize, graph: &CellGraph, side: &mut [u8]) -> u6
         }
     }
     crossed
+}
+
+fn work_chunk(n: usize) -> usize {
+    let threads = {
+        #[cfg(feature = "parallel")]
+        {
+            rayon::current_num_threads().max(1)
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            1
+        }
+    };
+    (n / threads).max(1)
 }
 
 /// Weighted median on each axis. Keeps the split with the smaller edge cut.
@@ -1300,7 +1325,194 @@ fn lightest_axis(
 }
 
 /// Light side of a weighted median. Average linear in the slice length.
+///
+/// A slice already ordered by cell id uses one histogram per axis. The
+/// bin count is the integer span of that coordinate, which is fixed by
+/// the cells in the slice. Ties stay on cell id, so the light set matches
+/// the serial quickselect.
 fn weighted_cut(
+    ids: &mut [u32],
+    geom: &RcbGeom,
+    axis: usize,
+    total: u64,
+    parts: u32,
+    parts_l: u32,
+) -> usize {
+    if total > 0 && ids_increase(ids) {
+        if let Some(cut) = weighted_cut_bins(ids, geom, axis, total, parts, parts_l) {
+            return cut;
+        }
+    }
+    weighted_cut_quick(ids, geom, axis, total, parts, parts_l)
+}
+
+fn ids_increase(ids: &[u32]) -> bool {
+    ids.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn coord_i64(geom: &RcbGeom, axis: usize, id: u32) -> Option<i64> {
+    let value = axis_coord(geom, axis, id);
+    if !value.is_finite() {
+        return None;
+    }
+    let whole = value as i64;
+    if whole as f64 != value {
+        return None;
+    }
+    Some(whole)
+}
+
+fn weighted_cut_bins(
+    ids: &mut [u32],
+    geom: &RcbGeom,
+    axis: usize,
+    total: u64,
+    parts: u32,
+    parts_l: u32,
+) -> Option<usize> {
+    let n = ids.len();
+    if n < 2 {
+        return Some(clamp_cut(0, n));
+    }
+    let mut min_c = i64::MAX;
+    let mut max_c = i64::MIN;
+    for &id in ids.iter() {
+        let c = coord_i64(geom, axis, id)?;
+        min_c = min_c.min(c);
+        max_c = max_c.max(c);
+    }
+    let bins = (max_c - min_c + 1) as usize;
+    if bins == 0 || bins > n {
+        return None;
+    }
+    let (hist_w, hist_n) = bin_hist(ids, geom, axis, min_c, bins)?;
+    let mut before_w = 0u64;
+    let mut before_n = 0usize;
+    let mut cut_bin = None;
+    for b in 0..bins {
+        let w = hist_w[b];
+        let count = hist_n[b];
+        if count == 0 {
+            continue;
+        }
+        if owner_of(before_w.saturating_add(w), 0, total, parts) < parts_l {
+            before_w = before_w.saturating_add(w);
+            before_n += count;
+            continue;
+        }
+        cut_bin = Some((b, before_w, before_n));
+        break;
+    }
+    let (cut_b, before_w, before_n) = cut_bin.unwrap_or((bins, before_w, before_n));
+    let cut_c = min_c + cut_b as i64;
+    let take = if cut_b >= bins {
+        0
+    } else if owner_of(before_w, 0, total, parts) >= parts_l {
+        0
+    } else {
+        bin_take(ids, geom, axis, cut_c, before_w, total, parts, parts_l)
+    };
+    let light_n = before_n + take;
+    let cut = clamp_cut(light_n, n);
+    arrange_cut(ids, geom, axis, cut_c, take, cut);
+    Some(cut)
+}
+
+fn bin_hist(
+    ids: &[u32],
+    geom: &RcbGeom,
+    axis: usize,
+    min_c: i64,
+    bins: usize,
+) -> Option<(Vec<u64>, Vec<usize>)> {
+    let one = |group: &[u32]| -> Option<(Vec<u64>, Vec<usize>)> {
+        let mut weight = vec![0u64; bins];
+        let mut count = vec![0usize; bins];
+        for &id in group {
+            let c = coord_i64(geom, axis, id)?;
+            let b = (c - min_c) as usize;
+            if b >= bins {
+                return None;
+            }
+            weight[b] = weight[b].saturating_add(geom.w[id as usize]);
+            count[b] += 1;
+        }
+        Some((weight, count))
+    };
+    #[cfg(feature = "parallel")]
+    {
+        if rayon::current_num_threads() > 1 && ids.len() > 1 {
+            use rayon::prelude::*;
+            let chunk = work_chunk(ids.len());
+            let parts: Vec<Option<(Vec<u64>, Vec<usize>)>> =
+                ids.par_chunks(chunk).map(one).collect();
+            let mut weight = vec![0u64; bins];
+            let mut count = vec![0usize; bins];
+            for part in parts {
+                let (w, c) = part?;
+                for b in 0..bins {
+                    weight[b] = weight[b].saturating_add(w[b]);
+                    count[b] += c[b];
+                }
+            }
+            return Some((weight, count));
+        }
+    }
+    one(ids)
+}
+
+fn bin_take(
+    ids: &[u32],
+    geom: &RcbGeom,
+    axis: usize,
+    cut_c: i64,
+    mut before_w: u64,
+    total: u64,
+    parts: u32,
+    parts_l: u32,
+) -> usize {
+    let mut take = 0usize;
+    for &id in ids {
+        let Some(c) = coord_i64(geom, axis, id) else {
+            continue;
+        };
+        if c != cut_c {
+            continue;
+        }
+        let w = geom.w[id as usize];
+        if owner_of(before_w, w, total, parts) >= parts_l {
+            break;
+        }
+        before_w = before_w.saturating_add(w);
+        take += 1;
+    }
+    take
+}
+
+fn arrange_cut(ids: &mut [u32], geom: &RcbGeom, axis: usize, cut_c: i64, take: usize, cut: usize) {
+    let mut seen = 0usize;
+    let mut light = Vec::with_capacity(cut);
+    let mut heavy = Vec::with_capacity(ids.len().saturating_sub(cut));
+    for &id in ids.iter() {
+        let Some(c) = coord_i64(geom, axis, id) else {
+            heavy.push(id);
+            continue;
+        };
+        if c < cut_c || (c == cut_c && seen < take) {
+            if c == cut_c {
+                seen += 1;
+            }
+            light.push(id);
+        } else {
+            heavy.push(id);
+        }
+    }
+    let n = light.len();
+    ids[..n].copy_from_slice(&light);
+    ids[n..].copy_from_slice(&heavy);
+}
+
+fn weighted_cut_quick(
     ids: &mut [u32],
     geom: &RcbGeom,
     axis: usize,
@@ -1406,6 +1618,7 @@ struct Phase {
     select: u64,
     fm: u64,
     pack: u64,
+    schedule: u64,
 }
 
 fn phase_wall(phase: Phase) -> u64 {
@@ -1413,14 +1626,46 @@ fn phase_wall(phase: Phase) -> u64 {
         .select
         .saturating_add(phase.fm)
         .saturating_add(phase.pack)
+        .saturating_add(phase.schedule)
 }
 
 fn record_phase(phase: Phase) {
     SELECT_NS.fetch_add(phase.select, AtomicOrdering::Relaxed);
     FM_NS.fetch_add(phase.fm, AtomicOrdering::Relaxed);
     PACK_NS.fetch_add(phase.pack, AtomicOrdering::Relaxed);
+    SCHEDULE_NS.fetch_add(phase.schedule, AtomicOrdering::Relaxed);
 }
 
+fn join_measured(a: Phase, b: Phase, wall: u64) -> Phase {
+    let sum_w = phase_wall(a).saturating_add(phase_wall(b));
+    let max_w = phase_wall(a).max(phase_wall(b));
+    // A sequential join lasts about as long as the two children.
+    // An overlapped join finishes before that sum.
+    // Ten microseconds covers timer noise, so a sequential join whose
+    // wall sits a few microseconds under the sum stays sequential.
+    let overlapped = wall.saturating_add(10_000) < sum_w;
+    let mut child = if overlapped {
+        if phase_wall(a) >= phase_wall(b) {
+            a
+        } else {
+            b
+        }
+    } else {
+        Phase {
+            select: a.select.saturating_add(b.select),
+            fm: a.fm.saturating_add(b.fm),
+            pack: a.pack.saturating_add(b.pack),
+            schedule: a.schedule.saturating_add(b.schedule),
+        }
+    };
+    let base = if overlapped { max_w } else { sum_w };
+    if wall > base {
+        child.schedule = child.schedule.saturating_add(wall - base);
+    }
+    child
+}
+
+#[cfg_attr(feature = "parallel", allow(dead_code))]
 fn phase_join(a: Phase, b: Phase) -> Phase {
     #[cfg(feature = "parallel")]
     {
@@ -1432,6 +1677,7 @@ fn phase_join(a: Phase, b: Phase) -> Phase {
         select: a.select.saturating_add(b.select),
         fm: a.fm.saturating_add(b.fm),
         pack: a.pack.saturating_add(b.pack),
+        schedule: a.schedule.saturating_add(b.schedule),
     }
 }
 
@@ -1440,6 +1686,7 @@ fn phase_after(select_here: u64, fm_here: u64, pack_here: u64, child: Phase) -> 
         select: select_here.saturating_add(child.select),
         fm: fm_here.saturating_add(child.fm),
         pack: pack_here.saturating_add(child.pack),
+        schedule: child.schedule,
     }
 }
 
@@ -1451,26 +1698,6 @@ struct RcbGeom {
 }
 
 fn rcb_slice(
-    ids: &mut [u32],
-    parts: u32,
-    part0: u32,
-    geom: &RcbGeom,
-    out: SendPtr,
-    graph: &CellGraph,
-    refine_cuts: bool,
-    ratio: (u64, u64),
-) -> Phase {
-    let t_all = Instant::now();
-    let mut phase = rcb_slice_timed(ids, parts, part0, geom, out, graph, refine_cuts, ratio);
-    let elapsed = t_all.elapsed().as_nanos() as u64;
-    let named = phase_wall(phase);
-    if elapsed > named {
-        phase.pack = phase.pack.saturating_add(elapsed - named);
-    }
-    phase
-}
-
-fn rcb_slice_timed(
     ids: &mut [u32],
     parts: u32,
     part0: u32,
@@ -1493,6 +1720,7 @@ fn rcb_slice_timed(
             select: 0,
             fm: 0,
             pack: t_pack.elapsed().as_nanos() as u64,
+            schedule: 0,
         };
     }
     let parts_l = parts / 2;
@@ -1595,7 +1823,17 @@ fn rcb_slice_timed(
             ratio,
         )
     };
-    phase_after(select_here, fm_here, pack_here, child)
+    let t_drop = Instant::now();
+    drop(left);
+    drop(right);
+    drop(side);
+    let pack_drop = t_drop.elapsed().as_nanos() as u64;
+    phase_after(
+        select_here,
+        fm_here,
+        pack_here.saturating_add(pack_drop),
+        child,
+    )
 }
 
 fn descend(
@@ -1615,6 +1853,7 @@ fn descend(
     {
         let left_out = out;
         let right_out = out;
+        let t_join = Instant::now();
         let (a, b) = rayon::join(
             move || {
                 rcb_slice(
@@ -1641,7 +1880,8 @@ fn descend(
                 )
             },
         );
-        return phase_join(a, b);
+        let wall = t_join.elapsed().as_nanos() as u64;
+        return join_measured(a, b, wall);
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -2455,23 +2695,55 @@ fn check_graph(graph: &CellGraph) -> Result<usize, Error> {
     if expect != n || graph.offsets.len() != n + 1 || graph.offsets[0] != 0 {
         return Err(Error::BadGraph);
     }
-    let mut prev = 0u32;
-    for &off in &graph.offsets {
-        if off < prev {
-            return Err(Error::BadGraph);
-        }
-        prev = off;
+    if !offsets_increase(&graph.offsets) {
+        return Err(Error::BadGraph);
     }
     let narc = graph.offsets[n] as usize;
     if graph.neighbor.len() != narc || graph.edge_weight.len() != narc {
         return Err(Error::BadGraph);
     }
-    for &nbr in &graph.neighbor {
-        if nbr as usize >= n {
-            return Err(Error::BadGraph);
-        }
+    if !neighbors_in_range(&graph.neighbor, n) {
+        return Err(Error::BadGraph);
     }
     Ok(n)
+}
+
+fn offsets_increase(offsets: &[u32]) -> bool {
+    let check = |start: usize, part: &[u32]| -> bool {
+        let mut prev = if start == 0 { 0 } else { offsets[start - 1] };
+        for &off in part {
+            if off < prev {
+                return false;
+            }
+            prev = off;
+        }
+        true
+    };
+    #[cfg(feature = "parallel")]
+    {
+        if rayon::current_num_threads() > 1 && offsets.len() > 1 {
+            use rayon::prelude::*;
+            let chunk = work_chunk(offsets.len());
+            return offsets
+                .par_chunks(chunk)
+                .enumerate()
+                .all(|(index, part)| check(index * chunk, part));
+        }
+    }
+    check(0, offsets)
+}
+
+fn neighbors_in_range(neighbor: &[u32], n: usize) -> bool {
+    let inside = |part: &[u32]| part.iter().all(|&nbr| (nbr as usize) < n);
+    #[cfg(feature = "parallel")]
+    {
+        if rayon::current_num_threads() > 1 && neighbor.len() > 1 {
+            use rayon::prelude::*;
+            let chunk = work_chunk(neighbor.len());
+            return neighbor.par_chunks(chunk).all(inside);
+        }
+    }
+    inside(neighbor)
 }
 
 fn check_assign(grid: &CellGrid, assign: &[u32]) -> Result<usize, Error> {
@@ -2706,6 +2978,33 @@ mod tests {
         let mut by_cmp = coords.clone();
         by_cmp.sort_by(|a, b| morton_cmp(*a, *b));
         assert_eq!(by_key, by_cmp);
+    }
+
+    #[test]
+    fn histogram_median_matches_quickselect() {
+        let mut weight = vec![1u64; 60];
+        weight[3] = 5;
+        weight[11] = 8;
+        weight[40] = 2;
+        let geom = RcbGeom {
+            x: (0..60).map(|i| (i % 9) as f64).collect(),
+            y: (0..60).map(|i| (i % 4) as f64).collect(),
+            z: (0..60).map(|i| (i % 3) as f64).collect(),
+            w: weight,
+        };
+        let total = geom.w.iter().sum();
+        for axis in 0..3 {
+            let mut hist = (0..60u32).collect::<Vec<_>>();
+            let mut quick = hist.clone();
+            let got = weighted_cut_bins(&mut hist, &geom, axis, total, 8, 4).unwrap();
+            let expect = weighted_cut_quick(&mut quick, &geom, axis, total, 8, 4);
+            assert_eq!(got, expect, "axis {axis}");
+            let mut a = hist[..got].to_vec();
+            let mut b = quick[..expect].to_vec();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "set axis {axis}");
+        }
     }
 
     #[test]
