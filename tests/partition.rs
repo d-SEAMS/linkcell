@@ -294,3 +294,27 @@ fn small_grid_cuts_meet_the_balanced_optimum() {
     .unwrap();
     assert!(edge_cut(&graph, &refined) <= edge_cut(&graph, &plain));
 }
+
+#[test]
+fn rcb_on_cell_counts_matches_the_pair_graph() {
+    let sim = Cell::ortho(18.0, 18.0, 12.0).unwrap();
+    let xyz = cloud(3000, 18.0, 11);
+    let graph = cell_graph(&xyz, &sim, 4.0, None, None).unwrap();
+    let request = PartRequest {
+        parts: 8,
+        method: Method::Rcb,
+        balance: None,
+        device: false,
+    };
+    let from_graph = linkcell::partition_graph(&graph, request).unwrap();
+    let from_counts = partition(&xyz, &sim, 4.0, None, None, request).unwrap();
+    assert_eq!(from_counts, from_graph);
+    let (num, den) = derived_balance(&graph.grid.weight, 8);
+    let total: u64 = graph.grid.weight.iter().sum();
+    let cap = (u128::from(total) * u128::from(num)) / (8 * u128::from(den));
+    let mut part = vec![0u64; 8];
+    for (c, &d) in from_counts.iter().enumerate() {
+        part[d as usize] += graph.grid.weight[c];
+    }
+    assert!(part.iter().all(|&w| u128::from(w) <= cap));
+}

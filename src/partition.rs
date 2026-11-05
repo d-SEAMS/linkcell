@@ -113,6 +113,18 @@ impl Method {
         matches!(self, Method::HilbertFm | Method::RcbFm)
     }
 
+    /// True when the cut reads pair-count arcs.
+    ///
+    /// A plain recursive coordinate bisection and a curve prefix use the
+    /// link-cell point counts only. Refinement, coarsening, and Scotch
+    /// walk the arcs, so those methods still build them.
+    fn needs_edges(self) -> bool {
+        matches!(
+            self,
+            Method::HilbertFm | Method::RcbFm | Method::Scotch | Method::PtScotch | Method::Multi
+        )
+    }
+
     fn from_code(code: u8) -> Result<Self, Error> {
         match code {
             0 => Ok(Method::Morton),
@@ -383,7 +395,18 @@ pub fn partition(
     cell_hint: Option<f64>,
     request: PartRequest,
 ) -> Result<Vec<u32>, Error> {
-    let prep = prepared(xyz, sim, cutoff, mask, cell_hint, true)?;
+    // The pair list is a full sort of every cutoff arc. A method that
+    // only reads cell counts must not build it: on the million-point
+    // frame that list is the whole call, and the bisection is the
+    // median of the link-cell bins.
+    let prep = prepared(
+        xyz,
+        sim,
+        cutoff,
+        mask,
+        cell_hint,
+        request.method.needs_edges(),
+    )?;
     partition_prepared(&prep, request)
 }
 
