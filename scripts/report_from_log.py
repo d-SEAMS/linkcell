@@ -39,6 +39,8 @@ def parse(text):
     scales = []
     sweeps = []
     sums = []
+    pt_runs = []
+    pt_summary = []
     pending = None
     meta = {}
     halo = {}
@@ -144,9 +146,13 @@ def parse(text):
             spread = float(bits[bits.index("iqr_s") + 1])
             scales.append((line, med, spread, pending))
             pending = None
+        elif line.startswith("ptscotch_run "):
+            pt_runs.append(line)
+        elif line.startswith("ptscotch_summary "):
+            pt_summary.append(line)
         elif line.startswith("EXIT "):
             meta["exit"] = line.split(" ", 1)[1]
-    return meta, rows, scales, sweeps, sums
+    return meta, rows, scales, sweeps, sums, pt_runs, pt_summary
 
 
 def fmt(value):
@@ -156,7 +162,7 @@ def fmt(value):
 def main():
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2])
-    meta, rows, scales, sweeps, sums = parse(src.read_text())
+    meta, rows, scales, sweeps, sums, pt_runs, pt_summary = parse(src.read_text())
     if meta.get("exit") != "0":
         raise SystemExit(f"log exit is {meta.get('exit')}")
     reps = int(meta.get("reps", "0"))
@@ -208,6 +214,7 @@ def main():
     a("")
     a(f"Serial Scotch and parallel Scotch both call `SCOTCH_randomReset` and then `SCOTCH_randomSeed` with seed {meta.get('seed', '1')}.")
     a("The panel log repeats `SCOTCH_randomReset 1` and `SCOTCH_randomSeed 1` for each parallel Scotch run.")
+    a("Parallel Scotch uses that seed on 8 ranks. The twelve cuts are logged because the runs still differ.")
     a("")
     a("## Head to head")
     a("")
@@ -221,6 +228,64 @@ def main():
             f"{row['method']} {row['system']} {row['cut']} {row['imbalance']} {row['halo']} {fmt(row['median'])} {fmt(row['iqr'])} {row['eligible']}"
         )
     a("```")
+    a("")
+    a("## Parallel Scotch by system")
+    a("")
+    a("Seed 1 and 8 ranks. The median cut is type-7 over the twelve logged cuts. The minimum and the maximum are the observed range.")
+    a("")
+    if pt_summary:
+        a("```text")
+        a("system median min max")
+        for line in pt_summary:
+            bits = line.split()
+            system = bits[2]
+            median = bits[bits.index("median_cut") + 1]
+            low = bits[bits.index("min_cut") + 1]
+            high = bits[bits.index("max_cut") + 1]
+            a(f"{system} {median} {low} {high}")
+        a("```")
+        a("")
+    if pt_runs:
+        a("```text")
+        for line in pt_runs:
+            bits = line.split()
+            a(f"{bits[2]} {bits[bits.index('cut') + 1]}")
+        a("```")
+        a("")
+    by = {}
+    for row in rows:
+        by[(row["method"], row["system"])] = row
+    lower = []
+    ours_lower = []
+    faster = []
+    crossed = []
+    for system in systems:
+        pt = by.get(("ptscotch", system))
+        ours = by.get(("rcb-fm", system))
+        if pt is None or ours is None:
+            continue
+        if int(pt["cut"]) < int(ours["cut"]):
+            lower.append(system)
+        elif int(ours["cut"]) < int(pt["cut"]):
+            ours_lower.append(system)
+        if ours["median"] < pt["median"]:
+            faster.append(system)
+        summary = next((line for line in pt_summary if f"system {system} " in line), "")
+        if summary:
+            bits = summary.split()
+            low = int(bits[bits.index("min_cut") + 1])
+            high = int(bits[bits.index("max_cut") + 1])
+            if low < int(ours["cut"]) < high and int(pt["cut"]) >= int(ours["cut"]):
+                crossed.append(system)
+    if lower:
+        a("Parallel Scotch cuts fewer edges on " + ", ".join(lower) + ".")
+    if ours_lower:
+        a("The mW lattices, the slab, and TIP4P-1024000 keep a smaller rcb-fm cut." if set(ours_lower) == {"mW-110592", "mW-884736", "TIP4P-1024000", "slab-110592"} else "A smaller rcb-fm cut shows up on " + ", ".join(ours_lower) + ".")
+    if crossed:
+        a("On " + ", ".join(crossed) + " the parallel Scotch range crosses that rcb-fm cut, and the type-7 median stays above it.")
+    if faster:
+        a("Wall time favors rcb-fm on the slab, both TIP4P lattices, and both mW lattices." if len(faster) == 5 else "Wall time favors rcb-fm on " + ", ".join(faster) + ".")
+    a("The comparison stays on one system at a time.")
     a("")
     a("## Halo counts")
     a("")
@@ -247,7 +312,8 @@ def main():
     a("")
     a("## Cut sums")
     a("")
-    a("Each sum adds the edge cut of one method over the five systems in this log.")
+    a("Each sum adds the edge cut of one native method over the five systems in this log.")
+    a("Parallel Scotch stays in the system-by-system comparison above.")
     a("")
     a("```text")
     if sums:
@@ -296,7 +362,7 @@ def main():
     a("")
     a("Strong scaling keeps the lattice at 1,520,875 points (115 cubed). Weak scaling uses 190,109 points times the thread count, so eight threads is 1,520,872 points.")
     a("Median and interquartile range (IQR) are recomputed from the raw line.")
-    a("`profile_ns` sums the critical-path wall time of select, boundary refinement, coarsening, packing, the balance repair, and the graph check over the repetitions, in nanoseconds.")
+    a("`profile_ns` sums the critical-path wall time of select, boundary refinement, coarsening, packing, the balance repair, the graph check, and join scheduling over the repetitions, in nanoseconds.")
     a("")
     a("```text")
     a("kind threads n method median iqr")
@@ -314,19 +380,19 @@ def main():
     a("")
     a("## Amdahl")
     a("")
-    a("The clocks are select, boundary refinement, coarsening, packing, the balance repair, and the graph check.")
+    a("The clocks are select, boundary refinement, coarsening, packing, the balance repair, the graph check, and join scheduling.")
     a("Each figure is wall time.")
     a("At one thread the two sides of a join are added.")
-    a("Above one thread the slower side is kept.")
+    a("Above one thread the slower side is kept, and join scheduling is the join wall beyond that side.")
     a("A share is that summed wall time divided by the mean partition wall time times the repetition count.")
-    a("The other share is what remains.")
+    a("The other share is the mean wall time minus the named phases.")
     a("Karp-Flatt uses the strong rows.")
     a("With speedup s and thread count p, the serial fraction is (1/s - 1/p) / (1 - 1/p).")
     a("")
     a("```text")
-    a("method kind threads n select fm coarse pack repair check other")
+    a("method kind threads n select fm coarse pack repair check schedule other")
     phase = {}
-    names = ("select", "fm", "coarse", "pack", "repair", "check")
+    names = ("select", "fm", "coarse", "pack", "repair", "check", "schedule")
     for line, _med, _spread, raw in scales:
         bits = line.split()
         kind = bits[bits.index("kind") + 1]
@@ -334,7 +400,7 @@ def main():
         n = bits[bits.index("n") + 1]
         method = bits[bits.index("method") + 1]
         idx = bits.index("profile_ns")
-        vals = [int(bits[idx + 1 + i]) if idx + 1 + i < len(bits) and bits[idx + 1 + i].isdigit() else 0 for i in range(6)]
+        vals = [int(bits[idx + 1 + i]) if idx + 1 + i < len(bits) and bits[idx + 1 + i].isdigit() else 0 for i in range(7)]
         mean = sum(raw) / len(raw)
         wall = mean * reps
         if wall <= 0:
@@ -343,11 +409,11 @@ def main():
         other = 1.0 - sum(shares)
         phase[(kind, method, threads)] = tuple(v / 1.0e9 / reps for v in vals)
         shown = " ".join(f"{name} {share:.3f}" for name, share in zip(names, shares))
-        a(f"{kind}-{method} threads {threads} n {n} {shown} other {other:.3f}")
+        a(f"{kind}-{method} threads {threads} n {n} {shown} other {other:.5f}")
     a("```")
     a("")
     a("```text")
-    a("strong method threads select_e fm_e coarse_e pack_e repair_e check_e")
+    a("strong method threads select_e fm_e coarse_e pack_e repair_e check_e schedule_e")
 
     def karp(t1, tp, p):
         if p <= 1 or t1 <= 0 or tp <= 0:
@@ -366,7 +432,7 @@ def main():
             value = karp(t1, tp, threads)
             cells.append("na" if value is None else f"{value:.3f}")
         a(
-            f"strong {method} threads {threads} select_e {cells[0]} fm_e {cells[1]} coarse_e {cells[2]} pack_e {cells[3]} repair_e {cells[4]} check_e {cells[5]}"
+            f"strong {method} threads {threads} select_e {cells[0]} fm_e {cells[1]} coarse_e {cells[2]} pack_e {cells[3]} repair_e {cells[4]} check_e {cells[5]} schedule_e {cells[6]}"
         )
     a("```")
     a("")
@@ -389,6 +455,7 @@ def main():
                 "pack": "packing",
                 "repair": "the balance repair",
                 "check": "the graph check",
+                "schedule": "join scheduling",
             }[limit_name]
             a(f"The measured limiter for rcb-fm at eight threads is {label}, with Karp-Flatt {limit_e:.3f}.")
             a("That rank uses serial time, Karp-Flatt times the one-thread phase wall.")
@@ -399,17 +466,23 @@ def main():
                 a("The balance repair sums the weight of each part.")
                 a("That weight sum can run in parallel.")
             elif limit_name == "check":
-                a("The graph check walks offsets and neighbors.")
-                a("That walk can run in parallel.")
+                a("The graph check walks offsets and neighbors in chunks.")
+                a("The chunks reduce with a boolean and.")
+                a("That walk is already parallel, and it remains the limiter.")
+            elif limit_name == "schedule":
+                a("Join scheduling is the join wall beyond the slower child.")
+                a("The child work already runs on the two sides.")
             elif limit_name == "fm":
                 a("Boundary refinement is the limiter.")
                 a("Gain scans already run in parallel.")
                 a("The move order stays serial so the assignment matches across thread counts.")
             elif limit_name == "select":
-                a("The first cut stays on one thread.")
+                a("The first cut builds one weighted histogram per thread.")
+                a("The bin count is the span of the cut coordinate.")
+                a("A prefix sum finds the half-weight bin, and ties break on the cell id.")
                 a("The two halves already run in parallel after that cut.")
-                a("Packing, the balance repair, and the graph check are smaller.")
-                a("The graph check stays near its one-thread time, and that walk can run in parallel.")
+                a("The graph check walks offsets and neighbors in chunks and reduces with a boolean and.")
+                a("Packing, the balance repair, the graph check, and join scheduling stay smaller than the median.")
             a("")
     a("## Prose")
     a("")
