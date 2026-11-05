@@ -319,7 +319,8 @@ struct CellGraph {
 };
 
 /// Domain id of each cell. `method` matches `lc_partition`.
-/// `balance <= 0` selects the derived bound. `device` asks for the CUDA curve split.
+/// `balance <= 0` selects `1 + parts * w_max / total`.
+/// `w_max` is the heaviest cell weight. `device` asks for the CUDA curve split.
 [[nodiscard]] inline std::vector<int>
 partition(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
           std::size_t parts, int method = 4, const int *mask = nullptr,

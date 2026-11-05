@@ -162,8 +162,10 @@ adjacency. Edge weights are pair counts from `lc_pairs_within` with
 `half` set. `lc_partition` writes one domain id per cell. `method` is
 0 Morton, 1 Hilbert, 2 recursive coordinate bisection (RCB), 3 Hilbert plus
 Fiduccia-Mattheyses, 4 bisection plus that pass, 5 Scotch, 6 multilevel,
-7 parallel Scotch. `balance <= 0` selects the derived bound
-`1 + parts * heaviest_cell / total_weight`. `lc_halo_width` writes three bin radii for
+7 parallel Scotch. `balance <= 0` selects `1 + parts * w_max / total`,
+where `w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
+That is the tightest bound a cell-aligned cut can promise, and it is the ratio the d-SEAMS domain driver derives per frame.
+`lc_halo_width` writes three bin radii for
 `cutoff * depth`. `lc_halo` writes the ghost cell ids.
 
 A null weight or domain pointer queries the count. The C++ wrappers

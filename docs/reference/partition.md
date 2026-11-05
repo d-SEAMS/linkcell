@@ -23,8 +23,11 @@ The default method is `rcb-fm`.
 On the five-system panel it has the smallest sum of edge cuts among the native methods that stay within the balance bound on every system.
 A tie breaks toward the smaller sum of median wall times.
 
-With `balance: None`, the bound is `1 + parts * heaviest_cell / total_weight`.
-A part may exceed the ideal share `total_weight / parts` by at most the heaviest cell, because a weighted median assigns that cell to one side.
+With `balance: None`, and with `lc_partition` when `balance <= 0`, the bound is `1 + parts * w_max / total`.
+`w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
+A weighted median assigns that indivisible cell to one side, so a part may exceed the ideal share `total / parts` by at most `w_max`.
+That is the tightest bound a cell-aligned cut can promise.
+The d-SEAMS domain driver derives the same ratio for each frame, and this entry point uses that rule so the two stay consistent.
 The same formula is used for every system.
 The caller can pass another bound of at least 1.
 A cell is never split.

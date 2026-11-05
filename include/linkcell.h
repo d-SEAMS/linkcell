@@ -348,8 +348,10 @@ int lc_cell_graph(const double *xyz,
  *
  * `method` is 0 Morton, 1 Hilbert, 2 recursive coordinate bisection,
  * 3 Hilbert plus Fiduccia-Mattheyses, 4 bisection plus that pass,
- * 5 Scotch, 6 multilevel, 7 PT-Scotch. `balance <= 0` selects the
- * derived bound `1 + parts * heaviest_cell / total_weight`. `device` nonzero runs
+ * 5 Scotch, 6 multilevel, 7 PT-Scotch. `balance <= 0` selects
+ * `1 + parts * w_max / total`, where `w_max` is the heaviest cell
+ * weight and `total` is the sum of the cell weights. That is the
+ * tightest bound a cell-aligned cut can promise. `device` nonzero runs
  * the curve split on the CUDA device and returns nonzero when that
  * device is absent. A null `out_domain` queries `*out_ncell`.
  *

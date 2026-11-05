@@ -515,7 +515,7 @@ fn main() {
     println!("halo_fraction largest ghost-cell count divided by owned-cell count");
     println!("parts {parts}");
     println!("reps {reps}");
-    println!("balance_bound 1 + parts * heaviest_cell / total_weight");
+    println!("balance_bound 1 + parts * w_max / total");
     println!("quantile type-7");
     println!("sweep_ratios 1.00 1.01 1.02 1.05 1.10");
     let rho = density_per_angstrom();

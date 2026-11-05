@@ -94,6 +94,8 @@ def parse(text):
             imb = bits[bits.index("imbalance") + 1]
             halo_f = bits[bits.index("halo_fraction") + 1]
             eligible = bits[bits.index("eligible") + 1]
+            printed_med = bits[bits.index("median_s") + 1]
+            printed_iqr = bits[bits.index("iqr_s") + 1]
             if pending is None:
                 raise SystemExit(f"missing raw samples for {name} {method}")
             med, spread = iqr(pending)
@@ -104,8 +106,10 @@ def parse(text):
                     "cut": cut,
                     "imbalance": imb,
                     "halo": halo_f,
-                    "median": med,
-                    "iqr": spread,
+                    "median": float(printed_med),
+                    "iqr": float(printed_iqr),
+                    "re_median": med,
+                    "re_iqr": spread,
                     "eligible": eligible,
                     "raw": pending,
                     "owned": halo.get("owned", ""),
@@ -120,13 +124,17 @@ def parse(text):
         elif line.startswith("sweep "):
             if pending is None:
                 raise SystemExit(f"missing raw samples for {line}")
-            med, spread = iqr(pending)
+            bits = line.split()
+            med = float(bits[bits.index("median_s") + 1])
+            spread = float(bits[bits.index("iqr_s") + 1])
             sweeps.append((line, med, spread, pending))
             pending = None
         elif line.startswith("scale_row "):
             if pending is None:
                 raise SystemExit(f"missing raw samples for {line}")
-            med, spread = iqr(pending)
+            bits = line.split()
+            med = float(bits[bits.index("median_s") + 1])
+            spread = float(bits[bits.index("iqr_s") + 1])
             scales.append((line, med, spread, pending))
             pending = None
         elif line.startswith("EXIT "):
@@ -166,7 +174,7 @@ def main():
     a("Ring membership, the Message Passing Interface (MPI) share, and ice clustering stay in seams-core.")
     a("eOn calls `pairs_within` only. rgpot does not call linkcell. readcon-core reads configuration (CON) frames and is not a caller.")
     a("")
-    a("This report is generated from one log. Every median and every interquartile range (IQR) is recomputed from the raw sample line for that cell. The type-7 quantile is the same rule the panel uses.")
+    a("This report is generated from one log. Every median and every interquartile range (IQR) is the value that log printed for that cell. The raw sample line is the series those values came from, at type-7.")
     a("")
     a(f"Hardware is {meta.get('hardware', 'Intel Xeon Processor')}, {meta.get('cores', '8')} physical cores, one thread per core, one node.")
     a("A second node was not run. The log line is `multi_node HOST NOT-RUN`, where HOST is the host process.")
@@ -206,17 +214,10 @@ def main():
     a("")
     a("## Halo counts")
     a("")
-    a("The rows below are the domain with the largest ghost-to-owned ratio for the last native method in the log, together with the bin widths in angstroms.")
+    a("Each row is the domain with the largest ghost-to-owned ratio on the last method that printed halo counts, with bin widths in angstroms.")
     a("")
     a("| System | Cells | Bin widths | Owned | Ghost |")
     a("| --- | ---: | --- | ---: | ---: |")
-    seen = set()
-    for row in rows:
-        if row["system"] in seen or not row["owned"]:
-            continue
-        # keep the last row that recorded halo for this system: overwrite by scanning
-        seen.add(row["system"])
-    # rescan for the last owned count per system
     last = {}
     for row in rows:
         if row["owned"]:

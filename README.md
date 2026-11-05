@@ -232,8 +232,11 @@ weight is the number of cutoff pairs with one end in each bin.
 cutoff and a shell count into three bin radii, and `halo` lists the
 ghost bins of one domain.
 
-The balance bound defaults to `1 + parts * heaviest_cell / total_weight` for every system.
+The balance bound defaults to `1 + parts * w_max / total` for every system.
+`w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
+`lc_partition` selects that ratio when `balance <= 0`.
 A weighted median assigns the straddling cell to one side, so a part can exceed the ideal share by at most that cell.
+That is the tightest bound a cell-aligned cut can promise, and it is the ratio the d-SEAMS domain driver derives per frame.
 The default method is chosen from the five-system panel in
 `examples/partition_panel.rs`: the native method with the smallest
 sum of edge cuts, among those that stay inside that bound, with a

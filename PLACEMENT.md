@@ -92,11 +92,15 @@ linkcell, in Rust, C (`lc_*`), C++ Resource Acquisition Is Initialization, and P
   cutoff and hint.
 - `cell_graph` adds the periodic adjacency. Each undirected edge's
   weight is the pair count from `pairs_within` (`half` set).
-- `partition` returns one domain id per cell. Methods are a Morton
-  curve, a Hilbert curve, weighted recursive coordinate bisection,
-  and a Fiduccia-Mattheyses pass under a balance bound. The bound is
-  an argument. The default is `1 + parts * heaviest_cell / total_weight`
-  for every system.
+- `partition` and `lc_partition` return one domain id per cell.
+  Methods are a Morton curve, a Hilbert curve, weighted recursive
+  coordinate bisection, and a Fiduccia-Mattheyses pass under a balance
+  bound. With `balance <= 0`, both use `1 + parts * w_max / total`.
+  `w_max` is the heaviest cell weight. `total` is the sum of the cell
+  weights. A weighted median assigns that indivisible cell to one side,
+  so a cell-aligned cut cannot promise a tighter bound. The d-SEAMS
+  domain driver derives the same ratio for each frame. A caller may
+  pass a looser bound. The default is this ratio on every system.
 - `halo_width(cutoff, depth, bin_width)` returns the three bin radii.
 - `halo` returns the ghost cell ids of one domain.
 - Parallel Scotch (PT-Scotch) is the `ptscotch` feature, off by default, and is not

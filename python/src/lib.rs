@@ -607,8 +607,9 @@ fn cell_graph_py<'py>(
 /// Domain id of each cell.
 ///
 /// `method` is `default`, `morton`, `hilbert`, `rcb`, `hilbert-fm`,
-/// `rcb-fm`, `multi`, or `scotch`. `balance` of `None` selects the
-/// derived bound `1 + parts * heaviest_cell / total_weight`.
+/// `rcb-fm`, `multi`, or `scotch`. `balance` of `None` selects
+/// `1 + parts * w_max / total`, where `w_max` is the heaviest cell
+/// weight and `total` is the sum of the cell weights.
 /// `device` runs the curve split on CUDA and raises when that device
 /// is absent.
 #[pyfunction]

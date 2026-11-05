@@ -27,9 +27,11 @@ use crate::Error;
 ///
 /// A weighted median gives the straddling cell to one part. That part
 /// may therefore exceed the ideal share `total / parts` by at most the
-/// heaviest cell. The bound is `(total + parts * w_max) / total`, which
-/// is `1 + parts * w_max / total`. The same formula is used for every
-/// system. `balance: None` selects it.
+/// heaviest cell `w_max`. The bound is `(total + parts * w_max) / total`,
+/// which is `1 + parts * w_max / total`. No cell-aligned cut can promise
+/// a tighter bound. `lc_partition` selects it when `balance <= 0`, which
+/// is the same per-frame rule the d-SEAMS domain driver derives.
+/// The same formula is used for every system. `balance: None` selects it.
 pub fn derived_balance(weight: &[u64], parts: u32) -> (u64, u64) {
     let total: u64 = weight.iter().copied().sum();
     if total == 0 || parts == 0 {
@@ -904,7 +906,96 @@ fn dispatch(
     if method.refines() {
         refine(&mut assign, graph, parts, ratio);
     }
+    if matches!(method, Method::RcbFm | Method::HilbertFm | Method::Multi) {
+        repair_balance(&mut assign, graph, parts, ratio);
+    }
+    if matches!(method, Method::RcbFm | Method::Multi)
+        && !holds_balance(&graph.grid.weight, &assign, parts, ratio)
+    {
+        assign = rcb_assign(graph, parts, false, ratio);
+    }
     Ok(assign)
+}
+
+fn part_cap(total: u64, parts: u32, ratio: (u64, u64)) -> u64 {
+    let (num, den) = ratio;
+    if parts == 0 || den == 0 {
+        return total;
+    }
+    ((u128::from(total) * u128::from(num)) / (u128::from(parts) * u128::from(den))) as u64
+}
+
+/// Move boundary weight off any part that finished above the cap.
+fn repair_balance(assign: &mut [u32], graph: &CellGraph, parts: u32, ratio: (u64, u64)) {
+    if parts <= 1 {
+        return;
+    }
+    let n = assign.len();
+    let weight = &graph.grid.weight;
+    let total: u64 = weight.iter().copied().sum();
+    let cap = part_cap(total, parts, ratio);
+    let mut part_w = vec![0u64; parts as usize];
+    for (c, &d) in assign.iter().enumerate() {
+        if (d as usize) < part_w.len() {
+            part_w[d as usize] += weight[c];
+        }
+    }
+    for _ in 0..n {
+        let Some(src) = part_w.iter().position(|&w| w > cap) else {
+            return;
+        };
+        let mut best: Option<(i64, usize, u32)> = None;
+        for cell in 0..n {
+            if assign[cell] as usize != src {
+                continue;
+            }
+            let w = weight[cell];
+            if w == 0 || part_w[src] < w || !part_boundary(cell, assign, graph) {
+                continue;
+            }
+            let lo = graph.offsets[cell] as usize;
+            let hi = graph.offsets[cell + 1] as usize;
+            let mut dests: Vec<u32> = Vec::new();
+            let mut to_src = 0i64;
+            let mut to_dest_w = vec![0i64; parts as usize];
+            for e in lo..hi {
+                let nbr = graph.neighbor[e] as usize;
+                let dest = assign[nbr];
+                let ww = graph.edge_weight[e] as i64;
+                if dest as usize == src {
+                    to_src += ww;
+                } else if (dest as usize) < to_dest_w.len() {
+                    to_dest_w[dest as usize] += ww;
+                    if !dests.contains(&dest) {
+                        dests.push(dest);
+                    }
+                }
+            }
+            for dest in dests {
+                if part_w[dest as usize].saturating_add(w) > cap {
+                    continue;
+                }
+                let gain = to_dest_w[dest as usize] - to_src;
+                let take = match best {
+                    None => true,
+                    Some((bg, bcell, bdest)) => {
+                        gain > bg
+                            || (gain == bg && (cell < bcell || (cell == bcell && dest < bdest)))
+                    }
+                };
+                if take {
+                    best = Some((gain, cell, dest));
+                }
+            }
+        }
+        let Some((_, cell, dest)) = best else {
+            return;
+        };
+        let w = weight[cell];
+        part_w[src] -= w;
+        part_w[dest as usize] += w;
+        assign[cell] = dest;
+    }
 }
 
 fn curve_assign(graph: &CellGraph, parts: u32, method: Method) -> Result<Vec<u32>, Error> {
