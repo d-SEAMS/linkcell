@@ -306,7 +306,10 @@ def main():
         threads = bits[bits.index("threads") + 1]
         n = bits[bits.index("n") + 1]
         method = bits[bits.index("method") + 1]
-        a(f"{kind} {threads} {n} {method} {fmt(med)} {fmt(spread)}")
+        digest = ""
+        if "assign_hash" in bits:
+            digest = " " + bits[bits.index("assign_hash") + 1]
+        a(f"{kind} {threads} {n} {method} {fmt(med)} {fmt(spread)}{digest}")
     a("```")
     a("")
     a("## Amdahl")

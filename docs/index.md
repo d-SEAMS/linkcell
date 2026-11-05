@@ -1,8 +1,10 @@
 # linkcell documentation
 
-Periodic linked-cell k-nearest neighbour search. The Rust crate is the
-implementation. The C ABI (`lc_*`) is the hourglass waist. C++ is a
-typed header over that ABI. Python is DLPack (dlpk) over that waist.
+Periodic linked-cell k-nearest neighbour search.
+The Rust crate is the implementation.
+The C ABI (`lc_*`) is the hourglass waist.
+C++ is a typed header over that ABI.
+Python is DLPack (dlpk) over that waist.
 
 ## Tutorials
 
@@ -24,4 +26,4 @@ typed header over that ABI. Python is DLPack (dlpk) over that waist.
 ## Explanation
 
 - [Minimum image and linked cells](explanation/mic-and-cells.md)
-- [SIMD paths and dispatch](explanation/simd-paths.md)
+- [Single Instruction, Multiple Data (SIMD) paths and dispatch](explanation/simd-paths.md)

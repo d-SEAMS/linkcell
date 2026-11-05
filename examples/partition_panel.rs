@@ -531,11 +531,12 @@ fn scale_case(parts: u32, reps: usize) {
     ];
     let mut samples = vec![Vec::with_capacity(reps); chosen.len()];
     let mut prof = vec![(0u64, 0u64, 0u64); chosen.len()];
-    for _ in 0..reps {
+    let mut hashes = vec![0u64; chosen.len()];
+    for rep in 0..reps {
         for (i, (name, method)) in chosen.iter().enumerate() {
             linkcell::profile_reset();
             let t0 = Instant::now();
-            partition_graph(
+            let assign = partition_graph(
                 &graph,
                 PartRequest {
                     parts,
@@ -550,6 +551,12 @@ fn scale_case(parts: u32, reps: usize) {
             prof[i].0 += sel;
             prof[i].1 += fm;
             prof[i].2 += coarse;
+            let hash = assign_hash(&assign);
+            if rep == 0 {
+                hashes[i] = hash;
+            } else if hashes[i] != hash {
+                panic!("scale {name} assignment changed across repetitions");
+            }
         }
     }
     for (i, (name, _)) in chosen.iter().enumerate() {
@@ -557,9 +564,20 @@ fn scale_case(parts: u32, reps: usize) {
         let (median, spread) = iqr(samples[i].clone());
         let (sel, fm, coarse) = prof[i];
         println!(
-            "scale_row kind {kind} threads {threads} n {n} method {name} median_s {median:.6} iqr_s {spread:.6} profile_ns {sel} {fm} {coarse}"
+            "scale_row kind {kind} threads {threads} n {n} method {name} median_s {median:.6} iqr_s {spread:.6} profile_ns {sel} {fm} {coarse} assign_hash {:016x}",
+            hashes[i]
         );
     }
+}
+
+/// FNV-1a over the domain ids. The same assignment always prints the same hash.
+fn assign_hash(assign: &[u32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &domain in assign {
+        hash ^= u64::from(domain);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn main() {

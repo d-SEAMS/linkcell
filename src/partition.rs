@@ -1874,7 +1874,9 @@ fn bisect_gains(
     };
     #[cfg(feature = "parallel")]
     {
-        if rayon::current_num_threads() > 1 && n >= 128 {
+        // The parallel map writes one slot per index, so it matches the
+        // serial map at every length. One thread stays on the serial map.
+        if rayon::current_num_threads() > 1 {
             use rayon::prelude::*;
             return (0..n).into_par_iter().map(one).collect();
         }
@@ -1930,7 +1932,9 @@ fn kway_proposal(
     };
     #[cfg(feature = "parallel")]
     {
-        if rayon::current_num_threads() > 1 && n >= 128 {
+        // Same rule as the bisection gain scan: every length, and only
+        // when the pool has more than one thread.
+        if rayon::current_num_threads() > 1 {
             use rayon::prelude::*;
             return (0..n).into_par_iter().map(one).collect();
         }

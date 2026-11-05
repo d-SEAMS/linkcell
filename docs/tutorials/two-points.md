@@ -23,7 +23,8 @@ int main(void) {
 }
 ```
 
-`xyz` is packed `x y z` triples. `out` has length `n * k` (here 2).
+`xyz` is packed `x y z` triples.
+`out` has length `n * k` (here 2).
 `n` and `k` are `size_t`; the integer literals convert.
 `out[i * k + j]` is the `j`-th neighbour of source `i`, nearest first.
 Unused slots are `-1`.
@@ -42,24 +43,26 @@ Prints:
 1 -> 0
 ```
 
-`examples/two_points.c` is a longer form (cubic and sheared). A
-Meson or CMake build of the crate runs it as the `two_points` test.
+`examples/two_points.c` is a longer form (cubic and sheared).
+A Meson or CMake build of the crate runs it as the `two_points` test.
 
 ## Periodic image
 
+The wrap is a nearer image.
 Replace the coordinates with a pair that wraps:
 
 ```c
   double xyz[] = {0.2, 0.0, 0.0, 9.4, 0.0, 0.0};
 ```
 
-The printed pairing is still `0 -> 1` and `1 -> 0`. The image across
-the a-face (distance 0.8) is nearer than the raw 9.2 vector.
+The printed pairing is still `0 -> 1` and `1 -> 0`.
+The image across the a-face (distance 0.8) is nearer than the raw 9.2 vector.
 
 ## C++
 
-Same packed `n * k` contract. `Neighbours` owns the buffer. Failure
-throws `linkcell::Error`.
+Same packed `n * k` contract.
+`Neighbours` owns the buffer.
+Failure throws `linkcell::Error`.
 
 ```cpp
 #include "linkcell.hpp"
@@ -78,6 +81,5 @@ int main() {
 c++ -std=c++17 two_points.cpp $(pkg-config --cflags --libs linkcell) -o two_points_cpp
 ```
 
-Next: [embed from C](../how-to/embed-c.md) or
-[embed from C++](../how-to/embed-cpp.md). Why the wrap is 0.8, not 9.2:
-[MIC and cells](../explanation/mic-and-cells.md).
+Next: [embed from C](../how-to/embed-c.md) or [embed from C++](../how-to/embed-cpp.md).
+Why the wrap is 0.8: [minimum image convention (MIC) and cells](../explanation/mic-and-cells.md).
