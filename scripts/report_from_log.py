@@ -215,7 +215,7 @@ def main():
     mhz = meta.get("mhz", "")
     a(f"The host line is `{meta.get('cpu_model', meta.get('hardware', ''))}`.")
     a(f"The cpu kind is {meta.get('cpu_kind', 'unread')}. nproc reports {meta.get('nproc', '')} processors. The clock reads {mhz} MHz.")
-    a("A kind of virtual means the flags include the hypervisor bit, so the model string is the guest name.")
+    a("Virtual means the hypervisor flag is set, and the model string is the guest name.")
     a("A second node is recorded as `multi_node HOST NOT-RUN`.")
     a(f"Scotch {meta.get('scotch_version', '')} builds the strategy `SCOTCH_STRATQUALITY|SCOTCH_STRATBALANCE`.")
     a(f"The join tick is {meta.get('tick', '')} nanoseconds, the measured `Instant` step on this host.")
@@ -302,13 +302,20 @@ def main():
                 ours_lower.append(system)
             if ours["median"] < pt["median"]:
                 faster.append(system)
-        if lower:
-            a("Parallel Scotch cuts fewer edges on " + ", ".join(lower) + ".")
-        if ours_lower:
-            a("rcb-fm cuts fewer edges on " + ", ".join(ours_lower) + ".")
-        if faster:
-            a("The whole-operation wall favors rcb-fm on " + ", ".join(faster) + ".")
-        a("Each sentence stays on the systems named in it.")
+        if section == "serial":
+            if ours_lower:
+                a("With one thread and one rank, rcb-fm leads the cut on " + ", ".join(ours_lower) + ".")
+            if lower:
+                a("With one thread and one rank, parallel Scotch leads the cut on " + ", ".join(lower) + ".")
+            if faster:
+                a("That one-rank block also finishes sooner for rcb-fm.")
+        else:
+            if lower:
+                a("Eight ranks give parallel Scotch the lower cut on " + ", ".join(lower) + ".")
+            if ours_lower:
+                a("rcb-fm keeps the smaller cut on " + ", ".join(ours_lower) + ".")
+            if faster:
+                a("The eight-thread whole clock is shorter for rcb-fm across this block.")
 
     compare("serial", "One thread beside one rank.")
     compare("ladder", "Eight threads beside eight ranks.")
