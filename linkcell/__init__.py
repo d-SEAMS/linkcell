@@ -9,13 +9,19 @@ on each tensor.
 
 from linkcell._lib import NeighborList as _NeighborList
 from linkcell._lib import __version__, gpu_available, knearest, pairs_within
+from linkcell._lib import cell_graph, cell_grid, halo, halo_width, partition
 
 __all__ = [
     "NeighborList",
     "__version__",
+    "cell_graph",
+    "cell_grid",
     "gpu_available",
+    "halo",
+    "halo_width",
     "knearest",
     "pairs_within",
+    "partition",
 ]
 
 

@@ -1,4 +1,4 @@
-# C ABI
+# C application binary interface (ABI)
 
 Header: `include/linkcell.h`. Prefix `lc_`. Caller owns every
 buffer. C++ (`include/linkcell.hpp`) is a header-only wrap of these
@@ -154,6 +154,22 @@ Neither returns `std::vector<std::vector<int>>`. Failure throws
 count, then `lc_pairs_within_rows` writes the returned vector from that
 same search.
 
+## Partition
+
+`lc_cell_grid` writes `nx, ny, nz`, three bin widths, and one point
+count per cell. `lc_cell_graph` adds the compressed sparse row (CSR) of the periodic
+adjacency. Edge weights are pair counts from `lc_pairs_within` with
+`half` set. `lc_partition` writes one domain id per cell. `method` is
+0 Morton, 1 Hilbert, 2 recursive coordinate bisection (RCB), 3 Hilbert plus
+Fiduccia-Mattheyses, 4 bisection plus that pass, 5 Scotch, 6 multilevel,
+7 parallel Scotch. `balance <= 0` selects the derived bound
+`1 + parts * heaviest_cell / total_weight`. `lc_halo_width` writes three bin radii for
+`cutoff * depth`. `lc_halo` writes the ghost cell ids.
+
+A null weight or domain pointer queries the count. The C++ wrappers
+are `linkcell::partition`, `linkcell::halo_width`, and
+`linkcell::halo`.
+
 ## Rust errors (same crate)
 
 `linkcell::Error`:
@@ -167,6 +183,10 @@ same search.
 | `MaskLen` | `mask` is `Some` and `mask.len() != n` |
 | `TooManyCells` | linked-cell mesh overflows the bin cap |
 | `Overflow` | `n * k` does not fit a slice |
+| `BadPartition` | The part count is zero, or the balance bound is below 1 |
+| `BadGraph` | The cell graph is not a square CSR of that grid |
+| `NoDevice` | A device curve split was requested and no device is loaded |
+| `ScotchDisabled` | Scotch support was not compiled in |
 
 `Error::Empty` is not a wrong-length buffer.
 

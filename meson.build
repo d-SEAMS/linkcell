@@ -137,7 +137,7 @@ if _gpu_on
   if host_machine.system() == 'windows'
     linkcell_gpu = static_library(
       'linkcell_gpu',
-      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp'],
+      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp', 'src/gpu/partition.cpp'],
       include_directories: include_directories('include'),
       dependencies: [gpulite_dep],
       cpp_args: _gpu_args,
@@ -148,7 +148,7 @@ if _gpu_on
   else
     linkcell_gpu = static_library(
       'linkcell_gpu',
-      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp'],
+      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp', 'src/gpu/partition.cpp'],
       include_directories: include_directories('include'),
       dependencies: [gpulite_dep],
       cpp_args: _gpu_args,

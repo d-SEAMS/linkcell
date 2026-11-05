@@ -17,10 +17,10 @@ still stops on the looser `reach * cell_min` bound
 (`linkcell::gpu::Workspace`). `src/kokkos/` is the certified walk on
 a Kokkos execution space. Pair lists stay on the host.
 
-It is a LODE library. The Rust crate is the implementation. The C ABI
+It is a Library of Data Exchange (LODE) library. The Rust crate is the implementation. The C application binary interface
 (`lc_*`) is the hourglass waist, the same shape as
-[readcon-core](https://github.com/lode-org/readcon-core). C++ is a RAII
-header over that ABI.
+[readcon-core](https://github.com/lode-org/readcon-core). C++ is a Resource Acquisition Is Initialization (RAII)
+header over that interface.
 
 Released versions live in [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog).
 Unreleased notes are files under `changelog.d/`. The cut is
@@ -222,6 +222,48 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   `lc_pairs_within_rows`, and the Python call write the `ijS` columns
   or `lc_pair` rows straight from the search, and a C count query
   keeps its search for the fill that follows on the same thread.
+
+## Domain partition
+
+`cell_grid` is the fractional mesh `pairs_within` uses, with a point
+count on each bin. `cell_graph` adds the periodic adjacency. An edge
+weight is the number of cutoff pairs with one end in each bin.
+`partition` returns one domain id per cell. `halo_width` turns a
+cutoff and a shell count into three bin radii, and `halo` lists the
+ghost bins of one domain.
+
+The balance bound defaults to `1 + parts * heaviest_cell / total_weight` for every system.
+A weighted median assigns the straddling cell to one side, so a part can exceed the ideal share by at most that cell.
+The default method is chosen from the five-system panel in
+`examples/partition_panel.rs`: the native method with the smallest
+sum of edge cuts, among those that stay inside that bound, with a
+tie broken by the sum of median wall times. Morton, Hilbert,
+recursive coordinate bisection (RCB), and a Fiduccia-Mattheyses pass are
+always built. Serial Scotch is `--features scotch`.
+Parallel Scotch is `--features ptscotch`.
+Neither library is vendored, and both features are off by default.
+The device path runs weights, curve keys, and the prefix split
+through gpulite. Copies both ways are inside that time.
+
+```rust
+use linkcell::{halo, halo_width, partition, PartRequest, Cell};
+
+let sim = Cell::ortho(10.0, 10.0, 10.0)?;
+let xyz = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+let domain = partition(&xyz, &sim, 3.0, None, None, PartRequest::new(2))?;
+let width = halo_width(3.0, 1, [10.0, 10.0, 10.0])?;
+let _ghosts = halo(
+    &linkcell::cell_grid(&xyz, &sim, 3.0, None, None)?,
+    &domain,
+    0,
+    width,
+)?;
+```
+
+`lc_cell_grid`, `lc_cell_graph`, `lc_partition`, `lc_halo_width`, and
+`lc_halo` are the C entry points. `linkcell::partition` in
+`include/linkcell.hpp` is the Resource Acquisition Is Initialization wrap. Python is `cell_grid`,
+`cell_graph`, `partition`, `halo_width`, and `halo`, all DLPack.
 
 ## License
 

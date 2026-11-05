@@ -11,8 +11,9 @@ use dlpk::sys::{
 };
 use dlpk::DLPackTensor;
 use linkcell::{
-    knearest_into_d2, knearest_into_many, lc_cell, pairs_within_columns, Cell, NeighborCalc,
-    PairColumns, VesinOptions,
+    cell_graph, cell_grid, halo, halo_width, knearest_into_d2, knearest_into_many, lc_cell,
+    pairs_within_columns, partition, Cell, Method, NeighborCalc, PairColumns, PartRequest,
+    VesinOptions,
 };
 use ndarray::{Array1, Array2, Array3};
 
@@ -490,6 +491,218 @@ fn pairs_within_py<'py>(
     ))
 }
 
+fn parse_method(name: &str) -> PyResult<Method> {
+    match name {
+        "default" => Ok(linkcell::DEFAULT_METHOD),
+        "morton" => Ok(Method::Morton),
+        "hilbert" => Ok(Method::Hilbert),
+        "rcb" => Ok(Method::Rcb),
+        "hilbert-fm" => Ok(Method::HilbertFm),
+        "rcb-fm" => Ok(Method::RcbFm),
+        "multi" => Ok(Method::Multi),
+        "scotch" => Ok(Method::Scotch),
+        _ => Err(PyValueError::new_err(
+            "method is default, morton, hilbert, rcb, hilbert-fm, rcb-fm, multi, or scotch",
+        )),
+    }
+}
+
+fn frame_points<'py>(
+    xyz: &Bound<'py, PyAny>,
+    cell: &Bound<'py, PyAny>,
+) -> PyResult<(Vec<[f64; 3]>, Cell)> {
+    if peek_cuda(xyz)? {
+        return Err(PyValueError::new_err(
+            "partition reads host tensors; move xyz to the CPU",
+        ));
+    }
+    let cell_buf = take_f64(cell)?;
+    let (sim, _) = parse_cell(&cell_buf)?;
+    let xyz_buf = take_f64(xyz)?;
+    let (pts, _n, n_frames) = parse_xyz(&xyz_buf)?;
+    if n_frames != 1 {
+        return Err(PyValueError::new_err("xyz must be one frame of shape (n, 3)"));
+    }
+    Ok((pts, sim))
+}
+
+/// Point counts on the linked-cell mesh.
+///
+/// Returns `(nxyz, bin_width, weight)`. `weight[i]` is the point count
+/// of cell `i` in the order `((iz * ny) + iy) * nx + ix`.
+#[pyfunction]
+#[pyo3(name = "cell_grid", signature = (xyz, cell, cutoff, mask=None, cell_hint=None))]
+fn cell_grid_py<'py>(
+    py: Python<'py>,
+    xyz: &Bound<'py, PyAny>,
+    cell: &Bound<'py, PyAny>,
+    cutoff: f64,
+    mask: Option<&Bound<'py, PyAny>>,
+    cell_hint: Option<f64>,
+) -> PyResult<(Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
+    let (pts, sim) = frame_points(xyz, cell)?;
+    let n = pts.len();
+    let mask_vec = match mask {
+        None => None,
+        Some(m) => Some(take_mask(m, n)?),
+    };
+    let grid = py
+        .detach(|| cell_grid(&pts, &sim, cutoff, mask_vec.as_deref(), cell_hint))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let nxyz = Array1::from_vec(vec![grid.nx, grid.ny, grid.nz]);
+    let width = Array1::from_vec(grid.bin_width.to_vec());
+    let weight = Array1::from_vec(grid.weight);
+    Ok((
+        to_pydlpack(py, nxyz)?,
+        to_pydlpack(py, width)?,
+        to_pydlpack(py, weight)?,
+    ))
+}
+
+/// Periodic adjacency. Edge weights are pair counts from `pairs_within`.
+///
+/// Returns `(nxyz, bin_width, weight, offsets, neighbor, edge_weight)`.
+#[pyfunction]
+#[pyo3(name = "cell_graph", signature = (xyz, cell, cutoff, mask=None, cell_hint=None))]
+fn cell_graph_py<'py>(
+    py: Python<'py>,
+    xyz: &Bound<'py, PyAny>,
+    cell: &Bound<'py, PyAny>,
+    cutoff: f64,
+    mask: Option<&Bound<'py, PyAny>>,
+    cell_hint: Option<f64>,
+) -> PyResult<(
+    Py<PyAny>,
+    Py<PyAny>,
+    Py<PyAny>,
+    Py<PyAny>,
+    Py<PyAny>,
+    Py<PyAny>,
+)> {
+    let (pts, sim) = frame_points(xyz, cell)?;
+    let n = pts.len();
+    let mask_vec = match mask {
+        None => None,
+        Some(m) => Some(take_mask(m, n)?),
+    };
+    let graph = py
+        .detach(|| cell_graph(&pts, &sim, cutoff, mask_vec.as_deref(), cell_hint))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let nxyz = Array1::from_vec(vec![graph.grid.nx, graph.grid.ny, graph.grid.nz]);
+    let width = Array1::from_vec(graph.grid.bin_width.to_vec());
+    let weight = Array1::from_vec(graph.grid.weight);
+    let offsets = Array1::from_vec(graph.offsets);
+    let neighbor = Array1::from_vec(graph.neighbor);
+    let edge = Array1::from_vec(graph.edge_weight);
+    Ok((
+        to_pydlpack(py, nxyz)?,
+        to_pydlpack(py, width)?,
+        to_pydlpack(py, weight)?,
+        to_pydlpack(py, offsets)?,
+        to_pydlpack(py, neighbor)?,
+        to_pydlpack(py, edge)?,
+    ))
+}
+
+/// Domain id of each cell.
+///
+/// `method` is `default`, `morton`, `hilbert`, `rcb`, `hilbert-fm`,
+/// `rcb-fm`, `multi`, or `scotch`. `balance` of `None` selects the
+/// derived bound `1 + parts * heaviest_cell / total_weight`.
+/// `device` runs the curve split on CUDA and raises when that device
+/// is absent.
+#[pyfunction]
+#[pyo3(
+    name = "partition",
+    signature = (xyz, cell, cutoff, parts, method="default", balance=None, mask=None, cell_hint=None, device=false)
+)]
+fn partition_py<'py>(
+    py: Python<'py>,
+    xyz: &Bound<'py, PyAny>,
+    cell: &Bound<'py, PyAny>,
+    cutoff: f64,
+    parts: u32,
+    method: &str,
+    balance: Option<f64>,
+    mask: Option<&Bound<'py, PyAny>>,
+    cell_hint: Option<f64>,
+    device: bool,
+) -> PyResult<Py<PyAny>> {
+    let method = parse_method(method)?;
+    let (pts, sim) = frame_points(xyz, cell)?;
+    let n = pts.len();
+    let mask_vec = match mask {
+        None => None,
+        Some(m) => Some(take_mask(m, n)?),
+    };
+    let request = PartRequest {
+        parts,
+        method,
+        balance,
+        device,
+    };
+    let assign = py
+        .detach(|| partition(&pts, &sim, cutoff, mask_vec.as_deref(), cell_hint, request))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let ids: Vec<i32> = assign
+        .into_iter()
+        .map(|v| i32::try_from(v).map_err(|_| PyRuntimeError::new_err("domain id overflow")))
+        .collect::<PyResult<_>>()?;
+    to_pydlpack(py, Array1::from_vec(ids))
+}
+
+/// Three bin radii for `cutoff * depth`.
+#[pyfunction]
+#[pyo3(name = "halo_width")]
+fn halo_width_py(cutoff: f64, depth: u32, bin_width: Vec<f64>) -> PyResult<(u32, u32, u32)> {
+    if bin_width.len() != 3 {
+        return Err(PyValueError::new_err("bin_width has length 3"));
+    }
+    let width = halo_width(cutoff, depth, [bin_width[0], bin_width[1], bin_width[2]])
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok((width[0], width[1], width[2]))
+}
+
+/// Ghost cell ids of `domain`.
+#[pyfunction]
+#[pyo3(name = "halo")]
+fn halo_py<'py>(
+    py: Python<'py>,
+    nxyz: Vec<i32>,
+    assign: Vec<i32>,
+    domain: u32,
+    width: Vec<u32>,
+) -> PyResult<Py<PyAny>> {
+    if nxyz.len() != 3 || width.len() != 3 {
+        return Err(PyValueError::new_err("nxyz and width have length 3"));
+    }
+    let ncell = (nxyz[0] as usize)
+        .checked_mul(nxyz[1] as usize)
+        .and_then(|v| v.checked_mul(nxyz[2] as usize))
+        .ok_or_else(|| PyValueError::new_err("nxyz overflow"))?;
+    if assign.len() != ncell {
+        return Err(PyValueError::new_err("assign length must be nx * ny * nz"));
+    }
+    let owned: Vec<u32> = assign
+        .into_iter()
+        .map(|v| u32::try_from(v).map_err(|_| PyValueError::new_err("negative domain")))
+        .collect::<PyResult<_>>()?;
+    let grid = linkcell::CellGrid {
+        nx: nxyz[0],
+        ny: nxyz[1],
+        nz: nxyz[2],
+        bin_width: [0.0; 3],
+        weight: vec![0; ncell],
+    };
+    let ghosts = halo(&grid, &owned, domain, [width[0], width[1], width[2]])
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let ids: Vec<i32> = ghosts
+        .into_iter()
+        .map(|v| i32::try_from(v).map_err(|_| PyRuntimeError::new_err("ghost id overflow")))
+        .collect::<PyResult<_>>()?;
+    to_pydlpack(py, Array1::from_vec(ids))
+}
+
 #[pyfunction]
 fn gpu_available() -> bool {
     gpu::available()
@@ -512,7 +725,7 @@ fn periodic_flags(obj: &Bound<'_, PyAny>) -> PyResult<[bool; 3]> {
 
 /// vesin-compatible calculator. `compute` returns one DLPack tensor per
 /// letter of `quantities` (`i`, `j`, `P`, `S`, `d`, `D`).
-#[pyclass(name = "NeighborList")]
+#[pyclass(name = "NeighborList", module = "linkcell._lib", subclass)]
 struct PyNeighborList {
     cutoff: f64,
     full: bool,
@@ -663,6 +876,11 @@ impl PyNeighborList {
 fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(knearest, m)?)?;
     m.add_function(wrap_pyfunction!(pairs_within_py, m)?)?;
+    m.add_function(wrap_pyfunction!(cell_grid_py, m)?)?;
+    m.add_function(wrap_pyfunction!(cell_graph_py, m)?)?;
+    m.add_function(wrap_pyfunction!(partition_py, m)?)?;
+    m.add_function(wrap_pyfunction!(halo_width_py, m)?)?;
+    m.add_function(wrap_pyfunction!(halo_py, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
     m.add_class::<PyNeighborList>()?;
     m.add_class::<PyDLPack>()?;

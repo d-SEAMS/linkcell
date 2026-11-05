@@ -1,0 +1,1 @@
+Add a native partitioner for the periodic cell grid, with Morton and Hilbert prefix splits, weighted recursive coordinate bisection, a Fiduccia-Mattheyses pass, optional Scotch, and a gpulite curve split.

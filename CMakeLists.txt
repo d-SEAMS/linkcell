@@ -145,6 +145,7 @@ if(LINKCELL_WITH_GPULITE)
   add_library(linkcell_gpu STATIC
     src/gpu/knearest.cpp
     src/gpu/capi.cpp
+    src/gpu/partition.cpp
   )
   add_library(linkcell::gpu ALIAS linkcell_gpu)
   target_include_directories(linkcell_gpu

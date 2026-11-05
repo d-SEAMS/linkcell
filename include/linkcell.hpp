@@ -15,6 +15,7 @@ extern "C" {
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -297,6 +298,99 @@ pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
 }
 
 [[nodiscard]] inline const char *version() noexcept { return lc_version(); }
+
+/// Fractional bins and a point count per bin.
+struct CellGrid {
+  int nx = 0;
+  int ny = 0;
+  int nz = 0;
+  std::array<double, 3> bin_width{};
+  std::vector<std::uint64_t> weight;
+
+  [[nodiscard]] std::size_t ncell() const noexcept { return weight.size(); }
+};
+
+/// Periodic adjacency. Each undirected pair is two arcs of one weight.
+struct CellGraph {
+  CellGrid grid;
+  std::vector<std::uint32_t> offsets;
+  std::vector<std::uint32_t> neighbor;
+  std::vector<std::uint64_t> edge_weight;
+};
+
+/// Domain id of each cell. `method` matches `lc_partition`.
+/// `balance <= 0` selects the derived bound. `device` asks for the CUDA curve split.
+[[nodiscard]] inline std::vector<int>
+partition(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
+          std::size_t parts, int method = 4, const int *mask = nullptr,
+          double cell_hint = 0.0, double balance = 0.0, bool device = false) {
+  if (n == 0 || xyz == nullptr) {
+    throw Error("no points");
+  }
+  const lc_cell raw = cell.raw();
+  std::size_t ncell = 0;
+  const int query = lc_partition(
+      xyz, detail::to_c_count(n, "n"), &raw, cutoff, mask, cell_hint, parts,
+      static_cast<std::uint8_t>(method), balance, device ? 1 : 0, nullptr, 0,
+      &ncell);
+  if (query != 0) {
+    const char *msg = lc_last_error();
+    throw Error(query, msg ? std::string(msg) : std::string("linkcell: partition failed"));
+  }
+  std::vector<int> out(ncell);
+  std::size_t wrote = 0;
+  const int fill = lc_partition(
+      xyz, detail::to_c_count(n, "n"), &raw, cutoff, mask, cell_hint, parts,
+      static_cast<std::uint8_t>(method), balance, device ? 1 : 0, out.data(),
+      ncell, &wrote);
+  if (fill != 0) {
+    const char *msg = lc_last_error();
+    throw Error(fill, msg ? std::string(msg) : std::string("linkcell: partition failed"));
+  }
+  out.resize(wrote);
+  return out;
+}
+
+/// Bin radii for `cutoff * depth`.
+[[nodiscard]] inline std::array<std::uint32_t, 3>
+halo_width(double cutoff, std::uint32_t depth,
+           const std::array<double, 3> &bin_width) {
+  std::array<std::uint32_t, 3> out{};
+  const int status = lc_halo_width(cutoff, depth, bin_width.data(), out.data());
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg) : std::string("linkcell: halo width failed"));
+  }
+  return out;
+}
+
+/// Ghost cell ids of `domain`.
+[[nodiscard]] inline std::vector<int>
+halo(const std::array<int, 3> &nxyz, const std::vector<int> &assign, int domain,
+     const std::array<std::uint32_t, 3> &width) {
+  std::size_t count = 0;
+  const int query =
+      lc_halo(nxyz.data(), assign.data(), assign.size(), domain, width.data(),
+              nullptr, 0, &count);
+  if (query != 0) {
+    const char *msg = lc_last_error();
+    throw Error(query, msg ? std::string(msg) : std::string("linkcell: halo failed"));
+  }
+  std::vector<int> out(count);
+  if (count == 0) {
+    return out;
+  }
+  std::size_t wrote = 0;
+  const int fill =
+      lc_halo(nxyz.data(), assign.data(), assign.size(), domain, width.data(),
+              out.data(), count, &wrote);
+  if (fill != 0) {
+    const char *msg = lc_last_error();
+    throw Error(fill, msg ? std::string(msg) : std::string("linkcell: halo failed"));
+  }
+  out.resize(wrote);
+  return out;
+}
 
 } // namespace linkcell
 

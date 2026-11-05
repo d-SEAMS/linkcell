@@ -9,6 +9,9 @@
  *   - lc_knearest_many is the frame-major batch (n_frames * n * k).
  *   - lc_pairs_within writes caller-owned i, j, shift, dist2 rows.
  *     Null outputs query the row count.
+ *   - lc_cell_grid, lc_cell_graph, and lc_partition write caller-owned
+ *     cell buffers. A null weight or domain pointer queries the count.
+ *   - lc_halo_width writes three bin radii. lc_halo writes ghost ids.
  *   - lc_last_error returns a thread-local pointer. Do not free. The
  *     pointer is invalid after the next lc_knearest on the same thread.
  *     lc_version does not read or write the slot.
@@ -280,6 +283,125 @@ int lc_pairs_within_rows(const double *xyz,
                          struct lc_pair *out,
                          size_t cap,
                          size_t *out_count);
+
+/**
+ * Point counts on the linked-cell mesh.
+ *
+ * `out_nxyz` receives `nx, ny, nz`. `out_width` receives the three
+ * bin widths. `out_weight` receives one count per cell, in the order
+ * `((iz * ny) + iy) * nx + ix`. A null `out_weight` is a query:
+ * `*out_ncell` is the cell count and the return is 0.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `simbox` points at one
+ * `lc_cell`. `mask`, if non-null, is readable for `n` ints.
+ * `out_ncell` is writable. On a fill, `out_nxyz` is writable for 3
+ * ints, `out_width` for 3 doubles, and `out_weight` for `*out_ncell`
+ * counts.
+ */
+int lc_cell_grid(const double *xyz,
+                 size_t n,
+                 const struct lc_cell *simbox,
+                 double cutoff,
+                 const int *mask,
+                 double cell_hint,
+                 int *out_nxyz,
+                 double *out_width,
+                 uint64_t *out_weight,
+                 size_t cap,
+                 size_t *out_ncell);
+
+/**
+ * Periodic cell adjacency. Edge weights are pair counts from
+ * `lc_pairs_within` with `half` set.
+ *
+ * A null `out_weight` queries `*out_ncell` and `*out_arcs` and
+ * returns 0. Otherwise every output buffer is required.
+ * `out_offsets` has length `ncell + 1`.
+ *
+ * # Safety
+ *
+ * Same point contract as `lc_cell_grid`. On a fill, `out_offsets`
+ * is writable for `ncell + 1` counts, and `out_neighbor` and
+ * `out_edge` for `*out_arcs` entries.
+ */
+int lc_cell_graph(const double *xyz,
+                  size_t n,
+                  const struct lc_cell *simbox,
+                  double cutoff,
+                  const int *mask,
+                  double cell_hint,
+                  int *out_nxyz,
+                  double *out_width,
+                  uint64_t *out_weight,
+                  uint32_t *out_offsets,
+                  uint32_t *out_neighbor,
+                  uint64_t *out_edge,
+                  size_t cap_weight,
+                  size_t cap_arcs,
+                  size_t *out_ncell,
+                  size_t *out_arcs);
+
+/**
+ * Domain id of each cell.
+ *
+ * `method` is 0 Morton, 1 Hilbert, 2 recursive coordinate bisection,
+ * 3 Hilbert plus Fiduccia-Mattheyses, 4 bisection plus that pass,
+ * 5 Scotch, 6 multilevel, 7 PT-Scotch. `balance <= 0` selects the
+ * derived bound `1 + parts * heaviest_cell / total_weight`. `device` nonzero runs
+ * the curve split on the CUDA device and returns nonzero when that
+ * device is absent. A null `out_domain` queries `*out_ncell`.
+ *
+ * # Safety
+ *
+ * Same point contract as `lc_cell_grid`. On a fill, `out_domain`
+ * is writable for `*out_ncell` ints.
+ */
+int lc_partition(const double *xyz,
+                 size_t n,
+                 const struct lc_cell *simbox,
+                 double cutoff,
+                 const int *mask,
+                 double cell_hint,
+                 size_t parts,
+                 uint8_t method,
+                 double balance,
+                 int device,
+                 int *out_domain,
+                 size_t cap,
+                 size_t *out_ncell);
+
+/**
+ * Bin radii for `cutoff * depth`. `out_width` receives three counts.
+ *
+ * # Safety
+ *
+ * `bin_width` is readable for 3 doubles. `out_width` is writable
+ * for 3 counts.
+ */
+int lc_halo_width(double cutoff,
+                  uint32_t depth,
+                  const double *bin_width,
+                  uint32_t *out_width);
+
+/**
+ * Ghost cells of `domain`. A null `out_ghost` queries `*out_count`.
+ *
+ * # Safety
+ *
+ * `nxyz` is readable for 3 ints. `assign` is readable for `ncell`
+ * ints. `width` is readable for 3 counts. On a fill, `out_ghost` is
+ * writable for `*out_count` ints.
+ */
+int lc_halo(const int *nxyz,
+            const int *assign,
+            size_t ncell,
+            int domain,
+            const uint32_t *width,
+            int *out_ghost,
+            size_t cap,
+            size_t *out_count);
 
 /**
  * Library version string. Process-static, NUL-terminated. Do not free.

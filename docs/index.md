@@ -19,6 +19,7 @@ typed header over that ABI. Python is DLPack (dlpk) over that waist.
 
 - [C API](reference/c-api.md)
 - [Algorithm](reference/algorithm.md)
+- [Cell partition](reference/partition.md)
 
 ## Explanation
 

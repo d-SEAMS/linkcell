@@ -288,7 +288,7 @@ pub(crate) fn in_pool<R: Send>(hits: usize, work: impl FnOnce() -> R + Send) -> 
 /// cuts that volume when a cell would otherwise hold many atoms. `8` is
 /// the cell-visit cost in units of one candidate check. A caller `cell_hint`
 /// still wins: [`bins::target_edge`] uses the hint whenever it is positive.
-fn default_edge(simbox: &Cell, n: usize, cutoff: f64) -> f64 {
+pub(crate) fn default_edge(simbox: &Cell, n: usize, cutoff: f64) -> f64 {
     const VISIT_COST: f64 = 8.0;
     let mut per = n as f64;
     for width in simbox.widths() {

@@ -28,12 +28,21 @@ parallel = ["dep:rayon"]
 tune = ["capi"]
 # Benchmark counters (`SimdTiming`). Off by default.
 timing = []
+# Serial Scotch (`SCOTCH_graphPart`). Off by default. Not vendored.
+scotch = []
+# PT-Scotch (`SCOTCH_dgraphPart`). Off by default. Not vendored.
+# The caller must already have initialized MPI. The panel uses the
+# standalone driver under `mpirun` instead of this feature.
+ptscotch = []
 
 [dependencies]
 # minimage 0.2 is not on crates.io yet. After it is published, replace the
 # git pin below with `minimage = { version = "0.2", default-features = false }`.
 minimage = { git = "https://github.com/lode-org/minimage.git", rev = "3abded515f2e3d0af40d8816a533a2941b1a36cf", default-features = false }
 rayon = { version = "1.10", optional = true }
+
+[build-dependencies]
+cc = "1.2"
 
 [[test]]
 name = "abi"
@@ -42,6 +51,9 @@ required-features = ["capi"]
 [[example]]
 name = "simd_bench"
 required-features = ["timing"]
+
+[[example]]
+name = "partition_panel"
 
 [profile.release]
 lto = true
