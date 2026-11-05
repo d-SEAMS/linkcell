@@ -230,6 +230,8 @@ int main(int argc, char **argv) {
   int32_t *vw = NULL;
   int32_t *ew = NULL;
   int32_t *part = NULL;
+  struct timespec whole0, whole1;
+  clock_gettime(CLOCK_MONOTONIC, &whole0);
   if (rank == 0) {
     FILE *in = fopen(argv[1], "rb");
     if (in == NULL) {
@@ -268,9 +270,12 @@ int main(int argc, char **argv) {
     die(rank, "partition");
   }
   if (rank == 0) {
+    printf("PART_SECONDS %.9f\n", seconds);
     printf("SECONDS %.9f\n", seconds);
     printf("SEED 1\n");
     printf("RANKS %d\n", size);
+    printf("SCOTCH_VERSION %d.%d.%d\n", SCOTCH_VERSION, SCOTCH_RELEASE, SCOTCH_PATCHLEVEL);
+    printf("STRATEGY SCOTCH_STRATQUALITY|SCOTCH_STRATBALANCE\n");
     printf("SCOTCH_randomReset 1\n");
     printf("SCOTCH_randomSeed 1\n");
     fflush(stdout);
@@ -282,6 +287,11 @@ int main(int argc, char **argv) {
       fprintf(outf, "%d\n", part[i]);
     }
     fclose(outf);
+    clock_gettime(CLOCK_MONOTONIC, &whole1);
+    double whole = (double)(whole1.tv_sec - whole0.tv_sec) +
+                   (double)(whole1.tv_nsec - whole0.tv_nsec) / 1.0e9;
+    printf("WHOLE_SECONDS %.9f\n", whole);
+    fflush(stdout);
     free(off);
     free(edg);
     free(vw);

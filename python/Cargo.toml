@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
+scotch = ["linkcell/scotch"]
 abi3 = ["pyo3/abi3-py312"]
 abi3t = ["pyo3/abi3t-py315"]
 

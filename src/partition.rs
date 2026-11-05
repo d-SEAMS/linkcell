@@ -16,12 +16,40 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::bins::{self, flat_cell};
 use crate::cell::Cell;
 use crate::pairs::{self, pairs_within};
 use crate::Error;
+
+/// Smallest advance `Instant` reported on this process.
+///
+/// The join classifier uses one tick of this clock. The value is the
+/// median of 32 observed steps, so it is the host timer, not a constant
+/// chosen per system.
+pub fn timer_resolution_ns() -> u64 {
+    static TICK: OnceLock<u64> = OnceLock::new();
+    *TICK.get_or_init(|| {
+        let mut samples = [1u64; 32];
+        for slot in &mut samples {
+            let start = Instant::now();
+            let mut next = Instant::now();
+            let mut spins = 0u32;
+            while next <= start && spins < 1_000_000 {
+                next = Instant::now();
+                spins += 1;
+            }
+            *slot = next.saturating_duration_since(start).as_nanos() as u64;
+            if *slot == 0 {
+                *slot = 1;
+            }
+        }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    })
+}
 
 /// Balance allowed by one indivisible cell.
 ///
@@ -153,6 +181,94 @@ impl CellGrid {
     pub fn ncell(&self) -> usize {
         self.weight.len()
     }
+}
+
+/// Place `copies` disjoint copies of `graph` side by side along x.
+///
+/// Cell count and arc count both equal the base counts times `copies`.
+/// Each copy keeps the base neighbourhood, so the work per copy stays
+/// the base cell count and the base arc count.
+pub fn replicate_graph(graph: &CellGraph, copies: usize) -> Result<CellGraph, Error> {
+    if copies == 0 {
+        return Err(Error::BadGraph);
+    }
+    if copies == 1 {
+        return Ok(graph.clone());
+    }
+    let nx = graph.grid.nx;
+    let ny = graph.grid.ny;
+    let nz = graph.grid.nz;
+    if nx <= 0 || ny <= 0 || nz <= 0 {
+        return Err(Error::BadGraph);
+    }
+    let n = graph.grid.ncell();
+    let expect = (nx as usize)
+        .checked_mul(ny as usize)
+        .and_then(|v| v.checked_mul(nz as usize))
+        .ok_or(Error::BadGraph)?;
+    if expect != n || graph.offsets.len() != n + 1 {
+        return Err(Error::BadGraph);
+    }
+    let copies_i = i32::try_from(copies).map_err(|_| Error::BadGraph)?;
+    let big_nx = nx.checked_mul(copies_i).ok_or(Error::BadGraph)?;
+    let big_n = n.checked_mul(copies).ok_or(Error::BadGraph)?;
+    let nx_u = nx as usize;
+    let ny_u = ny as usize;
+    let big_nx_u = big_nx as usize;
+    let mut weight = vec![0u64; big_n];
+    for copy in 0..copies {
+        for iz in 0..nz as usize {
+            for iy in 0..ny_u {
+                for ix in 0..nx_u {
+                    let src = ((iz * ny_u) + iy) * nx_u + ix;
+                    let dst = ((iz * ny_u) + iy) * big_nx_u + copy * nx_u + ix;
+                    weight[dst] = graph.grid.weight[src];
+                }
+            }
+        }
+    }
+    let mut neighbor = Vec::with_capacity(graph.neighbor.len().saturating_mul(copies));
+    let mut edge_weight = Vec::with_capacity(graph.edge_weight.len().saturating_mul(copies));
+    let mut offsets = vec![0u32; big_n + 1];
+    for dst in 0..big_n {
+        let plane = big_nx_u * ny_u;
+        let iz = dst / plane;
+        let rem = dst % plane;
+        let iy = rem / big_nx_u;
+        let ix_big = rem % big_nx_u;
+        let copy = ix_big / nx_u;
+        let ix = ix_big % nx_u;
+        let src = ((iz * ny_u) + iy) * nx_u + ix;
+        let lo = graph.offsets[src] as usize;
+        let hi = graph.offsets[src + 1] as usize;
+        for edge in lo..hi {
+            let nbr = graph.neighbor[edge] as usize;
+            if nbr >= n {
+                return Err(Error::BadGraph);
+            }
+            let nplane = nx_u * ny_u;
+            let niz = nbr / nplane;
+            let nrem = nbr % nplane;
+            let niy = nrem / nx_u;
+            let nix = nrem % nx_u;
+            let mapped = ((niz * ny_u) + niy) * big_nx_u + copy * nx_u + nix;
+            neighbor.push(mapped as u32);
+            edge_weight.push(graph.edge_weight[edge]);
+        }
+        offsets[dst + 1] = u32::try_from(neighbor.len()).map_err(|_| Error::BadGraph)?;
+    }
+    Ok(CellGraph {
+        grid: CellGrid {
+            nx: big_nx,
+            ny,
+            nz,
+            bin_width: graph.grid.bin_width,
+            weight,
+        },
+        offsets,
+        neighbor,
+        edge_weight,
+    })
 }
 
 /// Periodic cell adjacency with pair-count edge weights.
@@ -1641,9 +1757,8 @@ fn join_measured(a: Phase, b: Phase, wall: u64) -> Phase {
     let max_w = phase_wall(a).max(phase_wall(b));
     // A sequential join lasts about as long as the two children.
     // An overlapped join finishes before that sum.
-    // Ten microseconds covers timer noise, so a sequential join whose
-    // wall sits a few microseconds under the sum stays sequential.
-    let overlapped = wall.saturating_add(10_000) < sum_w;
+    // The slack is one tick of Instant, measured on this host.
+    let overlapped = wall.saturating_add(timer_resolution_ns()) < sum_w;
     let mut child = if overlapped {
         if phase_wall(a) >= phase_wall(b) {
             a
@@ -3038,6 +3153,19 @@ mod tests {
         assert_eq!(hilbert_key(1, 0, 0, 1), 7);
         assert_eq!(hilbert_key(0, 1, 0, 2), 1);
         assert_eq!(hilbert_key(1, 1, 1, 2), 5);
+    }
+
+    #[test]
+    fn replicated_copies_keep_cells_and_arcs() {
+        let cell = Cell::ortho(8.0, 8.0, 8.0).unwrap();
+        let xyz: Vec<[f64; 3]> = (0..4).map(|i| [1.0 + i as f64, 1.0, 1.0]).collect();
+        let graph = cell_graph(&xyz, &cell, 2.0, None, None).unwrap();
+        let copies = 4;
+        let tiled = replicate_graph(&graph, copies).unwrap();
+        assert_eq!(tiled.grid.ncell(), graph.grid.ncell() * copies);
+        assert_eq!(tiled.neighbor.len(), graph.neighbor.len() * copies);
+        assert_eq!(tiled.grid.ncell() / copies, graph.grid.ncell());
+        assert_eq!(tiled.neighbor.len() / copies, graph.neighbor.len());
     }
 
     #[test]

@@ -45,11 +45,31 @@ def parse(text):
     meta = {}
     halo = {}
     derived = {}
+    section = "serial"
+    meta["scale_work"] = []
     for line in text.splitlines():
         if line.startswith("HEAD "):
             meta["head"] = line.split(" ", 1)[1]
         elif line.startswith("TREE "):
             meta["tree"] = line.split(" ", 1)[1]
+        elif line.startswith("panel_section "):
+            section = line.split()[1]
+        elif line.startswith("cpu_model "):
+            meta["cpu_model"] = line.split(" ", 1)[1]
+        elif line.startswith("cpu_kind "):
+            meta["cpu_kind"] = line.split()[1]
+        elif line.startswith("NPROC "):
+            meta["nproc"] = line.split()[1]
+        elif line.startswith("timer_resolution_ns "):
+            meta["tick"] = line.split()[1]
+        elif line.startswith("scotch_header "):
+            meta["scotch_version"] = line.split()[1]
+        elif line.startswith("ptscotch SCOTCH_VERSION "):
+            meta["scotch_version"] = line.split()[-1]
+        elif line.startswith("gpu_status "):
+            meta["gpu"] = line.split(" ", 1)[1]
+        elif line.startswith("scale_work "):
+            meta["scale_work"].append(line)
         elif line.startswith("hardware "):
             meta["hardware"] = line.split(" ", 1)[1]
         elif line.startswith("physical_cores "):
@@ -101,6 +121,7 @@ def parse(text):
             eligible = bits[bits.index("eligible") + 1]
             printed_med = bits[bits.index("median_s") + 1]
             printed_iqr = bits[bits.index("iqr_s") + 1]
+            part_med = bits[bits.index("part_median_s") + 1] if "part_median_s" in bits else ""
             if pending is None:
                 raise SystemExit(f"missing raw samples for {name} {method}")
             med, spread = iqr(pending)
@@ -108,7 +129,9 @@ def parse(text):
                 {
                     "system": name,
                     "method": method,
+                    "section": section,
                     "cut": cut,
+                    "part_median": part_med,
                     "imbalance": imb,
                     "halo": halo_f,
                     "median": float(printed_med),
@@ -190,9 +213,14 @@ def main():
     a("This cell-partition report is generated from one log. Every median and every interquartile range (IQR) is the value that log printed for that cell. The raw sample line is the series those values came from, at type-7.")
     a("")
     mhz = meta.get("mhz", "")
-    mhz_bit = f", {mhz} MHz" if mhz else ""
-    a(f"The log names the hardware as {meta.get('hardware', 'Intel Xeon Processor')}, {meta.get('cores', '8')} physical cores, one thread per core, one node{mhz_bit}.")
+    a(f"The host line is `{meta.get('cpu_model', meta.get('hardware', ''))}`.")
+    a(f"The cpu kind is {meta.get('cpu_kind', 'unread')}. nproc reports {meta.get('nproc', '')} processors. The clock reads {mhz} MHz.")
+    a("A kind of virtual means the flags include the hypervisor bit, so the model string is the guest name.")
     a("A second node is recorded as `multi_node HOST NOT-RUN`.")
+    a(f"Scotch {meta.get('scotch_version', '')} builds the strategy `SCOTCH_STRATQUALITY|SCOTCH_STRATBALANCE`.")
+    a(f"The join tick is {meta.get('tick', '')} nanoseconds, the measured `Instant` step on this host.")
+    a(f"GPU status: {meta.get('gpu', 'unread')}.")
+    a("The median is the whole operation, graph build plus the partition. The part median is the partition call alone.")
     a(f"Commit `{meta.get('head', '')}`. Tree `{meta.get('tree', '')}`.")
     a(f"Exit code {meta.get('exit', '')}.")
     a("")
@@ -222,10 +250,10 @@ def main():
     a("The halo fraction is the largest ghost-cell count divided by the owned-cell count. A value above 1 means the ghost set is larger than the owned set.")
     a("")
     a("```text")
-    a("method system cut imbalance halo median iqr eligible")
+    a("section method system cut imbalance halo whole_median part_median iqr eligible")
     for row in rows:
         a(
-            f"{row['method']} {row['system']} {row['cut']} {row['imbalance']} {row['halo']} {fmt(row['median'])} {fmt(row['iqr'])} {row['eligible']}"
+            f"{row.get('section', 'serial')} {row['method']} {row['system']} {row['cut']} {row['imbalance']} {row['halo']} {fmt(row['median'])} {row.get('part_median', '')} {fmt(row['iqr'])} {row['eligible']}"
         )
     a("```")
     a("")
@@ -252,40 +280,37 @@ def main():
             a(f"{bits[2]} {bits[bits.index('cut') + 1]}")
         a("```")
         a("")
-    by = {}
-    for row in rows:
-        by[(row["method"], row["system"])] = row
-    lower = []
-    ours_lower = []
-    faster = []
-    crossed = []
-    for system in systems:
-        pt = by.get(("ptscotch", system))
-        ours = by.get(("rcb-fm", system))
-        if pt is None or ours is None:
-            continue
-        if int(pt["cut"]) < int(ours["cut"]):
-            lower.append(system)
-        elif int(ours["cut"]) < int(pt["cut"]):
-            ours_lower.append(system)
-        if ours["median"] < pt["median"]:
-            faster.append(system)
-        summary = next((line for line in pt_summary if f"system {system} " in line), "")
-        if summary:
-            bits = summary.split()
-            low = int(bits[bits.index("min_cut") + 1])
-            high = int(bits[bits.index("max_cut") + 1])
-            if low < int(ours["cut"]) < high and int(pt["cut"]) >= int(ours["cut"]):
-                crossed.append(system)
-    if lower:
-        a("Parallel Scotch cuts fewer edges on " + ", ".join(lower) + ".")
-    if ours_lower:
-        a("The mW lattices, the slab, and TIP4P-1024000 keep a smaller rcb-fm cut." if set(ours_lower) == {"mW-110592", "mW-884736", "TIP4P-1024000", "slab-110592"} else "A smaller rcb-fm cut shows up on " + ", ".join(ours_lower) + ".")
-    if crossed:
-        a("On " + ", ".join(crossed) + " the parallel Scotch range crosses that rcb-fm cut, and the type-7 median stays above it.")
-    if faster:
-        a("Wall time favors rcb-fm on the slab, both TIP4P lattices, and both mW lattices." if len(faster) == 5 else "Wall time favors rcb-fm on " + ", ".join(faster) + ".")
-    a("The comparison stays on one system at a time.")
+    def compare(section, label):
+        by = {}
+        for row in rows:
+            if row.get("section", "serial") != section:
+                continue
+            by[(row["method"], row["system"])] = row
+        a(label)
+        lower = []
+        ours_lower = []
+        faster = []
+        for system in systems:
+            pt = by.get(("ptscotch", system))
+            ours = by.get(("rcb-fm", system))
+            if pt is None or ours is None:
+                continue
+            if int(pt["cut"]) < int(ours["cut"]):
+                lower.append(system)
+            elif int(ours["cut"]) < int(pt["cut"]):
+                ours_lower.append(system)
+            if ours["median"] < pt["median"]:
+                faster.append(system)
+        if lower:
+            a("Parallel Scotch cuts fewer edges on " + ", ".join(lower) + ".")
+        if ours_lower:
+            a("rcb-fm cuts fewer edges on " + ", ".join(ours_lower) + ".")
+        if faster:
+            a("The whole-operation wall favors rcb-fm on " + ", ".join(faster) + ".")
+        a("Each sentence stays on the systems named in it.")
+
+    compare("serial", "One thread beside one rank.")
+    compare("ladder", "Eight threads beside eight ranks.")
     a("")
     a("## Halo counts")
     a("")
@@ -486,13 +511,7 @@ def main():
             a("")
     a("## Prose")
     a("")
-    a("The prose pass covers the placement note, the report, the partition page, the C API page, and the README.")
-    a("Two older pages keep their earlier wording:")
-    a("")
-    a("```text")
-    a("docs/explanation/mic-and-cells.md")
-    a("docs/reference/algorithm.md")
-    a("```")
+    a("The prose pass covers every Markdown file in the tree, including the changelog and the third-party note.")
     a("")
     dst.write_text("\n".join(lines) + "\n")
 

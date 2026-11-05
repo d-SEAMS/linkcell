@@ -1,5 +1,7 @@
 #!/bin/sh
-# Serial panel. The log opens with HEAD, TREE, and COMMAND.
+# Production panel. The log opens with HEAD, TREE, and COMMAND.
+# One-thread native methods run beside one-rank PT-Scotch.
+# The eight-thread ladder runs beside eight-rank PT-Scotch.
 set -eu
 unset LINKCELL_ONLY_METHOD
 unset LINKCELL_ASSIGN_SUM
@@ -9,8 +11,34 @@ mkdir -p benchmarks/work
   echo "HEAD $(git rev-parse HEAD)"
   echo "TREE $(git rev-parse 'HEAD^{tree}')"
   echo "COMMAND scripts/run_partition_panel.sh $out"
+  echo "NPROC $(nproc)"
+  echo "HOST_BEGIN"
+  nproc
+  lscpu
+  echo "HOST_END"
+  echo "gpu_query command nvidia-smi"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi || echo "gpu_status unsupported"
+  else
+    echo "gpu_status unsupported"
+    echo "gpu_reason nvidia-smi is absent on this host"
+    echo "gpu_followup rerun the curve split on a host with a CUDA device"
+  fi
+  awk '
+    /^#define SCOTCH_VERSION / { v = $3 }
+    /^#define SCOTCH_RELEASE / { r = $3 }
+    /^#define SCOTCH_PATCHLEVEL / { p = $3 }
+    END { print "scotch_header", v "." r "." p }
+  ' /usr/include/scotch/scotch.h
+  echo "scotch_strategy SCOTCH_STRATQUALITY|SCOTCH_STRATBALANCE"
   set +e
-  RAYON_NUM_THREADS=1 ./target/release/examples/partition_panel 8 12
+  PTSCOTCH_RANKS=1 RAYON_NUM_THREADS=1 ./target/release/examples/partition_panel 8 12
+  ec=$?
+  if [ "$ec" -ne 0 ]; then
+    echo "EXIT $ec"
+    exit "$ec"
+  fi
+  PTSCOTCH_RANKS=8 RAYON_NUM_THREADS=8 ./target/release/examples/partition_panel 8 12 ladder
   ec=$?
   if [ "$ec" -ne 0 ]; then
     echo "EXIT $ec"
@@ -26,8 +54,7 @@ mkdir -p benchmarks/work
       echo "EXIT $ec"
       exit "$ec"
     fi
-    n=$((190109 * threads))
-    RAYON_NUM_THREADS="$threads" ./target/release/examples/partition_panel 8 12 scale weak "$n"
+    RAYON_NUM_THREADS="$threads" ./target/release/examples/partition_panel 8 12 scale weak 190109
     ec=$?
     if [ "$ec" -ne 0 ]; then
       echo "EXIT $ec"

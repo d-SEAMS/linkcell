@@ -163,8 +163,8 @@ pub use pairs::{pairs_within, pairs_within_columns, Pair, PairColumns};
 pub use partition::{
     cell_graph, cell_grid, curve_split_device, derived_balance, derived_balance_f64, edge_cut,
     exclusive_prefix, halo, halo_width, hilbert_key, histogram, morton_cmp, morton_key, partition,
-    partition_graph, prefix_assign, profile_ns, profile_reset, score, CellGraph, CellGrid, Method,
-    PartRequest, PartScore, DEFAULT_METHOD,
+    partition_graph, prefix_assign, profile_ns, profile_reset, replicate_graph, score,
+    timer_resolution_ns, CellGraph, CellGrid, Method, PartRequest, PartScore, DEFAULT_METHOD,
 };
 pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
