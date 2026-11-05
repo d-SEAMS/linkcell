@@ -58,6 +58,8 @@ def parse(text):
             meta["cpu_model"] = line.split(" ", 1)[1]
         elif line.startswith("cpu_kind "):
             meta["cpu_kind"] = line.split()[1]
+        elif line.startswith("HOSTNAME "):
+            meta["hostname"] = line.split(" ", 1)[1]
         elif line.startswith("NPROC "):
             meta["nproc"] = line.split()[1]
         elif line.startswith("timer_resolution_ns "):
@@ -213,6 +215,7 @@ def main():
     a("This cell-partition report is generated from one log. Every median and every interquartile range (IQR) is the value that log printed for that cell. The raw sample line is the series those values came from, at type-7.")
     a("")
     mhz = meta.get("mhz", "")
+    a(f"The hostname is `{meta.get('hostname', '')}`.")
     a(f"The host line is `{meta.get('cpu_model', meta.get('hardware', ''))}`.")
     a(f"The cpu kind is {meta.get('cpu_kind', 'unread')}. nproc reports {meta.get('nproc', '')} processors. The clock reads {mhz} MHz.")
     a("Virtual means the hypervisor flag is set, and the model string is the guest name.")
@@ -519,11 +522,46 @@ def main():
                 a("The graph check walks offsets and neighbors in chunks and reduces with a boolean and.")
                 a("Packing, the balance repair, the graph check, and join scheduling stay smaller than the median.")
             a("")
+    if len(sys.argv) > 3:
+        add_ab(a, Path(sys.argv[3]).read_text())
     a("## Prose")
     a("")
     a("The prose pass covers every Markdown file in the tree, including the changelog and the third-party note.")
     a("")
     dst.write_text("\n".join(lines) + "\n")
+
+
+def add_ab(a, text):
+    """Wall times for the shared pairs_within entry at BASE and at the tip."""
+    arms = {}
+    host = ""
+    for line in text.splitlines():
+        if line.startswith("HOSTNAME "):
+            host = line.split(" ", 1)[1]
+        elif line.startswith("ab_summary "):
+            bits = line.split()
+            arm = bits[bits.index("arm") + 1]
+            arms[arm] = {
+                "median": bits[bits.index("median_s") + 1],
+                "iqr": bits[bits.index("iqr_s") + 1],
+                "pairs": bits[bits.index("pairs") + 1],
+            }
+    if "base" not in arms or "tip" not in arms:
+        return
+    a("## Before and after")
+    a("")
+    a("The shared entry is `pairs_within`.")
+    a("The public main revision stops at that entry, so the comparison uses it only.")
+    a(f"Twelve calls of each revision ran in turn on `{host}`.")
+    a("Each figure is the timed call after three warmups, in seconds, at type-7.")
+    a(
+        f"Public main wall time is {arms['base']['median']} seconds at the median, spread {arms['base']['iqr']} seconds."
+    )
+    a(
+        f"After the same warmups, the tip call takes {arms['tip']['median']} seconds, spread {arms['tip']['iqr']} seconds."
+    )
+    a(f"Both arms returned {arms['base']['pairs']} pairs.")
+    a("")
 
 
 if __name__ == "__main__":

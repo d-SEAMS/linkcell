@@ -8,6 +8,7 @@ This cell-partition report is generated from one log.
 Every median and every interquartile range (IQR) is the value that log printed for that cell.
 The raw sample line is the series those values came from, at type-7.
 
+The hostname is `cursor`.
 The host line is `Intel(R) Xeon(R) Processor`.
 The cpu kind is virtual. nproc reports 8 processors.
 The clock reads 2400 MHz.
@@ -710,6 +711,16 @@ A prefix sum finds the half-weight bin, and ties break on the cell id.
 The two halves already run in parallel after that cut.
 The graph check walks offsets and neighbors in chunks and reduces with a boolean and.
 Packing, the balance repair, the graph check, and join scheduling stay smaller than the median.
+
+## Before and after
+
+The shared entry is `pairs_within`.
+The public main revision stops at that entry, so the comparison uses it only.
+Twelve calls of each revision ran in turn on `cursor`.
+Each figure is the timed call after three warmups, in seconds, at type-7.
+Public main wall time is 0.001921 seconds at the median, spread 0.000268 seconds.
+After the same warmups, the tip call takes 0.002142 seconds, spread 0.000577 seconds.
+Both arms returned 729088 pairs.
 
 ## Prose
 

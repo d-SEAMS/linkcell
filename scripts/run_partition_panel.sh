@@ -11,6 +11,7 @@ mkdir -p benchmarks/work
   echo "HEAD $(git rev-parse HEAD)"
   echo "TREE $(git rev-parse 'HEAD^{tree}')"
   echo "COMMAND scripts/run_partition_panel.sh $out"
+  echo "HOSTNAME $(hostname)"
   unset OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS
   unset NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS GOTO_NUM_THREADS
   echo "NPROC $(nproc)"
