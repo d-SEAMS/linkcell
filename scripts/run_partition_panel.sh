@@ -11,9 +11,13 @@ mkdir -p benchmarks/work
   echo "HEAD $(git rev-parse HEAD)"
   echo "TREE $(git rev-parse 'HEAD^{tree}')"
   echo "COMMAND scripts/run_partition_panel.sh $out"
+  unset OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS
+  unset NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS GOTO_NUM_THREADS
   echo "NPROC $(nproc)"
+  echo "NPROC_ALL $(nproc --all)"
   echo "HOST_BEGIN"
   nproc
+  nproc --all
   lscpu
   echo "HOST_END"
   echo "gpu_query command nvidia-smi"
