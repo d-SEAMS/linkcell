@@ -37,8 +37,9 @@ class Partition:
         self.xyz = np.ascontiguousarray(xyz)
         self.cell = np.array([n * spacing, n * spacing, n * spacing], dtype=np.float64)
         self.cutoff = 4.3065
-        self.tol = "0.03"
-        work = "benchmarks/work" if os.path.isdir("benchmarks/work") else "work"
+        self.tol = "1.1"
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        work = os.path.join(root, "benchmarks", "work")
         os.makedirs(work, exist_ok=True)
         self.graph_path = os.path.join(work, "asv-ptscotch.bin")
         self.assign_path = os.path.join(work, "asv-assign.txt")
@@ -112,7 +113,8 @@ def _write_graphs(bench):
 
 
 def _tool(name):
-    for path in (os.path.join("benchmarks", "work", name), os.path.join("work", name)):
-        if os.path.isfile(path):
-            return path
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    path = os.path.join(root, "benchmarks", "work", name)
+    if os.path.isfile(path):
+        return path
     raise RuntimeError(f"missing {name}")
