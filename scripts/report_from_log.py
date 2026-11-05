@@ -314,7 +314,7 @@ def main():
     a("")
     a("## Amdahl")
     a("")
-    a("Select, boundary refinement, coarsening, packing, the balance repair, and the graph check are timed on the critical path.")
+    a("The clocks are select, boundary refinement, coarsening, packing, the balance repair, and the graph check.")
     a("Each figure is wall time.")
     a("At one thread the two sides of a join are added.")
     a("Above one thread the slower side is kept.")
@@ -378,10 +378,10 @@ def main():
             value = karp(one[i], eight[i], 8)
             if value is None:
                 continue
-            scored.append((value, name))
+            scored.append((value * one[i], value, name))
         if scored:
             scored.sort(reverse=True)
-            limit_e, limit_name = scored[0]
+            _serial, limit_e, limit_name = scored[0]
             label = {
                 "select": "the weighted median",
                 "fm": "boundary refinement",
@@ -391,6 +391,7 @@ def main():
                 "check": "the graph check",
             }[limit_name]
             a(f"The measured limiter for rcb-fm at eight threads is {label}, with Karp-Flatt {limit_e:.3f}.")
+            a("That rank uses serial time, Karp-Flatt times the one-thread phase wall.")
             if limit_name == "pack":
                 a("Packing fills coordinates and splits cell ids.")
                 a("That coordinate fill and the top id split can run in parallel.")
@@ -405,9 +406,10 @@ def main():
                 a("Gain scans already run in parallel.")
                 a("The move order stays serial so the assignment matches across thread counts.")
             elif limit_name == "select":
-                a("The weighted median is the limiter.")
                 a("The first cut stays on one thread.")
                 a("The two halves already run in parallel after that cut.")
+                a("Packing, the balance repair, and the graph check are smaller.")
+                a("The graph check stays near its one-thread time, and that walk can run in parallel.")
             a("")
     a("## Prose")
     a("")
