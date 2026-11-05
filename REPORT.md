@@ -428,6 +428,10 @@ weak-multi threads 8 n 1520872 select 0.129 fm 0.178 coarse 0.703 other 0.000
 ## Prose
 
 The prose pass covers the placement note, the report, the partition page, the C API page, and the README.
-Minimum-image wording stays as it was.
-Algorithm sentences stay as they were.
+Two older pages keep their earlier wording:
+
+```text
+docs/explanation/mic-and-cells.md
+docs/reference/algorithm.md
+```
 
