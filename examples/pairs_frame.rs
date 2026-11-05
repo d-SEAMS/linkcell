@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use linkcell::{pairs_within, Cell};
+use linkcell::{pairs_within, pairs_within_count, Cell};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -78,4 +78,22 @@ fn main() {
     println!(
         "pop shape=frame-{n} threads={threads} n={n} reps={reps} wall_ns={wall_ns}"
     );
+    if std::env::var("PAIRS_SPLIT").ok().as_deref() == Some("1") {
+        for _ in 0..3 {
+            let ncount = pairs_within_count(&xyz, &cell, 4.0, None, None, false).expect("count");
+            assert_eq!(ncount, pairs.len());
+        }
+        let t1 = Instant::now();
+        let mut counted = 0usize;
+        for _ in 0..reps {
+            counted += pairs_within_count(&xyz, &cell, 4.0, None, None, false).expect("count");
+        }
+        let count_ns = t1.elapsed().as_nanos() as u64;
+        println!(
+            "split n={} box={boxl} pairs={} count={} reps={reps} write_ns={wall_ns} count_ns={count_ns} counted={counted}",
+            xyz.len(),
+            pairs.len(),
+            pairs.len()
+        );
+    }
 }

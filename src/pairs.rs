@@ -118,6 +118,28 @@ pub fn pairs_within(
     Ok(out)
 }
 
+/// How many rows [`pairs_within`] would write, without writing them.
+///
+/// The tile still plans the bins and tests every candidate. It does not
+/// store a `Pair` row, so the time is the search rather than the row
+/// stream. The count matches `pairs_within(...).len()` for the same
+/// arguments.
+pub fn pairs_within_count(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+) -> Result<usize, Error> {
+    let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+    if let Some(words) = plan.fused().filter(|_| knobs::fused()) {
+        return Ok(plan.count_rows(&words));
+    }
+    Ok(plan.search().rows())
+}
+
 /// Ask Linux to back the 2 MB-aligned interior of a large buffer this
 /// library allocated with transparent huge pages, so the row stores take
 /// one page walk per 2 MB rather than per 4 KB. It is advice: the system's
@@ -3841,6 +3863,18 @@ impl Plan {
         // Safety: every row below `n` is written.
         unsafe { out.set_len(n) };
         out
+    }
+
+    /// [`pairs_within_count`]: the tile's row count, with no row stored.
+    #[cfg(feature = "parallel")]
+    fn count_rows(&self, words: &RowWords) -> usize {
+        let mut counter = Counter;
+        let all = (0, self.grid.offsets.len() - 1, 0);
+        if self.half {
+            self.fused_side::<false, true, COUNT, _>(words, &mut counter, false, all)
+        } else {
+            self.fused_side::<false, false, COUNT, _>(words, &mut counter, false, all)
+        }
     }
 
     /// The tile kernel over every block into `sink`, for a full or a half

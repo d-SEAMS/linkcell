@@ -159,7 +159,7 @@ pub use error::Error;
 pub use knearest::{
     knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Neighbors,
 };
-pub use pairs::{pairs_within, pairs_within_columns, Pair, PairColumns};
+pub use pairs::{pairs_within, pairs_within_columns, pairs_within_count, Pair, PairColumns};
 pub use partition::{
     cell_graph, cell_grid, curve_split_device, derived_balance, derived_balance_f64, edge_cut,
     exclusive_prefix, halo, halo_width, hilbert_key, histogram, morton_cmp, morton_key, partition,
