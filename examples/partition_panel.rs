@@ -530,7 +530,7 @@ fn scale_case(parts: u32, reps: usize) {
         ("multi", Method::Multi),
     ];
     let mut samples = vec![Vec::with_capacity(reps); chosen.len()];
-    let mut prof = vec![(0u64, 0u64, 0u64); chosen.len()];
+    let mut prof = vec![(0u64, 0u64, 0u64, 0u64, 0u64, 0u64); chosen.len()];
     let mut hashes = vec![0u64; chosen.len()];
     for rep in 0..reps {
         for (i, (name, method)) in chosen.iter().enumerate() {
@@ -547,10 +547,13 @@ fn scale_case(parts: u32, reps: usize) {
             )
             .unwrap_or_else(|err| panic!("scale {name}: {err}"));
             samples[i].push(t0.elapsed().as_secs_f64());
-            let (sel, fm, coarse) = linkcell::profile_ns();
+            let (sel, fm, coarse, pack, repair, check) = linkcell::profile_ns();
             prof[i].0 += sel;
             prof[i].1 += fm;
             prof[i].2 += coarse;
+            prof[i].3 += pack;
+            prof[i].4 += repair;
+            prof[i].5 += check;
             let hash = assign_hash(&assign);
             if rep == 0 {
                 hashes[i] = hash;
@@ -562,9 +565,9 @@ fn scale_case(parts: u32, reps: usize) {
     for (i, (name, _)) in chosen.iter().enumerate() {
         print_raw(&samples[i]);
         let (median, spread) = iqr(samples[i].clone());
-        let (sel, fm, coarse) = prof[i];
+        let (sel, fm, coarse, pack, repair, check) = prof[i];
         println!(
-            "scale_row kind {kind} threads {threads} n {n} method {name} median_s {median:.6} iqr_s {spread:.6} profile_ns {sel} {fm} {coarse} assign_hash {:016x}",
+            "scale_row kind {kind} threads {threads} n {n} method {name} median_s {median:.6} iqr_s {spread:.6} profile_ns {sel} {fm} {coarse} {pack} {repair} {check} assign_hash {:016x}",
             hashes[i]
         );
     }
@@ -665,7 +668,7 @@ fn main() {
             .collect();
         let mut samples = vec![Vec::with_capacity(reps); chosen.len()];
         let mut assigns: Vec<Vec<u32>> = vec![Vec::new(); chosen.len()];
-        let mut prof = vec![(0u64, 0u64, 0u64); chosen.len()];
+        let mut prof = vec![(0u64, 0u64, 0u64, 0u64, 0u64, 0u64); chosen.len()];
         let zjob = if allow_method("zoltan-rcb") {
             zoltan_job(&system, &graph, parts)
         } else {
@@ -693,10 +696,13 @@ fn main() {
                 let assign = partition_graph(&graph, request)
                     .unwrap_or_else(|err| panic!("{} {name}: {err}", system.name));
                 samples[i].push(t0.elapsed().as_secs_f64());
-                let (sel, fm, coarse) = linkcell::profile_ns();
+                let (sel, fm, coarse, pack, repair, check) = linkcell::profile_ns();
                 prof[i].0 += sel;
                 prof[i].1 += fm;
                 prof[i].2 += coarse;
+                prof[i].3 += pack;
+                prof[i].4 += repair;
+                prof[i].5 += check;
                 if std::env::var("LINKCELL_ASSIGN_SUM").is_ok() {
                     let sum: u64 = assign.iter().map(|&d| u64::from(d)).sum();
                     let mix = assign.iter().fold(0u64, |acc, &d| {
@@ -737,10 +743,12 @@ fn main() {
             let got = score(&graph, &assigns[i], parts, width).unwrap();
             let (owned, ghosts) = worst_halo(&graph.grid, &assigns[i], parts, width);
             print_raw(&samples[i]);
-            let (sel, fm, coarse) = prof[i];
+            let (sel, fm, coarse, pack, repair, check) = prof[i];
             let (median, spread) = iqr(samples[i].clone());
             let eligible = native(name) && under_default(&graph.grid.weight, parts, got.imbalance);
-            println!("halo_owned {owned} halo_ghost {ghosts} profile_ns {sel} {fm} {coarse}");
+            println!(
+                "halo_owned {owned} halo_ghost {ghosts} profile_ns {sel} {fm} {coarse} {pack} {repair} {check}"
+            );
             println!(
                 "system {} method {name} cut {} imbalance {:.6} halo_fraction {:.6} median_s {:.6} iqr_s {:.6} eligible {}",
                 system.name,

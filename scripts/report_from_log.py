@@ -296,7 +296,7 @@ def main():
     a("")
     a("Strong scaling keeps the lattice at 1,520,875 points (115 cubed). Weak scaling uses 190,109 points times the thread count, so eight threads is 1,520,872 points.")
     a("Median and interquartile range (IQR) are recomputed from the raw line.")
-    a("`profile_ns` sums the critical-path wall time of select, boundary refinement, and coarsening over the repetitions, in nanoseconds.")
+    a("`profile_ns` sums the critical-path wall time of select, boundary refinement, coarsening, packing, the balance repair, and the graph check over the repetitions, in nanoseconds.")
     a("")
     a("```text")
     a("kind threads n method median iqr")
@@ -314,40 +314,40 @@ def main():
     a("")
     a("## Amdahl")
     a("")
-    a("Select, boundary refinement, and coarsening are timed on the critical path.")
-    a("Each figure is wall time. At one thread the two sides of a join are added. Above one thread the slower side is kept.")
+    a("Select, boundary refinement, coarsening, packing, the balance repair, and the graph check are timed on the critical path.")
+    a("Each figure is wall time.")
+    a("At one thread the two sides of a join are added.")
+    a("Above one thread the slower side is kept.")
     a("A share is that summed wall time divided by the mean partition wall time times the repetition count.")
-    a("The other share is what remains, and a negative value would mean the phases over-count the wall clock.")
-    a("Karp-Flatt uses the strong rows. With speedup s and thread count p, the serial fraction is (1/s - 1/p) / (1 - 1/p).")
+    a("The other share is what remains.")
+    a("Karp-Flatt uses the strong rows.")
+    a("With speedup s and thread count p, the serial fraction is (1/s - 1/p) / (1 - 1/p).")
     a("")
     a("```text")
-    a("method kind threads n select fm coarse other")
+    a("method kind threads n select fm coarse pack repair check other")
     phase = {}
+    names = ("select", "fm", "coarse", "pack", "repair", "check")
     for line, _med, _spread, raw in scales:
         bits = line.split()
         kind = bits[bits.index("kind") + 1]
         threads = int(bits[bits.index("threads") + 1])
         n = bits[bits.index("n") + 1]
         method = bits[bits.index("method") + 1]
-        sel = int(bits[bits.index("profile_ns") + 1])
-        fm = int(bits[bits.index("profile_ns") + 2])
-        coarse = int(bits[bits.index("profile_ns") + 3])
+        idx = bits.index("profile_ns")
+        vals = [int(bits[idx + 1 + i]) if idx + 1 + i < len(bits) and bits[idx + 1 + i].isdigit() else 0 for i in range(6)]
         mean = sum(raw) / len(raw)
         wall = mean * reps
         if wall <= 0:
             continue
-        s_sel = (sel / 1.0e9) / wall
-        s_fm = (fm / 1.0e9) / wall
-        s_coarse = (coarse / 1.0e9) / wall
-        other = 1.0 - s_sel - s_fm - s_coarse
-        phase[(kind, method, threads)] = (sel / 1.0e9 / reps, fm / 1.0e9 / reps, coarse / 1.0e9 / reps)
-        a(
-            f"{kind}-{method} threads {threads} n {n} select {s_sel:.3f} fm {s_fm:.3f} coarse {s_coarse:.3f} other {other:.3f}"
-        )
+        shares = [(v / 1.0e9) / wall for v in vals]
+        other = 1.0 - sum(shares)
+        phase[(kind, method, threads)] = tuple(v / 1.0e9 / reps for v in vals)
+        shown = " ".join(f"{name} {share:.3f}" for name, share in zip(names, shares))
+        a(f"{kind}-{method} threads {threads} n {n} {shown} other {other:.3f}")
     a("```")
     a("")
     a("```text")
-    a("strong method threads select_e fm_e coarse_e")
+    a("strong method threads select_e fm_e coarse_e pack_e repair_e check_e")
 
     def karp(t1, tp, p):
         if p <= 1 or t1 <= 0 or tp <= 0:
@@ -365,9 +365,50 @@ def main():
         for t1, tp in zip(base, cur):
             value = karp(t1, tp, threads)
             cells.append("na" if value is None else f"{value:.3f}")
-        a(f"strong {method} threads {threads} select_e {cells[0]} fm_e {cells[1]} coarse_e {cells[2]}")
+        a(
+            f"strong {method} threads {threads} select_e {cells[0]} fm_e {cells[1]} coarse_e {cells[2]} pack_e {cells[3]} repair_e {cells[4]} check_e {cells[5]}"
+        )
     a("```")
     a("")
+    eight = phase.get(("strong", "rcb-fm", 8))
+    one = phase.get(("strong", "rcb-fm", 1))
+    if eight is not None and one is not None:
+        scored = []
+        for i, name in enumerate(names):
+            value = karp(one[i], eight[i], 8)
+            if value is None:
+                continue
+            scored.append((value, name))
+        if scored:
+            scored.sort(reverse=True)
+            limit_e, limit_name = scored[0]
+            label = {
+                "select": "the weighted median",
+                "fm": "boundary refinement",
+                "coarse": "coarsening",
+                "pack": "packing",
+                "repair": "the balance repair",
+                "check": "the graph check",
+            }[limit_name]
+            a(f"The measured limiter for rcb-fm at eight threads is {label}, with Karp-Flatt {limit_e:.3f}.")
+            if limit_name == "pack":
+                a("Packing fills coordinates and splits cell ids.")
+                a("That coordinate fill and the top id split can run in parallel.")
+            elif limit_name == "repair":
+                a("The balance repair sums the weight of each part.")
+                a("That weight sum can run in parallel.")
+            elif limit_name == "check":
+                a("The graph check walks offsets and neighbors.")
+                a("That walk can run in parallel.")
+            elif limit_name == "fm":
+                a("Boundary refinement is the limiter.")
+                a("Gain scans already run in parallel.")
+                a("The move order stays serial so the assignment matches across thread counts.")
+            elif limit_name == "select":
+                a("The weighted median is the limiter.")
+                a("The first cut stays on one thread.")
+                a("The two halves already run in parallel after that cut.")
+            a("")
     a("## Prose")
     a("")
     a("The prose pass covers the placement note, the report, the partition page, the C API page, and the README.")

@@ -275,10 +275,24 @@ pub fn partition(
 /// returns [`Error::NoDevice`] here. Build the assignment from points
 /// with [`partition`] when the device path is required.
 pub fn partition_graph(graph: &CellGraph, request: PartRequest) -> Result<Vec<u32>, Error> {
+    let t_all = Instant::now();
+    let start = profile_sum();
+    let result = partition_graph_timed(graph, request);
+    let elapsed = t_all.elapsed().as_nanos() as u64;
+    let used = profile_sum().saturating_sub(start);
+    if elapsed > used {
+        PACK_NS.fetch_add(elapsed - used, AtomicOrdering::Relaxed);
+    }
+    result
+}
+
+fn partition_graph_timed(graph: &CellGraph, request: PartRequest) -> Result<Vec<u32>, Error> {
     if request.device {
         return Err(Error::NoDevice);
     }
+    let t_check = Instant::now();
     check_graph(graph)?;
+    CHECK_NS.fetch_add(t_check.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     let ratio = balance_ratio(request.balance, &graph.grid.weight, request.parts)?;
     if request.parts == 0 {
         return Err(Error::BadPartition);
@@ -770,6 +784,7 @@ fn rcb_on(
     ratio: (u64, u64),
 ) -> Vec<u32> {
     let n = graph.grid.ncell();
+    let t_pack = Instant::now();
     let mut x = vec![0.0; n];
     let mut y = vec![0.0; n];
     let mut z = vec![0.0; n];
@@ -786,6 +801,7 @@ fn rcb_on(
     };
     let mut ids: Vec<u32> = (0..n as u32).collect();
     let mut out = vec![0u32; n];
+    PACK_NS.fetch_add(t_pack.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     let phase = rcb_slice(
         &mut ids,
         parts,
@@ -917,12 +933,22 @@ fn dispatch(
         refine(&mut assign, graph, parts, ratio);
     }
     if matches!(method, Method::RcbFm | Method::HilbertFm | Method::Multi) {
+        let t_repair = Instant::now();
         repair_balance(&mut assign, graph, parts, ratio);
-    }
-    if matches!(method, Method::RcbFm | Method::Multi)
-        && !holds_balance(&graph.grid.weight, &assign, parts, ratio)
-    {
-        assign = rcb_assign(graph, parts, false, ratio);
+        if matches!(method, Method::RcbFm | Method::Multi)
+            && !holds_balance(&graph.grid.weight, &assign, parts, ratio)
+        {
+            REPAIR_NS.fetch_add(
+                t_repair.elapsed().as_nanos() as u64,
+                AtomicOrdering::Relaxed,
+            );
+            assign = rcb_assign(graph, parts, false, ratio);
+        } else {
+            REPAIR_NS.fetch_add(
+                t_repair.elapsed().as_nanos() as u64,
+                AtomicOrdering::Relaxed,
+            );
+        }
     }
     Ok(assign)
 }
@@ -1110,28 +1136,47 @@ fn owner_of(before: u64, weight: u64, total: u64, parts: u32) -> u32 {
 static SELECT_NS: AtomicU64 = AtomicU64::new(0);
 static FM_NS: AtomicU64 = AtomicU64::new(0);
 static COARSE_NS: AtomicU64 = AtomicU64::new(0);
+static PACK_NS: AtomicU64 = AtomicU64::new(0);
+static REPAIR_NS: AtomicU64 = AtomicU64::new(0);
+static CHECK_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Zero the phase counters used by the next partition.
 pub fn profile_reset() {
     SELECT_NS.store(0, AtomicOrdering::Relaxed);
     FM_NS.store(0, AtomicOrdering::Relaxed);
     COARSE_NS.store(0, AtomicOrdering::Relaxed);
+    PACK_NS.store(0, AtomicOrdering::Relaxed);
+    REPAIR_NS.store(0, AtomicOrdering::Relaxed);
+    CHECK_NS.store(0, AtomicOrdering::Relaxed);
 }
 
-/// Critical-path wall time, in nanoseconds, of the weighted median, the
-/// boundary refinement, and coarsening.
+/// Critical-path wall time, in nanoseconds.
 ///
-/// Each value is the sum over the calls since [`profile_reset`]. Inside a
-/// parallel bisection the recorded time is the slower child, then the
-/// serial work on that path. One thread adds the children, because the
-/// join runs them in order. The three sums are therefore wall time, and
-/// a later share is that wall time over the partition wall time.
-pub fn profile_ns() -> (u64, u64, u64) {
+/// The fields are the weighted median, boundary refinement, coarsening,
+/// packing, the balance repair, and the graph check. Packing fills
+/// coordinates, measures the span, and splits cell ids. Each value is
+/// the sum over the calls since [`profile_reset`]. Inside a parallel
+/// bisection the recorded time is the slower child, then the serial work
+/// on that path. One thread adds the children, because the join runs
+/// them in order.
+pub fn profile_ns() -> (u64, u64, u64, u64, u64, u64) {
     (
         SELECT_NS.load(AtomicOrdering::Relaxed),
         FM_NS.load(AtomicOrdering::Relaxed),
         COARSE_NS.load(AtomicOrdering::Relaxed),
+        PACK_NS.load(AtomicOrdering::Relaxed),
+        REPAIR_NS.load(AtomicOrdering::Relaxed),
+        CHECK_NS.load(AtomicOrdering::Relaxed),
     )
+}
+
+fn profile_sum() -> u64 {
+    let (sel, fm, coarse, pack, repair, check) = profile_ns();
+    sel.saturating_add(fm)
+        .saturating_add(coarse)
+        .saturating_add(pack)
+        .saturating_add(repair)
+        .saturating_add(check)
 }
 
 fn axis_coord(geom: &RcbGeom, axis: usize, id: u32) -> f64 {
@@ -1313,6 +1358,7 @@ fn weighted_cut(
 
 fn rcb_assign(graph: &CellGraph, parts: u32, refine_cuts: bool, ratio: (u64, u64)) -> Vec<u32> {
     let n = graph.grid.ncell();
+    let t_pack = Instant::now();
     let mut x = vec![0.0f64; n];
     let mut y = vec![0.0f64; n];
     let mut z = vec![0.0f64; n];
@@ -1330,6 +1376,7 @@ fn rcb_assign(graph: &CellGraph, parts: u32, refine_cuts: bool, ratio: (u64, u64
     };
     let mut ids: Vec<u32> = (0..n as u32).collect();
     let mut out = vec![0u32; n];
+    PACK_NS.fetch_add(t_pack.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     let phase = rcb_slice(
         &mut ids,
         parts,
@@ -1351,39 +1398,48 @@ unsafe impl Sync for SendPtr {}
 
 /// Wall time of one bisection subtree.
 ///
-/// `select` and `fm` are sequential on a single branch. A join keeps the
-/// slower child when more than one thread is in the pool, and adds the
-/// children when the join is serial.
+/// `select`, `fm`, and `pack` are sequential on a single branch. A join
+/// keeps the slower child when more than one thread is in the pool, and
+/// adds the children when the join is serial.
 #[derive(Clone, Copy, Default)]
 struct Phase {
     select: u64,
     fm: u64,
+    pack: u64,
+}
+
+fn phase_wall(phase: Phase) -> u64 {
+    phase
+        .select
+        .saturating_add(phase.fm)
+        .saturating_add(phase.pack)
 }
 
 fn record_phase(phase: Phase) {
     SELECT_NS.fetch_add(phase.select, AtomicOrdering::Relaxed);
     FM_NS.fetch_add(phase.fm, AtomicOrdering::Relaxed);
+    PACK_NS.fetch_add(phase.pack, AtomicOrdering::Relaxed);
 }
 
 fn phase_join(a: Phase, b: Phase) -> Phase {
     #[cfg(feature = "parallel")]
     {
         if rayon::current_num_threads() > 1 {
-            let aw = a.select.saturating_add(a.fm);
-            let bw = b.select.saturating_add(b.fm);
-            return if aw >= bw { a } else { b };
+            return if phase_wall(a) >= phase_wall(b) { a } else { b };
         }
     }
     Phase {
         select: a.select.saturating_add(b.select),
         fm: a.fm.saturating_add(b.fm),
+        pack: a.pack.saturating_add(b.pack),
     }
 }
 
-fn phase_after(select_here: u64, fm_here: u64, child: Phase) -> Phase {
+fn phase_after(select_here: u64, fm_here: u64, pack_here: u64, child: Phase) -> Phase {
     Phase {
         select: select_here.saturating_add(child.select),
         fm: fm_here.saturating_add(child.fm),
+        pack: pack_here.saturating_add(child.pack),
     }
 }
 
@@ -1404,18 +1460,44 @@ fn rcb_slice(
     refine_cuts: bool,
     ratio: (u64, u64),
 ) -> Phase {
+    let t_all = Instant::now();
+    let mut phase = rcb_slice_timed(ids, parts, part0, geom, out, graph, refine_cuts, ratio);
+    let elapsed = t_all.elapsed().as_nanos() as u64;
+    let named = phase_wall(phase);
+    if elapsed > named {
+        phase.pack = phase.pack.saturating_add(elapsed - named);
+    }
+    phase
+}
+
+fn rcb_slice_timed(
+    ids: &mut [u32],
+    parts: u32,
+    part0: u32,
+    geom: &RcbGeom,
+    out: SendPtr,
+    graph: &CellGraph,
+    refine_cuts: bool,
+    ratio: (u64, u64),
+) -> Phase {
     if ids.is_empty() {
         return Phase::default();
     }
     if parts <= 1 || ids.len() == 1 {
+        let t_pack = Instant::now();
         for &id in ids.iter() {
             // Each cell id is written by exactly one bisection branch.
             unsafe { out.0.add(id as usize).write(part0) };
         }
-        return Phase::default();
+        return Phase {
+            select: 0,
+            fm: 0,
+            pack: t_pack.elapsed().as_nanos() as u64,
+        };
     }
     let parts_l = parts / 2;
     let parts_r = parts - parts_l;
+    let t_pack = Instant::now();
     let mut min = [f64::MAX; 3];
     let mut max = [f64::MIN; 3];
     for &id in ids.iter() {
@@ -1438,6 +1520,7 @@ fn rcb_slice(
         2
     };
     let total: u64 = ids.iter().map(|&id| geom.w[id as usize]).sum();
+    let pack_span = t_pack.elapsed().as_nanos() as u64;
     let t_sel = Instant::now();
     let mut cut = if refine_cuts {
         // The longest axis is not the lightest cut when pair counts differ.
@@ -1454,10 +1537,12 @@ fn rcb_slice(
     if cut >= ids.len() {
         cut = ids.len() - 1;
     }
+    let t_side = Instant::now();
     let mut side = vec![1u8; ids.len()];
     for s in side.iter_mut().take(cut) {
         *s = 0;
     }
+    let pack_side = t_side.elapsed().as_nanos() as u64;
     let t_fm = Instant::now();
     if refine_cuts {
         bipartition_fm(ids, &mut side, geom, graph, parts_l, parts_r, ratio);
@@ -1467,6 +1552,7 @@ fn rcb_slice(
     } else {
         0
     };
+    let t_split = Instant::now();
     let mut left = Vec::new();
     let mut right = Vec::new();
     for (i, &id) in ids.iter().enumerate() {
@@ -1476,6 +1562,9 @@ fn rcb_slice(
             right.push(id);
         }
     }
+    let pack_here = pack_span
+        .saturating_add(pack_side)
+        .saturating_add(t_split.elapsed().as_nanos() as u64);
     let child = if left.is_empty() || right.is_empty() {
         let (left_ids, right_ids) = ids.split_at_mut(cut);
         descend(
@@ -1506,7 +1595,7 @@ fn rcb_slice(
             ratio,
         )
     };
-    phase_after(select_here, fm_here, child)
+    phase_after(select_here, fm_here, pack_here, child)
 }
 
 fn descend(
