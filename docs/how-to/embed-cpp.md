@@ -1,10 +1,10 @@
 # Embed linkcell from C++
 
-`include/linkcell.hpp` is a C++17 Resource Acquisition Is Initialization (RAII) header over `linkcell.h`.
-The header stays on the one CPU library.
-Link the same package target a C consumer links.
+`include/linkcell.hpp` is a C++17 RAII header over `linkcell.h`. It
+does not add a second CPU library. Link the same package target a C
+consumer links.
 
-The CPU library header's `linkcell::knearest` returns an owning packed `Neighbours`.
+`linkcell::knearest` returns an owning packed `Neighbours`.
 `knearest_into` writes a caller-owned `int *` and takes `out_len`,
 which must be `n * k`. Neither returns `std::vector<std::vector<int>>`.
 Unused slots are `-1`. Failure throws `linkcell::Error`.
@@ -60,8 +60,8 @@ ws.knearest_into_many_dcell(xyz_dev, n, 1, cell_dev, 9, k, out_dev,
                             n * k);
 ```
 
-The device cell header reports `linkcell::gpu::available()` false when a CUDA driver or NVIDIA runtime compilation (NVRTC)
-fails to load. gpulite loads both at runtime; no CUDA SDK is needed
+`linkcell::gpu::available()` is false when a CUDA driver or NVRTC
+cannot be loaded. gpulite loads both at runtime; no CUDA SDK is needed
 to build the target.
 
 A general parallelepiped is `linkcell::Cell::from_vectors(a, b, c,

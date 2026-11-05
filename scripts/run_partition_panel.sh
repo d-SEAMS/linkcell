@@ -1,6 +1,8 @@
 #!/bin/sh
 # Serial panel. The log opens with HEAD, TREE, and COMMAND.
 set -eu
+unset LINKCELL_ONLY_METHOD
+unset LINKCELL_ASSIGN_SUM
 out=${1:-benchmarks/work/panel.txt}
 mkdir -p benchmarks/work
 {

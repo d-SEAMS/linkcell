@@ -14,8 +14,19 @@ Hilbert order is code 1 and uses that prefix on the cells.
 Weighted recursive coordinate bisection (RCB) is code 2.
 Code 3 adds Fiduccia-Mattheyses after the Hilbert order.
 Code 4, `rcb-fm`, refines the bisection.
+The gain of each boundary cell is scanned in parallel and then stored in index order.
+The pass takes improving moves, then as many non-positive moves as the heaviest cell weighs, and keeps the best prefix.
+That weight is the slack in the balance bound, so the valley length comes from the graph.
+One thread and many threads therefore write the same assignment.
 `SCOTCH_graphPart` is code 5 when the `scotch` feature is on.
 Heavy-edge coarsening after the `rcb-fm` cut is code 6, `multi`.
+A contracted vertex may weigh at most the part cap.
+That cap is the most weight the balance bound allows one part to hold.
+With the derived ratio the cap is the ideal share plus the heaviest cell.
+Matching stops when a pair would cross the cap.
+Coarsening stops once the coarse graph is no larger than the part count.
+A later cycle replaces the incumbent only while the edge cut falls and every part stays inside the bound.
+The following cycle ends once the cut stays level.
 `SCOTCH_dgraphPart` is code 7 when the `ptscotch` feature is on.
 
 Our method computes the default bisection on those cells with code 4, `rcb-fm`.

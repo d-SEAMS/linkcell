@@ -13,8 +13,8 @@
 //! unless compiled in.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::collections::BTreeMap;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
@@ -512,13 +512,16 @@ fn partition_prepared(prep: &Prepared, request: PartRequest) -> Result<Vec<u32>,
     )
 }
 
-/// Coarse vertices retained per part. One vertex then weighs at most about
-/// `1 / COARSE_PER_PART` of a part, so the initial geometric cut can meet
-/// the balance bound before refinement.
-const COARSE_PER_PART: u32 = 32;
-
-/// Partition-aware uncoarsening passes after the geometric incumbent.
-const V_CYCLES: u32 = 2;
+/// Largest weight one contracted vertex may have.
+///
+/// [`part_cap`] is the most weight `under_balance` allows one part to
+/// hold. With the derived ratio that cap is the ideal share plus the
+/// heaviest fine cell, so the stop is tied to the part count and
+/// `w_max`. A coarse vertex above the cap cannot sit in any part, and
+/// matching refuses a pair that would cross it.
+fn cluster_cap(total: u64, parts: u32, w_max: u64, ratio: (u64, u64)) -> u64 {
+    part_cap(total, parts, ratio).max(w_max).max(1)
+}
 
 fn multi_assign(graph: &CellGraph, parts: u32, ratio: (u64, u64)) -> Vec<u32> {
     let n = graph.grid.ncell();
@@ -527,11 +530,13 @@ fn multi_assign(graph: &CellGraph, parts: u32, ratio: (u64, u64)) -> Vec<u32> {
         let (ix, iy, iz) = unravel(c, graph.grid.nx, graph.grid.ny);
         coords.push((f64::from(ix), f64::from(iy), f64::from(iz)));
     }
-    // Geometric bisection is the incumbent. A V-cycle replaces it only when
-    // the cut falls and every part stays inside the balance bound.
+    // Geometric bisection is the incumbent. A later cycle replaces it
+    // only when the integer cut falls and every part stays inside the
+    // balance bound. The cut cannot fall forever, so the loop ends when
+    // a cycle brings no gain.
     let mut best = rcb_assign(graph, parts, true, ratio);
     let mut best_cut = edge_cut(graph, &best);
-    for _ in 0..V_CYCLES {
+    loop {
         let next = v_cycle(graph, &coords, &best, parts, ratio);
         let next_cut = edge_cut(graph, &next);
         if next_cut < best_cut && holds_balance(&graph.grid.weight, &next, parts, ratio) {
@@ -557,7 +562,9 @@ fn holds_balance(weight: &[u64], assign: &[u32], parts: u32, ratio: (u64, u64)) 
         part_w[d as usize] += weight[c];
         total += weight[c];
     }
-    part_w.iter().all(|&w| under_balance(w, total, parts, ratio))
+    part_w
+        .iter()
+        .all(|&w| under_balance(w, total, parts, ratio))
 }
 
 /// One uncoarsening pass. Matching stays inside the current parts, so the
@@ -571,14 +578,16 @@ fn v_cycle(
 ) -> Vec<u32> {
     let n = graph.grid.ncell();
     let total: u64 = graph.grid.weight.iter().copied().sum();
-    let stop_n = parts.saturating_mul(COARSE_PER_PART).max(parts.max(2));
-    if n <= stop_n as usize {
+    let w_max = graph.grid.weight.iter().copied().max().unwrap_or(0);
+    let cap = cluster_cap(total, parts, w_max, ratio);
+    // One vertex per part is already a legal assignment. A vertex above
+    // the cap cannot be paired without producing an unsplittable part.
+    if n <= parts as usize || graph.grid.weight.iter().any(|&w| w > cap) {
         let mut out = assign.to_vec();
         refine(&mut out, graph, parts, ratio);
         return out;
     }
     let t0 = Instant::now();
-    let cap = (total / u64::from(stop_n).max(1)).max(1);
     let mate = heavy_match(graph, cap, Some(assign));
     let shrunk = mate.iter().enumerate().any(|(v, &m)| m != v as u32);
     if !shrunk {
@@ -777,7 +786,7 @@ fn rcb_on(
     };
     let mut ids: Vec<u32> = (0..n as u32).collect();
     let mut out = vec![0u32; n];
-    rcb_slice(
+    let phase = rcb_slice(
         &mut ids,
         parts,
         0,
@@ -787,6 +796,7 @@ fn rcb_on(
         refine_cuts,
         ratio,
     );
+    record_phase(phase);
     out
 }
 
@@ -1076,11 +1086,7 @@ pub fn prefix_assign(order: &[u32], weight: &[u64], parts: u32) -> Vec<u32> {
     let total: u64 = weight.iter().copied().sum();
     let mut before = 0u64;
     for &cell in order {
-        let w = if total == 0 {
-            1
-        } else {
-            weight[cell as usize]
-        };
+        let w = if total == 0 { 1 } else { weight[cell as usize] };
         let tot = if total == 0 { n as u64 } else { total };
         assign[cell as usize] = owner_of(before, w, tot, parts);
         before += w;
@@ -1112,7 +1118,14 @@ pub fn profile_reset() {
     COARSE_NS.store(0, AtomicOrdering::Relaxed);
 }
 
-/// Nanoseconds in the weighted median, the boundary pass, and coarsening.
+/// Critical-path wall time, in nanoseconds, of the weighted median, the
+/// boundary refinement, and coarsening.
+///
+/// Each value is the sum over the calls since [`profile_reset`]. Inside a
+/// parallel bisection the recorded time is the slower child, then the
+/// serial work on that path. One thread adds the children, because the
+/// join runs them in order. The three sums are therefore wall time, and
+/// a later share is that wall time over the partition wall time.
 pub fn profile_ns() -> (u64, u64, u64) {
     (
         SELECT_NS.load(AtomicOrdering::Relaxed),
@@ -1317,7 +1330,7 @@ fn rcb_assign(graph: &CellGraph, parts: u32, refine_cuts: bool, ratio: (u64, u64
     };
     let mut ids: Vec<u32> = (0..n as u32).collect();
     let mut out = vec![0u32; n];
-    rcb_slice(
+    let phase = rcb_slice(
         &mut ids,
         parts,
         0,
@@ -1327,6 +1340,7 @@ fn rcb_assign(graph: &CellGraph, parts: u32, refine_cuts: bool, ratio: (u64, u64
         refine_cuts,
         ratio,
     );
+    record_phase(phase);
     out
 }
 
@@ -1334,6 +1348,44 @@ fn rcb_assign(graph: &CellGraph, parts: u32, refine_cuts: bool, ratio: (u64, u64
 struct SendPtr(*mut u32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
+
+/// Wall time of one bisection subtree.
+///
+/// `select` and `fm` are sequential on a single branch. A join keeps the
+/// slower child when more than one thread is in the pool, and adds the
+/// children when the join is serial.
+#[derive(Clone, Copy, Default)]
+struct Phase {
+    select: u64,
+    fm: u64,
+}
+
+fn record_phase(phase: Phase) {
+    SELECT_NS.fetch_add(phase.select, AtomicOrdering::Relaxed);
+    FM_NS.fetch_add(phase.fm, AtomicOrdering::Relaxed);
+}
+
+fn phase_join(a: Phase, b: Phase) -> Phase {
+    #[cfg(feature = "parallel")]
+    {
+        if rayon::current_num_threads() > 1 {
+            let aw = a.select.saturating_add(a.fm);
+            let bw = b.select.saturating_add(b.fm);
+            return if aw >= bw { a } else { b };
+        }
+    }
+    Phase {
+        select: a.select.saturating_add(b.select),
+        fm: a.fm.saturating_add(b.fm),
+    }
+}
+
+fn phase_after(select_here: u64, fm_here: u64, child: Phase) -> Phase {
+    Phase {
+        select: select_here.saturating_add(child.select),
+        fm: fm_here.saturating_add(child.fm),
+    }
+}
 
 struct RcbGeom {
     x: Vec<f64>,
@@ -1351,16 +1403,16 @@ fn rcb_slice(
     graph: &CellGraph,
     refine_cuts: bool,
     ratio: (u64, u64),
-) {
+) -> Phase {
     if ids.is_empty() {
-        return;
+        return Phase::default();
     }
     if parts <= 1 || ids.len() == 1 {
         for &id in ids.iter() {
             // Each cell id is written by exactly one bisection branch.
             unsafe { out.0.add(id as usize).write(part0) };
         }
-        return;
+        return Phase::default();
     }
     let parts_l = parts / 2;
     let parts_r = parts - parts_l;
@@ -1395,7 +1447,7 @@ fn rcb_slice(
     } else {
         weighted_cut(ids, geom, axis, total, parts, parts_l)
     };
-    SELECT_NS.fetch_add(t_sel.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    let select_here = t_sel.elapsed().as_nanos() as u64;
     if cut == 0 {
         cut = 1;
     }
@@ -1406,9 +1458,15 @@ fn rcb_slice(
     for s in side.iter_mut().take(cut) {
         *s = 0;
     }
+    let t_fm = Instant::now();
     if refine_cuts {
         bipartition_fm(ids, &mut side, geom, graph, parts_l, parts_r, ratio);
     }
+    let fm_here = if refine_cuts {
+        t_fm.elapsed().as_nanos() as u64
+    } else {
+        0
+    };
     let mut left = Vec::new();
     let mut right = Vec::new();
     for (i, &id) in ids.iter().enumerate() {
@@ -1418,27 +1476,37 @@ fn rcb_slice(
             right.push(id);
         }
     }
-    if left.is_empty() || right.is_empty() {
+    let child = if left.is_empty() || right.is_empty() {
         let (left_ids, right_ids) = ids.split_at_mut(cut);
         descend(
-            left_ids, parts_l, part0, right_ids, parts_r, part0 + parts_l, geom, out, graph,
-            refine_cuts, ratio,
-        );
-        return;
-    }
-    descend(
-        &mut left,
-        parts_l,
-        part0,
-        &mut right,
-        parts_r,
-        part0 + parts_l,
-        geom,
-        out,
-        graph,
-        refine_cuts,
-        ratio,
-    );
+            left_ids,
+            parts_l,
+            part0,
+            right_ids,
+            parts_r,
+            part0 + parts_l,
+            geom,
+            out,
+            graph,
+            refine_cuts,
+            ratio,
+        )
+    } else {
+        descend(
+            &mut left,
+            parts_l,
+            part0,
+            &mut right,
+            parts_r,
+            part0 + parts_l,
+            geom,
+            out,
+            graph,
+            refine_cuts,
+            ratio,
+        )
+    };
+    phase_after(select_here, fm_here, child)
 }
 
 fn descend(
@@ -1453,20 +1521,44 @@ fn descend(
     graph: &CellGraph,
     refine_cuts: bool,
     ratio: (u64, u64),
-) {
+) -> Phase {
     #[cfg(feature = "parallel")]
     {
         let left_out = out;
         let right_out = out;
-        rayon::join(
-            move || rcb_slice(left, parts_l, part_l, geom, left_out, graph, refine_cuts, ratio),
-            move || rcb_slice(right, parts_r, part_r, geom, right_out, graph, refine_cuts, ratio),
+        let (a, b) = rayon::join(
+            move || {
+                rcb_slice(
+                    left,
+                    parts_l,
+                    part_l,
+                    geom,
+                    left_out,
+                    graph,
+                    refine_cuts,
+                    ratio,
+                )
+            },
+            move || {
+                rcb_slice(
+                    right,
+                    parts_r,
+                    part_r,
+                    geom,
+                    right_out,
+                    graph,
+                    refine_cuts,
+                    ratio,
+                )
+            },
         );
+        return phase_join(a, b);
     }
     #[cfg(not(feature = "parallel"))]
     {
-        rcb_slice(left, parts_l, part_l, geom, out, graph, refine_cuts, ratio);
-        rcb_slice(right, parts_r, part_r, geom, out, graph, refine_cuts, ratio);
+        let a = rcb_slice(left, parts_l, part_l, geom, out, graph, refine_cuts, ratio);
+        let b = rcb_slice(right, parts_r, part_r, geom, out, graph, refine_cuts, ratio);
+        phase_join(a, b)
     }
 }
 
@@ -1498,7 +1590,17 @@ fn bipartition_fm(
     let total = weight_l + weight_r;
     loop {
         if !boundary_pass(
-            ids, side, &index, geom, graph, parts_l, parts_r, parts, ratio, total, &mut weight_l,
+            ids,
+            side,
+            &index,
+            geom,
+            graph,
+            parts_l,
+            parts_r,
+            parts,
+            ratio,
+            total,
+            &mut weight_l,
             &mut weight_r,
         ) {
             break;
@@ -1516,13 +1618,7 @@ fn side_limit(total: u64, side_parts: u32, parts: u32, ratio: (u64, u64)) -> u64
     (num / den) as u64
 }
 
-fn cross_gain(
-    slot: usize,
-    ids: &[u32],
-    side: &[u8],
-    index: &[usize],
-    graph: &CellGraph,
-) -> i64 {
+fn cross_gain(slot: usize, ids: &[u32], side: &[u8], index: &[usize], graph: &CellGraph) -> i64 {
     let id = ids[slot] as usize;
     let src = side[slot];
     let mut to_src = 0i64;
@@ -1564,6 +1660,7 @@ fn side_fits(
     new_l <= limit_l && new_r <= limit_r
 }
 
+#[allow(dead_code)]
 fn bucket_drop(slot: usize, bins: &mut BTreeMap<i64, Vec<u32>>, loc: &mut [Option<(i64, usize)>]) {
     let Some((gain, at)) = loc[slot] else { return };
     let bin = bins.get_mut(&gain).unwrap();
@@ -1582,6 +1679,7 @@ fn bucket_drop(slot: usize, bins: &mut BTreeMap<i64, Vec<u32>>, loc: &mut [Optio
     loc[slot] = None;
 }
 
+#[allow(dead_code)]
 fn bucket_add(
     slot: usize,
     bins: &mut BTreeMap<i64, Vec<u32>>,
@@ -1613,6 +1711,7 @@ fn bucket_add(
     bin.push(slot as u32);
 }
 
+#[allow(dead_code)]
 fn boundary_pass(
     ids: &[u32],
     side: &mut [u8],
@@ -1634,17 +1733,34 @@ fn boundary_pass(
     let mut locked = vec![false; n];
     let mut loc: Vec<Option<(i64, usize)>> = vec![None; n];
     let mut bins: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+    // Gains are a pure function of the current sides. The parallel scan
+    // matches the serial scan, and slots enter each bucket in index order.
+    let gains = bisect_gains(
+        ids, side, index, graph, geom, *weight_l, *weight_r, limit_l, limit_r,
+    );
     for slot in 0..n {
-        bucket_add(
-            slot, &mut bins, &mut loc, ids, side, index, graph, geom, &locked, *weight_l,
-            *weight_r, limit_l, limit_r,
-        );
+        let Some(gain) = gains[slot] else {
+            continue;
+        };
+        let bin = bins.entry(gain).or_default();
+        loc[slot] = Some((gain, bin.len()));
+        bin.push(slot as u32);
     }
     let mut moves: Vec<(usize, u8)> = Vec::new();
     let mut cum: i128 = 0;
     let mut best: i128 = 0;
     let mut best_len = 0usize;
+    // The balance bound lets a part absorb one extra heaviest cell.
+    // The pass may try that many non-positive moves, then it stops.
+    let heaviest = ids.iter().map(|&id| geom.w[id as usize]).max().unwrap_or(1);
+    let mut neg_left = heaviest.max(1) as usize;
     while let Some((&gain, _)) = bins.iter().next_back() {
+        if gain <= 0 {
+            neg_left = neg_left.saturating_sub(1);
+            if neg_left == 0 {
+                break;
+            }
+        }
         let bin = bins.get_mut(&gain).unwrap();
         let slot = bin.pop().unwrap() as usize;
         if bin.is_empty() {
@@ -1654,7 +1770,9 @@ fn boundary_pass(
         if locked[slot] {
             continue;
         }
-        if !side_fits(slot, ids, side, geom, *weight_l, *weight_r, limit_l, limit_r) {
+        if !side_fits(
+            slot, ids, side, geom, *weight_l, *weight_r, limit_l, limit_r,
+        ) {
             continue;
         }
         let fresh = cross_gain(slot, ids, side, index, graph);
@@ -1690,8 +1808,8 @@ fn boundary_pass(
             let other = index[graph.neighbor[e] as usize];
             if other != usize::MAX && !locked[other] {
                 bucket_add(
-                    other, &mut bins, &mut loc, ids, side, index, graph, geom, &locked,
-                    *weight_l, *weight_r, limit_l, limit_r,
+                    other, &mut bins, &mut loc, ids, side, index, graph, geom, &locked, *weight_l,
+                    *weight_r, limit_l, limit_r,
                 );
             }
         }
@@ -1699,7 +1817,11 @@ fn boundary_pass(
     if best <= 0 {
         best_len = 0;
     }
-    for &(slot, src) in moves.iter().rev().take(moves.len().saturating_sub(best_len)) {
+    for &(slot, src) in moves
+        .iter()
+        .rev()
+        .take(moves.len().saturating_sub(best_len))
+    {
         let id = ids[slot] as usize;
         let w = geom.w[id];
         if side[slot] == 0 {
@@ -1711,7 +1833,7 @@ fn boundary_pass(
         }
         side[slot] = src;
     }
-    FM_NS.fetch_add(t0.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    let _ = t0;
     best > 0
 }
 
@@ -1729,11 +1851,42 @@ fn is_boundary(slot: usize, ids: &[u32], side: &[u8], index: &[usize], graph: &C
     false
 }
 
+fn bisect_gains(
+    ids: &[u32],
+    side: &[u8],
+    index: &[usize],
+    graph: &CellGraph,
+    geom: &RcbGeom,
+    weight_l: u64,
+    weight_r: u64,
+    limit_l: u64,
+    limit_r: u64,
+) -> Vec<Option<i64>> {
+    let n = ids.len();
+    let one = |slot: usize| -> Option<i64> {
+        if !is_boundary(slot, ids, side, index, graph) {
+            return None;
+        }
+        if !side_fits(slot, ids, side, geom, weight_l, weight_r, limit_l, limit_r) {
+            return None;
+        }
+        Some(cross_gain(slot, ids, side, index, graph))
+    };
+    #[cfg(feature = "parallel")]
+    {
+        if rayon::current_num_threads() > 1 && n >= 128 {
+            use rayon::prelude::*;
+            return (0..n).into_par_iter().map(one).collect();
+        }
+    }
+    (0..n).map(one).collect()
+}
+
 fn refine(assign: &mut [u32], graph: &CellGraph, parts: u32, ratio: (u64, u64)) {
     if parts <= 1 {
         return;
     }
-    let n = graph.grid.ncell();
+    let t0 = Instant::now();
     let weight = &graph.grid.weight;
     let mut part_w = vec![0u64; parts as usize];
     for (c, &d) in assign.iter().enumerate() {
@@ -1745,9 +1898,47 @@ fn refine(assign: &mut [u32], graph: &CellGraph, parts: u32, ratio: (u64, u64)) 
             break;
         }
     }
-    let _ = n;
+    FM_NS.fetch_add(t0.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 }
 
+fn kway_proposal(
+    assign: &[u32],
+    graph: &CellGraph,
+    parts: u32,
+    ratio: (u64, u64),
+    part_w: &[u64],
+    total: u64,
+    weight: &[u64],
+) -> Vec<Option<(i64, u32)>> {
+    let n = assign.len();
+    let one = |cell: usize| -> Option<(i64, u32)> {
+        if !part_boundary(cell, assign, graph) {
+            return None;
+        }
+        let mut scratch = vec![0u64; parts as usize];
+        best_move(
+            cell as u32,
+            assign,
+            graph,
+            parts,
+            ratio,
+            part_w,
+            total,
+            weight,
+            &mut scratch,
+        )
+    };
+    #[cfg(feature = "parallel")]
+    {
+        if rayon::current_num_threads() > 1 && n >= 128 {
+            use rayon::prelude::*;
+            return (0..n).into_par_iter().map(one).collect();
+        }
+    }
+    (0..n).map(one).collect()
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Cand {
     gain: i64,
@@ -1771,6 +1962,7 @@ impl PartialOrd for Cand {
     }
 }
 
+#[allow(dead_code)]
 fn fm_pass(
     assign: &mut [u32],
     graph: &CellGraph,
@@ -1786,30 +1978,34 @@ fn fm_pass(
     let mut stamp = vec![0u32; n];
     let mut heap: BinaryHeap<Cand> = BinaryHeap::new();
     let mut scratch = vec![0u64; parts as usize];
+    // The proposal is a pure function of the current assignment. Cells
+    // are pushed in index order, so the heap matches a serial scan.
+    let proposal = kway_proposal(assign, graph, parts, ratio, part_w, total, weight);
     for cell in 0..n {
-        if !part_boundary(cell, assign, graph) {
+        let Some((gain, dest)) = proposal[cell] else {
             continue;
-        }
-        push_best(
-            cell as u32,
-            assign,
-            graph,
-            parts,
-            ratio,
-            part_w,
-            total,
-            weight,
-            &locked,
-            &mut stamp,
-            &mut scratch,
-            &mut heap,
-        );
+        };
+        stamp[cell] = stamp[cell].wrapping_add(1);
+        heap.push(Cand {
+            gain,
+            cell: cell as u32,
+            dest,
+            stamp: stamp[cell],
+        });
     }
     let mut moves: Vec<(u32, u32, u32)> = Vec::new();
     let mut cum: i128 = 0;
     let mut best: i128 = 0;
     let mut best_len = 0usize;
+    let heaviest = weight.iter().copied().max().unwrap_or(1);
+    let mut neg_left = heaviest.max(1) as usize;
     while let Some(cand) = heap.pop() {
+        if cand.gain <= 0 {
+            neg_left = neg_left.saturating_sub(1);
+            if neg_left == 0 {
+                break;
+            }
+        }
         let cell = cand.cell as usize;
         if locked[cell] || stamp[cell] != cand.stamp {
             continue;
@@ -1881,7 +2077,7 @@ fn fm_pass(
         part_w[*src as usize] += w;
         assign[*cell as usize] = *src;
     }
-    FM_NS.fetch_add(t0.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    let _ = t0;
     best > 0
 }
 
@@ -1897,6 +2093,7 @@ fn part_boundary(cell: usize, assign: &[u32], graph: &CellGraph) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn push_best(
     cell: u32,
     assign: &[u32],
@@ -1956,7 +2153,8 @@ fn best_move(
         }
         let new_src = part_w[src as usize] - w;
         let new_dest = part_w[dest as usize] + w;
-        if !under_balance(new_src, total, parts, ratio) || !under_balance(new_dest, total, parts, ratio)
+        if !under_balance(new_src, total, parts, ratio)
+            || !under_balance(new_dest, total, parts, ratio)
         {
             continue;
         }
@@ -2407,7 +2605,11 @@ mod tests {
             }
         }
         let mut by_key = coords.clone();
-        by_key.sort_by(|a, b| morton_key(a[0], a[1], a[2]).unwrap().cmp(&morton_key(b[0], b[1], b[2]).unwrap()));
+        by_key.sort_by(|a, b| {
+            morton_key(a[0], a[1], a[2])
+                .unwrap()
+                .cmp(&morton_key(b[0], b[1], b[2]).unwrap())
+        });
         let mut by_cmp = coords.clone();
         by_cmp.sort_by(|a, b| morton_cmp(*a, *b));
         assert_eq!(by_key, by_cmp);

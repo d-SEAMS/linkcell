@@ -6,14 +6,12 @@ it with DLPack (dlpk); see [Embed from Python](embed-python.md).
 Device searches use `lc_gpu_*` (`include/linkcell_gpu.h`) from the
 separate GPU package target.
 
-The Python and GPU wraps use this library hourglass.
 `lc_knearest` takes packed `double` xyz (`n` triples), `size_t n`,
-and `size_t k`.
-The caller owns an `int` buffer of length `n * k`. Unused
+`size_t k`, and a caller-owned `int` buffer of length `n * k`. Unused
 slots are `-1`. `lc_knearest_d2` also writes squared distances.
 `lc_knearest_many` is the frame-major batch. Returns 0 on success. On
-failure, read `lc_last_error()` on the same thread and leave
-the pointer alone.
+failure, read `lc_last_error()` on the same thread and do not free
+the pointer.
 
 ## Meson wrap
 
@@ -39,10 +37,9 @@ executable('app', 'app.c', dependencies: linkcell_dep)
 Linux).
 
 For the device API, request `linkcell-gpu` with fallback
-`['linkcell', 'linkcell_gpu_dep']`.
-The dependency defines `LINKCELL_HAS_GPULITE`.
-The dependency links its C++ implementation.
-Enable C++ in a C-only project that uses `lc_gpu_*`.
+`['linkcell', 'linkcell_gpu_dep']`. The dependency defines
+`LINKCELL_HAS_GPULITE` and links its C++ implementation, so enable C++
+in a C-only project that uses `lc_gpu_*`.
 
 ## CMake
 

@@ -24,4 +24,4 @@ typed header over that ABI. Python is DLPack (dlpk) over that waist.
 ## Explanation
 
 - [Minimum image and linked cells](explanation/mic-and-cells.md)
-- [Single instruction, multiple data (SIMD) paths and dispatch](explanation/simd-paths.md)
+- [SIMD paths and dispatch](explanation/simd-paths.md)

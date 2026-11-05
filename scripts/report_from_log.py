@@ -62,6 +62,8 @@ def parse(text):
             meta["mw"] = line.split(" ", 1)[1]
         elif line.startswith("reps "):
             meta["reps"] = line.split(" ", 1)[1]
+        elif line.startswith("cpu_mhz "):
+            meta["mhz"] = line.split()[-1]
         elif line.startswith("balance_bound "):
             meta["bound"] = line.split(" ", 1)[1]
         elif line.startswith("scotch_seed "):
@@ -181,8 +183,10 @@ def main():
     a("")
     a("This cell-partition report is generated from one log. Every median and every interquartile range (IQR) is the value that log printed for that cell. The raw sample line is the series those values came from, at type-7.")
     a("")
-    a(f"The log names the hardware as {meta.get('hardware', 'Intel Xeon Processor')}, {meta.get('cores', '8')} physical cores, one thread per core, one node.")
-    a("The host process (HOST) records a second node as `multi_node HOST NOT-RUN`.")
+    mhz = meta.get("mhz", "")
+    mhz_bit = f", {mhz} MHz" if mhz else ""
+    a(f"The log names the hardware as {meta.get('hardware', 'Intel Xeon Processor')}, {meta.get('cores', '8')} physical cores, one thread per core, one node{mhz_bit}.")
+    a("A second node is recorded as `multi_node HOST NOT-RUN`.")
     a(f"Commit `{meta.get('head', '')}`. Tree `{meta.get('tree', '')}`.")
     a(f"Exit code {meta.get('exit', '')}.")
     a("")
@@ -292,7 +296,7 @@ def main():
     a("")
     a("Strong scaling keeps the lattice at 1,520,875 points (115 cubed). Weak scaling uses 190,109 points times the thread count, so eight threads is 1,520,872 points.")
     a("Median and interquartile range (IQR) are recomputed from the raw line.")
-    a("`profile_ns` is the summed select, Fiduccia-Mattheyses, and coarsen time over the repetitions, in nanoseconds.")
+    a("`profile_ns` sums the critical-path wall time of select, boundary refinement, and coarsening over the repetitions, in nanoseconds.")
     a("")
     a("```text")
     a("kind threads n method median iqr")
@@ -307,32 +311,58 @@ def main():
     a("")
     a("## Amdahl")
     a("")
-    a("Select, boundary refinement, and coarsening are the profiled parts of each scaling run.")
-    a("Each share is that summed time divided by the median wall time times the repetition count.")
-    a("The other share is what remains of the median.")
+    a("Select, boundary refinement, and coarsening are timed on the critical path.")
+    a("Each figure is wall time. At one thread the two sides of a join are added. Above one thread the slower side is kept.")
+    a("A share is that summed wall time divided by the mean partition wall time times the repetition count.")
+    a("The other share is what remains, and a negative value would mean the phases over-count the wall clock.")
+    a("Karp-Flatt uses the strong rows. With speedup s and thread count p, the serial fraction is (1/s - 1/p) / (1 - 1/p).")
     a("")
     a("```text")
     a("method kind threads n select fm coarse other")
-    for line, med, _spread, _raw in scales:
+    phase = {}
+    for line, _med, _spread, raw in scales:
         bits = line.split()
         kind = bits[bits.index("kind") + 1]
-        threads = bits[bits.index("threads") + 1]
+        threads = int(bits[bits.index("threads") + 1])
         n = bits[bits.index("n") + 1]
         method = bits[bits.index("method") + 1]
         sel = int(bits[bits.index("profile_ns") + 1])
         fm = int(bits[bits.index("profile_ns") + 2])
         coarse = int(bits[bits.index("profile_ns") + 3])
-        wall = med * reps
+        mean = sum(raw) / len(raw)
+        wall = mean * reps
         if wall <= 0:
             continue
-        def share(ns):
-            return min(1.0, (ns / 1.0e9) / wall)
-
-        s_sel, s_fm, s_coarse = share(sel), share(fm), share(coarse)
-        other = max(0.0, 1.0 - s_sel - s_fm - s_coarse)
+        s_sel = (sel / 1.0e9) / wall
+        s_fm = (fm / 1.0e9) / wall
+        s_coarse = (coarse / 1.0e9) / wall
+        other = 1.0 - s_sel - s_fm - s_coarse
+        phase[(kind, method, threads)] = (sel / 1.0e9 / reps, fm / 1.0e9 / reps, coarse / 1.0e9 / reps)
         a(
             f"{kind}-{method} threads {threads} n {n} select {s_sel:.3f} fm {s_fm:.3f} coarse {s_coarse:.3f} other {other:.3f}"
         )
+    a("```")
+    a("")
+    a("```text")
+    a("strong method threads select_e fm_e coarse_e")
+
+    def karp(t1, tp, p):
+        if p <= 1 or t1 <= 0 or tp <= 0:
+            return None
+        speed = t1 / tp
+        return (1.0 / speed - 1.0 / p) / (1.0 - 1.0 / p)
+
+    strong_keys = sorted(k for k in phase if k[0] == "strong" and k[2] > 1)
+    for kind, method, threads in strong_keys:
+        base = phase.get((kind, method, 1))
+        if base is None:
+            continue
+        cur = phase[(kind, method, threads)]
+        cells = []
+        for t1, tp in zip(base, cur):
+            value = karp(t1, tp, threads)
+            cells.append("na" if value is None else f"{value:.3f}")
+        a(f"strong {method} threads {threads} select_e {cells[0]} fm_e {cells[1]} coarse_e {cells[2]}")
     a("```")
     a("")
     a("## Prose")

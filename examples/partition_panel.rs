@@ -68,7 +68,12 @@ fn factors(n: usize) -> (usize, usize, usize) {
 fn lattice(n: usize, rho: f64) -> (Vec<[f64; 3]>, Cell) {
     let (nx, ny, nz) = factors(n);
     let spacing = rho.powf(-1.0 / 3.0);
-    let cell = Cell::ortho(nx as f64 * spacing, ny as f64 * spacing, nz as f64 * spacing).unwrap();
+    let cell = Cell::ortho(
+        nx as f64 * spacing,
+        ny as f64 * spacing,
+        nz as f64 * spacing,
+    )
+    .unwrap();
     let mut xyz = Vec::with_capacity(n);
     for iz in 0..nz {
         for iy in 0..ny {
@@ -91,11 +96,7 @@ fn tip4p(n_sites: usize, rho: f64) -> (Vec<[f64; 3]>, Cell) {
     let n_mol = n_sites / 4;
     let (oxygen, cell) = lattice(n_mol, rho);
     let half = TIP4P_ANGLE.to_radians() / 2.0;
-    let h1 = [
-        TIP4P_OH * half.sin(),
-        0.0,
-        TIP4P_OH * half.cos(),
-    ];
+    let h1 = [TIP4P_OH * half.sin(), 0.0, TIP4P_OH * half.cos()];
     let h2 = [-h1[0], 0.0, h1[2]];
     let msite = [0.0, 0.0, TIP4P_M];
     let mut xyz = Vec::with_capacity(n_sites);
@@ -136,11 +137,36 @@ fn systems() -> Vec<System> {
     let (d, cd) = tip4p(1_024_000, rho);
     let (e, ce) = slab(110_592, rho);
     vec![
-        System { name: "mW-110592", xyz: a, cell: ca, cutoff: mw_cut },
-        System { name: "mW-884736", xyz: b, cell: cb, cutoff: mw_cut },
-        System { name: "TIP4P-128000", xyz: c, cell: cc, cutoff: TIP4P_CUTOFF },
-        System { name: "TIP4P-1024000", xyz: d, cell: cd, cutoff: TIP4P_CUTOFF },
-        System { name: "slab-110592", xyz: e, cell: ce, cutoff: mw_cut },
+        System {
+            name: "mW-110592",
+            xyz: a,
+            cell: ca,
+            cutoff: mw_cut,
+        },
+        System {
+            name: "mW-884736",
+            xyz: b,
+            cell: cb,
+            cutoff: mw_cut,
+        },
+        System {
+            name: "TIP4P-128000",
+            xyz: c,
+            cell: cc,
+            cutoff: TIP4P_CUTOFF,
+        },
+        System {
+            name: "TIP4P-1024000",
+            xyz: d,
+            cell: cd,
+            cutoff: TIP4P_CUTOFF,
+        },
+        System {
+            name: "slab-110592",
+            xyz: e,
+            cell: ce,
+            cutoff: mw_cut,
+        },
     ]
 }
 
@@ -240,13 +266,40 @@ fn print_raw(samples: &[f64]) {
     println!("raw {text}");
 }
 
-fn zoltan_row(
-    system: &System,
-    graph: &linkcell::CellGraph,
-    parts: u32,
-    reps: usize,
-    width: [u32; 3],
-) -> Option<Row> {
+fn cpu_mhz() -> u32 {
+    let Ok(text) = fs::read_to_string("/proc/cpuinfo") else {
+        return 0;
+    };
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("cpu MHz") else {
+            continue;
+        };
+        let Some(val) = rest.split(':').nth(1) else {
+            continue;
+        };
+        if let Ok(mhz) = val.trim().parse::<f64>() {
+            return mhz.round() as u32;
+        }
+    }
+    0
+}
+
+fn allow_method(name: &str) -> bool {
+    match std::env::var("LINKCELL_ONLY_METHOD") {
+        Ok(filter) if !filter.is_empty() => name.contains(filter.as_str()),
+        _ => true,
+    }
+}
+
+struct ExtJob {
+    kind: &'static str,
+    bin: String,
+    graph_path: String,
+    assign_path: String,
+    tol: String,
+}
+
+fn zoltan_job(system: &System, graph: &linkcell::CellGraph, parts: u32) -> Option<ExtJob> {
     let bin = std::path::Path::new("benchmarks/work/zoltan_rcb");
     if !bin.is_file() {
         println!("method zoltan-rcb system {} HOST NOT-RUN", system.name);
@@ -273,64 +326,20 @@ fn zoltan_row(
         .ok()?;
     }
     drop(file);
-    let mut samples = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let tol = format!("{:.8}", linkcell::derived_balance_f64(&graph.grid.weight, parts));
-        let out = Command::new(bin)
-            .arg(&grid_path)
-            .arg(&assign_path)
-            .arg(&tol)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            println!("method zoltan-rcb system {} HOST NOT-RUN", system.name);
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut found = None;
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("SECONDS ") {
-                found = rest.trim().parse::<f64>().ok();
-            }
-        }
-        samples.push(found?);
-    }
-    let text = fs::read_to_string(&assign_path).ok()?;
-    let assign: Vec<u32> = text
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.parse().ok())
-        .collect::<Option<_>>()?;
-    let got = score(graph, &assign, parts, width).ok()?;
-    print_raw(&samples);
-    let (median, spread) = iqr(samples);
-    println!(
-        "system {} method zoltan-rcb cut {} imbalance {:.6} halo_fraction {:.6} median_s {:.6} iqr_s {:.6} eligible 0",
-        system.name, got.cut, got.imbalance, got.halo_fraction, median, spread
+    let tol = format!(
+        "{:.8}",
+        linkcell::derived_balance_f64(&graph.grid.weight, parts)
     );
-    Some(Row {
-        system: system.name.to_string(),
-        method: "zoltan-rcb".to_string(),
-        cut: got.cut,
-        imbalance: got.imbalance,
-        halo: got.halo_fraction,
-        median,
-        iqr: spread,
-        eligible: false,
+    Some(ExtJob {
+        kind: "zoltan-rcb",
+        bin: bin.to_str()?.to_string(),
+        graph_path: grid_path,
+        assign_path,
+        tol,
     })
 }
 
-fn write_i32(file: &mut fs::File, value: i32) -> std::io::Result<()> {
-    file.write_all(&value.to_le_bytes())
-}
-
-fn ptscotch_row(
-    system: &System,
-    graph: &linkcell::CellGraph,
-    parts: u32,
-    reps: usize,
-    width: [u32; 3],
-) -> Option<Row> {
+fn ptscotch_job(system: &System, graph: &linkcell::CellGraph, parts: u32) -> Option<ExtJob> {
     let bin = std::path::Path::new("benchmarks/work/ptscotch_part");
     if !bin.is_file() {
         println!("method ptscotch system {} HOST NOT-RUN", system.name);
@@ -344,7 +353,6 @@ fn ptscotch_row(
         println!("method ptscotch system {} HOST NOT-RUN", system.name);
         return None;
     }
-    let nnz = *graph.offsets.last().unwrap_or(&0);
     write_i32(&mut file, n as i32).ok()?;
     write_i32(&mut file, parts as i32).ok()?;
     for &v in &graph.offsets {
@@ -368,34 +376,68 @@ fn ptscotch_row(
         write_i32(&mut file, v as i32).ok()?;
     }
     drop(file);
-    let _ = nnz;
     let tol = format!(
         "{:.8}",
         linkcell::derived_balance_f64(&graph.grid.weight, parts) - 1.0
     );
-    let mut samples = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let out = Command::new("mpirun")
-            .args(["-np", "8", bin.to_str()?, &graph_path, &assign_path, &tol])
+    Some(ExtJob {
+        kind: "ptscotch",
+        bin: bin.to_str()?.to_string(),
+        graph_path,
+        assign_path,
+        tol,
+    })
+}
+
+fn ext_once(job: &ExtJob) -> Option<f64> {
+    let out = if job.kind == "ptscotch" {
+        Command::new("mpirun")
+            .args([
+                "-np",
+                "8",
+                &job.bin,
+                &job.graph_path,
+                &job.assign_path,
+                &job.tol,
+            ])
             .output()
-            .ok()?;
-        if !out.status.success() {
-            println!("method ptscotch system {} HOST NOT-RUN", system.name);
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut found = None;
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("SECONDS ") {
-                found = rest.trim().parse::<f64>().ok();
-            }
-            if line.starts_with("SCOTCH_randomSeed") || line.starts_with("RANKS") {
-                println!("ptscotch {line}");
-            }
-        }
-        samples.push(found?);
+            .ok()?
+    } else {
+        Command::new(&job.bin)
+            .arg(&job.graph_path)
+            .arg(&job.assign_path)
+            .arg(&job.tol)
+            .output()
+            .ok()?
+    };
+    if !out.status.success() {
+        println!("method {} HOST NOT-RUN", job.kind);
+        return None;
     }
-    let text = fs::read_to_string(&assign_path).ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut found = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("SECONDS ") {
+            found = rest.trim().parse::<f64>().ok();
+        }
+        if job.kind == "ptscotch"
+            && (line.starts_with("SCOTCH_randomSeed") || line.starts_with("RANKS"))
+        {
+            println!("ptscotch {line}");
+        }
+    }
+    found
+}
+
+fn ext_row(
+    system: &System,
+    graph: &linkcell::CellGraph,
+    parts: u32,
+    width: [u32; 3],
+    job: &ExtJob,
+    samples: Vec<f64>,
+) -> Option<Row> {
+    let text = fs::read_to_string(&job.assign_path).ok()?;
     let assign: Vec<u32> = text
         .lines()
         .filter(|l| !l.is_empty())
@@ -405,12 +447,12 @@ fn ptscotch_row(
     print_raw(&samples);
     let (median, spread) = iqr(samples);
     println!(
-        "system {} method ptscotch cut {} imbalance {:.6} halo_fraction {:.6} median_s {:.6} iqr_s {:.6} eligible 0",
-        system.name, got.cut, got.imbalance, got.halo_fraction, median, spread
+        "system {} method {} cut {} imbalance {:.6} halo_fraction {:.6} median_s {:.6} iqr_s {:.6} eligible 0",
+        system.name, job.kind, got.cut, got.imbalance, got.halo_fraction, median, spread
     );
     Some(Row {
         system: system.name.to_string(),
-        method: "ptscotch".to_string(),
+        method: job.kind.to_string(),
         cut: got.cut,
         imbalance: got.imbalance,
         halo: got.halo_fraction,
@@ -420,30 +462,38 @@ fn ptscotch_row(
     })
 }
 
+fn write_i32(file: &mut fs::File, value: i32) -> std::io::Result<()> {
+    file.write_all(&value.to_le_bytes())
+}
+
 fn sweep_ratios() -> [f64; 5] {
     [1.00, 1.01, 1.02, 1.05, 1.10]
 }
 
 fn sweep_system(system: &System, graph: &linkcell::CellGraph, parts: u32, reps: usize) {
+    let chosen = methods();
     for ratio in sweep_ratios() {
-        for (name, method) in methods() {
-            let mut samples = Vec::with_capacity(reps);
-            let mut assign = Vec::new();
-            for _ in 0..reps {
+        let mut samples = vec![Vec::with_capacity(reps); chosen.len()];
+        let mut assigns = vec![Vec::new(); chosen.len()];
+        for _ in 0..reps {
+            for (i, (name, method)) in chosen.iter().enumerate() {
                 let request = PartRequest {
                     parts,
-                    method,
+                    method: *method,
                     balance: Some(ratio),
                     device: false,
                 };
                 let t0 = Instant::now();
-                assign = partition_graph(graph, request)
+                let assign = partition_graph(graph, request)
                     .unwrap_or_else(|err| panic!("sweep {} {name}: {err}", system.name));
-                samples.push(t0.elapsed().as_secs_f64());
+                samples[i].push(t0.elapsed().as_secs_f64());
+                assigns[i] = assign;
             }
-            let got = score(graph, &assign, parts, [0, 0, 0]).unwrap();
-            print_raw(&samples);
-            let (median, spread) = iqr(samples);
+        }
+        for (i, (name, _)) in chosen.iter().enumerate() {
+            let got = score(graph, &assigns[i], parts, [0, 0, 0]).unwrap();
+            print_raw(&samples[i]);
+            let (median, spread) = iqr(samples[i].clone());
             println!(
                 "sweep ratio {ratio:.2} system {} method {name} cut {} imbalance {:.6} median_s {median:.6} iqr_s {spread:.6}",
                 system.name, got.cut, got.imbalance
@@ -455,12 +505,18 @@ fn sweep_system(system: &System, graph: &linkcell::CellGraph, parts: u32, reps: 
 fn scale_case(parts: u32, reps: usize) {
     let mut args = std::env::args().skip(4);
     let kind = args.next().unwrap_or_else(|| "strong".into());
-    let n: usize = args.next().unwrap_or_else(|| "1520875".into()).parse().unwrap();
+    let n: usize = args
+        .next()
+        .unwrap_or_else(|| "1520875".into())
+        .parse()
+        .unwrap();
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "1".into());
     println!("hardware Intel Xeon Processor");
     println!("physical_cores 8");
     println!("threads_per_core 1");
     println!("node single");
+    println!("cpu_mhz {}", cpu_mhz());
+    println!("schedule round-robin");
     println!("scale {kind} threads {threads} n {n} parts {parts} reps {reps}");
     let rho = density_per_angstrom();
     let (xyz, cell) = lattice(n, rho);
@@ -468,30 +524,38 @@ fn scale_case(parts: u32, reps: usize) {
     let graph = cell_graph(&xyz, &cell, cutoff, None, None)
         .unwrap_or_else(|err| panic!("scale graph: {err}"));
     println!("scale_ncell {}", graph.grid.ncell());
-    for (name, method) in [
+    let chosen = [
         ("rcb", Method::Rcb),
         ("rcb-fm", Method::RcbFm),
         ("multi", Method::Multi),
-    ] {
-        linkcell::profile_reset();
-        let mut samples = Vec::with_capacity(reps);
-        for _ in 0..reps {
+    ];
+    let mut samples = vec![Vec::with_capacity(reps); chosen.len()];
+    let mut prof = vec![(0u64, 0u64, 0u64); chosen.len()];
+    for _ in 0..reps {
+        for (i, (name, method)) in chosen.iter().enumerate() {
+            linkcell::profile_reset();
             let t0 = Instant::now();
             partition_graph(
                 &graph,
                 PartRequest {
                     parts,
-                    method,
+                    method: *method,
                     balance: None,
                     device: false,
                 },
             )
             .unwrap_or_else(|err| panic!("scale {name}: {err}"));
-            samples.push(t0.elapsed().as_secs_f64());
+            samples[i].push(t0.elapsed().as_secs_f64());
+            let (sel, fm, coarse) = linkcell::profile_ns();
+            prof[i].0 += sel;
+            prof[i].1 += fm;
+            prof[i].2 += coarse;
         }
-        print_raw(&samples);
-        let (median, spread) = iqr(samples);
-        let (sel, fm, coarse) = linkcell::profile_ns();
+    }
+    for (i, (name, _)) in chosen.iter().enumerate() {
+        print_raw(&samples[i]);
+        let (median, spread) = iqr(samples[i].clone());
+        let (sel, fm, coarse) = prof[i];
         println!(
             "scale_row kind {kind} threads {threads} n {n} method {name} median_s {median:.6} iqr_s {spread:.6} profile_ns {sel} {fm} {coarse}"
         );
@@ -499,8 +563,16 @@ fn scale_case(parts: u32, reps: usize) {
 }
 
 fn main() {
-    let parts: u32 = std::env::args().nth(1).unwrap_or_else(|| "8".into()).parse().unwrap();
-    let reps: usize = std::env::args().nth(2).unwrap_or_else(|| "12".into()).parse().unwrap();
+    let parts: u32 = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "8".into())
+        .parse()
+        .unwrap();
+    let reps: usize = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "12".into())
+        .parse()
+        .unwrap();
     if std::env::args().nth(3).as_deref() == Some("scale") {
         scale_case(parts, reps);
         return;
@@ -511,6 +583,8 @@ fn main() {
     println!("threads_per_core 1");
     println!("node single");
     println!("multi_node HOST NOT-RUN");
+    println!("cpu_mhz {}", cpu_mhz());
+    println!("schedule round-robin");
     println!("scotch_seed 1");
     println!("halo_fraction largest ghost-cell count divided by owned-cell count");
     println!("parts {parts}");
@@ -525,7 +599,12 @@ fn main() {
     println!("tip4p_cutoff_A {TIP4P_CUTOFF}");
 
     let probe = Cell::ortho(8.0, 8.0, 8.0).unwrap();
-    let xyz = vec![[1.0, 1.0, 1.0], [2.0, 1.0, 1.0], [1.0, 2.0, 1.0], [2.0, 2.0, 1.0]];
+    let xyz = vec![
+        [1.0, 1.0, 1.0],
+        [2.0, 1.0, 1.0],
+        [1.0, 2.0, 1.0],
+        [2.0, 2.0, 1.0],
+    ];
     match curve_split_device(&xyz, &probe, 2.0, None, None, 2, Method::Morton) {
         Err(Error::NoDevice) => println!("gpu_curve HOST NOT-RUN"),
         Ok(_) => println!("gpu_curve ran"),
@@ -534,7 +613,10 @@ fn main() {
 
     let mut rows: Vec<Row> = Vec::new();
     for system in systems() {
-        if only.as_ref().is_some_and(|name| !system.name.contains(name.as_str())) {
+        if only
+            .as_ref()
+            .is_some_and(|name| !system.name.contains(name.as_str()))
+        {
             continue;
         }
         let t_graph = Instant::now();
@@ -558,31 +640,89 @@ fn main() {
             "derived_balance {bnum}/{bden} {:.8} heaviest_cell {heavy}",
             linkcell::derived_balance_f64(&graph.grid.weight, parts)
         );
-        for (name, method) in methods() {
-            let mut samples = Vec::with_capacity(reps);
-            let mut assign = Vec::new();
-            linkcell::profile_reset();
-            for _ in 0..reps {
+        println!("cpu_mhz {}", cpu_mhz());
+        let chosen: Vec<_> = methods()
+            .into_iter()
+            .filter(|(name, _)| allow_method(name))
+            .collect();
+        let mut samples = vec![Vec::with_capacity(reps); chosen.len()];
+        let mut assigns: Vec<Vec<u32>> = vec![Vec::new(); chosen.len()];
+        let mut prof = vec![(0u64, 0u64, 0u64); chosen.len()];
+        let zjob = if allow_method("zoltan-rcb") {
+            zoltan_job(&system, &graph, parts)
+        } else {
+            None
+        };
+        let pjob = if allow_method("ptscotch") {
+            ptscotch_job(&system, &graph, parts)
+        } else {
+            None
+        };
+        let mut zsamples = Vec::with_capacity(reps);
+        let mut psamples = Vec::with_capacity(reps);
+        let mut z_ok = zjob.is_some();
+        let mut p_ok = pjob.is_some();
+        for _ in 0..reps {
+            for (i, (name, method)) in chosen.iter().enumerate() {
+                linkcell::profile_reset();
                 let request = PartRequest {
                     parts,
-                    method,
+                    method: *method,
                     balance: None,
                     device: false,
                 };
                 let t0 = Instant::now();
-                assign = partition_graph(&graph, request)
+                let assign = partition_graph(&graph, request)
                     .unwrap_or_else(|err| panic!("{} {name}: {err}", system.name));
-                samples.push(t0.elapsed().as_secs_f64());
+                samples[i].push(t0.elapsed().as_secs_f64());
+                let (sel, fm, coarse) = linkcell::profile_ns();
+                prof[i].0 += sel;
+                prof[i].1 += fm;
+                prof[i].2 += coarse;
+                if std::env::var("LINKCELL_ASSIGN_SUM").is_ok() {
+                    let sum: u64 = assign.iter().map(|&d| u64::from(d)).sum();
+                    let mix = assign.iter().fold(0u64, |acc, &d| {
+                        acc.wrapping_mul(0x9e3779b97f4a7c15)
+                            .wrapping_add(u64::from(d))
+                    });
+                    println!("assign_sum {name} {sum} {mix}");
+                }
+                assigns[i] = assign;
             }
-            let got = score(&graph, &assign, parts, width).unwrap();
-            let (owned, ghosts) = worst_halo(&graph.grid, &assign, parts, width);
-            print_raw(&samples);
-            let (sel, fm, coarse) = linkcell::profile_ns();
-            let (median, spread) = iqr(samples);
+            if z_ok {
+                if let Some(job) = &zjob {
+                    match ext_once(job) {
+                        Some(sample) => zsamples.push(sample),
+                        None => {
+                            println!("method zoltan-rcb system {} HOST NOT-RUN", system.name);
+                            z_ok = false;
+                        }
+                    }
+                }
+            }
+            if p_ok {
+                if let Some(job) = &pjob {
+                    match ext_once(job) {
+                        Some(sample) => psamples.push(sample),
+                        None => {
+                            println!("method ptscotch system {} HOST NOT-RUN", system.name);
+                            p_ok = false;
+                        }
+                    }
+                }
+            }
+        }
+        for (i, (name, _)) in chosen.iter().enumerate() {
+            if assigns[i].is_empty() {
+                continue;
+            }
+            let got = score(&graph, &assigns[i], parts, width).unwrap();
+            let (owned, ghosts) = worst_halo(&graph.grid, &assigns[i], parts, width);
+            print_raw(&samples[i]);
+            let (sel, fm, coarse) = prof[i];
+            let (median, spread) = iqr(samples[i].clone());
             let eligible = native(name) && under_default(&graph.grid.weight, parts, got.imbalance);
-            println!(
-                "halo_owned {owned} halo_ghost {ghosts} profile_ns {sel} {fm} {coarse}"
-            );
+            println!("halo_owned {owned} halo_ghost {ghosts} profile_ns {sel} {fm} {coarse}");
             println!(
                 "system {} method {name} cut {} imbalance {:.6} halo_fraction {:.6} median_s {:.6} iqr_s {:.6} eligible {}",
                 system.name,
@@ -604,13 +744,27 @@ fn main() {
                 eligible,
             });
         }
-        if let Some(row) = zoltan_row(&system, &graph, parts, reps, width) {
-            rows.push(row);
+        if let Some(job) = &zjob {
+            if zsamples.len() == reps {
+                if let Some(row) = ext_row(&system, &graph, parts, width, job, zsamples) {
+                    rows.push(row);
+                }
+            }
         }
-        if let Some(row) = ptscotch_row(&system, &graph, parts, reps, width) {
-            rows.push(row);
+        if let Some(job) = &pjob {
+            if psamples.len() == reps {
+                if let Some(row) = ext_row(&system, &graph, parts, width, job, psamples) {
+                    rows.push(row);
+                }
+            }
         }
-        sweep_system(&system, &graph, parts, reps);
+        if std::env::var("LINKCELL_ONLY_METHOD")
+            .ok()
+            .filter(|f| !f.is_empty())
+            .is_none()
+        {
+            sweep_system(&system, &graph, parts, reps);
+        }
     }
 
     let mut totals: Vec<(&str, u64, f64, bool)> = Vec::new();
@@ -626,7 +780,10 @@ fn main() {
         let time: f64 = mine.iter().map(|r| r.median).sum();
         let ok = mine.iter().all(|r| r.eligible);
         totals.push((name, cut, time, ok));
-        println!("sum method {name} cut {cut} median_s {time:.6} eligible {}", ok as u8);
+        println!(
+            "sum method {name} cut {cut} median_s {time:.6} eligible {}",
+            ok as u8
+        );
     }
     let mut eligible: Vec<_> = totals.iter().filter(|t| t.3).cloned().collect();
     if eligible.is_empty() {
