@@ -716,11 +716,20 @@ Packing, the balance repair, the graph check, and join scheduling stay smaller t
 
 The shared entry is `pairs_within`.
 The public main revision stops at that entry, so the comparison uses it only.
-Twelve calls of each revision ran in turn on `cursor`.
+24 calls of each revision ran in turn on `cursor`.
 Each figure is the timed call after three warmups, in seconds, at type-7.
-Public main wall time is 0.002143 seconds at the median, spread 0.000260 seconds.
-After the same warmups, the tip call takes 0.002104 seconds, spread 0.000646 seconds.
+Public main wall time is 0.001669 seconds at the median, spread 0.000129 seconds.
+After the same warmups, the tip call takes 0.001421 seconds, spread 0.000298 seconds.
 Both arms returned 729088 pairs.
+The ratio of the tip median to the public main median is 0.8517.
+Ten thousand bootstrap resamples place that ratio from 0.7978 to 0.9540.
+A wider frame places 1000000 points in a cube 207.5 angstroms on a side.
+The same twenty-four calls ran in turn on that frame.
+There the public main median is 0.279292 seconds, spread 0.018449 seconds.
+The tip median on that frame is 0.261402 seconds, spread 0.004732 seconds.
+Both arms of the wide frame returned 26000000 pairs.
+The wide-frame median ratio is 0.9359.
+Its bootstrap interval runs from 0.9071 to 0.9447.
 
 ## Prose
 

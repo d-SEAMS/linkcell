@@ -598,7 +598,7 @@ def add_ab(a, text):
         )
     if "base" in frame and "tip" in frame:
         a(
-            f"A wider frame holds {frame_n} points in a cube {frame_box} angstroms on a side."
+            f"A wider frame places {frame_n} points in a cube {frame_box} angstroms on a side."
         )
         a("The same twenty-four calls ran in turn on that frame.")
         a(
