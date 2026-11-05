@@ -38,6 +38,7 @@ def parse(text):
     rows = []
     scales = []
     sweeps = []
+    sums = []
     pending = None
     meta = {}
     halo = {}
@@ -121,6 +122,10 @@ def parse(text):
             )
             pending = None
             halo = {}
+        elif line.startswith("sum method "):
+            sums.append(line)
+        elif line.startswith("default_method "):
+            meta["default"] = line.split()[-1]
         elif line.startswith("sweep "):
             if pending is None:
                 raise SystemExit(f"missing raw samples for {line}")
@@ -139,7 +144,7 @@ def parse(text):
             pending = None
         elif line.startswith("EXIT "):
             meta["exit"] = line.split(" ", 1)[1]
-    return meta, rows, scales, sweeps
+    return meta, rows, scales, sweeps, sums
 
 
 def fmt(value):
@@ -149,7 +154,7 @@ def fmt(value):
 def main():
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2])
-    meta, rows, scales, sweeps = parse(src.read_text())
+    meta, rows, scales, sweeps, sums = parse(src.read_text())
     if meta.get("exit") != "0":
         raise SystemExit(f"log exit is {meta.get('exit')}")
     reps = int(meta.get("reps", "0"))
@@ -236,6 +241,25 @@ def main():
     a("The one-bin shell can contain more cells than the part.")
     a("The fraction divides ghosts by owned cells.")
     a("")
+    a("## Cut sums")
+    a("")
+    a("Each sum adds the edge cut of one method over the five systems in this log.")
+    a("")
+    a("```text")
+    if sums:
+        for line in sums:
+            a(line)
+    else:
+        by_method = {}
+        for row in rows:
+            by_method.setdefault(row["method"], 0)
+            by_method[row["method"]] += int(row["cut"])
+        for method, total in by_method.items():
+            a(f"sum method {method} cut {total}")
+    if meta.get("default"):
+        a(f"default_method {meta['default']}")
+    a("```")
+    a("")
     a("## Raw samples")
     a("")
     a("Each line is the twelve wall times, in seconds, in the order they were measured.")
@@ -281,12 +305,41 @@ def main():
         a(f"{kind} {threads} {n} {method} {fmt(med)} {fmt(spread)}")
     a("```")
     a("")
-    a("## Profile")
+    a("## Amdahl")
+    a("")
+    a("Select, boundary refinement, and coarsening are the profiled parts of each scaling run.")
+    a("Each share is that summed time divided by the median wall time times the repetition count.")
+    a("The other share is what remains of the median.")
     a("")
     a("```text")
-    for line, _med, _spread, _raw in scales:
-        a(line)
+    a("method kind threads n select fm coarse other")
+    for line, med, _spread, _raw in scales:
+        bits = line.split()
+        kind = bits[bits.index("kind") + 1]
+        threads = bits[bits.index("threads") + 1]
+        n = bits[bits.index("n") + 1]
+        method = bits[bits.index("method") + 1]
+        sel = int(bits[bits.index("profile_ns") + 1])
+        fm = int(bits[bits.index("profile_ns") + 2])
+        coarse = int(bits[bits.index("profile_ns") + 3])
+        wall = med * reps
+        if wall <= 0:
+            continue
+        def share(ns):
+            return min(1.0, (ns / 1.0e9) / wall)
+
+        s_sel, s_fm, s_coarse = share(sel), share(fm), share(coarse)
+        other = max(0.0, 1.0 - s_sel - s_fm - s_coarse)
+        a(
+            f"{kind}-{method} threads {threads} n {n} select {s_sel:.3f} fm {s_fm:.3f} coarse {s_coarse:.3f} other {other:.3f}"
+        )
     a("```")
+    a("")
+    a("## Prose")
+    a("")
+    a("The prose pass covers the placement note, the report, the partition page, the C API page, and the README.")
+    a("Minimum-image wording stays as it was.")
+    a("Algorithm sentences stay as they were.")
     a("")
     dst.write_text("\n".join(lines) + "\n")
 
