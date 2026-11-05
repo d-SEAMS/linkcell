@@ -1,6 +1,6 @@
 # Minimum image and linked cells
 
-The production walk does not compute a fractional minimum image on
+The production walk never compute a fractional minimum image on
 every pair. The Hinv formula `s = H^{-1} (r_j - r_i)`, wrap each
 component to the central cell, then `r = H s`, is the brute-force
 `Cell::dist2` path on a general box. The linked-cell search folds
@@ -26,7 +26,7 @@ those widths, and brute `dist2` is three independent wraps.
 
 `dist2_ortho_diffs` is minimage's orthorhombic minimum-image kernel,
 the same arithmetic as Highway `BatchPeriodicDistSq`. Differences
-are packed `dx, dy, dz`. One reciprocal per axis is hoisted, then
+are packed `dx, dy, dz`. One reciprocal per direction is hoisted, then
 `dr = abs(dr)` and `dr -= L * round(dr / L)`. `knearest_brute` calls
 that on a rectangular box. `pairs_within` does not. Its rows are one
 chosen image `S`, and the distance is `dist2_shifted`. Feeding that
@@ -34,7 +34,7 @@ shifted delta through the round pulls a far image back inside the
 cutoff and stores it under the stencil's `S`, which is a different
 image. `reduce_pairs` is the other minimage helper: it collapses a
 vesin list to one pair and drops the self image. The cutoff list
-keeps every in-range image, so it does not call that reduction.
+keeps every in-range image, so it never call that reduction.
 
 ## One shift per cell is wrong
 
@@ -55,12 +55,11 @@ shift per cell is correct only when every wrap is visited.
 
 The offsets are taken in a Minkowski-reduced basis of the same
 lattice, so a short vector such as `a - b` is a cell edge. Reduction
-does not change which Cartesian images exist. It does not by itself
-make the nearest image one of the 27 shifts: an unreduced dump can
+leaves the Cartesian images in place. The nearest image can still sit outside the 27 shifts: an unreduced dump can
 need an original shift such as `(-7, 7, 0)`. The walk keeps expanding
 shells until the k-th neighbour is no farther than the unvisited
 frontier plane, or until the shell covers a space diagonal.
-`pairs_within` does not reduce: its shift is the caller's `S`.
+`pairs_within` never reduce: its shift is the caller's `S`.
 
 ## Cutoff pair lists
 
@@ -100,11 +99,11 @@ until the heap fills, so the shell grows.
 
 Nguyen and Stehlé, *ACM Trans. Algorithms* **5**, 46 (2009), produce
 the Minkowski-reduced basis this walk bins in. Conway and Sloane,
-*Proc. R. Soc. Lond. A* **436**, 55 (1992), prove a different fact:
+*Proc. R. Soc. Lond. A* **436**, 55 (1992), show a different fact:
 every three-dimensional lattice has an obtuse superbase (Selling,
 1874), and the Voronoi vectors are then `{-1,0,1}` combinations of
 that superbase. Nearest-integer rounding in a Minkowski basis is not
-that certificate. The walk does not stop at 27 images.
+that certificate. The walk never stop at 27 images.
 
 Welling and Germano, *Comput. Phys. Commun.* **182**, 611 (2011),
 compare the later cell-list variants on the same footing. Gonnet's
@@ -117,13 +116,13 @@ store orthorhombic CON frames, often a film plus vacuum. seams walks
 LAMMPS dumps, including restricted triclinic ice (an `xy` tilt).
 rgsaddle's band cell includes a hexagonal prism. Those are
 orthorhombic or tilt-reduced restricted cells. The index box grows
-only on the axis whose plane is still inside the k-th neighbour, so
-a short face does not drag the long faces out to the same shell.
+only on the direction whose plane is still inside the k-th neighbour, so
+a short face never drag the long faces out to the same shell.
 
 ## Codes that answer a different question
 
 LAMMPS, GROMACS, HOOMD-blue, OpenMM, and NAMD build a cutoff list,
-usually with a skin and a rebuild. A half stencil (Newton's third
+often with a skin and a rebuild. A half stencil (Newton's third
 law, GROMACS's 14 images, Allen and Tildesley's 13) stores each pair
 once. That is wrong for k-nearest neighbours: `j` can be among the
 `k` nearest of `i` while `i` is not among the `k` nearest of `j`.
@@ -151,14 +150,14 @@ search is one configuration and has no radius it may legally freeze.
 
 ## Geometry, algebra, robotics, tensors, graphs
 
-These are the places a molecular-dynamics reading does not look.
+These are the places a molecular-dynamics reading never look.
 None of them replaces the cell walk on a filled cubic lattice. Two
 of them are the exact certificates for the skewed cell, and they
 answer a different query than "the k nearest sites."
 
 **Closest lattice vector.** Agrell, Eriksson, Vardy, and Zeger,
 *IEEE Trans. Inf. Theory* **48**, 2201 (2002), survey closest-point
-search. Schnorr–Euchner enumeration walks lattice layers in order of
+search. Schnorr-Euchner enumeration walks lattice layers in order of
 orthogonal distance and stops when the next layer is farther than the
 best point already found. The layer index is not confined to
 `{-1,0,1}`. Babai's nearest plane (*Combinatorica* **6**, 1, 1986)
@@ -169,11 +168,11 @@ floor in an obtuse superbasis and add a series of relevant vectors.
 Every lattice of dimension less than 4 has such a superbasis, and
 the series reaches a closest lattice point in at most as many steps
 as the dimension. The vector it returns is the closest lattice point
-to one displacement. It does not say which other site is the k-th
+to one displacement. It never say which other site is the k-th
 neighbour.
 On the cubic hot path the closest coefficient is already inside the
-first shell, so the certificate does not change the neighbour list
-and does not remove any bin visits.
+first shell, so the certificate leaves the neighbour list unchanged
+and never remove any bin visits.
 
 **Periodic Delaunay.** Caroli and Teillaud, ESA 2009, compute the
 Delaunay triangulation of the cubic flat torus, keeping one copy of
@@ -183,7 +182,7 @@ that cubic torus and can return the nearest vertex. Osang,
 Rouxel-Labbé, and Teillaud, ESA 2020, extend it to a general lattice
 by reducing to an obtuse superbase and folding each point with a
 closest-vector query. The dual is an exact 1-nearest structure. The
-link of a vertex is not the 4 nearest neighbours: a site's fourth
+link of a vertex differs from the 4 nearest neighbours: a site's fourth
 neighbour need not be a Delaunay edge. Dickerson and Eppstein,
 *Comput. Geom.* **5**, 277 (1996), recover the k nearest from a
 Delaunay search in `O(k n log n)` in Euclidean space, with no
@@ -205,9 +204,9 @@ already cited above.
 circles, and `RP^3`. On `(S^1)^3` the distance is the Euclidean
 minimum image of an orthorhombic box, and a node is discarded only
 when the circular distance to its rectangle is already worse than
-the best point seen. The proof is for one neighbour. The same prune
+the best point seen. The argument is for one neighbour. The same prune
 is the wrong Euclidean distance on a skewed cell, because the metric
-no longer splits across axes. Ichnowski and Alterovitz, WAFR 2014,
+no longer splits across directions. Ichnowski and Alterovitz, WAFR 2014,
 search `SO(3)` and `SE(3)` with four kd-trees on the quaternion
 3-sphere. That distance is a great-arc plus a translation, not
 `R^3` modulo a lattice. OMPL's torus state space is the embedded
@@ -225,7 +224,7 @@ kernel. Novikov, Gneushev, Kadeishvili, and Oseledets, arXiv:2410.04462
 (2024), use a tensor train as an approximate point-cloud index, with
 no periodic cell. The orthorhombic minimum image is a sum of three
 circular distances, which is why the ortho path never multiplies by
-`H`. That is the product metric above, not a tensor decomposition.
+`H`. That is the product metric a scalar, in contrast with a tensor decomposition.
 
 **Graph construction.** Crystal networks take a cutoff ball, or k
 neighbours from inside a ball. Xie and Grossman, *Phys. Rev. Lett.*
@@ -236,9 +235,11 @@ fairchem's periodic radius graph repeats the lattice out to
 `ceil(radius / face height)` and then caps the list. Park and
 Wolverton, *Phys. Rev. Materials* **4**, 063801 (2020), connect
 Voronoi neighbours instead. A Voronoi face can be longer than a
-non-neighbour, so that graph is not the k nearest sites. Ruff,
+non-neighbour, so that graph differs from the k nearest sites. Ruff,
 Reiser, Stühmer, and Friederich, *Digital Discovery* **3**, 594
 (2024), compare periodic k-nearest, radius, and Voronoi edges and
 keep k = 24. NequIP, Allegro, and MACE consume a cutoff list. None
 of these is an uncapped Euclidean k-nearest walk, and none of them
-adds a bin test this search does not already apply.
+adds a bin test this search never already apply.
+
+Names in the citations: Association for Computing Machinery (ACM), configuration frames (CON), Nanoscale Molecular Dynamics (NAMD), Highly Optimized Object Oriented Molecular Dynamics (HOOMD), Institute of Electrical and Electronics Engineers (IEEE), Society for Industrial and Applied Mathematics (SIAM), European Symposium on Algorithms (ESA), Computational Geometry Algorithms Library (CGAL), Workshop on the Algorithmic Foundations of Robotics (WAFR), Open Motion Planning Library (OMPL), Geometric Near-neighbor Access Tree (GNAT), International Conference on Intelligent Robots and Systems (IROS), Transactions on Pattern Analysis and Machine Intelligence (TPAMI), Knowledge Discovery and Data Mining (KDD), and the MACE interatomic potential (MACE).

@@ -78,10 +78,9 @@ int lc_pairs_within_rows(const double *xyz, size_t n, const lc_cell *simbox,
 rows. Null `out` queries `*out_count`.
 
 A query, or a short buffer, keeps its search on the calling thread.
-The next call on that thread with the same inputs bit for bit (`xyz`,
-the box, `cutoff`, `mask`, `cell_hint`, `half`) writes the rows from
-it without searching again; any other call drops it. A fill that
-writes keeps nothing, so a count-then-fill pair is one search.
+That thread writes the rows from the saved search when the next call repeats `xyz`, the box, `cutoff`, `mask`, `cell_hint`, and `half` bit for bit.
+Any other call drops the saved search.
+A fill that writes keeps nothing, so a count-then-fill pair is one search.
 
 ## Errors and version
 
@@ -90,10 +89,10 @@ const char *lc_last_error(void);
 const char *lc_version(void);
 ```
 
-Both return pointers the caller must not free. `lc_last_error` is
+Both return pointers the caller leaves alone. `lc_last_error` is
 thread-local and `NULL` after a successful `lc_knearest` on that
-thread, or if none has failed yet. `lc_version` does not read or write
-the slot. The pointer is invalid after the next `lc_knearest` on the
+thread, or if none has failed yet. `lc_version` returns the process-static version string.
+The pointer is invalid after the next `lc_knearest` on the
 same thread. Distinct searches may run concurrently; each thread reads
 its own slot. `lc_version` is process-static.
 
@@ -184,9 +183,9 @@ are `linkcell::partition`, `linkcell::halo_width`, and
 | `BufferSize` | `knearest_into` / `out` length is not `n * k` |
 | `MaskLen` | `mask` is `Some` and `mask.len() != n` |
 | `TooManyCells` | linked-cell mesh overflows the bin cap |
-| `Overflow` | `n * k` does not fit a slice |
+| `Overflow` | `n * k` overflows a slice |
 | `BadPartition` | The part count is zero, or the balance bound is below 1 |
-| `BadGraph` | The cell graph is not a square CSR of that grid |
+| `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |
 | `NoDevice` | A device curve split was requested and no device is loaded |
 | `ScotchDisabled` | Scotch support was not compiled in |
 

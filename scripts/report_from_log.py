@@ -172,12 +172,12 @@ def main():
     a("")
     a("The cell graph, the partition, and the geometric halo live in linkcell.")
     a("Ring membership, the Message Passing Interface (MPI) share, and ice clustering stay in seams-core.")
-    a("eOn calls `pairs_within` only. rgpot does not call linkcell. readcon-core reads configuration (CON) frames and is not a caller.")
+    a("eOn calls `pairs_within` only. rgpot builds pairs through vesin. readcon-core reads configuration (CON) frames.")
     a("")
-    a("This report is generated from one log. Every median and every interquartile range (IQR) is the value that log printed for that cell. The raw sample line is the series those values came from, at type-7.")
+    a("This cell-partition report is generated from one log. Every median and every interquartile range (IQR) is the value that log printed for that cell. The raw sample line is the series those values came from, at type-7.")
     a("")
-    a(f"Hardware is {meta.get('hardware', 'Intel Xeon Processor')}, {meta.get('cores', '8')} physical cores, one thread per core, one node.")
-    a("A second node was not run. The log line is `multi_node HOST NOT-RUN`, where HOST is the host process.")
+    a(f"The log names the hardware as {meta.get('hardware', 'Intel Xeon Processor')}, {meta.get('cores', '8')} physical cores, one thread per core, one node.")
+    a("The host process (HOST) records a second node as `multi_node HOST NOT-RUN`.")
     a(f"Commit `{meta.get('head', '')}`. Tree `{meta.get('tree', '')}`.")
     a(f"Exit code {meta.get('exit', '')}.")
     a("")
@@ -205,45 +205,52 @@ def main():
     a("Times are seconds. The pair is the median and the interquartile range (IQR) of the raw samples.")
     a("The halo fraction is the largest ghost-cell count divided by the owned-cell count. A value above 1 means the ghost set is larger than the owned set.")
     a("")
-    a("| System | Method | Cut | Imbalance | Halo | Median | IQR | Eligible |")
-    a("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    a("```text")
+    a("method system cut imbalance halo median iqr eligible")
     for row in rows:
         a(
-            f"| {row['system']} | {row['method']} | {row['cut']} | {row['imbalance']} | {row['halo']} | {fmt(row['median'])} | {fmt(row['iqr'])} | {row['eligible']} |"
+            f"{row['method']} {row['system']} {row['cut']} {row['imbalance']} {row['halo']} {fmt(row['median'])} {fmt(row['iqr'])} {row['eligible']}"
         )
+    a("```")
     a("")
     a("## Halo counts")
     a("")
     a("Each row is the domain with the largest ghost-to-owned ratio on the last method that printed halo counts, with bin widths in angstroms.")
     a("")
-    a("| System | Cells | Bin widths | Owned | Ghost |")
-    a("| --- | ---: | --- | ---: | ---: |")
     last = {}
     for row in rows:
         if row["owned"]:
             last[row["system"]] = row
+    a("```text")
     for name in systems:
         row = last.get(name)
         if row is None:
             continue
-        a(f"| {name} | {row['ncell']} | {row['bin']} | {row['owned']} | {row['ghost']} |")
+        a(
+            f"{name} owned {row['owned']} ghosts {row['ghost']} cells {row['ncell']} bin_widths {row['bin']}"
+        )
+    a("```")
     a("")
     a("On the small TIP4P lattice the bin is about as wide as the 7.5 angstrom cutoff, so the radius is one bin.")
-    a("A part then owns a few hundred cells, and the one-bin shell around that part can contain more cells than the part itself.")
-    a("The fraction is ghosts divided by owned cells, not ghosts divided by the whole grid.")
+    a("That part owns a few hundred cells.")
+    a("The one-bin shell can contain more cells than the part.")
+    a("The fraction divides ghosts by owned cells.")
     a("")
     a("## Raw samples")
     a("")
     a("Each line is the twelve wall times, in seconds, in the order they were measured.")
     a("")
+    a("```text")
     for row in rows:
         text = " ".join(fmt(v) for v in row["raw"])
-        a(f"- {row['system']} {row['method']}: {text}")
+        a(f"{row['method']} {row['system']} {text}")
+    a("```")
     a("")
     a("## Balance sweep")
     a("")
-    a("The same five ratios are used on every system. The main table uses the derived bound, not one of these fixed ratios.")
+    a("The same five ratios appear on every system in this sweep. The main table uses the derived bound.")
     a("")
+    a("```text")
     for line, med, spread, _raw in sweeps:
         bits = line.split()
         # sweep ratio R system S method M cut C imbalance I median_s M iqr_s Q
@@ -253,29 +260,33 @@ def main():
         cut = bits[bits.index("cut") + 1]
         imb = bits[bits.index("imbalance") + 1]
         a(
-            f"- ratio {ratio} {system} {method} cut {cut} imbalance {imb} median {fmt(med)} iqr {fmt(spread)}"
+            f"{method} {ratio} {system} cut {cut} imbalance {imb} median {fmt(med)} iqr {fmt(spread)}"
         )
+    a("```")
     a("")
     a("## Scaling")
     a("")
-    a("Strong scaling holds the lattice at 1,520,875 points (115 cubed). Weak scaling uses 190,109 points times the thread count, so eight threads is 1,520,872 points.")
+    a("Strong scaling keeps the lattice at 1,520,875 points (115 cubed). Weak scaling uses 190,109 points times the thread count, so eight threads is 1,520,872 points.")
     a("Median and interquartile range (IQR) are recomputed from the raw line.")
     a("`profile_ns` is the summed select, Fiduccia-Mattheyses, and coarsen time over the repetitions, in nanoseconds.")
     a("")
-    a("| Kind | Threads | N | Method | Median | IQR |")
-    a("| --- | ---: | ---: | --- | ---: | ---: |")
+    a("```text")
+    a("kind threads n method median iqr")
     for line, med, spread, _raw in scales:
         bits = line.split()
         kind = bits[bits.index("kind") + 1]
         threads = bits[bits.index("threads") + 1]
         n = bits[bits.index("n") + 1]
         method = bits[bits.index("method") + 1]
-        a(f"| {kind} | {threads} | {n} | {method} | {fmt(med)} | {fmt(spread)} |")
+        a(f"{kind} {threads} {n} {method} {fmt(med)} {fmt(spread)}")
+    a("```")
     a("")
     a("## Profile")
     a("")
+    a("```text")
     for line, _med, _spread, _raw in scales:
-        a(f"- {line}")
+        a(line)
+    a("```")
     a("")
     dst.write_text("\n".join(lines) + "\n")
 

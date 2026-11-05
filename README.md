@@ -17,7 +17,7 @@ still stops on the looser `reach * cell_min` bound
 (`linkcell::gpu::Workspace`). `src/kokkos/` is the certified walk on
 a Kokkos execution space. Pair lists stay on the host.
 
-It is a Library of Data Exchange (LODE) library. The Rust crate is the implementation. The C application binary interface
+The host pair-list library is a Library of Data Exchange (LODE) library for the linked-cell walk. The Rust crate is the implementation. The C application binary interface
 (`lc_*`) is the hourglass waist, the same shape as
 [readcon-core](https://github.com/lode-org/readcon-core). C++ is a Resource Acquisition Is Initialization (RAII)
 header over that interface.
@@ -39,7 +39,7 @@ installed library. Meson, CMake, and pkg-config install both shared and
 static CPU libraries. The device API is a separate static library with
 `linkcell_gpu.h` / `linkcell_gpu.hpp`.
 
-Python takes the same search through DLPack (dlpk). Any `__dlpack__()`
+The Python library install takes the same search through DLPack (dlpk). Any `__dlpack__()`
 object (numpy, torch, jax, cupy) is a valid `xyz` / `cell`, on any
 device. A CUDA `xyz` stays on device; a CUDA `cell` is inverted on
 device. `torch.from_dlpack` consumes `(indices, dist2)`.
@@ -186,7 +186,7 @@ d-SEAMS writes the same keys from `SEAMS_CONFIG` / `seams --tpp`.
 | Tutorial | [Two points](docs/tutorials/two-points.md) |
 | How-to | [Embed from C](docs/how-to/embed-c.md), [Embed from C++](docs/how-to/embed-cpp.md), [pkg-config](docs/how-to/pkg-config.md) |
 | Reference | [C ABI](docs/reference/c-api.md), [Algorithm](docs/reference/algorithm.md) |
-| Explanation | [MIC and cells](docs/explanation/mic-and-cells.md) |
+| Explanation | [Minimum image convention (MIC) and cells](docs/explanation/mic-and-cells.md) |
 
 Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](docs/index.md).
 
@@ -197,20 +197,20 @@ Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](doc
   Binning is in fractional space, so a sheared dump is not treated as
   orthogonal.
 - Points fold into the primary cell once. Each source then grows a
-  rectangular box of neighbour cells, one axis at a time. Pair
+  rectangular box of neighbour cells, one direction at a time. Pair
   distances are a Cartesian subtract plus that cell's lattice
   translation (`dist2_shifted` and `lattice_shift`), the vesin /
   LAMMPS ghost construction. Orthorhombic boxes use three independent
   wraps and skip the two Hinv matvecs. The batched form of that wrap
   is minimage's Highway kernel, `dist2_ortho_diffs`, re-exported here
   and used by the orthorhombic brute-force check. A cutoff row keeps
-  the stencil image, so `pairs_within` does not run that round on an
+  the stencil image, so `pairs_within` skips that round on an
   already shifted difference. A restricted triclinic box is
   tilt-reduced and uses a triangular shift.
 - One lattice shift per unique cell is wrong unless every wrap of that
   cell is visited. The walk visits integer cell offsets, so each wrap
   of a bin is a separate visit.
-- `knearest` does not take a cutoff. A cell-size hint only sets the bin
+- `knearest` takes a neighbour count and a cell-size hint. The hint only sets the bin
   width. `knearest` stores each bin as a contiguous slice. An
   orthorhombic cell is binned as stored, a restricted triclinic cell
   is tilt-reduced, and a general orientation is Minkowski-reduced.
@@ -235,12 +235,13 @@ ghost bins of one domain.
 The balance bound defaults to `1 + parts * w_max / total` for every system.
 `w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
 `lc_partition` selects that ratio when `balance <= 0`.
-A weighted median assigns the straddling cell to one side, so a part can exceed the ideal share by at most that cell.
+A weighted median assigns the straddling cell to one side.
+The part may exceed the ideal share by at most that cell.
 That is the tightest bound a cell-aligned cut can promise, and it is the ratio the d-SEAMS domain driver derives per frame.
-The default method is chosen from the five-system panel in
-`examples/partition_panel.rs`: the native method with the smallest
-sum of edge cuts, among those that stay inside that bound, with a
-tie broken by the sum of median wall times. Morton, Hilbert,
+Our method computes the default from the five-system panel in
+`examples/partition_panel.rs`.
+We report the native cut with the smallest sum of edge cuts among the cuts that stay inside that bound.
+A tie breaks toward the smaller sum of median wall times. Morton, Hilbert,
 recursive coordinate bisection (RCB), and a Fiduccia-Mattheyses pass are
 always built. Serial Scotch is `--features scotch`.
 Parallel Scotch is `--features ptscotch`.
@@ -270,4 +271,4 @@ let _ghosts = halo(
 
 ## License
 
-MIT
+Massachusetts Institute of Technology (MIT)

@@ -42,12 +42,13 @@ Prints:
 1 -> 0
 ```
 
-`examples/two_points.c` is a longer form (cubic and sheared). A
-Meson or CMake build of the crate runs it as the `two_points` test.
+`examples/two_points.c` shows a cubic cell and a sheared cell.
+The crate test runs that example.
 
 ## Periodic image
 
-Replace the coordinates with a pair that wraps:
+Replace the coordinates with a wrapping pair.
+The x values are 0.2 and 9.4.
 
 ```c
   double xyz[] = {0.2, 0.0, 0.0, 9.4, 0.0, 0.0};
@@ -80,4 +81,4 @@ c++ -std=c++17 two_points.cpp $(pkg-config --cflags --libs linkcell) -o two_poin
 
 Next: [embed from C](../how-to/embed-c.md) or
 [embed from C++](../how-to/embed-cpp.md). Why the wrap is 0.8, not 9.2:
-[MIC and cells](../explanation/mic-and-cells.md).
+[Minimum image convention (MIC) and cells](../explanation/mic-and-cells.md).

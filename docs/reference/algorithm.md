@@ -2,7 +2,7 @@
 
 Linked-cell k-nearest search in `src/knearest.rs`. Allen and
 Tildesley linked cells, a k-heap per source, and a rectangular index
-box that grows until the k-th neighbour cannot lie past an unvisited
+box that grows until the k-th neighbour never lie past an unvisited
 face. The search takes no cutoff.
 
 ## Inputs
@@ -35,8 +35,8 @@ a sheared box uses `Hinv` only for this fold.
 ## Shells
 
 For each source, walk integer cell offsets `(dx, dy, dz)`. The first
-visit is the 3×3×3 around the home bin. After that the index box
-grows one axis at a time: an axis whose unvisited plane is already
+visit is the 3x3x3 around the home bin. After that the index box
+grows one direction at a time: a direction whose unvisited plane is already
 farther than the k-th neighbour stays put, and a short face can take
 another layer while the long faces do not. A cube shell is the case
 where all three planes fail together. `max_reach` is the space
@@ -50,7 +50,7 @@ Each offset maps to:
   `Cell::lattice_shift`
 
 The pair distance is `Cell::dist2_shifted`: Cartesian subtract of the
-folded points plus that shift. The inner loop does not wrap with
+folded points plus that shift. The inner loop never wrap with
 `Hinv`.
 
 The same primary bin can appear under more than one wrap. Each wrap
@@ -64,7 +64,7 @@ An orthorhombic box is already the basis the shells walk.
 A restricted triclinic box (LAMMPS dump bounds, a CON file with a
 non-right angle, the cells seams and rgsaddle pass) is tilt-reduced
 in place, GROMACS `correct_box`, and the shift is the triangular
-product. A general orientation is Minkowski-reduced (Nguyen–Stehlé).
+product. A general orientation is Minkowski-reduced (Nguyen-Stehlé).
 The basis spans the same Cartesian lattice. A 27-image check on that
 basis can still miss a closer shift; the shell cap is the space
 diagonal divided by the minimum cell height, and the frontier test
@@ -72,8 +72,7 @@ stops the walk once the k-th neighbour is certified.
 `pairs_within` keeps the caller's basis, because the returned shift
 `S` is an integer combination of that H. Each unordered pair is
 tested once. A full list writes both `(i, j, S)` and `(j, i, -S)`.
-On Linux the pair buffer stays on the heap, so a repeated call does
-not fault those pages in again.
+On Linux the pair buffer stays on the heap, so a repeated call reuses those pages.
 The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.
@@ -88,8 +87,8 @@ front to back, so the random accesses are reads of the fold. For 4096
 atoms on one thread the bins take 0.038 ms (0.044 ms shuffled), against
 0.061 and 0.082 ms with the key formed per lane and a scatter into the
 slot columns. Inside a bin the
-slots follow a Morton code of the atom's sub-cell, two or four per axis
-so that a sub-cell holds about one atom, then atom index. Eight slots
+slots follow a Morton code of the atom's sub-cell, two or four per direction
+so that a sub-cell stores about one atom, then atom index. Eight slots
 in a row, one vector of targets, are then a compact block of the bin
 whatever order the caller's atoms come in; with the atoms of a lattice
 shuffled, the one-thread 4096-atom call took 1.67 ms with that order
@@ -99,8 +98,7 @@ operations in its order (the division or the `Hinv` product, `wrap01`,
 the bin truncation, and `H`), so every position and bin is the same
 bits as `Cell::fractional` and `Cell::cartesian`. The sums are separate
 multiplies and adds: a fused multiply-add would round once and would
-not match. AVX2 is selected only when FMA is present. The kernels do
-not enable FMA. The floor inside `wrap01` is minimage `floor_fast` for
+disagree. AVX2 is selected only when FMA is present. The kernels leave FMA off. The floor inside `wrap01` is minimage `floor_fast` for
 this architecture: truncation toward zero on x86_64, and `f64::floor`
 elsewhere. On x86_64 an input of -0 stays -0 in the fraction. The
 previous AVX-512 round toward -inf mapped that input to +0.
@@ -110,7 +108,7 @@ the k-nearest scan, and cutoff pairs. AVX-512 is selected only when
 AVX-512F, AVX-512VL, POPCNT, and FMA are all present. The k-nearest mesh uses the same fold, and its
 candidate scan uses the same width on the SoA `x`, `y`, `z` columns.
 The fold and the neighbour rows are bitwise and ordering identical
-for one thread and for several. When the walk
+for one thread and for many. When the walk
 splits across threads, from 1024 atoms each thread folds one block of
 atoms and groups it by bin in its own staging area. Each thread then
 owns a run of bins, balanced by atoms, reads their atoms from every
@@ -129,8 +127,8 @@ The walk splits across threads from an ideal-gas estimate of ten
 thousand pairs (on this 8-core host one thread is faster at 512 atoms
 in an 18 Å cube at 4 Å, eight from 768). A split call reserves the row
 buffer on the caller's thread from that estimate, then builds the bins,
-searches, and writes in one pool entry: the caller does not run the
-serial steps while every worker spins, and does not wake between
+searches, and writes in one pool entry: the caller never run the
+serial steps while every worker spins, and never wake between
 search and write. A short estimate grows the buffer on the caller's
 thread. glibc gives a large block allocated on a worker its own heap
 and unmaps it when the block is freed, so the buffer the caller keeps
@@ -156,7 +154,7 @@ so the second four hits of a vector permute from the same pair. A half
 list is written from the tile too, one row per hit on the side
 `keep_half` keeps: one compare of the source against the compressed
 targets picks each hit's side (a target with the source's own index,
-which only an image of the source's own bin holds, takes the shift's
+which only an image of the source's own bin stores, takes the shift's
 side), and each register of rows is one permute through an index
 blended between the forward and the mirrored table, so eight hits are
 five registers; the columns blend `i`, `j`, the shift, and `dist2` the
@@ -164,13 +162,13 @@ same way. Before, a half list searched into the hit buffer and wrote
 each row with a scalar branch on its side, and took longer than the
 full list (4096 atoms: 1.33 ms, now 0.82 ms; 0.3.8 1.88 ms). The
 buffered writers take eight hits at a time the same way, so C's
-`lc_pairs_within`, and Python and Rust on several threads, no longer
+`lc_pairs_within`, and Python and Rust on many threads, no longer
 branch per row either (C, one thread, 4096 atoms: 1.51 to 1.14 ms). When
 bins hold under eight atoms on average the block loop runs as a twin
 compiled with the tile's target features and the tile inlines into it,
 since with a few atoms a block the call into the tile is most of the
 block (256 atoms in the 18 Å cube: 0.020 to 0.017 ms).
-On several threads, a full list of `Pair` rows on AVX-512 whose rows
+On many threads, a full list of `Pair` rows on AVX-512 whose rows
 outgrow a thread's L2 (the same 3 MB a thread as the prefetch) is
 written from the tile as well: each thread counts the rows of its range
 of bins (the tile with nothing written), the counts give each range its
@@ -197,20 +195,19 @@ passes 3 MB a thread, so the store finds its line in L1: the tile for
 rows and for columns, the buffered AVX-512 writers, and the scalar row,
 half-list, column, and C writers. The one-thread call drops to 1.15 to
 1.21 ms. Smaller lists stay in a 2 MB L2 and only pay the instructions,
-so 256 and 1024 atoms do not prefetch; from 1536 atoms the gain is 10
+so 256 and 1024 atoms never prefetch; from 1536 atoms the gain is 10
 to 16%, on two and four threads 2 to 4%, and on eight threads none,
-where the cores share the L3's bandwidth rather than each waiting on its
+where the cores share the L3's throughput rather than each waiting on its
 own fill buffers. A store-only probe bounds the rest: straight 64-byte
 stores of those 29 MB with the same prefetch take 0.95 ms (a memset
 0.85 ms), and the same stores in the tile's own bursts, two to ten
 registers a hit vector, 1.03 to 1.16 ms, depending on how predictable
 the burst lengths are. The walk is within that range, and dropping both
-compresses, or broadcasting each group's sources from memory, does not
-change it: the tile's own work now runs behind the stores. Staging the
+compresses, or broadcasting each group's sources from memory, leaves the time alone: the tile's own work now runs behind the stores. Staging the
 rows in L1 and copying them out in 1 to 4 KB bursts, or streaming every
 few lines past the cache, was slower. On Linux the `Pair` vector and the
 columns of at least 4 MB that a call allocates are advised to use
-transparent huge pages on their 2 MB-aligned interior, so those stores
+transparent large pages on their 2 MB-aligned interior, so those stores
 walk the page tables once per 2 MB (without the advice the call takes
 1.32 ms); buffers a caller passes in are left alone.
 
@@ -223,11 +220,11 @@ its search for the matching fill on the same thread.
 
 With the bin edge equal to the cutoff the search radius is 1, and the
 gap between any two cells inside that stencil is 0, so the bin test
-does not drop a cell. vesin's cell list then evaluates
+never drop a cell. vesin's cell list then evaluates
 `27 ρ − 1` ordered distances per atom (`ρ` atoms in the cell). This
 walk evaluates `(ρ − 1) / 2 + 13 ρ`, which is exactly half:
 `scripts/cutoff_work.py` simplifies the ratio to 2. vesin also forms
-`S H` with a 3×3 product on every candidate. This walk forms that
+`S H` with a 3x3 product on every candidate. This walk forms that
 shift once per cell pair. The extra traffic is the hit buffer and the
 40-byte row.
 
@@ -241,8 +238,8 @@ bin, the tile moves the source box into the target frame and tests it
 against eight target boxes in one vector; a target run whose box is at
 least `cutoff^2` plus twice the rounding bound away is not loaded.
 Every source lies inside its moved box (rounding is monotonic) and
-every target inside its own, so a skipped run holds no lane the tile
-would keep: the rows, their order, and their bits do not change, and a
+every target inside its own, so a skipped run stores no lane the tile
+would keep: the rows, their order, and their bits stay the same, and a
 test compares them against the tile with the boxes off. The boxes are
 built when the bins hold four runs of eight on average and tested for
 partner bins of four runs or more; with fewer, the bin stencil has
@@ -251,9 +248,9 @@ already culled at that scale and the box test costs more than it skips
 4096-atom cube at 4 Å, 64 atoms per bin, 82% of the 444 thousand
 source-vectors held no pair; with the boxes 124 thousand are tested, and
 the one-thread call drops from 1.49 to 1.42 ms. Those vectors were
-cheap, three fused multiply-adds and a compare mostly hidden behind the
+cheap, three fused multiply-adds and a compare often hidden behind the
 row stores, so the gain is the compute that did not overlap. An earlier
-box test per 4×8 tile, one box pair at a time, was slower than the tile
+box test per 4x8 tile, one box pair at a time, was slower than the tile
 alone. A cluster bitmask would still expand into the same row.
 
 Columns half a cutoff across along `b` and `c`, each sorted along `a`
@@ -262,17 +259,17 @@ each four sources, test about half as many vectors as the 27-bin
 stencil (200 thousand against 442 thousand source-vectors for that
 cube). They were slower on this host: about 1.9 ms on one thread and
 0.48 ms on eight, against 1.6 ms and 0.38 ms. Almost every vector in a
-window holds a hit, so each one pays the compress and the row permutes,
+window stores a hit, so each one pays the compress and the row permutes,
 and those share the one 512-bit shuffle port; the 27-bin tile skips
 most vectors after three fused multiply-adds and a compare.
 
 The walk's thresholds and paths can be autotuned. The `tune` feature
 builds `lc_tune_set` (expected pairs where the walk splits, atoms from
-which a split walk builds its bins on several threads, the one-thread
+which a split walk builds its bins on many threads, the one-thread
 full list written from the tile or buffered first, bin ranges per
 thread, and the output bytes per thread from which the writers
 prefetch) and `lc_tune_pairs`, a timed call that returns a checksum of its
-rows; the shipped header declares neither. `scripts/tune-pairs.py`
+rows; the included header declares neither. `scripts/tune-pairs.py`
 drives them with Kernel Tuner, one compiled C function per
 configuration, and checks every configuration's rows against the
 default one. On this host, for the 4096-atom cube, the 1080
@@ -297,7 +294,7 @@ plane is still the nearest, and shrinking the plane would walk another
 shell. The older `reach * cell_min` bound is that distance when the
 source sits on the outer face of its cell; a source in the interior
 stops sooner. The device walk still uses `reach * cell_min`, which is
-a lower bound on the same plane, so it does not stop earlier.
+a lower bound on the same plane, so it never stop earlier.
 
 `knearest` returns `Neighbors` rows (`indices`, `dist2`), nearest
 first. `knearest_into` / `lc_knearest` write packed indices.
@@ -306,18 +303,18 @@ first. `knearest_into` / `lc_knearest` write packed indices.
 
 `knearest_brute` is the all-pairs check used by tests and small
 systems. An orthorhombic box calls `dist2_ortho_diffs` (the Highway
-batch: SoA differences, one reciprocal per axis, then the per-axis
+batch: SoA differences, one reciprocal per direction, then the per-direction
 round). Any other box calls `Cell::dist2_euclidean` per pair: Smith
 half-edge test, then a Minkowski-reduced 27-image. The 27-image of an
 unreduced H misses lattice points such as `2(a-b)`. The fractional
-wrap of a hex-prism body diagonal is not nearest. It is not the
+wrap of a hex-prism body diagonal is not nearest. It stays the
 production walk.
 
 The citations are in [MIC and cells](../explanation/mic-and-cells.md).
 The pair kernel is Rapaport's cell shift. The expanding shells are
-Bentley, Weide, and Yao's cell technique. Schnorr–Euchner enumeration
+Bentley, Weide, and Yao's cell technique. Schnorr-Euchner enumeration
 and McKilliam, Grant, and Clarkson's obtuse-superbase search certify
-the closest lattice vector; they do not list the k nearest sites.
+the closest lattice vector; they never list the k nearest sites.
 A periodic Delaunay triangulation certifies the nearest site, not the
 fourth. A kd-tree on a product of circles (Yershova and LaValle) is
 exact for one neighbour on an orthorhombic torus. Crystal-graph
@@ -327,7 +324,7 @@ builders take a cutoff, or k neighbours inside a ball.
 
 linkcell is a sub-library. An MPI caller keeps the primary
 communicator and passes a sub-communicator. MPI setup stays in that
-caller. The POP3 figures below are the threads inside one search:
+caller. The POP3 figures follow the threads inside one search:
 the share that sub-communicator already assigned to this call.
 
 The `parallel` Cargo feature (on by default) maps sources with
@@ -354,8 +351,7 @@ and counts it into an atomic counter; the offsets are a parallel scan
 over runs of bins (a mesh can have more bins than points), the same
 counters become scatter cursors, and crowded bins are sorted by index
 in parallel, so the occupant order matches the serial build. Below that
-count the mesh stays serial. The cubic hot path is 4096 points and does
-not take the parallel build. `--no-default-features` keeps the whole
+count the mesh stays serial. The cubic hot path is 4096 points and stays on the serial build. `--no-default-features` keeps the whole
 search serial.
 
 `examples/knn_scale.rs` and `examples/pairs_scale.rs` time one fixed
@@ -379,7 +375,7 @@ no ideal-network model, so communication efficiency stays one number.
 
 `linkcell::gpu::Workspace` is the gpulite CUDA walk. It still stops on
 `reach * cell_min`, which is a lower bound on the host plane, so it
-does not stop earlier than the host. `k <= 16`. That path is separate
+never stop earlier than the host. `k <= 16`. That path is separate
 from the Kokkos walk.
 
 `src/kokkos/` is the certified walk on `Kokkos::DefaultExecutionSpace`.
@@ -387,7 +383,7 @@ The caller starts Kokkos. The standalone timer calls
 `Kokkos::initialize` because that program is the whole process. A
 caller that already started Kokkos keeps doing so, and an MPI caller
 still passes a sub-communicator. Fold, bin, exclusive scan, and the
-per-axis index box run as Kokkos parallel loops. The stop is the host
+per-direction index box run as Kokkos parallel loops. The stop is the host
 plane test, not `reach * cell_min`.
 `k <= 16`. The sources are not in the Cargo or CMake graph, so a
 build without Kokkos stays the same. A Cuda execution space uses this
@@ -401,3 +397,5 @@ the communication-efficiency gap. The hierarchy is the same one as
 the host script, and the same missing PMU means no instruction, IPC,
 or frequency scaling. `scripts/bench-kokkos.sh` builds that bench
 against a Kokkos install and prints the hierarchy.
+
+Names: minimum image convention (MIC), configuration frames (CON), the aarch64 vector extension (NEON), fused multiply-add (FMA), Message Passing Interface (MPI), instructions per cycle (IPC), and the performance monitoring unit (PMU).

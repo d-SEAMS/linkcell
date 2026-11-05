@@ -1,7 +1,8 @@
 # Embed linkcell from Python
 
-The Python module wraps the C waist with DLPack (dlpk). It does not
-take `numpy.ndarray` as the ABI. Any object with `__dlpack__()` is
+The Python module wraps the C waist with DLPack (dlpk).
+The module accepts any object with `__dlpack__()`, which covers a `numpy.ndarray`.
+Any object with `__dlpack__()` is
 valid input. The return value implements `__dlpack__()`; consume it
 with `numpy.from_dlpack` or `torch.from_dlpack`.
 
@@ -40,5 +41,5 @@ Wheels:
 
 - `abi3-py312`: one wheel per platform, GIL CPython 3.12+
 - `abi3t-py315`: one wheel per platform, CPython 3.15+ GIL and
-  free-threaded (PEP 803). Build with maturin 1.14+ and
+  free-threaded (Python Enhancement Proposal (PEP) 803). Build with maturin 1.14+ and
   `--features abi3t`.
