@@ -6,25 +6,21 @@
 
 Periodic linked-cell neighbour lists for molecular simulations.
 
-`pairs_within` is the cutoff list: one row per atom-image, the caller's
-shift `S`, and a squared distance strictly below the cutoff squared.
-`knearest` is the k-nearest list. nanoflann builds Euclidean KD-trees
-without a minimum-image convention. The walk is the linked-cell method
-of Allen and Tildesley (*Computer Simulation of Liquids*). k-nearest
-shells stop when the k-th neighbour reaches the unvisited plane. The
-optional gpulite path runs that k-nearest walk on a CUDA device and
-still stops on the looser `reach * cell_min` bound
-(`linkcell::gpu::Workspace`). `src/kokkos/` is the certified walk on
-a Kokkos execution space. Pair lists stay on the host.
+`pairs_within` is the cutoff list: one row per atom-image, the caller's shift `S`, and a squared distance strictly below the cutoff squared.
+`knearest` is the k-nearest list. nanoflann builds Euclidean KD-trees without a minimum-image convention.
+The walk is the linked-cell method of Allen and Tildesley (*Computer Simulation of Liquids*). k-nearest shells stop when the k-th neighbour reaches the unvisited plane.
+The optional gpulite path runs that k-nearest walk on a CUDA device and still stops on the looser `reach * cell_min` bound (`linkcell::gpu::Workspace`).
+`src/kokkos/` is the certified walk on a Kokkos execution space.
+Pair lists stay on the host.
 
-The host pair-list library is a Library of Data Exchange (LODE) library for the linked-cell walk. The Rust crate is the implementation. The C application binary interface
-(`lc_*`) is the hourglass waist, the same shape as
-[readcon-core](https://github.com/lode-org/readcon-core). C++ is a Resource Acquisition Is Initialization (RAII)
-header over that interface.
+The host pair-list library is a Library of Data Exchange (LODE) library for the linked-cell walk.
+The Rust crate is the implementation.
+The C application binary interface (`lc_*`) is the hourglass waist, the same shape as [readcon-core](https://github.com/lode-org/readcon-core).
+C++ is a Resource Acquisition Is Initialization (RAII) header over that interface.
 
 Released versions live in [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog).
-Unreleased notes are files under `changelog.d/`. The cut is
-`towncrier build --version X.Y.Z`.
+Unreleased notes are files under `changelog.d/`.
+The cut is `towncrier build --version X.Y.Z`.
 
 ## Install
 
@@ -34,18 +30,15 @@ Rust:
 cargo add linkcell
 ```
 
-C and C++ consumers include `linkcell.h` or `linkcell.hpp` and link the
-installed library. Meson, CMake, and pkg-config install both shared and
-static CPU libraries. The device API is a separate static library with
-`linkcell_gpu.h` / `linkcell_gpu.hpp`.
+C and C++ consumers include `linkcell.h` or `linkcell.hpp` and link the installed library.
+Meson, CMake, and pkg-config install both shared and static CPU libraries.
+The device API is a separate static library with `linkcell_gpu.h` / `linkcell_gpu.hpp`.
 
-The Python library install takes the same search through DLPack (dlpk). Any `__dlpack__()`
-object (numpy, torch, jax, cupy) is a valid `xyz` / `cell`, on any
-device. A CUDA `xyz` stays on device; a CUDA `cell` is inverted on
-device. `torch.from_dlpack` consumes `(indices, dist2)`.
-Wheels: one CPython 3.12 limited-ABI (`abi3`) artifact per platform
-(GIL, 3.12+), and one `abi3t` artifact (CPython 3.15+ GIL and
-free-threaded).
+The Python library install takes the same search through DLPack (dlpk).
+Any `__dlpack__()` object (numpy, torch, jax, cupy) is a valid `xyz` / `cell`, on any device.
+A CUDA `xyz` stays on device; a CUDA `cell` is inverted on device.
+`torch.from_dlpack` consumes `(indices, dist2)`.
+Wheels: one CPython 3.12 limited-ABI (`abi3`) artifact per platform (GIL, 3.12+), and one `abi3t` artifact (CPython 3.15+ GIL and free-threaded).
 
 ```
 pip install linkcell
@@ -108,9 +101,8 @@ target_link_libraries(device_app PRIVATE linkcell::gpu)
 ```
 
 `LINKCELL_WITH_GPULITE=ON` builds `linkcell::gpu` and is the default.
-`linkcell::cpp` carries the C++17 requirement; `linkcell::linkcell` stays
-valid in a C-only project. The same target names work in the build tree and
-from an installed prefix.
+`linkcell::cpp` carries the C++17 requirement; `linkcell::linkcell` stays valid in a C-only project.
+The same target names work in the build tree and from an installed prefix.
 
 ### pkg-config
 
@@ -119,9 +111,8 @@ pkg-config --cflags --libs linkcell
 pkg-config --cflags --libs linkcell-gpu
 ```
 
-Both Meson and CMake write `linkcell.pc` and, when the device target is
-built, `linkcell-gpu.pc`. Use `pkg-config --static` when selecting the
-CPU static archive and its private system libraries.
+Both Meson and CMake write `linkcell.pc` and, when the device target is built, `linkcell-gpu.pc`.
+Use `pkg-config --static` when selecting the CPU static archive and its private system libraries.
 
 ## Rust
 
@@ -156,7 +147,9 @@ if (lc_knearest(xyz, 2, &box, 1, NULL, 0.0, out) != 0) {
 }
 ```
 
-`n` and `k` are `size_t`. `out` has length `n * k`. Unused slots are `-1`.
+`n` and `k` are `size_t`.
+`out` has length `n * k`.
+Unused slots are `-1`.
 Neighbours of source `i` are `out[i*k + 0 ..]`, nearest first.
 
 ## C++
@@ -169,14 +162,13 @@ const double xyz[] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0};
 const linkcell::Neighbours nn = linkcell::knearest(xyz, 2, box, 1);
 ```
 
-`nn` owns the packed `n * k` buffer. Unused slots are `-1`.
-`nn.neighbour(i, j)` is the j-th neighbour of i. Failure throws
-`linkcell::Error`.
+`nn` owns the packed `n * k` buffer.
+Unused slots are `-1`.
+`nn.neighbour(i, j)` is the j-th neighbour of i.
+Failure throws `linkcell::Error`.
 
-The optional device walk reads occupancy from the environment:
-`LINKCELL_TPP` (threads per particle) and `LINKCELL_BLOCK` (CUDA
-block size). Unset, the library picks a pair that maximises particles
-per block under the device thread and 48 KiB shared-memory limits.
+The optional device walk reads occupancy from the environment: `LINKCELL_TPP` (threads per particle) and `LINKCELL_BLOCK` (CUDA block size).
+Unset, the library picks a pair that maximises particles per block under the device thread and 48 KiB shared-memory limits.
 d-SEAMS writes the same keys from `SEAMS_CONFIG` / `seams --tpp`.
 
 ## Docs
@@ -188,49 +180,39 @@ d-SEAMS writes the same keys from `SEAMS_CONFIG` / `seams --tpp`.
 | Reference | [C ABI](docs/reference/c-api.md), [Algorithm](docs/reference/algorithm.md) |
 | Explanation | [Minimum image convention (MIC) and cells](docs/explanation/mic-and-cells.md) |
 
-Rust API: [docs.rs/linkcell](https://docs.rs/linkcell). Map: [docs/index.md](docs/index.md).
+Rust API: [docs.rs/linkcell](https://docs.rs/linkcell).
+Map: [docs/index.md](docs/index.md).
 
 ## Design
 
-- The cell is a general parallelepiped: three lattice vectors plus an
-  origin. Orthorhombic boxes are `Cell::ortho` / `lc_cell_ortho`.
-  Binning is in fractional space, so a sheared dump is not treated as
-  orthogonal.
-- Points fold into the primary cell once. Each source then grows a
-  rectangular box of neighbour cells, one direction at a time. Pair
-  distances are a Cartesian subtract plus that cell's lattice
-  translation (`dist2_shifted` and `lattice_shift`), the vesin /
-  LAMMPS ghost construction. Orthorhombic boxes use three independent
-  wraps and skip the two Hinv matvecs. The batched form of that wrap
-  is minimage's Highway kernel, `dist2_ortho_diffs`, re-exported here
-  and used by the orthorhombic brute-force check. A cutoff row keeps
-  the stencil image, so `pairs_within` skips that round on an
-  already shifted difference. A restricted triclinic box is
-  tilt-reduced and uses a triangular shift.
-- One lattice shift per unique cell is wrong unless every wrap of that
-  cell is visited. The walk visits integer cell offsets, so each wrap
-  of a bin is a separate visit.
-- `knearest` takes a neighbour count and a cell-size hint. The hint only sets the bin
-  width. `knearest` stores each bin as a contiguous slice. An
-  orthorhombic cell is binned as stored, a restricted triclinic cell
-  is tilt-reduced, and a general orientation is Minkowski-reduced.
-  The box grows until the k-th neighbour is no farther than the
-  nearest unvisited face.
-- A cutoff pair list is `pairs_within` / `lc_pairs_within` /
-  `linkcell.pairs_within`: atom-image rows with the caller's shift
-  `S`. `knearest` is the k-nearest list. `pairs_within_columns`,
-  `lc_pairs_within_rows`, and the Python call write the `ijS` columns
-  or `lc_pair` rows straight from the search, and a C count query
-  keeps its search for the fill that follows on the same thread.
+- The cell is a general parallelepiped: three lattice vectors plus an origin.
+  Orthorhombic boxes are `Cell::ortho` / `lc_cell_ortho`.
+  Binning is in fractional space, so a sheared dump is not treated as orthogonal.
+- Points fold into the primary cell once.
+  Each source then grows a rectangular box of neighbour cells, one direction at a time.
+  Pair distances are a Cartesian subtract plus that cell's lattice translation (`dist2_shifted` and `lattice_shift`), the vesin / LAMMPS ghost construction.
+  Orthorhombic boxes use three independent wraps and skip the two Hinv matvecs.
+  The batched form of that wrap is minimage's Highway kernel, `dist2_ortho_diffs`, re-exported here and used by the orthorhombic brute-force check.
+  A cutoff row keeps the stencil image, so `pairs_within` skips that round on an already shifted difference.
+  A restricted triclinic box is tilt-reduced and uses a triangular shift.
+- One lattice shift per unique cell is wrong unless every wrap of that cell is visited.
+  The walk visits integer cell offsets, so each wrap of a bin is a separate visit.
+- `knearest` takes a neighbour count and a cell-size hint.
+  The hint only sets the bin width.
+  `knearest` stores each bin as a contiguous slice.
+  An orthorhombic cell is binned as stored, a restricted triclinic cell is tilt-reduced, and a general orientation is Minkowski-reduced.
+  The box grows until the k-th neighbour is no farther than the nearest unvisited face.
+- A cutoff pair list is `pairs_within` / `lc_pairs_within` / `linkcell.pairs_within`: atom-image rows with the caller's shift `S`.
+  `knearest` is the k-nearest list.
+  `pairs_within_columns`, `lc_pairs_within_rows`, and the Python call write the `ijS` columns or `lc_pair` rows straight from the search, and a C count query keeps its search for the fill that follows on the same thread.
 
 ## Domain partition
 
-`cell_grid` is the fractional mesh `pairs_within` uses, with a point
-count on each bin. `cell_graph` adds the periodic adjacency. An edge
-weight is the number of cutoff pairs with one end in each bin.
-`partition` returns one domain id per cell. `halo_width` turns a
-cutoff and a shell count into three bin radii, and `halo` lists the
-ghost bins of one domain.
+`cell_grid` is the fractional mesh `pairs_within` uses, with a point count on each bin.
+`cell_graph` adds the periodic adjacency.
+An edge weight is the number of cutoff pairs with one end in each bin.
+`partition` returns one domain id per cell.
+`halo_width` turns a cutoff and a shell count into three bin radii, and `halo` lists the ghost bins of one domain.
 
 The balance bound defaults to `1 + parts * w_max / total` for every system.
 `w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
@@ -238,16 +220,15 @@ The balance bound defaults to `1 + parts * w_max / total` for every system.
 A weighted median assigns the straddling cell to one side.
 The part may exceed the ideal share by at most that cell.
 That is the tightest bound a cell-aligned cut can promise, and it is the ratio the d-SEAMS domain driver derives per frame.
-Our method computes the default from the five-system panel in
-`examples/partition_panel.rs`.
+Our method computes the default from the five-system panel in `examples/partition_panel.rs`.
 We report the native cut with the smallest sum of edge cuts among the cuts that stay inside that bound.
-A tie breaks toward the smaller sum of median wall times. Morton, Hilbert,
-recursive coordinate bisection (RCB), and a Fiduccia-Mattheyses pass are
-always built. Serial Scotch is `--features scotch`.
+A tie breaks toward the smaller sum of median wall times.
+Morton, Hilbert, recursive coordinate bisection (RCB), and a Fiduccia-Mattheyses pass are always built.
+Serial Scotch is `--features scotch`.
 Parallel Scotch is `--features ptscotch`.
 Neither library is vendored, and both features are off by default.
-The device path runs weights, curve keys, and the prefix split
-through gpulite. Copies both ways are inside that time.
+The device path runs weights, curve keys, and the prefix split through gpulite.
+Copies both ways are inside that time.
 
 ```rust
 use linkcell::{halo, halo_width, partition, PartRequest, Cell};
@@ -264,10 +245,9 @@ let _ghosts = halo(
 )?;
 ```
 
-`lc_cell_grid`, `lc_cell_graph`, `lc_partition`, `lc_halo_width`, and
-`lc_halo` are the C entry points. `linkcell::partition` in
-`include/linkcell.hpp` is the Resource Acquisition Is Initialization wrap. Python is `cell_grid`,
-`cell_graph`, `partition`, `halo_width`, and `halo`, all DLPack.
+`lc_cell_grid`, `lc_cell_graph`, `lc_partition`, `lc_halo_width`, and `lc_halo` are the C entry points.
+`linkcell::partition` in `include/linkcell.hpp` is the Resource Acquisition Is Initialization wrap.
+Python is `cell_grid`, `cell_graph`, `partition`, `halo_width`, and `halo`, all DLPack.
 
 ## License
 

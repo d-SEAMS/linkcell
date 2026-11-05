@@ -1,9 +1,10 @@
 # C application binary interface (ABI)
 
-Header: `include/linkcell.h`. Prefix `lc_`. Caller owns every
-buffer. C++ (`include/linkcell.hpp`) is a header-only wrap of these
-entry points. Device searches are `lc_gpu_*` in
-`include/linkcell_gpu.h`; link the package's `linkcell-gpu` target.
+Header: `include/linkcell.h`.
+Prefix `lc_`.
+Caller owns every buffer.
+C++ (`include/linkcell.hpp`) is a header-only wrap of these entry points.
+Device searches are `lc_gpu_*` in `include/linkcell_gpu.h`; link the package's `linkcell-gpu` target.
 
 ## Cell
 
@@ -18,8 +19,8 @@ typedef struct lc_cell {
 lc_cell lc_cell_ortho(double lx, double ly, double lz);
 ```
 
-Lattice vectors are rows `a`, `b`, `c` (the same order vesin uses)
-plus an origin. `lc_cell_ortho` builds a diagonal box at the origin.
+Lattice vectors are rows `a`, `b`, `c` (the same order vesin uses) plus an origin.
+`lc_cell_ortho` builds a diagonal box at the origin.
 
 ## Search
 
@@ -49,7 +50,8 @@ int lc_knearest_many(const double *xyz, size_t n, size_t n_frames,
 | `out_d2` | Optional. Caller-owned, length `n * k` (`n_frames * n * k` for `lc_knearest_many`). Unused slots are `NaN`. `NULL` skips distances. |
 | `n_frames` | Frame count for `lc_knearest_many`. `xyz` is frame-major. |
 
-`lc_knearest` is the one-frame, indices-only entry. Returns 0 on success, nonzero on failure.
+`lc_knearest` is the one-frame, indices-only entry.
+Returns 0 on success, nonzero on failure.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
@@ -58,10 +60,11 @@ int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
                     double *out_d2, size_t cap, size_t *out_count);
 ```
 
-A cutoff list is `lc_pairs_within`. Each row is one atom-image.
-`out_shift[3 * t + 0..3]` is `(na, nb, nc)`, the vesin / tonari shift
-`S` in the caller's basis. Squared distance is strictly below
-`cutoff * cutoff`. `half` nonzero keeps one side of `(i, j, S)`.
+A cutoff list is `lc_pairs_within`.
+Each row is one atom-image.
+`out_shift[3 * t + 0..3]` is `(na, nb, nc)`, the vesin / tonari shift `S` in the caller's basis.
+Squared distance is strictly below `cutoff * cutoff`.
+`half` nonzero keeps one side of `(i, j, S)`.
 Null `out_i`, `out_j`, `out_shift`, and `out_d2` query `*out_count`.
 A short `cap` writes that count and returns nonzero.
 
@@ -74,8 +77,8 @@ int lc_pairs_within_rows(const double *xyz, size_t n, const lc_cell *simbox,
                          size_t *out_count);
 ```
 
-`lc_pairs_within_rows` is the same list as one array of `lc_pair`
-rows. Null `out` queries `*out_count`.
+`lc_pairs_within_rows` is the same list as one array of `lc_pair` rows.
+Null `out` queries `*out_count`.
 
 A query, or a short buffer, keeps its search on the calling thread.
 That thread writes the rows from the saved search when the next call repeats `xyz`, the box, `cutoff`, `mask`, `cell_hint`, and `half` bit for bit.
@@ -89,12 +92,12 @@ const char *lc_last_error(void);
 const char *lc_version(void);
 ```
 
-Both return pointers the caller leaves alone. `lc_last_error` is
-thread-local and `NULL` after a successful `lc_knearest` on that
-thread, or if none has failed yet. `lc_version` returns the process-static version string.
-The pointer is invalid after the next `lc_knearest` on the
-same thread. Distinct searches may run concurrently; each thread reads
-its own slot. `lc_version` is process-static.
+Both return pointers the caller leaves alone.
+`lc_last_error` is thread-local and `NULL` after a successful `lc_knearest` on that thread, or if none has failed yet.
+`lc_version` returns the process-static version string.
+The pointer is invalid after the next `lc_knearest` on the same thread.
+Distinct searches may run concurrently; each thread reads its own slot.
+`lc_version` is process-static.
 
 ## C++ wrap
 
@@ -146,30 +149,27 @@ std::vector<ShiftedPair> pairs_within(const double *xyz, std::size_t n,
 
 `knearest` returns an owning packed `Neighbours` (`n * k` ints).
 `knearest_into` writes a caller buffer and requires `out_len == n * k`.
-Neither returns `std::vector<std::vector<int>>`. Failure throws
-`linkcell::Error`. Requires C++17.
+Neither returns `std::vector<std::vector<int>>`.
+Failure throws `linkcell::Error`.
+Requires C++17.
 
-`ShiftedPair` has the layout of `lc_pair`. `pairs_within` queries the
-count, then `lc_pairs_within_rows` writes the returned vector from that
-same search.
+`ShiftedPair` has the layout of `lc_pair`.
+`pairs_within` queries the count, then `lc_pairs_within_rows` writes the returned vector from that same search.
 
 ## Partition
 
-`lc_cell_grid` writes `nx, ny, nz`, three bin widths, and one point
-count per cell. `lc_cell_graph` adds the compressed sparse row (CSR) of the periodic
-adjacency. Edge weights are pair counts from `lc_pairs_within` with
-`half` set. `lc_partition` writes one domain id per cell. `method` is
-0 Morton, 1 Hilbert, 2 recursive coordinate bisection (RCB), 3 Hilbert plus
-Fiduccia-Mattheyses, 4 bisection plus that pass, 5 Scotch, 6 multilevel,
-7 parallel Scotch. `balance <= 0` selects `1 + parts * w_max / total`,
-where `w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
+`lc_cell_grid` writes `nx, ny, nz`, three bin widths, and one point count per cell.
+`lc_cell_graph` adds the compressed sparse row (CSR) of the periodic adjacency.
+Edge weights are pair counts from `lc_pairs_within` with `half` set.
+`lc_partition` writes one domain id per cell.
+`method` is 0 Morton, 1 Hilbert, 2 recursive coordinate bisection (RCB), 3 Hilbert plus Fiduccia-Mattheyses, 4 bisection plus that pass, 5 Scotch, 6 multilevel, 7 parallel Scotch.
+`balance <= 0` selects `1 + parts * w_max / total`, where `w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
 That is the tightest bound a cell-aligned cut can promise, and it is the ratio the d-SEAMS domain driver derives per frame.
-`lc_halo_width` writes three bin radii for
-`cutoff * depth`. `lc_halo` writes the ghost cell ids.
+`lc_halo_width` writes three bin radii for `cutoff * depth`.
+`lc_halo` writes the ghost cell ids.
 
-A null weight or domain pointer queries the count. The C++ wrappers
-are `linkcell::partition`, `linkcell::halo_width`, and
-`linkcell::halo`.
+A null weight or domain pointer queries the count.
+The C++ wrappers are `linkcell::partition`, `linkcell::halo_width`, and `linkcell::halo`.
 
 ## Rust errors (same crate)
 

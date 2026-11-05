@@ -1,0 +1,433 @@
+# Cell partition
+
+The cell graph, the partition, and the geometric halo live in linkcell.
+Ring membership, the Message Passing Interface (MPI) share, and ice clustering stay in seams-core.
+eOn calls `pairs_within` only. rgpot builds pairs through vesin. readcon-core reads configuration (CON) frames.
+
+This cell-partition report is generated from one log.
+Every median and every interquartile range (IQR) is the value that log printed for that cell.
+The raw sample line is the series those values came from, at type-7.
+
+The log names the hardware as Intel Xeon Processor, 8 physical cores, one thread per core, one node.
+The host process (HOST) records a second node as `multi_node HOST NOT-RUN`.
+Commit `528c585f5ae58cfb83f0f803cfca25bf4c9f5c80`.
+Tree `5147dec25260eafb73974e087ba68e8c66fda681`.
+Exit code 0.
+
+## Balance
+
+The bound is `1 + parts * w_max / total`.
+A weighted median gives the straddling cell to one side, so a part can exceed the ideal share by at most the heaviest cell.
+The ratio is `1 + parts * heaviest_cell / total_weight`.
+The same formula is used on every system.
+
+## Cutoff and density
+
+The mW cutoff is 4.306500 Ångströms, which is 1.8 times sigma with sigma 2.3925 Ångströms.
+The TIP4P cutoff is 7.5 Ångströms, the spherical cutoff in Jorgensen, Chandrasekhar, Madura, Impey, and Klein, Journal of Chemical Physics 79, 926 (1983).
+The water density used to place molecules is 0.03342796 molecules per cubic Ångström.
+Basis: 1 g cm-3, molar mass 18.01528 g mol-1.
+One cubic centimetre is 1e24 cubic Ångströms, so the conversion from moles per cubic centimetre to molecules per cubic Ångström uses the factor 1e-24.
+
+## Scotch seed
+
+Serial Scotch and parallel Scotch both call `SCOTCH_randomReset` and then `SCOTCH_randomSeed` with seed 1.
+The panel log repeats `SCOTCH_randomReset 1` and `SCOTCH_randomSeed 1` for each parallel Scotch run.
+
+## Head to head
+
+Times are seconds.
+The pair is the median and the interquartile range (IQR) of the raw samples.
+The halo fraction is the largest ghost-cell count divided by the owned-cell count.
+A value above 1 means the ghost set is larger than the owned set.
+
+```text
+method system cut imbalance halo median iqr eligible
+morton mW-110592 20894 1.000145 0.941354 0.020377 0.000449 1
+hilbert mW-110592 20694 1.000145 0.943571 0.002139 0.000066 1
+rcb mW-110592 13824 1.000000 0.396092 0.002278 0.000294 1
+hilbert-fm mW-110592 20562 1.000579 0.942962 0.159576 0.002768 1
+rcb-fm mW-110592 13824 1.000000 0.396092 0.047830 0.000644 1
+multi mW-110592 13824 1.000000 0.396092 0.086391 0.010091 1
+scotch mW-110592 15547 1.000217 0.478564 0.118502 0.002327 0
+zoltan-rcb mW-110592 13824 1.000000 0.396092 0.003748 0.000201 0
+ptscotch mW-110592 14234 1.000000 0.407338 13.606550 0.498656 0
+morton mW-884736 83857 1.000009 0.397780 0.194797 0.003261 1
+hilbert mW-884736 81032 1.000018 0.418792 0.021288 0.000350 1
+rcb mW-884736 55990 1.000009 0.186900 0.014673 0.000381 1
+hilbert-fm mW-884736 80736 1.000072 0.418554 2.913718 0.181952 1
+rcb-fm mW-884736 55811 1.000072 0.183409 2.371757 0.150739 1
+multi mW-884736 55818 1.000072 0.183409 2.411114 0.130341 1
+scotch mW-884736 64754 1.000054 0.232028 0.700322 0.032064 0
+zoltan-rcb mW-884736 55983 1.000009 0.186892 0.029975 0.001532 0
+ptscotch mW-884736 69664 1.000000 0.245637 55.409679 0.954035 0
+morton TIP4P-128000 2804168 1.000000 1.687500 0.000726 0.000019 1
+hilbert TIP4P-128000 2791850 1.000687 1.661710 0.000081 0.000004 1
+rcb TIP4P-128000 2492438 1.000625 1.353383 0.000126 0.000010 1
+hilbert-fm TIP4P-128000 2664700 1.004063 1.500000 0.027526 0.000377 1
+rcb-fm TIP4P-128000 2145600 1.000000 1.000000 0.013934 0.000127 1
+multi TIP4P-128000 2145600 1.000000 1.000000 0.018666 0.000254 1
+scotch TIP4P-128000 2169032 1.005375 1.052632 0.014916 0.000917 0
+zoltan-rcb TIP4P-128000 2485058 1.000625 1.353383 0.000237 0.000013 0
+ptscotch TIP4P-128000 2130992 1.001250 1.007692 3.552665 0.280528 0
+morton TIP4P-1024000 13084202 1.000320 0.812144 0.007483 0.000241 1
+hilbert TIP4P-1024000 12710308 1.000195 0.848197 0.000941 0.000033 1
+rcb TIP4P-1024000 9965162 1.000266 0.576619 0.001000 0.000188 1
+hilbert-fm TIP4P-1024000 12148882 1.000758 0.844591 0.906265 0.006089 1
+rcb-fm TIP4P-1024000 8793439 1.000766 0.466543 0.263006 0.003444 1
+multi TIP4P-1024000 8800880 1.000766 0.466263 0.307242 0.004437 1
+scotch TIP4P-1024000 8911827 1.000719 0.490884 0.099789 0.002262 0
+zoltan-rcb TIP4P-1024000 9897435 1.000312 0.564509 0.001638 0.000215 0
+ptscotch TIP4P-1024000 8791842 1.000172 0.479867 5.012810 0.258354 0
+morton slab-110592 18819 1.000217 0.750051 0.039276 0.000630 1
+hilbert slab-110592 18188 1.000145 0.747628 0.004565 0.000155 1
+rcb slab-110592 12672 1.000000 0.500000 0.002710 0.000249 1
+hilbert-fm slab-110592 18064 1.000579 0.744908 0.192218 0.002027 1
+rcb-fm slab-110592 11520 1.000000 0.396092 0.042852 0.000828 1
+multi slab-110592 11520 1.000000 0.396092 0.094538 0.003836 1
+scotch slab-110592 12553 1.000579 0.531308 0.144080 0.000836 0
+zoltan-rcb slab-110592 12672 1.000000 0.500000 0.007224 0.000238 0
+ptscotch slab-110592 11640 1.000000 2.648012 24.133782 0.555198 0
+```
+
+## Halo counts
+
+Each row is the domain with the largest ghost-to-owned ratio on the last method that printed halo counts, with bin widths in Ångströms.
+
+```text
+mW-110592 owned 5015 ghosts 2400 cells 39304 bin_widths 4.382538 4.382538 4.382538
+mW-884736 owned 40771 ghosts 9460 cells 328509 bin_widths 4.319023 4.319023 4.319023
+TIP4P-128000 owned 266 ghosts 280 cells 2080 bin_widths 7.760744 7.641348 7.760744
+TIP4P-1024000 owned 2139 ghosts 1050 cells 17160 bin_widths 7.760744 7.641348 7.525570
+slab-110592 owned 10205 ghosts 5422 cells 79764 bin_widths 4.382538 4.382538 4.319023
+```
+
+On the small TIP4P lattice the bin is about as wide as the 7.5 Ångström cutoff, so the radius is one bin.
+That part owns a few hundred cells.
+The one-bin shell can contain more cells than the part.
+The fraction divides ghosts by owned cells.
+
+## Cut sums
+
+Each sum adds the edge cut of one method over the five systems in this log.
+
+```text
+sum method morton cut 16011940 median_s 0.262659 eligible 1
+sum method hilbert cut 15622072 median_s 0.029014 eligible 1
+sum method rcb cut 12540086 median_s 0.020788 eligible 1
+sum method hilbert-fm cut 14932944 median_s 4.199303 eligible 1
+sum method rcb-fm cut 11020194 median_s 2.739378 eligible 1
+sum method multi cut 11027642 median_s 2.917952 eligible 1
+default_method rcb-fm
+```
+
+## Raw samples
+
+Each line is the twelve wall times, in seconds, in the order they were measured.
+
+```text
+morton mW-110592 0.020489 0.019521 0.019758 0.020019 0.020416 0.019894 0.020338 0.020787 0.020420 0.020420 0.020660 0.020310
+hilbert mW-110592 0.002145 0.002136 0.002133 0.002173 0.002357 0.002155 0.001997 0.002064 0.002217 0.002095 0.002088 0.002142
+rcb mW-110592 0.002529 0.002011 0.002576 0.002112 0.002227 0.002382 0.002380 0.002329 0.002003 0.002064 0.002096 0.002382
+hilbert-fm mW-110592 0.158669 0.158300 0.158942 0.168046 0.159717 0.161126 0.154682 0.163701 0.162002 0.159436 0.157995 0.160246
+rcb-fm mW-110592 0.047844 0.046533 0.047512 0.047186 0.050770 0.047517 0.047434 0.047815 0.048276 0.048845 0.047944 0.048091
+multi mW-110592 0.086597 0.086918 0.102238 0.089733 0.081982 0.081191 0.081859 0.098971 0.108812 0.086186 0.084195 0.080907
+scotch mW-110592 0.129340 0.118606 0.120349 0.117473 0.115631 0.114511 0.114343 0.118820 0.120456 0.118464 0.117289 0.118539
+zoltan-rcb mW-110592 0.003577 0.003543 0.004079 0.003843 0.003668 0.003632 0.003731 0.003766 0.003793 0.004299 0.003498 0.003811
+ptscotch mW-110592 13.861341 13.333401 13.462076 13.583179 14.048213 13.629922 13.426311 13.288549 17.290525 13.570352 14.135319 13.919650
+morton mW-884736 0.198471 0.195652 0.196386 0.194640 0.193091 0.194954 0.189223 0.189035 0.191945 0.196690 0.192783 0.195348
+hilbert mW-884736 0.022965 0.022375 0.021342 0.021491 0.021259 0.021445 0.021083 0.021317 0.021019 0.021114 0.021144 0.020829
+rcb mW-884736 0.016243 0.014793 0.014418 0.014102 0.014952 0.014735 0.014712 0.014254 0.014462 0.014569 0.014634 0.018341
+hilbert-fm mW-884736 2.824358 2.886115 2.865121 3.007650 3.005439 2.941320 2.966335 3.518408 2.823087 3.031645 2.816722 2.738072
+rcb-fm mW-884736 2.383183 2.836450 2.524284 2.462995 2.615777 2.317189 2.331041 2.360331 2.331896 2.267379 2.236291 2.456843
+multi mW-884736 2.657370 2.612333 2.549760 2.393472 2.494245 2.373528 2.381287 2.396896 2.496331 2.425333 2.356817 2.321357
+scotch mW-884736 0.689212 0.680862 0.684292 0.697835 0.731687 0.690025 0.674860 0.723909 0.718758 0.702808 0.710681 0.724874
+zoltan-rcb mW-884736 0.031621 0.031907 0.031049 0.030010 0.030251 0.028654 0.030903 0.029939 0.029786 0.028997 0.029544 0.028853
+ptscotch mW-884736 55.319755 55.486808 56.501927 54.497818 55.467644 56.342276 54.854272 54.631006 55.784575 55.351715 54.775067 55.800297
+morton TIP4P-128000 0.000758 0.000728 0.000741 0.000779 0.000720 0.000731 0.000724 0.000718 0.000721 0.000713 0.000715 0.000737
+hilbert TIP4P-128000 0.000130 0.000108 0.000094 0.000082 0.000081 0.000082 0.000081 0.000081 0.000081 0.000081 0.000080 0.000081
+rcb TIP4P-128000 0.000426 0.000152 0.000132 0.000126 0.000132 0.000118 0.000123 0.000116 0.000127 0.000127 0.000121 0.000123
+hilbert-fm TIP4P-128000 0.027548 0.027258 0.029563 0.027581 0.027301 0.027687 0.027207 0.027661 0.027773 0.027499 0.027082 0.027504
+rcb-fm TIP4P-128000 0.014039 0.013782 0.014021 0.014099 0.013948 0.013920 0.014039 0.013696 0.013892 0.013900 0.013915 0.013967
+multi TIP4P-128000 0.018563 0.018677 0.018166 0.018442 0.018770 0.018686 0.018748 0.018513 0.018458 0.018656 0.019317 0.019020
+scotch TIP4P-128000 0.016912 0.014877 0.014956 0.016553 0.015365 0.015106 0.015031 0.014380 0.014214 0.014122 0.014020 0.014267
+zoltan-rcb TIP4P-128000 0.000330 0.000239 0.000235 0.000235 0.000245 0.000255 0.000258 0.000237 0.000237 0.000231 0.000226 0.000223
+ptscotch TIP4P-128000 3.710729 3.707717 3.558712 3.320732 3.299190 3.442394 3.870356 3.519375 3.648028 3.546617 3.905370 3.384585
+morton TIP4P-1024000 0.009207 0.008144 0.007705 0.007692 0.007341 0.007630 0.007479 0.007483 0.007304 0.007455 0.007483 0.007453
+hilbert TIP4P-1024000 0.001050 0.000960 0.000946 0.000937 0.000940 0.001145 0.000997 0.000934 0.000943 0.000938 0.000933 0.000934
+rcb TIP4P-1024000 0.001186 0.000942 0.000982 0.001048 0.000907 0.000986 0.001014 0.000847 0.000910 0.001203 0.001183 0.001102
+hilbert-fm TIP4P-1024000 0.917187 0.929950 0.907087 0.903265 0.917151 0.900883 0.906363 0.908407 0.906167 0.904944 0.904917 0.896704
+rcb-fm TIP4P-1024000 0.258797 0.261100 0.268771 0.263231 0.258875 0.260653 0.263328 0.260004 0.268451 0.265415 0.262780 0.263441
+multi TIP4P-1024000 0.303828 0.305287 0.309697 0.304013 0.307394 0.308151 0.307365 0.307119 0.324032 0.310574 0.303518 0.304129
+scotch TIP4P-1024000 0.102878 0.102918 0.099933 0.115976 0.098805 0.097946 0.098629 0.099835 0.099742 0.099501 0.100792 0.099133
+zoltan-rcb TIP4P-1024000 0.001619 0.001657 0.001439 0.001490 0.001447 0.001435 0.001682 0.001556 0.001782 0.001731 0.001778 0.001669
+ptscotch TIP4P-1024000 4.831476 4.954114 4.953825 5.071505 5.271746 4.951014 4.782419 5.302474 5.172359 4.890645 5.091898 5.260022
+morton slab-110592 0.039193 0.039298 0.039446 0.041900 0.040715 0.040309 0.039254 0.039528 0.038998 0.039024 0.038937 0.039117
+hilbert slab-110592 0.004503 0.004600 0.004443 0.004616 0.004430 0.004674 0.004452 0.004615 0.004464 0.004553 0.004576 0.004747
+rcb slab-110592 0.002934 0.002970 0.003117 0.002500 0.002694 0.002886 0.002670 0.002662 0.002465 0.002820 0.002609 0.002726
+hilbert-fm slab-110592 0.193004 0.191119 0.192386 0.190792 0.194312 0.192714 0.192367 0.192070 0.194100 0.189997 0.190661 0.189973
+rcb-fm slab-110592 0.043859 0.042572 0.042776 0.042400 0.042420 0.043269 0.043136 0.042593 0.042714 0.042928 0.044773 0.051322
+multi slab-110592 0.097085 0.099867 0.098464 0.093149 0.097837 0.094572 0.093514 0.094915 0.094504 0.094052 0.093206 0.093120
+scotch slab-110592 0.148000 0.144029 0.143086 0.144106 0.144557 0.145657 0.143964 0.144511 0.144054 0.143233 0.144798 0.142342
+zoltan-rcb slab-110592 0.008864 0.007336 0.007194 0.007349 0.007253 0.007148 0.006782 0.007062 0.006860 0.007259 0.007486 0.007114
+ptscotch slab-110592 24.004338 24.561887 24.741622 25.041206 23.745461 23.970428 24.136826 24.067383 24.130738 24.430277 24.771400 24.079256
+```
+
+## Balance sweep
+
+The same five ratios appear on every system in this sweep.
+The main table uses the derived bound.
+
+```text
+morton 1.00 mW-110592 cut 20894 imbalance 1.000145 median 0.019620 iqr 0.000611
+hilbert 1.00 mW-110592 cut 20694 imbalance 1.000145 median 0.002103 iqr 0.000099
+rcb 1.00 mW-110592 cut 13824 imbalance 1.000000 median 0.002380 iqr 0.000265
+hilbert-fm 1.00 mW-110592 cut 20692 imbalance 1.000000 median 0.005704 iqr 0.000195
+rcb-fm 1.00 mW-110592 cut 13824 imbalance 1.000000 median 0.007512 iqr 0.000334
+multi 1.00 mW-110592 cut 13824 imbalance 1.000000 median 0.024882 iqr 0.000411
+scotch 1.00 mW-110592 cut 20801 imbalance 1.000000 median 0.119071 iqr 0.002239
+morton 1.01 mW-110592 cut 20894 imbalance 1.000145 median 0.019866 iqr 0.000496
+hilbert 1.01 mW-110592 cut 20694 imbalance 1.000145 median 0.002005 iqr 0.000044
+rcb 1.01 mW-110592 cut 13824 imbalance 1.000000 median 0.002371 iqr 0.000330
+hilbert-fm 1.01 mW-110592 cut 20162 imbalance 1.009983 median 0.127108 iqr 0.001467
+rcb-fm 1.01 mW-110592 cut 13824 imbalance 1.000000 median 0.055876 iqr 0.001078
+multi 1.01 mW-110592 cut 13824 imbalance 1.000000 median 0.101119 iqr 0.001556
+scotch 1.01 mW-110592 cut 14698 imbalance 1.009910 median 0.113889 iqr 0.001853
+morton 1.02 mW-110592 cut 20894 imbalance 1.000145 median 0.019136 iqr 0.000850
+hilbert 1.02 mW-110592 cut 20694 imbalance 1.000145 median 0.001972 iqr 0.000080
+rcb 1.02 mW-110592 cut 13824 imbalance 1.000000 median 0.002279 iqr 0.000303
+hilbert-fm 1.02 mW-110592 cut 19643 imbalance 1.019965 median 0.245250 iqr 0.001275
+rcb-fm 1.02 mW-110592 cut 13824 imbalance 1.000000 median 0.053077 iqr 0.001119
+multi 1.02 mW-110592 cut 13824 imbalance 1.000000 median 0.101532 iqr 0.003949
+scotch 1.02 mW-110592 cut 14391 imbalance 1.019676 median 0.102952 iqr 0.004620
+morton 1.05 mW-110592 cut 20894 imbalance 1.000145 median 0.019198 iqr 0.000340
+hilbert 1.05 mW-110592 cut 20694 imbalance 1.000145 median 0.002047 iqr 0.000093
+rcb 1.05 mW-110592 cut 13824 imbalance 1.000000 median 0.002269 iqr 0.000228
+hilbert-fm 1.05 mW-110592 cut 19497 imbalance 1.048973 median 0.146745 iqr 0.001775
+rcb-fm 1.05 mW-110592 cut 13824 imbalance 1.000000 median 0.051848 iqr 0.001115
+multi 1.05 mW-110592 cut 13824 imbalance 1.000000 median 0.108719 iqr 0.011159
+scotch 1.05 mW-110592 cut 14817 imbalance 1.045139 median 0.115961 iqr 0.003400
+morton 1.10 mW-110592 cut 20894 imbalance 1.000145 median 0.018887 iqr 0.000554
+hilbert 1.10 mW-110592 cut 20694 imbalance 1.000145 median 0.002029 iqr 0.000107
+rcb 1.10 mW-110592 cut 13824 imbalance 1.000000 median 0.002693 iqr 0.000292
+hilbert-fm 1.10 mW-110592 cut 19408 imbalance 1.092159 median 0.097820 iqr 0.001907
+rcb-fm 1.10 mW-110592 cut 13824 imbalance 1.000000 median 0.050900 iqr 0.001833
+multi 1.10 mW-110592 cut 13824 imbalance 1.000000 median 0.097722 iqr 0.003188
+scotch 1.10 mW-110592 cut 15098 imbalance 1.099826 median 0.121879 iqr 0.003548
+morton 1.00 mW-884736 cut 83857 imbalance 1.000009 median 0.195616 iqr 0.001963
+hilbert 1.00 mW-884736 cut 81032 imbalance 1.000018 median 0.021937 iqr 0.000685
+rcb 1.00 mW-884736 cut 55990 imbalance 1.000009 median 0.014329 iqr 0.000160
+hilbert-fm 1.00 mW-884736 cut 81032 imbalance 1.000000 median 0.054910 iqr 0.000748
+rcb-fm 1.00 mW-884736 cut 55990 imbalance 1.000009 median 0.149644 iqr 0.016583
+multi 1.00 mW-884736 cut 55990 imbalance 1.000009 median 0.367077 iqr 0.015797
+scotch 1.00 mW-884736 cut 81445 imbalance 1.000000 median 0.718757 iqr 0.043289
+morton 1.01 mW-884736 cut 83857 imbalance 1.000009 median 0.211807 iqr 0.010748
+hilbert 1.01 mW-884736 cut 81032 imbalance 1.000018 median 0.021800 iqr 0.000525
+rcb 1.01 mW-884736 cut 55990 imbalance 1.000009 median 0.015273 iqr 0.001063
+hilbert-fm 1.01 mW-884736 cut 79309 imbalance 1.009992 median 0.980767 iqr 0.022445
+rcb-fm 1.01 mW-884736 cut 55632 imbalance 1.001203 median 0.755877 iqr 0.031429
+multi 1.01 mW-884736 cut 55632 imbalance 1.001203 median 1.218636 iqr 0.030131
+scotch 1.01 mW-884736 cut 58097 imbalance 1.009865 median 0.598802 iqr 0.008063
+morton 1.02 mW-884736 cut 83857 imbalance 1.000009 median 0.181215 iqr 0.005538
+hilbert 1.02 mW-884736 cut 81032 imbalance 1.000018 median 0.019541 iqr 0.000098
+rcb 1.02 mW-884736 cut 55990 imbalance 1.000009 median 0.014188 iqr 0.000763
+hilbert-fm 1.02 mW-884736 cut 78986 imbalance 1.019992 median 1.689370 iqr 0.029763
+rcb-fm 1.02 mW-884736 cut 55488 imbalance 1.019965 median 0.904672 iqr 0.013950
+multi 1.02 mW-884736 cut 55488 imbalance 1.019965 median 2.228101 iqr 0.041106
+scotch 1.02 mW-884736 cut 60287 imbalance 1.019938 median 0.617554 iqr 0.006938
+morton 1.05 mW-884736 cut 83857 imbalance 1.000009 median 0.179333 iqr 0.001071
+hilbert 1.05 mW-884736 cut 81032 imbalance 1.000018 median 0.019575 iqr 0.000140
+rcb 1.05 mW-884736 cut 55990 imbalance 1.000009 median 0.013663 iqr 0.000389
+hilbert-fm 1.05 mW-884736 cut 77659 imbalance 1.049995 median 1.885871 iqr 0.013175
+rcb-fm 1.05 mW-884736 cut 55488 imbalance 1.019965 median 0.645242 iqr 0.078262
+multi 1.05 mW-884736 cut 55488 imbalance 1.019965 median 1.116811 iqr 0.018978
+scotch 1.05 mW-884736 cut 62348 imbalance 1.018971 median 0.610252 iqr 0.005961
+morton 1.10 mW-884736 cut 83857 imbalance 1.000009 median 0.180320 iqr 0.000946
+hilbert 1.10 mW-884736 cut 81032 imbalance 1.000018 median 0.019491 iqr 0.000218
+rcb 1.10 mW-884736 cut 55990 imbalance 1.000009 median 0.013766 iqr 0.000676
+hilbert-fm 1.10 mW-884736 cut 76583 imbalance 1.099998 median 2.684165 iqr 0.027998
+rcb-fm 1.10 mW-884736 cut 55488 imbalance 1.019965 median 0.590381 iqr 0.012337
+multi 1.10 mW-884736 cut 55488 imbalance 1.019965 median 1.112144 iqr 0.044767
+scotch 1.10 mW-884736 cut 59853 imbalance 1.086842 median 0.624985 iqr 0.011474
+morton 1.00 TIP4P-128000 cut 2804168 imbalance 1.000000 median 0.000726 iqr 0.000059
+hilbert 1.00 TIP4P-128000 cut 2791850 imbalance 1.000687 median 0.000071 iqr 0.000001
+rcb 1.00 TIP4P-128000 cut 2492438 imbalance 1.000625 median 0.000142 iqr 0.000047
+hilbert-fm 1.00 TIP4P-128000 cut 2791850 imbalance 1.000687 median 0.000184 iqr 0.000003
+rcb-fm 1.00 TIP4P-128000 cut 2145600 imbalance 1.000000 median 0.000674 iqr 0.000260
+multi 1.00 TIP4P-128000 cut 2145600 imbalance 1.000000 median 0.003173 iqr 0.000138
+scotch 1.00 TIP4P-128000 cut 2776979 imbalance 1.000687 median 0.008783 iqr 0.000305
+morton 1.01 TIP4P-128000 cut 2804168 imbalance 1.000000 median 0.000715 iqr 0.000008
+hilbert 1.01 TIP4P-128000 cut 2791850 imbalance 1.000687 median 0.000088 iqr 0.000016
+rcb 1.01 TIP4P-128000 cut 2492438 imbalance 1.000625 median 0.000118 iqr 0.000020
+hilbert-fm 1.01 TIP4P-128000 cut 2668242 imbalance 1.005250 median 0.032086 iqr 0.000606
+rcb-fm 1.01 TIP4P-128000 cut 2130992 imbalance 1.001250 median 0.020707 iqr 0.000565
+multi 1.01 TIP4P-128000 cut 2130992 imbalance 1.001250 median 0.025964 iqr 0.000580
+scotch 1.01 TIP4P-128000 cut 2172264 imbalance 1.008563 median 0.015229 iqr 0.002059
+morton 1.02 TIP4P-128000 cut 2804168 imbalance 1.000000 median 0.000723 iqr 0.000047
+hilbert 1.02 TIP4P-128000 cut 2791850 imbalance 1.000687 median 0.000088 iqr 0.000029
+rcb 1.02 TIP4P-128000 cut 2492438 imbalance 1.000625 median 0.000142 iqr 0.000116
+hilbert-fm 1.02 TIP4P-128000 cut 2667911 imbalance 1.016563 median 0.019649 iqr 0.000872
+rcb-fm 1.02 TIP4P-128000 cut 2145600 imbalance 1.000000 median 0.017495 iqr 0.001289
+multi 1.02 TIP4P-128000 cut 2145600 imbalance 1.000000 median 0.022828 iqr 0.000537
+scotch 1.02 TIP4P-128000 cut 2196133 imbalance 1.019062 median 0.015361 iqr 0.000753
+morton 1.05 TIP4P-128000 cut 2804168 imbalance 1.000000 median 0.000795 iqr 0.000100
+hilbert 1.05 TIP4P-128000 cut 2791850 imbalance 1.000687 median 0.000071 iqr 0.000003
+rcb 1.05 TIP4P-128000 cut 2492438 imbalance 1.000625 median 0.000131 iqr 0.000023
+hilbert-fm 1.05 TIP4P-128000 cut 2658326 imbalance 1.049063 median 0.018941 iqr 0.000459
+rcb-fm 1.05 TIP4P-128000 cut 2120992 imbalance 1.050000 median 0.026092 iqr 0.000294
+multi 1.05 TIP4P-128000 cut 2120512 imbalance 1.050000 median 0.042398 iqr 0.000247
+scotch 1.05 TIP4P-128000 cut 2155060 imbalance 1.050000 median 0.013028 iqr 0.000962
+morton 1.10 TIP4P-128000 cut 2804168 imbalance 1.000000 median 0.000717 iqr 0.000009
+hilbert 1.10 TIP4P-128000 cut 2791850 imbalance 1.000687 median 0.000073 iqr 0.000001
+rcb 1.10 TIP4P-128000 cut 2492438 imbalance 1.000625 median 0.000135 iqr 0.000009
+hilbert-fm 1.10 TIP4P-128000 cut 2654022 imbalance 1.096750 median 0.018861 iqr 0.000418
+rcb-fm 1.10 TIP4P-128000 cut 2092800 imbalance 1.062500 median 0.019277 iqr 0.000333
+multi 1.10 TIP4P-128000 cut 2092800 imbalance 1.062500 median 0.025336 iqr 0.000275
+scotch 1.10 TIP4P-128000 cut 2118900 imbalance 1.089063 median 0.013545 iqr 0.000636
+morton 1.00 TIP4P-1024000 cut 13084202 imbalance 1.000320 median 0.007513 iqr 0.000172
+hilbert 1.00 TIP4P-1024000 cut 12710308 imbalance 1.000195 median 0.000932 iqr 0.000040
+rcb 1.00 TIP4P-1024000 cut 9965162 imbalance 1.000266 median 0.000940 iqr 0.000205
+hilbert-fm 1.00 TIP4P-1024000 cut 12710308 imbalance 1.000195 median 0.002004 iqr 0.000539
+rcb-fm 1.00 TIP4P-1024000 cut 9965162 imbalance 1.000266 median 0.006264 iqr 0.000952
+multi 1.00 TIP4P-1024000 cut 9965162 imbalance 1.000266 median 0.028276 iqr 0.000451
+scotch 1.00 TIP4P-1024000 cut 15041835 imbalance 1.000133 median 0.081109 iqr 0.002189
+morton 1.01 TIP4P-1024000 cut 13084202 imbalance 1.000320 median 0.007455 iqr 0.000028
+hilbert 1.01 TIP4P-1024000 cut 12710308 imbalance 1.000195 median 0.000921 iqr 0.000015
+rcb 1.01 TIP4P-1024000 cut 9965162 imbalance 1.000266 median 0.000978 iqr 0.000115
+hilbert-fm 1.01 TIP4P-1024000 cut 11660353 imbalance 1.009836 median 0.339002 iqr 0.003944
+rcb-fm 1.01 TIP4P-1024000 cut 8741847 imbalance 1.009797 median 0.260548 iqr 0.008205
+multi 1.01 TIP4P-1024000 cut 8762734 imbalance 1.009813 median 0.343920 iqr 0.007833
+scotch 1.01 TIP4P-1024000 cut 8949479 imbalance 1.009922 median 0.108437 iqr 0.002049
+morton 1.02 TIP4P-1024000 cut 13084202 imbalance 1.000320 median 0.007588 iqr 0.000055
+hilbert 1.02 TIP4P-1024000 cut 12710308 imbalance 1.000195 median 0.001011 iqr 0.000048
+rcb 1.02 TIP4P-1024000 cut 9965162 imbalance 1.000266 median 0.001022 iqr 0.000103
+hilbert-fm 1.02 TIP4P-1024000 cut 11267257 imbalance 1.019906 median 0.680096 iqr 0.006723
+rcb-fm 1.02 TIP4P-1024000 cut 8726026 imbalance 1.019969 median 0.251427 iqr 0.006353
+multi 1.02 TIP4P-1024000 cut 8699900 imbalance 1.017969 median 0.477043 iqr 0.011415
+scotch 1.02 TIP4P-1024000 cut 8861660 imbalance 1.020000 median 0.102959 iqr 0.001588
+morton 1.05 TIP4P-1024000 cut 13084202 imbalance 1.000320 median 0.007478 iqr 0.000085
+hilbert 1.05 TIP4P-1024000 cut 12710308 imbalance 1.000195 median 0.000930 iqr 0.000021
+rcb 1.05 TIP4P-1024000 cut 9965162 imbalance 1.000266 median 0.001010 iqr 0.000184
+hilbert-fm 1.05 TIP4P-1024000 cut 10655523 imbalance 1.049945 median 0.669311 iqr 0.015538
+rcb-fm 1.05 TIP4P-1024000 cut 8695784 imbalance 1.050000 median 0.290970 iqr 0.002454
+multi 1.05 TIP4P-1024000 cut 8746824 imbalance 1.050000 median 0.349881 iqr 0.003328
+scotch 1.05 TIP4P-1024000 cut 8730300 imbalance 1.028125 median 0.098982 iqr 0.008193
+morton 1.10 TIP4P-1024000 cut 13084202 imbalance 1.000320 median 0.007547 iqr 0.000178
+hilbert 1.10 TIP4P-1024000 cut 12710308 imbalance 1.000195 median 0.000925 iqr 0.000024
+rcb 1.10 TIP4P-1024000 cut 9965162 imbalance 1.000266 median 0.000952 iqr 0.000164
+hilbert-fm 1.10 TIP4P-1024000 cut 10540010 imbalance 1.081750 median 0.338846 iqr 0.008124
+rcb-fm 1.10 TIP4P-1024000 cut 8530800 imbalance 1.100000 median 0.191117 iqr 0.001088
+multi 1.10 TIP4P-1024000 cut 8523300 imbalance 1.100000 median 0.401891 iqr 0.006236
+scotch 1.10 TIP4P-1024000 cut 8812500 imbalance 1.058594 median 0.096275 iqr 0.001940
+morton 1.00 slab-110592 cut 18819 imbalance 1.000217 median 0.039112 iqr 0.000283
+hilbert 1.00 slab-110592 cut 18188 imbalance 1.000145 median 0.004405 iqr 0.000075
+rcb 1.00 slab-110592 cut 12672 imbalance 1.000000 median 0.002666 iqr 0.000261
+hilbert-fm 1.00 slab-110592 cut 18200 imbalance 1.000000 median 0.007290 iqr 0.000094
+rcb-fm 1.00 slab-110592 cut 11520 imbalance 1.000000 median 0.009411 iqr 0.000174
+multi 1.00 slab-110592 cut 11520 imbalance 1.000000 median 0.041261 iqr 0.000262
+scotch 1.00 slab-110592 cut 16596 imbalance 1.000000 median 0.141807 iqr 0.001139
+morton 1.01 slab-110592 cut 18819 imbalance 1.000217 median 0.038714 iqr 0.000120
+hilbert 1.01 slab-110592 cut 18188 imbalance 1.000145 median 0.004420 iqr 0.000107
+rcb 1.01 slab-110592 cut 12672 imbalance 1.000000 median 0.002696 iqr 0.000357
+hilbert-fm 1.01 slab-110592 cut 17931 imbalance 1.009983 median 0.145857 iqr 0.000385
+rcb-fm 1.01 slab-110592 cut 11520 imbalance 1.000000 median 0.057040 iqr 0.001897
+multi 1.01 slab-110592 cut 11520 imbalance 1.000000 median 0.117483 iqr 0.000523
+scotch 1.01 slab-110592 cut 11839 imbalance 1.009549 median 0.112982 iqr 0.000932
+morton 1.02 slab-110592 cut 18819 imbalance 1.000217 median 0.039010 iqr 0.000186
+hilbert 1.02 slab-110592 cut 18188 imbalance 1.000145 median 0.004430 iqr 0.000127
+rcb 1.02 slab-110592 cut 12672 imbalance 1.000000 median 0.002664 iqr 0.000195
+hilbert-fm 1.02 slab-110592 cut 17824 imbalance 1.019965 median 0.123255 iqr 0.000752
+rcb-fm 1.02 slab-110592 cut 11520 imbalance 1.000000 median 0.054667 iqr 0.000482
+multi 1.02 slab-110592 cut 11520 imbalance 1.000000 median 0.117042 iqr 0.001310
+scotch 1.02 slab-110592 cut 12384 imbalance 1.018953 median 0.119186 iqr 0.002034
+morton 1.05 slab-110592 cut 18819 imbalance 1.000217 median 0.039069 iqr 0.000136
+hilbert 1.05 slab-110592 cut 18188 imbalance 1.000145 median 0.004555 iqr 0.000197
+rcb 1.05 slab-110592 cut 12672 imbalance 1.000000 median 0.002561 iqr 0.000288
+hilbert-fm 1.05 slab-110592 cut 17766 imbalance 1.042028 median 0.121082 iqr 0.001225
+rcb-fm 1.05 slab-110592 cut 11520 imbalance 1.000000 median 0.052766 iqr 0.001036
+multi 1.05 slab-110592 cut 11520 imbalance 1.000000 median 0.115146 iqr 0.001272
+scotch 1.05 slab-110592 cut 11911 imbalance 1.049986 median 0.117265 iqr 0.000676
+morton 1.10 slab-110592 cut 18819 imbalance 1.000217 median 0.038979 iqr 0.000167
+hilbert 1.10 slab-110592 cut 18188 imbalance 1.000145 median 0.004449 iqr 0.000131
+rcb 1.10 slab-110592 cut 12672 imbalance 1.000000 median 0.002661 iqr 0.000097
+hilbert-fm 1.10 slab-110592 cut 17474 imbalance 1.099682 median 0.116730 iqr 0.001296
+rcb-fm 1.10 slab-110592 cut 11520 imbalance 1.000000 median 0.041270 iqr 0.000332
+multi 1.10 slab-110592 cut 11520 imbalance 1.000000 median 0.103037 iqr 0.000383
+scotch 1.10 slab-110592 cut 11938 imbalance 1.094184 median 0.115515 iqr 0.001174
+```
+
+## Scaling
+
+Strong scaling keeps the lattice at 1,520,875 points (115 cubed).
+Weak scaling uses 190,109 points times the thread count, so eight threads is 1,520,872 points.
+Median and interquartile range (IQR) are recomputed from the raw line.
+`profile_ns` is the summed select, Fiduccia-Mattheyses, and coarsen time over the repetitions, in nanoseconds.
+
+```text
+kind threads n method median iqr
+strong 1 1520875 rcb 0.021740 0.000918
+strong 1 1520875 rcb-fm 0.807527 0.008758
+strong 1 1520875 multi 1.665991 0.053135
+weak 1 190109 rcb 0.005606 0.000171
+weak 1 190109 rcb-fm 0.022260 0.000250
+weak 1 190109 multi 0.070960 0.002206
+strong 2 1520875 rcb 0.016339 0.001021
+strong 2 1520875 rcb-fm 0.736028 0.012594
+strong 2 1520875 multi 1.524526 0.015866
+weak 2 380218 rcb 0.002696 0.000355
+weak 2 380218 rcb-fm 0.009232 0.000616
+weak 2 380218 multi 0.038362 0.000519
+strong 4 1520875 rcb 0.015319 0.000471
+strong 4 1520875 rcb-fm 0.720726 0.013464
+strong 4 1520875 multi 1.538565 0.013686
+weak 4 760436 rcb 0.004746 0.000362
+weak 4 760436 rcb-fm 0.019870 0.001045
+weak 4 760436 multi 0.073378 0.000757
+strong 8 1520875 rcb 0.014850 0.000490
+strong 8 1520875 rcb-fm 0.727513 0.014164
+strong 8 1520875 multi 1.571054 0.037909
+weak 8 1520872 rcb 0.010724 0.001162
+weak 8 1520872 rcb-fm 0.067836 0.001302
+weak 8 1520872 multi 0.325104 0.005557
+```
+
+## Amdahl
+
+Select, boundary refinement, and coarsening are the profiled parts of each scaling run.
+Each share is that summed time divided by the median wall time times the repetition count.
+The other share is what remains of the median.
+
+```text
+method kind threads n select fm coarse other
+strong-rcb threads 1 n 1520875 select 0.423 fm 0.000 coarse 0.000 other 0.577
+strong-rcb-fm threads 1 n 1520875 select 0.096 fm 0.877 coarse 0.000 other 0.027
+strong-multi threads 1 n 1520875 select 0.048 fm 0.766 coarse 0.167 other 0.019
+weak-rcb threads 1 n 190109 select 0.284 fm 0.000 coarse 0.000 other 0.716
+weak-rcb-fm threads 1 n 190109 select 0.475 fm 0.256 coarse 0.000 other 0.268
+weak-multi threads 1 n 190109 select 0.153 fm 0.094 coarse 0.622 other 0.131
+strong-rcb threads 2 n 1520875 select 0.573 fm 0.000 coarse 0.000 other 0.427
+strong-rcb-fm threads 2 n 1520875 select 0.106 fm 0.960 coarse 0.000 other 0.000
+strong-multi threads 2 n 1520875 select 0.051 fm 0.799 coarse 0.180 other 0.000
+weak-rcb threads 2 n 380218 select 0.315 fm 0.000 coarse 0.000 other 0.685
+weak-rcb-fm threads 2 n 380218 select 0.552 fm 0.383 coarse 0.000 other 0.065
+weak-multi threads 2 n 380218 select 0.132 fm 0.127 coarse 0.699 other 0.042
+strong-rcb threads 4 n 1520875 select 0.612 fm 0.000 coarse 0.000 other 0.388
+strong-rcb-fm threads 4 n 1520875 select 0.108 fm 0.982 coarse 0.000 other 0.000
+strong-multi threads 4 n 1520875 select 0.051 fm 0.800 coarse 0.183 other 0.000
+weak-rcb threads 4 n 760436 select 0.357 fm 0.000 coarse 0.000 other 0.643
+weak-rcb-fm threads 4 n 760436 select 0.612 fm 0.537 coarse 0.000 other 0.000
+weak-multi threads 4 n 760436 select 0.165 fm 0.169 coarse 0.687 other 0.000
+strong-rcb threads 8 n 1520875 select 0.632 fm 0.000 coarse 0.000 other 0.368
+strong-rcb-fm threads 8 n 1520875 select 0.108 fm 0.980 coarse 0.000 other 0.000
+strong-multi threads 8 n 1520875 select 0.054 fm 0.802 coarse 0.181 other 0.000
+weak-rcb threads 8 n 1520872 select 0.389 fm 0.000 coarse 0.000 other 0.611
+weak-rcb-fm threads 8 n 1520872 select 0.539 fm 0.652 coarse 0.000 other 0.000
+weak-multi threads 8 n 1520872 select 0.129 fm 0.178 coarse 0.703 other 0.000
+```
+
+## Prose
+
+The prose pass covers the placement note, the report, the partition page, the C API page, and the README.
+Minimum-image wording stays as it was.
+Algorithm sentences stay as they were.
+
