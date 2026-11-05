@@ -242,7 +242,8 @@ def main():
     a("")
     a(f"Serial Scotch and parallel Scotch both call `SCOTCH_randomReset` and then `SCOTCH_randomSeed` with seed {meta.get('seed', '1')}.")
     a("The panel log repeats `SCOTCH_randomReset 1` and `SCOTCH_randomSeed 1` for each parallel Scotch run.")
-    a("Parallel Scotch uses that seed on 8 ranks. The twelve cuts are logged because the runs still differ.")
+    a("One-rank Scotch and eight-rank Scotch both use seed 1.")
+    a("The twelve cuts are logged because the runs still differ.")
     a("")
     a("## Head to head")
     a("")
@@ -426,15 +427,17 @@ def main():
         method = bits[bits.index("method") + 1]
         idx = bits.index("profile_ns")
         vals = [int(bits[idx + 1 + i]) if idx + 1 + i < len(bits) and bits[idx + 1 + i].isdigit() else 0 for i in range(7)]
+        build = int(bits[bits.index("build_ns") + 1]) if "build_ns" in bits else 0
         mean = sum(raw) / len(raw)
         wall = mean * reps
         if wall <= 0:
             continue
         shares = [(v / 1.0e9) / wall for v in vals]
-        other = 1.0 - sum(shares)
+        build_share = (build / 1.0e9) / wall
+        other = 1.0 - sum(shares) - build_share
         phase[(kind, method, threads)] = tuple(v / 1.0e9 / reps for v in vals)
         shown = " ".join(f"{name} {share:.3f}" for name, share in zip(names, shares))
-        a(f"{kind}-{method} threads {threads} n {n} {shown} other {other:.5f}")
+        a(f"{kind}-{method} threads {threads} n {n} build {build_share:.3f} {shown} other {other:.5f}")
     a("```")
     a("")
     a("```text")

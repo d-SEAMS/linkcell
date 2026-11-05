@@ -651,6 +651,7 @@ fn scale_case(parts: u32, reps: usize) {
     ];
     let mut samples = vec![Vec::with_capacity(reps); chosen.len()];
     let mut parts_s = vec![Vec::with_capacity(reps); chosen.len()];
+    let mut build_ns = vec![0u64; chosen.len()];
     let mut prof = vec![(0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64); chosen.len()];
     let mut hashes = vec![0u64; chosen.len()];
     for rep in 0..reps {
@@ -661,6 +662,7 @@ fn scale_case(parts: u32, reps: usize) {
                 .unwrap_or_else(|err| panic!("scale graph {name}: {err}"));
             let built = linkcell::replicate_graph(&built, copies)
                 .unwrap_or_else(|err| panic!("scale replicate {name}: {err}"));
+            build_ns[i] += t_whole.elapsed().as_nanos() as u64;
             let t_part = Instant::now();
             let assign = partition_graph(
                 &built,
@@ -698,7 +700,8 @@ fn scale_case(parts: u32, reps: usize) {
         let (part_median, _) = iqr(parts_s[i].clone());
         let (sel, fm, coarse, pack, repair, check, schedule) = prof[i];
         println!(
-            "scale_row kind {kind} threads {threads} n {n} method {name} median_s {median:.6} iqr_s {spread:.6} part_median_s {part_median:.6} profile_ns {sel} {fm} {coarse} {pack} {repair} {check} {schedule} assign_hash {:016x}",
+            "scale_row kind {kind} threads {threads} n {n} method {name} median_s {median:.6} iqr_s {spread:.6} part_median_s {part_median:.6} build_ns {} profile_ns {sel} {fm} {coarse} {pack} {repair} {check} {schedule} assign_hash {:016x}",
+            build_ns[i],
             hashes[i]
         );
     }
