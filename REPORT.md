@@ -718,8 +718,8 @@ The shared entry is `pairs_within`.
 The public main revision stops at that entry, so the comparison uses it only.
 Twelve calls of each revision ran in turn on `cursor`.
 Each figure is the timed call after three warmups, in seconds, at type-7.
-Public main wall time is 0.001921 seconds at the median, spread 0.000268 seconds.
-After the same warmups, the tip call takes 0.002142 seconds, spread 0.000577 seconds.
+Public main wall time is 0.002143 seconds at the median, spread 0.000260 seconds.
+After the same warmups, the tip call takes 0.002104 seconds, spread 0.000646 seconds.
 Both arms returned 729088 pairs.
 
 ## Prose
