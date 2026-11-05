@@ -2244,7 +2244,11 @@ fn prefetch<T>(p: *const T) {
     // Safety: a prefetch never faults and changes nothing the program
     // can read, wherever it points.
     unsafe {
-        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
+        // The row stream is written once. A plain prefetch brings the line
+        // in shared, and the store then waits on a second fetch for
+        // ownership. This host has PREFETCHW (`3dnowprefetch`), so the
+        // line arrives exclusive and the store does not fetch it again.
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>(p as *const i8)
     };
     #[cfg(not(target_arch = "x86_64"))]
     let _ = p;
@@ -3597,10 +3601,111 @@ unsafe fn avx512_fused<
     }
     let j_hi = block.j_hi;
     let nvec = (j_hi - block.j_lo + 7) / 8;
-    // One source at a time, then its targets in slot order. That is the
-    // scalar walk's order. Four sources at once would interleave hits.
+    // Hits of one source stay together, in slot order, which is the
+    // scalar walk's order. A run of four sources shares one target load.
+    // The bin coordinates are three columns, and reading them once per
+    // source misses L1 once a bin leaves the 48 KB data cache. Hits are
+    // buffered, then written source by source, so the rows stay in order.
+    // A bin longer than the buffer keeps the one-source loop.
+    const QUAD: usize = 4;
+    const QUAD_CAP: usize = 192;
+    let quad = !block.tri
+        && block.i_hi - block.i_lo >= QUAD
+        && j_hi - block.j_lo <= QUAD_CAP;
     let cull_box = !block.tri && c.cull && nvec >= CULL_RUNS;
-    if cull_box {
+    /// One target run against `ns` sources. Distances use the same
+    /// products as [`direct_vec`].
+    macro_rules! quad_hits {
+        ($s0:expr, $ns:expr, $slot:expr, $cnt:expr, $idb:expr, $d2b:expr) => {{
+            let slot = $slot;
+            let (tm, jx, jy, jz, jids) = if slot + 8 <= j_hi {
+                (
+                    0xffu8,
+                    _mm512_loadu_pd(c.x.add(slot)),
+                    _mm512_loadu_pd(c.y.add(slot)),
+                    _mm512_loadu_pd(c.z.add(slot)),
+                    _mm256_loadu_si256(c.id.add(slot) as *const __m256i),
+                )
+            } else {
+                let tm: u8 = ((1u32 << (j_hi - slot)) - 1) as u8;
+                (
+                    tm,
+                    _mm512_maskz_loadu_pd(tm, c.x.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.y.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.z.add(slot)),
+                    _mm256_maskz_loadu_epi32(tm, c.id.add(slot) as *const i32),
+                )
+            };
+            for k in 0..$ns {
+                let sk = $s0 + k;
+                let px = *c.x.add(sk) - sx;
+                let py = *c.y.add(sk) - sy;
+                let pz = *c.z.add(sk) - sz;
+                let dx = _mm512_sub_pd(jx, _mm512_set1_pd(px));
+                let dy = _mm512_sub_pd(jy, _mm512_set1_pd(py));
+                let dz = _mm512_sub_pd(jz, _mm512_set1_pd(pz));
+                let d2v = _mm512_add_pd(
+                    _mm512_add_pd(_mm512_mul_pd(dx, dx), _mm512_mul_pd(dy, dy)),
+                    _mm512_mul_pd(dz, dz),
+                );
+                let lo: u8 = _mm512_mask_cmp_pd_mask(tm, d2v, cut_exact, _CMP_LT_OQ);
+                if lo != 0 {
+                    let knt = lo.count_ones() as usize;
+                    let at = $cnt[k];
+                    _mm512_storeu_pd(
+                        ($d2b[k].as_mut_ptr() as *mut f64).add(at),
+                        _mm512_maskz_compress_pd(lo, d2v),
+                    );
+                    _mm256_storeu_si256(
+                        ($idb[k].as_mut_ptr() as *mut i32).add(at) as *mut _,
+                        _mm256_maskz_compress_epi32(lo, jids),
+                    );
+                    $cnt[k] = at + knt;
+                }
+            }
+        }};
+    }
+    macro_rules! quad_flush {
+        ($s0:expr, $ns:expr, $cnt:expr, $idb:expr, $d2b:expr) => {{
+            for k in 0..$ns {
+                let iu = *c.id.add($s0 + k);
+                let mut h = 0usize;
+                while h < $cnt[k] {
+                    let m = ($cnt[k] - h).min(8);
+                    let d2v = _mm512_loadu_pd(($d2b[k].as_ptr() as *const f64).add(h));
+                    let jids = _mm256_loadu_si256(
+                        ($idb[k].as_ptr() as *const i32).add(h) as *const __m256i,
+                    );
+                    let mask = ((1u32 << m) - 1) as u8;
+                    emit!(mask, iu, d2v, jids);
+                    h += m;
+                }
+            }
+        }};
+    }
+    if quad && cull_box {
+        let cut_box = _mm512_set1_pd(cut2 + 2.0 * margin);
+        let zero = std::arch::x86_64::_mm512_setzero_pd();
+        let mut s = block.i_lo;
+        while s + QUAD <= block.i_hi {
+            let mut cnt = [0usize; QUAD];
+            // Written before they are read. Zeroing them would be a second
+            // store stream the size of the bin.
+            let mut idb = [std::mem::MaybeUninit::<[i32; QUAD_CAP + 8]>::uninit(); QUAD];
+            let mut d2b = [std::mem::MaybeUninit::<[f64; QUAD_CAP + 8]>::uninit(); QUAD];
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                quad_hits!(s, QUAD, slot, cnt, idb, d2b);
+            });
+            quad_flush!(s, QUAD, cnt, idb, d2b);
+            s += QUAD;
+        }
+        for s in s..block.i_hi {
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
+            });
+        }
+    } else if cull_box {
         let cut_box = _mm512_set1_pd(cut2 + 2.0 * margin);
         let zero = std::arch::x86_64::_mm512_setzero_pd();
         for s in block.i_lo..block.i_hi {
@@ -3608,6 +3713,28 @@ unsafe fn avx512_fused<
                 let (tm, jids) = load!(slot, j_hi);
                 lanes!(s, slot, tm, jids);
             });
+        }
+    } else if quad {
+        let mut s = block.i_lo;
+        while s + QUAD <= block.i_hi {
+            let mut cnt = [0usize; QUAD];
+            let mut idb = [std::mem::MaybeUninit::<[i32; QUAD_CAP + 8]>::uninit(); QUAD];
+            let mut d2b = [std::mem::MaybeUninit::<[f64; QUAD_CAP + 8]>::uninit(); QUAD];
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                quad_hits!(s, QUAD, slot, cnt, idb, d2b);
+                slot += 8;
+            }
+            quad_flush!(s, QUAD, cnt, idb, d2b);
+            s += QUAD;
+        }
+        for s in s..block.i_hi {
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
+                slot += 8;
+            }
         }
     } else if !block.tri {
         for s in block.i_lo..block.i_hi {

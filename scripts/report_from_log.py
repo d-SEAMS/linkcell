@@ -532,19 +532,49 @@ def main():
 
 
 def add_ab(a, text):
-    """Wall times for the shared pairs_within entry at BASE and at the tip."""
+    """Wall times for the shared pairs_within entry at public main and at the tip."""
     arms = {}
+    frame = {}
     host = ""
+    reps = "12"
+    ratio = None
+    fratio = None
+    frame_n = ""
+    frame_box = ""
     for line in text.splitlines():
+        bits = line.split()
         if line.startswith("HOSTNAME "):
             host = line.split(" ", 1)[1]
+        elif line.startswith("reps "):
+            reps = bits[1]
         elif line.startswith("ab_summary "):
-            bits = line.split()
             arm = bits[bits.index("arm") + 1]
             arms[arm] = {
                 "median": bits[bits.index("median_s") + 1],
                 "iqr": bits[bits.index("iqr_s") + 1],
                 "pairs": bits[bits.index("pairs") + 1],
+            }
+        elif line.startswith("ab_ratio "):
+            ratio = {
+                "value": bits[bits.index("median_ratio") + 1],
+                "lo": bits[bits.index("ci_low") + 1],
+                "hi": bits[bits.index("ci_high") + 1],
+            }
+        elif line.startswith("frame "):
+            frame_n = bits[bits.index("n") + 1]
+            frame_box = bits[bits.index("box") + 1]
+        elif line.startswith("frame_summary "):
+            arm = bits[bits.index("arm") + 1]
+            frame[arm] = {
+                "median": bits[bits.index("median_s") + 1],
+                "iqr": bits[bits.index("iqr_s") + 1],
+                "pairs": bits[bits.index("pairs") + 1],
+            }
+        elif line.startswith("frame_ratio "):
+            fratio = {
+                "value": bits[bits.index("median_ratio") + 1],
+                "lo": bits[bits.index("ci_low") + 1],
+                "hi": bits[bits.index("ci_high") + 1],
             }
     if "base" not in arms or "tip" not in arms:
         return
@@ -552,7 +582,7 @@ def add_ab(a, text):
     a("")
     a("The shared entry is `pairs_within`.")
     a("The public main revision stops at that entry, so the comparison uses it only.")
-    a(f"Twelve calls of each revision ran in turn on `{host}`.")
+    a(f"{reps} calls of each revision ran in turn on `{host}`.")
     a("Each figure is the timed call after three warmups, in seconds, at type-7.")
     a(
         f"Public main wall time is {arms['base']['median']} seconds at the median, spread {arms['base']['iqr']} seconds."
@@ -561,6 +591,28 @@ def add_ab(a, text):
         f"After the same warmups, the tip call takes {arms['tip']['median']} seconds, spread {arms['tip']['iqr']} seconds."
     )
     a(f"Both arms returned {arms['base']['pairs']} pairs.")
+    if ratio is not None:
+        a(f"The ratio of the tip median to the public main median is {ratio['value']}.")
+        a(
+            f"Ten thousand bootstrap resamples place that ratio from {ratio['lo']} to {ratio['hi']}."
+        )
+    if "base" in frame and "tip" in frame:
+        a(
+            f"A wider frame holds {frame_n} points in a cube {frame_box} angstroms on a side."
+        )
+        a("The same twenty-four calls ran in turn on that frame.")
+        a(
+            f"There the public main median is {frame['base']['median']} seconds, spread {frame['base']['iqr']} seconds."
+        )
+        a(
+            f"The tip median on that frame is {frame['tip']['median']} seconds, spread {frame['tip']['iqr']} seconds."
+        )
+        a(f"Both arms of the wide frame returned {frame['base']['pairs']} pairs.")
+        if fratio is not None:
+            a(f"The wide-frame median ratio is {fratio['value']}.")
+            a(
+                f"Its bootstrap interval runs from {fratio['lo']} to {fratio['hi']}."
+            )
     a("")
 
 
