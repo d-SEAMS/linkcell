@@ -3267,13 +3267,12 @@ unsafe fn avx512_fused<
         __m256i, _mm256_cmp_epu32_mask, _mm256_cmpeq_epi32_mask, _mm256_loadu_si256,
         _mm256_mask_blend_epi32, _mm256_maskz_compress_epi32, _mm256_maskz_loadu_epi32,
         _mm256_set1_epi32, _mm256_storeu_si256, _mm512_add_pd, _mm512_castpd_si512,
-        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_fmadd_pd, _mm512_loadu_pd,
-        _mm512_loadu_si512, _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask,
-        _mm512_mask_set1_epi32, _mm512_mask_storeu_epi64, _mm512_maskz_compress_pd,
-        _mm512_maskz_loadu_pd, _mm512_mul_pd, _mm512_permutex2var_epi32, _mm512_permutexvar_epi32,
-        _mm512_permutexvar_pd, _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32,
-        _mm512_setr_epi64, _mm512_storeu_pd, _mm512_storeu_si512, _mm512_sub_pd, _CMP_LT_OQ,
-        _MM_CMPINT_LT,
+        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_loadu_pd, _mm512_loadu_si512,
+        _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask, _mm512_mask_set1_epi32,
+        _mm512_mask_storeu_epi64, _mm512_maskz_compress_pd, _mm512_maskz_loadu_pd, _mm512_mul_pd,
+        _mm512_permutex2var_epi32, _mm512_permutexvar_epi32, _mm512_permutexvar_pd,
+        _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd,
+        _mm512_storeu_si512, _mm512_sub_pd, _CMP_LT_OQ, _MM_CMPINT_LT,
     };
     let [sx, sy, sz] = block.shift;
     let [ox, oy, oz] = block.delta;
@@ -3306,8 +3305,7 @@ unsafe fn avx512_fused<
             six,
         ),
     ];
-    let cut_lo = _mm512_set1_pd(cut2 - margin);
-    let cut_hi = cut2 + margin;
+    let cut_exact = _mm512_set1_pd(cut2);
     let mut n = out.n;
     // Half list: a target with the source's own index, which only a
     // periodic image of the source's own bin holds, keeps the forward row
@@ -3339,112 +3337,6 @@ unsafe fn avx512_fused<
         )),
     );
 
-    // One hit decided by the direct formula: both rows (one for a half
-    // list), exactly.
-    macro_rules! put_one {
-        ($iu:expr, $j:expr, $d2:expr) => {{
-            let (a, b, d) = ($iu, $j, $d2);
-            if MODE == COUNT {
-                let _ = (a, b, d);
-                n += if HALF { 1 } else { 2 };
-            } else if HALF {
-                let (i, j, s) = if keep_half(a as usize, b as usize, shift_s) {
-                    (a, b, shift_s)
-                } else {
-                    (b, a, neg)
-                };
-                if COLS {
-                    *out.ci.add(n) = i as i32;
-                    *out.cj.add(n) = j as i32;
-                    *out.cd.add(n) = d;
-                    let so = out.cs.add(3 * n);
-                    *so = s[0];
-                    *so.add(1) = s[1];
-                    *so.add(2) = s[2];
-                } else {
-                    let row = (out.rows as *mut std::mem::MaybeUninit<Pair>).add(n);
-                    (*row).write(Pair {
-                        i: i as usize,
-                        j: j as usize,
-                        shift: s,
-                        dist2: d,
-                    });
-                }
-                n += 1;
-            } else {
-                if COLS {
-                    *out.ci.add(n) = a as i32;
-                    *out.cj.add(n) = b as i32;
-                    *out.cd.add(n) = d;
-                    *out.ci.add(n + 1) = b as i32;
-                    *out.cj.add(n + 1) = a as i32;
-                    *out.cd.add(n + 1) = d;
-                    let so = out.cs.add(3 * n);
-                    *so = shift_s[0];
-                    *so.add(1) = shift_s[1];
-                    *so.add(2) = shift_s[2];
-                    *so.add(3) = neg[0];
-                    *so.add(4) = neg[1];
-                    *so.add(5) = neg[2];
-                } else {
-                    let row = (out.rows as *mut std::mem::MaybeUninit<Pair>).add(n);
-                    let (i, j) = (a as usize, b as usize);
-                    (*row).write(Pair {
-                        i,
-                        j,
-                        shift: shift_s,
-                        dist2: d,
-                    });
-                    (*row.add(1)).write(Pair {
-                        i: j,
-                        j: i,
-                        shift: neg,
-                        dist2: d,
-                    });
-                }
-                n += 2;
-            }
-        }};
-    }
-    macro_rules! direct {
-        ($s:expr, $slot:expr, $mask:expr) => {{
-            let s = $s;
-            let iu = *c.id.add(s);
-            let px = *c.x.add(s) - sx;
-            let py = *c.y.add(s) - sy;
-            let pz = *c.z.add(s) - sz;
-            let mut bits: u32 = u32::from($mask);
-            while bits != 0 {
-                let slot = $slot + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let dx = *c.x.add(slot) - px;
-                let dy = *c.y.add(slot) - py;
-                let dz = *c.z.add(slot) - pz;
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < cut2 {
-                    put_one!(iu, *c.id.add(slot), d2);
-                }
-            }
-        }};
-    }
-    macro_rules! source {
-        ($s:expr) => {{
-            let s = $s;
-            let px = *c.rx.add(s) + ox;
-            let py = *c.ry.add(s) + oy;
-            let pz = *c.rz.add(s) + oz;
-            let pp = px * px + py * py + pz * pz;
-            (
-                *c.id.add(s),
-                _mm512_set1_pd(-2.0 * px),
-                _mm512_set1_pd(-2.0 * py),
-                _mm512_set1_pd(-2.0 * pz),
-                _mm512_set1_pd(pp),
-                _mm512_set1_pd(cut_hi - pp),
-            )
-        }};
-    }
-    // The kept lanes `lo` of one source: compress, then whole registers.
     macro_rules! emit {
         ($lo:expr, $iu:expr, $d2v:expr, $jids:expr) => {{
             let lo: u8 = $lo;
@@ -3677,24 +3569,15 @@ unsafe fn avx512_fused<
             )
         }};
     }
+    // One exact distance, the same products as the scalar walk. The
+    // expanded box test used to run first and then recompute this.
     macro_rules! lanes {
-        ($s:expr, $slot:expr, $tm:expr, $src:expr, $jx:expr, $jy:expr, $jz:expr, $jr:expr, $jids:expr) => {{
-            let (iu, ax, ay, az, pp, thr) = $src;
-            let t = _mm512_fmadd_pd(
-                $jz,
-                az,
-                _mm512_fmadd_pd($jy, ay, _mm512_fmadd_pd($jx, ax, $jr)),
-            );
-            let hi: u8 = _mm512_mask_cmp_pd_mask($tm, t, thr, _CMP_LT_OQ);
-            if hi != 0 {
-                let d2_exp = _mm512_add_pd(t, pp);
-                let lo: u8 = _mm512_mask_cmp_pd_mask(hi, d2_exp, cut_lo, _CMP_LT_OQ);
-                if lo == hi {
-                    let d2v = direct_vec!($s, $slot, $tm);
-                    emit!(lo, iu, d2v, $jids);
-                } else {
-                    direct!($s, $slot, hi);
-                }
+        ($s:expr, $slot:expr, $tm:expr, $jids:expr) => {{
+            let d2v = direct_vec!($s, $slot, $tm);
+            let lo: u8 = _mm512_mask_cmp_pd_mask($tm, d2v, cut_exact, _CMP_LT_OQ);
+            if lo != 0 {
+                let iu = *c.id.add($s);
+                emit!(lo, iu, d2v, $jids);
             }
         }};
     }
@@ -3702,22 +3585,11 @@ unsafe fn avx512_fused<
         ($slot:expr, $j_hi:expr) => {{
             let slot = $slot;
             if slot + 8 <= $j_hi {
-                (
-                    0xffu8,
-                    _mm512_loadu_pd(c.rx.add(slot)),
-                    _mm512_loadu_pd(c.ry.add(slot)),
-                    _mm512_loadu_pd(c.rz.add(slot)),
-                    _mm512_loadu_pd(c.r2.add(slot)),
-                    _mm256_loadu_si256(c.id.add(slot) as *const __m256i),
-                )
+                (0xffu8, _mm256_loadu_si256(c.id.add(slot) as *const __m256i))
             } else {
                 let tm: u8 = ((1u32 << ($j_hi - slot)) - 1) as u8;
                 (
                     tm,
-                    _mm512_maskz_loadu_pd(tm, c.rx.add(slot)),
-                    _mm512_maskz_loadu_pd(tm, c.ry.add(slot)),
-                    _mm512_maskz_loadu_pd(tm, c.rz.add(slot)),
-                    _mm512_maskz_loadu_pd(tm, c.r2.add(slot)),
                     _mm256_maskz_loadu_epi32(tm, c.id.add(slot) as *const i32),
                 )
             }
@@ -3732,29 +3604,26 @@ unsafe fn avx512_fused<
         let cut_box = _mm512_set1_pd(cut2 + 2.0 * margin);
         let zero = std::arch::x86_64::_mm512_setzero_pd();
         for s in block.i_lo..block.i_hi {
-            let s0 = source!(s);
             near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
-                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
-                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
             });
         }
     } else if !block.tri {
         for s in block.i_lo..block.i_hi {
-            let s0 = source!(s);
             let mut slot = block.j_lo;
             while slot < j_hi {
-                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
-                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
                 slot += 8;
             }
         }
     } else {
         for s in block.i_lo..block.i_hi {
-            let s0 = source!(s);
             let mut slot = s + 1;
             while slot < j_hi {
-                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
-                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
                 slot += 8;
             }
         }
