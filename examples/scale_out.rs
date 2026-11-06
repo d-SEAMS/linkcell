@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use linkcell::{
-    cell_grid, halo, halo_width, pairs_within_into, partition, Cell, Method, PartRequest, Pair,
+    halo_width, mesh_cut, owned_cells, pairs_within_columns, pairs_within_into, rank_mask, Cell,
+    Method, Pair, PairColumns, PartRequest,
 };
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -50,17 +51,6 @@ fn fill(n: usize, boxl: f64) -> Vec<[f64; 3]> {
     xyz
 }
 
-fn bin_coord(s: f64, n: i32) -> i32 {
-    let mut c = (s * f64::from(n)) as i32;
-    if c < 0 {
-        c = 0;
-    }
-    if c >= n {
-        c = n - 1;
-    }
-    c
-}
-
 fn main() {
     let n = env_usize("PAIRS_N", 1_000_000);
     let boxl = env_f64("PAIRS_BOX", 207.5);
@@ -77,7 +67,7 @@ fn main() {
         (0u64, 0u64, vec![mask], vec![xyz.len()], vec![0usize])
     } else {
         let t_part = Instant::now();
-        let assign = partition(
+        let cut = mesh_cut(
             &xyz,
             &cell,
             4.0,
@@ -92,73 +82,54 @@ fn main() {
         )
         .expect("partition");
         let part_ns = t_part.elapsed().as_nanos() as u64;
-        let grid = cell_grid(&xyz, &cell, 4.0, None, None).expect("grid");
-        let width = halo_width(4.0, 1, grid.bin_width).expect("width");
+        let width = halo_width(4.0, 1, cut.grid.bin_width).expect("width");
         let t_halo = Instant::now();
-        let mut point_cell = vec![0usize; xyz.len()];
-        let nx = grid.nx;
-        let ny = grid.ny;
-        let nz = grid.nz;
-        for (slot, p) in point_cell.iter_mut().zip(xyz.iter()) {
-            let s = cell.fractional(*p);
-            let ix = bin_coord(s[0], nx) as usize;
-            let iy = bin_coord(s[1], ny) as usize;
-            let iz = bin_coord(s[2], nz) as usize;
-            *slot = (iz * ny as usize + iy) * nx as usize + ix;
-        }
+        let lists = owned_cells(&cut.assign, parts);
         let built: Vec<_> = std::thread::scope(|scope| {
             let mut joins = Vec::new();
             for rank in 0..parts {
-                let assign = &assign;
-                let grid = &grid;
-                let point_cell = &point_cell;
+                let cells = &lists[rank as usize];
+                let cut = &cut;
                 let dir = &dir;
                 joins.push(scope.spawn(move || {
-                    let ghosts = halo(grid, assign, rank, width).expect("halo");
-                    let mut live = vec![false; grid.ncell()];
-                    let mut owned = 0usize;
-                    for (c, &domain) in assign.iter().enumerate() {
-                        if domain == rank {
-                            live[c] = true;
-                        }
-                    }
-                    for g in &ghosts {
-                        live[*g as usize] = true;
-                    }
-                    let mut mask = vec![false; point_cell.len()];
-                    for (i, &c) in point_cell.iter().enumerate() {
-                        if assign[c] == rank {
-                            owned += 1;
-                        }
-                        mask[i] = live[c];
-                    }
-                    let bytes: Vec<u8> = mask.iter().map(|m| u8::from(*m)).collect();
+                    let t_paint = Instant::now();
+                    let view =
+                        rank_mask(&cut.grid, &cut.assign, &cut.point_cell, cells, rank, width);
+                    let paint_ns = t_paint.elapsed().as_nanos() as u64;
+                    let bytes: Vec<u8> = view.mask.iter().map(|m| u8::from(*m)).collect();
                     fs::write(dir.join(format!("mask-{parts}-{rank}.bin")), &bytes).expect("mask");
-                    (rank, mask, owned, ghosts.len())
+                    (view, paint_ns)
                 }));
             }
-            let mut rows: Vec<_> = joins.into_iter().map(|j| j.join().expect("halo")).collect();
-            rows.sort_by_key(|(rank, _, _, _)| *rank);
-            rows
+            joins
+                .into_iter()
+                .map(|join| join.join().expect("halo"))
+                .collect()
         });
         let halo_ns = t_halo.elapsed().as_nanos() as u64;
+        let paint_ns = built.iter().map(|(_, ns)| *ns).max().unwrap_or(0);
         let mut masks = Vec::new();
         let mut owned_n = Vec::new();
         let mut halo_n = Vec::new();
-        for (_, mask, owned, ghosts) in built {
-            masks.push(mask);
-            owned_n.push(owned);
-            halo_n.push(ghosts);
+        for (view, _) in built {
+            masks.push(view.mask);
+            owned_n.push(view.owned);
+            halo_n.push(view.ghosts);
         }
+        println!("paint_ns={paint_ns}");
         (part_ns, halo_ns, masks, owned_n, halo_n)
     };
     println!(
         "parts={parts} part_ns={part_ns} halo_ns={halo_ns} cores={}",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     );
     // One thread per rank, pinned for both the warmup and the timed
     // call. A fresh thread would allocate again and fault the row buffer.
-    let ncores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let ncores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let (mf0, mj0) = faults();
     let t_wall = Instant::now();
     let rows: Vec<_> = std::thread::scope(|scope| {
@@ -218,7 +189,57 @@ fn main() {
     } else {
         bytes_out as f64 / (slow_ns as f64 / 1e9) / 1e9
     };
+    let cold_ns = part_ns.saturating_add(halo_ns).saturating_add(slow_ns);
     println!("traffic bytes_out={bytes_out} slow_ns={slow_ns} store_gbps={gbps:.3}");
+    // The domain driver keeps the cut. The cold total pays for it on the
+    // first frame. A later frame pays the pair list only.
+    println!("cold_ns={cold_ns} reused_ns={slow_ns}");
+    if std::env::var("PAIRS_SOA").ok().as_deref() == Some("1") {
+        time_columns(&xyz, &cell, &masks, parts);
+    }
+}
+
+fn time_columns(xyz: &[[f64; 3]], cell: &Cell, masks: &[Vec<bool>], parts: u32) -> u64 {
+    let ncores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let t0 = Instant::now();
+    let slow = std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for rank in 0..parts {
+            let mask = &masks[rank as usize];
+            joins.push(scope.spawn(move || {
+                pin((rank as usize) % ncores);
+                let mut cols = PairColumns::default();
+                let _ = pairs_within_columns(xyz, cell, 4.0, Some(mask), None, false, &mut cols);
+                let t = Instant::now();
+                pairs_within_columns(xyz, cell, 4.0, Some(mask), None, false, &mut cols)
+                    .expect("columns");
+                (t.elapsed().as_nanos() as u64, cols.len())
+            }));
+        }
+        joins
+            .into_iter()
+            .map(|join| join.join().expect("columns"))
+            .map(|(ns, rows)| (ns, rows))
+            .fold((0u64, 0u64), |(slow, bytes), (ns, rows)| {
+                let col = 2 * std::mem::size_of::<i32>()
+                    + std::mem::size_of::<[i32; 3]>()
+                    + std::mem::size_of::<f64>();
+                (slow.max(ns), bytes + rows as u64 * col as u64)
+            })
+    });
+    let wall = t0.elapsed().as_nanos() as u64;
+    let gbps = if slow.0 == 0 {
+        0.0
+    } else {
+        slow.1 as f64 / (slow.0 as f64 / 1e9) / 1e9
+    };
+    println!(
+        "soa wall_ns={wall} slow_ns={} bytes_out={} store_gbps={gbps:.3}",
+        slow.0, slow.1
+    );
+    slow.0
 }
 
 fn pin(cpu: usize) {

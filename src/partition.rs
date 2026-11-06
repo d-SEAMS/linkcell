@@ -499,6 +499,8 @@ struct Prepared {
     graph: CellGraph,
     /// Flat bin of each active point, in point order with masked points omitted.
     active_bins: Vec<u32>,
+    /// Bin of every point. A masked point keeps bin 0.
+    point_cell: Vec<u32>,
 }
 
 /// Point counts on the link-cell grid. Threads own disjoint point ranges
@@ -619,7 +621,176 @@ fn prepared(
             edge_weight,
         },
         active_bins,
+        point_cell: bin_of,
     })
+}
+
+/// Assignment, the grid it was cut on, and the bin of every point.
+///
+/// One binning feeds the cut. A later frame that keeps this cut does not
+/// bin again.
+pub struct MeshCut {
+    /// Domain of each cell.
+    pub assign: Vec<u32>,
+    /// Bins and point weights.
+    pub grid: CellGrid,
+    /// Bin of each point, in point order.
+    pub point_cell: Vec<u32>,
+}
+
+/// Cut the mesh once and keep the point bins.
+pub fn mesh_cut(
+    xyz: &[[f64; 3]],
+    sim: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    request: PartRequest,
+) -> Result<MeshCut, Error> {
+    let prep = prepared(
+        xyz,
+        sim,
+        cutoff,
+        mask,
+        cell_hint,
+        request.method.needs_edges(),
+    )?;
+    let assign = partition_prepared(&prep, request)?;
+    Ok(MeshCut {
+        assign,
+        grid: prep.graph.grid,
+        point_cell: prep.point_cell,
+    })
+}
+
+/// Point mask of one rank after its halo is painted.
+pub struct RankMask {
+    /// Points whose bin is owned or lies in the halo.
+    pub mask: Vec<bool>,
+    /// Points in cells this rank owns.
+    pub owned: usize,
+    /// Ghost cells, the painted bins this rank does not own.
+    pub ghosts: usize,
+}
+
+/// Paint each rank's halo while walking the cells that rank owns.
+///
+/// The owned lists come from one shared pass over the assignment. Each
+/// rank then paints its stencil from those cells and reads the point
+/// bins already stored on the cut. The ghost count matches [`halo`].
+pub fn fused_masks(
+    grid: &CellGrid,
+    assign: &[u32],
+    point_cell: &[u32],
+    parts: u32,
+    width: [u32; 3],
+) -> Result<Vec<RankMask>, Error> {
+    let n = check_assign(grid, assign)?;
+    if parts == 0 {
+        return Err(Error::BadPartition);
+    }
+    for &domain in assign {
+        if domain >= parts {
+            return Err(Error::BadPartition);
+        }
+    }
+    for &cell in point_cell {
+        if cell as usize >= n {
+            return Err(Error::BadPartition);
+        }
+    }
+    let owned = owned_cells(assign, parts);
+    let built = std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for rank in 0..parts {
+            let cells = &owned[rank as usize];
+            joins
+                .push(scope.spawn(move || rank_mask(grid, assign, point_cell, cells, rank, width)));
+        }
+        joins
+            .into_iter()
+            .map(|join| join.join().expect("rank mask"))
+            .collect()
+    });
+    Ok(built)
+}
+
+/// Cells of each domain, in cell order.
+pub fn owned_cells(assign: &[u32], parts: u32) -> Vec<Vec<u32>> {
+    let n = assign.len();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = if n >= 8192 { threads.max(1) } else { 1 };
+    let chunk = (n + threads - 1) / threads;
+    let mut hits: Vec<(usize, Vec<Vec<u32>>)> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for t in 0..threads {
+            let lo = t * chunk;
+            let hi = ((t + 1) * chunk).min(n);
+            if lo >= hi {
+                continue;
+            }
+            joins.push(scope.spawn(move || {
+                let mut rows = vec![Vec::new(); parts as usize];
+                for cell in lo..hi {
+                    rows[assign[cell] as usize].push(cell as u32);
+                }
+                (t, rows)
+            }));
+        }
+        for join in joins {
+            hits.push(join.join().expect("owned"));
+        }
+    });
+    hits.sort_by_key(|(t, _)| *t);
+    let mut owned = vec![Vec::new(); parts as usize];
+    for (_, rows) in hits {
+        for (rank, cells) in rows.into_iter().enumerate() {
+            owned[rank].extend(cells);
+        }
+    }
+    owned
+}
+
+/// Halo and point mask for one rank, from that rank's own cells.
+///
+/// The stencil is painted in the same walk that visits those cells.
+pub fn rank_mask(
+    grid: &CellGrid,
+    assign: &[u32],
+    point_cell: &[u32],
+    cells: &[u32],
+    rank: u32,
+    width: [u32; 3],
+) -> RankMask {
+    let n = grid.ncell();
+    let mut mark = vec![0u8; n];
+    for &cell in cells {
+        let (ix, iy, iz) = unravel(cell as usize, grid.nx, grid.ny);
+        paint(&mut mark, grid.nx, grid.ny, grid.nz, ix, iy, iz, width);
+    }
+    let mut ghosts = 0usize;
+    for (cell, &flag) in mark.iter().enumerate() {
+        if flag != 0 && assign[cell] != rank {
+            ghosts += 1;
+        }
+    }
+    let mut mask = vec![false; point_cell.len()];
+    let mut owned_pts = 0usize;
+    for (i, &cell) in point_cell.iter().enumerate() {
+        let cell = cell as usize;
+        if assign[cell] == rank {
+            owned_pts += 1;
+        }
+        mask[i] = mark[cell] != 0;
+    }
+    RankMask {
+        mask,
+        owned: owned_pts,
+        ghosts,
+    }
 }
 
 fn arcs_from_pairs(
@@ -1677,9 +1848,21 @@ fn bin_take(
 }
 
 fn arrange_cut(ids: &mut [u32], geom: &RcbGeom, axis: usize, cut_c: i64, take: usize, cut: usize) {
+    #[cfg(feature = "parallel")]
+    if rayon::current_num_threads() > 1 && ids.len() >= 4096 {
+        arrange_cut_parallel(ids, geom, axis, cut_c, take);
+        return;
+    }
+    let _ = cut;
+    arrange_cut_serial(ids, geom, axis, cut_c, take);
+}
+
+/// Split the slice in encounter order. Cells below the cut bin, then the
+/// first `take` cells of that bin, stay on the light side.
+fn arrange_cut_serial(ids: &mut [u32], geom: &RcbGeom, axis: usize, cut_c: i64, take: usize) {
     let mut seen = 0usize;
-    let mut light = Vec::with_capacity(cut);
-    let mut heavy = Vec::with_capacity(ids.len().saturating_sub(cut));
+    let mut light = Vec::with_capacity(ids.len());
+    let mut heavy = Vec::with_capacity(ids.len());
     for &id in ids.iter() {
         let Some(c) = coord_i64(geom, axis, id) else {
             heavy.push(id);
@@ -1697,6 +1880,85 @@ fn arrange_cut(ids: &mut [u32], geom: &RcbGeom, axis: usize, cut_c: i64, take: u
     let n = light.len();
     ids[..n].copy_from_slice(&light);
     ids[n..].copy_from_slice(&heavy);
+}
+
+/// Same light set and same order as [`arrange_cut_serial`], with one
+/// chunk of the slice per thread.
+#[cfg(feature = "parallel")]
+fn arrange_cut_parallel(ids: &mut [u32], geom: &RcbGeom, axis: usize, cut_c: i64, take: usize) {
+    use rayon::prelude::*;
+    let chunk = work_chunk(ids.len());
+    let groups: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = ids
+        .par_chunks(chunk)
+        .map(|group| {
+            let mut below = Vec::new();
+            let mut equal = Vec::new();
+            let mut above = Vec::new();
+            for &id in group {
+                match coord_i64(geom, axis, id) {
+                    Some(c) if c < cut_c => below.push(id),
+                    Some(c) if c == cut_c => equal.push(id),
+                    _ => above.push(id),
+                }
+            }
+            (below, equal, above)
+        })
+        .collect();
+    let mut below = Vec::new();
+    let mut equal = Vec::new();
+    let mut above = Vec::new();
+    for (lo, mid, hi) in groups {
+        below.extend(lo);
+        equal.extend(mid);
+        above.extend(hi);
+    }
+    let take = take.min(equal.len());
+    let light_n = below.len() + take;
+    ids[..below.len()].copy_from_slice(&below);
+    ids[below.len()..light_n].copy_from_slice(&equal[..take]);
+    let rest = equal.len() - take;
+    ids[light_n..light_n + rest].copy_from_slice(&equal[take..]);
+    ids[light_n + rest..].copy_from_slice(&above);
+}
+
+/// Span and weight of a slice. Threads own disjoint id ranges.
+fn slice_span(ids: &[u32], geom: &RcbGeom) -> ([f64; 3], [f64; 3], u64) {
+    let one = |group: &[u32]| {
+        let mut min = [f64::MAX; 3];
+        let mut max = [f64::MIN; 3];
+        let mut total = 0u64;
+        for &id in group {
+            let c = [
+                geom.x[id as usize],
+                geom.y[id as usize],
+                geom.z[id as usize],
+            ];
+            for axis in 0..3 {
+                min[axis] = min[axis].min(c[axis]);
+                max[axis] = max[axis].max(c[axis]);
+            }
+            total = total.saturating_add(geom.w[id as usize]);
+        }
+        (min, max, total)
+    };
+    #[cfg(feature = "parallel")]
+    if rayon::current_num_threads() > 1 && ids.len() >= 4096 {
+        use rayon::prelude::*;
+        let chunk = work_chunk(ids.len());
+        let parts: Vec<_> = ids.par_chunks(chunk).map(one).collect();
+        let mut min = [f64::MAX; 3];
+        let mut max = [f64::MIN; 3];
+        let mut total = 0u64;
+        for (lo, hi, weight) in parts {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(lo[axis]);
+                max[axis] = max[axis].max(hi[axis]);
+            }
+            total = total.saturating_add(weight);
+        }
+        return (min, max, total);
+    }
+    one(ids)
 }
 
 fn weighted_cut_quick(
@@ -1912,19 +2174,7 @@ fn rcb_slice(
     let parts_l = parts / 2;
     let parts_r = parts - parts_l;
     let t_pack = Instant::now();
-    let mut min = [f64::MAX; 3];
-    let mut max = [f64::MIN; 3];
-    for &id in ids.iter() {
-        let c = [
-            geom.x[id as usize],
-            geom.y[id as usize],
-            geom.z[id as usize],
-        ];
-        for a in 0..3 {
-            min[a] = min[a].min(c[a]);
-            max[a] = max[a].max(c[a]);
-        }
-    }
+    let (min, max, total) = slice_span(ids, geom);
     let span = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
     let axis = if span[0] >= span[1] && span[0] >= span[2] {
         0
@@ -1933,7 +2183,6 @@ fn rcb_slice(
     } else {
         2
     };
-    let total: u64 = ids.iter().map(|&id| geom.w[id as usize]).sum();
     let pack_span = t_pack.elapsed().as_nanos() as u64;
     let t_sel = Instant::now();
     let mut cut = if refine_cuts {
@@ -1951,6 +2200,25 @@ fn rcb_slice(
     if cut >= ids.len() {
         cut = ids.len() - 1;
     }
+    // The weighted cut already lays the light cells in the prefix. The two
+    // sides descend from that prefix, with no second copy of the ids.
+    if !refine_cuts {
+        let (left_ids, right_ids) = ids.split_at_mut(cut);
+        let child = descend(
+            left_ids,
+            parts_l,
+            part0,
+            right_ids,
+            parts_r,
+            part0 + parts_l,
+            geom,
+            out,
+            graph,
+            refine_cuts,
+            ratio,
+        );
+        return phase_after(select_here, 0, pack_span, child);
+    }
     let t_side = Instant::now();
     let mut side = vec![1u8; ids.len()];
     for s in side.iter_mut().take(cut) {
@@ -1958,14 +2226,8 @@ fn rcb_slice(
     }
     let pack_side = t_side.elapsed().as_nanos() as u64;
     let t_fm = Instant::now();
-    if refine_cuts {
-        bipartition_fm(ids, &mut side, geom, graph, parts_l, parts_r, ratio);
-    }
-    let fm_here = if refine_cuts {
-        t_fm.elapsed().as_nanos() as u64
-    } else {
-        0
-    };
+    bipartition_fm(ids, &mut side, geom, graph, parts_l, parts_r, ratio);
+    let fm_here = t_fm.elapsed().as_nanos() as u64;
     let t_split = Instant::now();
     let mut left = Vec::new();
     let mut right = Vec::new();

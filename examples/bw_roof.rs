@@ -102,4 +102,146 @@ fn main() {
         let gbps = copy_gbps(threads, bytes);
         println!("copy threads={threads} bytes={bytes} gbps={gbps:.3}");
     }
+    // Payload bytes only. A temporal store of a cold line also reads it
+    // (write allocate). A non-temporal store does not.
+    for threads in [1usize, 2, 4, 8] {
+        for kind in ["line64", "pair40", "soa"] {
+            let temporal = stream_gbps(kind, threads, bytes, false);
+            let nontemporal = stream_gbps(kind, threads, bytes, true);
+            println!(
+                "store kind={kind} threads={threads} temporal_gbps={temporal:.3} nontemporal_gbps={nontemporal:.3}"
+            );
+        }
+    }
+}
+
+fn stream_gbps(kind: &str, threads: usize, bytes: usize, nontemporal: bool) -> f64 {
+    let chunk = (bytes + threads - 1) / threads;
+    let mut bufs = Vec::new();
+    for _ in 0..threads {
+        // 64 bytes of headroom so a slice can be aligned.
+        let mut raw = vec![0u8; chunk + 128];
+        let addr = raw.as_mut_ptr() as usize;
+        let aligned = (addr + 63) & !63;
+        let off = aligned - addr;
+        bufs.push((raw, off, chunk));
+    }
+    let once = |bufs: &mut [(Vec<u8>, usize, usize)]| {
+        std::thread::scope(|scope| {
+            for (raw, off, len) in bufs.iter_mut() {
+                let addr = unsafe { raw.as_mut_ptr().add(*off) } as usize;
+                let len = *len;
+                scope.spawn(move || {
+                    fill_bytes(kind, addr as *mut u8, len, nontemporal);
+                });
+            }
+        });
+    };
+    once(&mut bufs);
+    let reps = 4usize;
+    let t0 = Instant::now();
+    for _ in 0..reps {
+        once(&mut bufs);
+    }
+    let sec = t0.elapsed().as_secs_f64() / reps as f64;
+    bytes as f64 / sec / 1e9
+}
+
+fn fill_bytes(kind: &str, ptr: *mut u8, len: usize, nontemporal: bool) {
+    match kind {
+        "line64" => fill_lines(ptr, len, nontemporal),
+        "pair40" => fill_pairs(ptr, len, nontemporal),
+        "soa" => fill_soa(ptr, len, nontemporal),
+        _ => {}
+    }
+}
+
+fn fill_lines(ptr: *mut u8, len: usize, nontemporal: bool) {
+    let n = len / 64;
+    if nontemporal {
+        unsafe { stream_lines(ptr, n) };
+    } else {
+        unsafe {
+            for i in 0..n {
+                let p = ptr.add(i * 64) as *mut u64;
+                let v = std::hint::black_box(i as u64);
+                for lane in 0..8 {
+                    std::ptr::write(p.add(lane), v);
+                }
+            }
+        }
+    }
+}
+
+fn fill_pairs(ptr: *mut u8, len: usize, nontemporal: bool) {
+    let nbytes = (len / 40) * 40;
+    unsafe {
+        if nontemporal {
+            // The packed records stay 40 bytes. Streaming stores still move
+            // whole aligned lines of that byte range.
+            stream_lines(ptr, nbytes / 64);
+        } else {
+            let n = nbytes / 40;
+            for i in 0..n {
+                let p = ptr.add(i * 40) as *mut u64;
+                let v = std::hint::black_box(i as u64);
+                std::ptr::write(p, v);
+                std::ptr::write(p.add(1), v);
+                std::ptr::write(p.add(2), v);
+                std::ptr::write(p.add(3), v);
+                std::ptr::write(p.add(4), v);
+            }
+        }
+    }
+}
+
+fn fill_soa(ptr: *mut u8, len: usize, nontemporal: bool) {
+    // Four columns of a 28-byte row: i, j, shift, dist2. Each column
+    // starts on a 64-byte boundary so a streaming store is aligned.
+    let align = |n: usize| (n + 63) & !63;
+    let mut rows = len / 28;
+    loop {
+        let need = align(rows * 4) + align(rows * 4) + align(rows * 12) + align(rows * 8);
+        if need <= len || rows == 0 {
+            break;
+        }
+        rows -= 1;
+    }
+    if rows == 0 {
+        return;
+    }
+    let widths = [rows * 4, rows * 4, rows * 12, rows * 8];
+    let mut at = 0usize;
+    for bytes in widths {
+        unsafe {
+            if nontemporal {
+                stream_lines(ptr.add(at), bytes / 64);
+            } else {
+                let words = bytes / 8;
+                let p = ptr.add(at) as *mut u64;
+                for i in 0..words {
+                    std::ptr::write(p.add(i), std::hint::black_box(i as u64));
+                }
+            }
+        }
+        at += align(bytes);
+    }
+}
+
+#[target_feature(enable = "avx512f")]
+unsafe fn stream_lines(ptr: *mut u8, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm512_setzero_si512, _mm512_stream_si512, _mm_sfence};
+        let z = _mm512_setzero_si512();
+        let p = ptr as *mut std::arch::x86_64::__m512i;
+        for i in 0..n {
+            _mm512_stream_si512(p.add(i), z);
+        }
+        _mm_sfence();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (ptr, n);
+    }
 }

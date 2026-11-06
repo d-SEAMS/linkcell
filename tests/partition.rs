@@ -2,8 +2,8 @@
 //! and a relabel, and at least the curve cut on a small grid.
 
 use linkcell::{
-    cell_graph, cell_grid, curve_split_device, edge_cut, halo, halo_width, partition, score,
-    derived_balance, Cell, CellGraph, CellGrid, Method, PartRequest,
+    cell_graph, cell_grid, curve_split_device, derived_balance, edge_cut, fused_masks, halo,
+    halo_width, mesh_cut, partition, score, Cell, CellGraph, CellGrid, Method, PartRequest,
 };
 
 fn cloud(n: usize, box_l: f64, seed: u64) -> Vec<[f64; 3]> {
@@ -244,7 +244,13 @@ fn small_grid_cuts_meet_the_balanced_optimum() {
     let (num, den) = derived_balance(&graph.grid.weight, 2);
     let optimal = brute_cut(&graph, 2, num, den);
     assert_eq!(optimal, 2);
-    for method in [Method::Morton, Method::Hilbert, Method::HilbertFm, Method::Rcb, Method::RcbFm] {
+    for method in [
+        Method::Morton,
+        Method::Hilbert,
+        Method::HilbertFm,
+        Method::Rcb,
+        Method::RcbFm,
+    ] {
         let assign = linkcell::partition_graph(
             &graph,
             PartRequest {
@@ -317,4 +323,42 @@ fn rcb_on_cell_counts_matches_the_pair_graph() {
         part[d as usize] += graph.grid.weight[c];
     }
     assert!(part.iter().all(|&w| u128::from(w) <= cap));
+}
+
+#[test]
+fn fused_halo_matches_the_cell_halo() {
+    let sim = Cell::ortho(18.0, 18.0, 12.0).unwrap();
+    let xyz = cloud(3000, 18.0, 11);
+    let request = PartRequest {
+        parts: 4,
+        method: Method::Rcb,
+        balance: None,
+        device: false,
+    };
+    let cut = mesh_cut(&xyz, &sim, 4.0, None, None, request).unwrap();
+    let plain = partition(&xyz, &sim, 4.0, None, None, request).unwrap();
+    assert_eq!(cut.assign, plain);
+    let width = halo_width(4.0, 1, cut.grid.bin_width).unwrap();
+    let ranks = fused_masks(&cut.grid, &cut.assign, &cut.point_cell, 4, width).unwrap();
+    for (rank, view) in ranks.iter().enumerate() {
+        let ghosts = halo(&cut.grid, &cut.assign, rank as u32, width).unwrap();
+        assert_eq!(view.ghosts, ghosts.len());
+        let mut live = vec![false; cut.grid.ncell()];
+        for (cell, &domain) in cut.assign.iter().enumerate() {
+            if domain == rank as u32 {
+                live[cell] = true;
+            }
+        }
+        for ghost in ghosts {
+            live[ghost as usize] = true;
+        }
+        let mut owned = 0usize;
+        for (i, &cell) in cut.point_cell.iter().enumerate() {
+            assert_eq!(view.mask[i], live[cell as usize]);
+            if cut.assign[cell as usize] == rank as u32 {
+                owned += 1;
+            }
+        }
+        assert_eq!(view.owned, owned);
+    }
 }
