@@ -501,6 +501,66 @@ struct Prepared {
     active_bins: Vec<u32>,
 }
 
+/// Point counts on the link-cell grid. Threads own disjoint point ranges
+/// and private histograms, then the histograms add. The active-bin list
+/// stays in point order.
+fn bin_points(
+    xyz: &[[f64; 3]],
+    sim: &Cell,
+    mask: Option<&[bool]>,
+    dims: [i32; 3],
+    ncell: usize,
+) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
+    let n = xyz.len();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = if n >= 8192 { threads.max(1) } else { 1 };
+    let chunk = (n + threads - 1) / threads;
+    let mut bin_of = vec![0u32; n];
+    let mut weight = vec![0u64; ncell];
+    let mut hits: Vec<(usize, Vec<(usize, u32)>, Vec<u64>)> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for t in 0..threads {
+            let lo = t * chunk;
+            let hi = ((t + 1) * chunk).min(n);
+            if lo >= hi {
+                continue;
+            }
+            joins.push(scope.spawn(move || {
+                let mut local = vec![0u64; ncell];
+                let mut active = Vec::new();
+                for i in lo..hi {
+                    if mask.is_some_and(|m| !m[i]) {
+                        continue;
+                    }
+                    let (_, b) = bins::fold_point(sim, xyz[i], dims);
+                    let c = flat_cell(b, dims) as u32;
+                    local[c as usize] += 1;
+                    active.push((i, c));
+                }
+                (t, active, local)
+            }));
+        }
+        for join in joins {
+            hits.push(join.join().expect("bin"));
+        }
+    });
+    hits.sort_by_key(|(t, _, _)| *t);
+    let mut active_bins = Vec::new();
+    for (_, active, local) in hits {
+        for (c, w) in local.into_iter().enumerate() {
+            weight[c] += w;
+        }
+        for (i, c) in active {
+            bin_of[i] = c;
+            active_bins.push(c);
+        }
+    }
+    (weight, active_bins, bin_of)
+}
+
 fn prepared(
     xyz: &[[f64; 3]],
     sim: &Cell,
@@ -539,19 +599,7 @@ fn prepared(
         box_w[1] / f64::from(dims[1]),
         box_w[2] / f64::from(dims[2]),
     ];
-    let mut weight = vec![0u64; ncell];
-    let mut active_bins = Vec::with_capacity(n_act);
-    let mut bin_of = vec![0u32; xyz.len()];
-    for (i, p) in xyz.iter().enumerate() {
-        if mask.is_some_and(|m| !m[i]) {
-            continue;
-        }
-        let (_, b) = bins::fold_point(sim, *p, dims);
-        let c = flat_cell(b, dims) as u32;
-        bin_of[i] = c;
-        weight[c as usize] += 1;
-        active_bins.push(c);
-    }
+    let (weight, active_bins, bin_of) = bin_points(xyz, sim, mask, dims, ncell);
     let (offsets, neighbor, edge_weight) = if with_edges {
         arcs_from_pairs(xyz, sim, cutoff, mask, cell_hint, &bin_of, ncell)?
     } else {
