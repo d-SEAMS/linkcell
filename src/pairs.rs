@@ -140,6 +140,30 @@ pub fn pairs_within_count(
     Ok(plan.search().rows())
 }
 
+/// Write [`pairs_within`] into `out`, keeping its allocation.
+///
+/// A rank that calls this twice reuses the pages from the first call.
+/// A fresh `Vec` on every call is unmapped and faulted again, which on
+/// a half-frame list costs more than walking the pairs.
+pub fn pairs_within_into(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+    out: &mut Vec<Pair>,
+) -> Result<(), Error> {
+    let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    if let Some(words) = plan.fused().filter(|_| knobs::fused()) {
+        plan.fused_into_vec(&words, out);
+        return Ok(());
+    }
+    *out = plan.search().into_pairs();
+    Ok(())
+}
+
 /// Ask Linux to back the 2 MB-aligned interior of a large buffer this
 /// library allocated with transparent huge pages, so the row stores take
 /// one page walk per 2 MB rather than per 4 KB. It is advice: the system's
@@ -635,8 +659,13 @@ fn retain_pair_pages() {
                 extern "C" {
                     fn mallopt(param: i32, value: i32) -> i32;
                 }
+                // M_TRIM_THRESHOLD: keep a freed pair buffer on the heap.
+                // M_MMAP_MAX: a large row buffer otherwise comes from mmap
+                // and disappears on free, so the next call faults every
+                // page. Zero mmap slots keeps the buffer in the arena,
+                // including a rank thread that allocates its own.
                 let _ = mallopt(-1, -1);
-                let _ = mallopt(-3, 256 << 20);
+                let _ = mallopt(-4, 0);
             }
         });
     }
@@ -3865,6 +3894,21 @@ impl Plan {
         out
     }
 
+    /// [`pairs_within_into`]: fill `out`, growing it only when it is short.
+    fn fused_into_vec(&self, words: &RowWords, out: &mut Vec<Pair>) {
+        let _timer = crate::pop::JobTimer::new();
+        let guess = self.fused_guess();
+        out.clear();
+        if out.capacity() < guess {
+            out.reserve(guess - out.len());
+        }
+        advise_huge(out);
+        let ahead = ahead(out.capacity(), std::mem::size_of::<Pair>());
+        let n = self.fused_sink::<false, _>(words, out, ahead);
+        // Safety: every row below `n` is written.
+        unsafe { out.set_len(n) };
+    }
+
     /// [`pairs_within_count`]: the tile's row count, with no row stored.
     #[cfg(feature = "parallel")]
     fn count_rows(&self, words: &RowWords) -> usize {
@@ -4335,12 +4379,59 @@ impl Walk<'_> {
     /// A denser shell grows the buffer.
     fn guess_hits(&self, n_src: usize) -> usize {
         let w = self.grid.widths;
-        let volume = (w[0] * w[1] * w[2]).max(1.0e-30);
+        let full = (w[0] * w[1] * w[2]).max(1.0e-30);
         let radius = self.cut2.sqrt();
         let shell = 4.1887902047863905 * radius * radius * radius;
         let n = self.grid.atoms().max(1) as f64;
-        let neighbors = (n * shell / volume).ceil().max(1.0);
+        // A rank's atoms fill a block of bins, not the whole cell. The
+        // gas count uses that block's volume, so the row buffer covers
+        // the list on the first allocation.
+        let volume = full * self.occupied_fraction();
+        let neighbors = (n * shell / volume).ceil().max(1.0).min(n);
         ((n_src as f64) * neighbors * 0.5 * 1.25) as usize
+    }
+
+    /// Share of the cell that holds at least one atom, from the bin
+    /// bounding box. One means the atoms span every axis.
+    fn occupied_fraction(&self) -> f64 {
+        let nx = self.grid.n[0];
+        let ny = self.grid.n[1];
+        let nz = self.grid.n[2];
+        if nx <= 0 || ny <= 0 || nz <= 0 {
+            return 1.0;
+        }
+        let ncell = (nx as usize) * (ny as usize) * (nz as usize);
+        let off = &self.grid.offsets;
+        if off.len() != ncell + 1 {
+            return 1.0;
+        }
+        let mut min = [i32::MAX; 3];
+        let mut max = [i32::MIN; 3];
+        let mut any = false;
+        for c in 0..ncell {
+            if off[c + 1] == off[c] {
+                continue;
+            }
+            any = true;
+            let ix = (c % nx as usize) as i32;
+            let iy = ((c / nx as usize) % ny as usize) as i32;
+            let iz = (c / (nx as usize * ny as usize)) as i32;
+            min[0] = min[0].min(ix);
+            min[1] = min[1].min(iy);
+            min[2] = min[2].min(iz);
+            max[0] = max[0].max(ix);
+            max[1] = max[1].max(iy);
+            max[2] = max[2].max(iz);
+        }
+        if !any {
+            return 1.0;
+        }
+        let span = [
+            (max[0] - min[0] + 1) as f64 / f64::from(nx),
+            (max[1] - min[1] + 1) as f64 / f64::from(ny),
+            (max[2] - min[2] + 1) as f64 / f64::from(nz),
+        ];
+        (span[0] * span[1] * span[2]).clamp(1.0 / ncell as f64, 1.0)
     }
 
     fn fill_range(&self, start: usize, end: usize) -> Scratch {

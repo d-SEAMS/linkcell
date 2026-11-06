@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use linkcell::{pairs_within, Cell};
+use linkcell::{pairs_within_into, Cell, Pair};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -52,9 +52,32 @@ fn main() {
     let xyz = fill(n, boxl);
     let cell = Cell::ortho(boxl, boxl, boxl).expect("box");
     let active = mask.iter().filter(|m| **m).count();
-    let _ = pairs_within(&xyz, &cell, 4.0, Some(&mask), None, false).expect("warm");
+    let mut rows = Vec::<Pair>::new();
+    let _ = pairs_within_into(&xyz, &cell, 4.0, Some(&mask), None, false, &mut rows);
+    let (f0, j0, rss0) = usage();
     let t0 = Instant::now();
-    let got = pairs_within(&xyz, &cell, 4.0, Some(&mask), None, false).expect("pairs");
+    pairs_within_into(&xyz, &cell, 4.0, Some(&mask), None, false, &mut rows).expect("pairs");
     let pairs_ns = t0.elapsed().as_nanos() as u64;
-    println!("mask={path} active={active} pairs={} pairs_ns={pairs_ns}", got.len());
+    let (f1, j1, rss1) = usage();
+    println!(
+        "active={active} pairs={} pairs_ns={pairs_ns} minflt={} majflt={} rss_kb={rss0}->{rss1}",
+        rows.len(),
+        f1.saturating_sub(f0),
+        j1.saturating_sub(j0)
+    );
+}
+
+fn usage() -> (u64, u64, u64) {
+    let raw = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = raw.split_once(')').map(|(_, r)| r).unwrap_or("");
+    let bits: Vec<&str> = rest.split_whitespace().collect();
+    let num = |i: usize| bits.get(i).and_then(|s| s.parse().ok()).unwrap_or(0u64);
+    let rss = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (num(7), num(9), rss)
 }
