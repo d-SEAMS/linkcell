@@ -406,6 +406,57 @@ int lc_halo(const int *nxyz,
             size_t *out_count);
 
 /**
+ * Domain of each cell and the bin of each point, from one mesh cut.
+ *
+ * `method` and `balance` follow `lc_partition`. A null `out_domain`
+ * queries `*out_ncell`. On a fill, `out_nxyz` is three ints,
+ * `out_width` is three bin widths, `out_domain` is one domain per
+ * cell, and `out_point_cell` is one bin per point.
+ */
+int lc_mesh_cut(const double *xyz,
+                size_t n,
+                const struct lc_cell *simbox,
+                double cutoff,
+                const int *mask,
+                double cell_hint,
+                size_t parts,
+                uint8_t method,
+                double balance,
+                int device,
+                int *out_nxyz,
+                double *out_width,
+                int *out_domain,
+                int *out_point_cell,
+                size_t cap_cell,
+                size_t cap_point,
+                size_t *out_ncell);
+
+/**
+ * Domain of each cell from caller-supplied weights.
+ *
+ * `nxyz` is `nx, ny, nz`. `weight` has one count per cell, in the
+ * order `((iz * ny) + iy) * nx + ix`. `method` and `balance` follow
+ * `lc_partition`. A plain bisection reads these weights and not the
+ * pair arcs. `out_domain` receives one domain per cell.
+ */
+int lc_partition_weights(const int *nxyz,
+                         const uint64_t *weight,
+                         size_t ncell,
+                         size_t parts,
+                         uint8_t method,
+                         double balance,
+                         int *out_domain);
+
+/**
+ * Use `n` Rayon threads for later searches. `n <= 0` means one thread.
+ * Safe to call again with a different `n`.
+ */
+void lc_set_threads(int n);
+
+/** Width last passed to `lc_set_threads`, or the global pool when unset. */
+int lc_num_threads(void);
+
+/**
  * Library version string. Process-static, NUL-terminated. Do not free.
  */
 const char *lc_version(void);

@@ -362,3 +362,64 @@ fn fused_halo_matches_the_cell_halo() {
         assert_eq!(view.owned, owned);
     }
 }
+
+#[test]
+fn caller_weights_move_the_bisection() {
+    let nx = 8i32;
+    let ny = 4i32;
+    let nz = 4i32;
+    let ncell = (nx * ny * nz) as usize;
+    let mut weight = vec![1u64; ncell];
+    // The low-x slab is the expensive one.
+    for iz in 0..nz {
+        for iy in 0..ny {
+            for ix in 0..2 {
+                let cell = ((iz * ny + iy) * nx + ix) as usize;
+                weight[cell] = 40;
+            }
+        }
+    }
+    let graph = CellGraph {
+        grid: CellGrid {
+            nx,
+            ny,
+            nz,
+            bin_width: [1.0; 3],
+            weight: weight.clone(),
+        },
+        offsets: vec![0; ncell + 1],
+        neighbor: Vec::new(),
+        edge_weight: Vec::new(),
+    };
+    let assign = linkcell::partition_graph(
+        &graph,
+        PartRequest {
+            parts: 2,
+            method: Method::Rcb,
+            balance: None,
+            device: false,
+        },
+    )
+    .unwrap();
+    assert_partition(&assign, ncell, 2);
+    let mut load = [0u64; 2];
+    for (cell, &domain) in assign.iter().enumerate() {
+        load[domain as usize] += weight[cell];
+    }
+    let mean = (load[0] + load[1]) as f64 / 2.0;
+    let imbalance = (load[0].max(load[1]) as f64) / mean;
+    let (bound_num, bound_den) = derived_balance(&weight, 2);
+    let bound = bound_num as f64 / bound_den as f64;
+    assert!(imbalance <= bound + 1e-9, "{imbalance} > {bound}");
+    let heavy = assign[0];
+    let mut heavy_cells = 0usize;
+    let mut light_cells = 0usize;
+    for &domain in &assign {
+        if domain == heavy {
+            heavy_cells += 1;
+        } else {
+            light_cells += 1;
+        }
+    }
+    assert!(heavy_cells < light_cells);
+}
