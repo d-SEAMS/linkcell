@@ -164,7 +164,8 @@ pub use pairs::{
 };
 pub use partition::{
     cell_graph, cell_grid, curve_split_device, derived_balance, derived_balance_f64, edge_cut,
-    exclusive_prefix, fused_masks, halo, halo_width, hilbert_key, histogram, mesh_cut, morton_cmp,
+    exclusive_prefix, fused_masks, halo, halo_width, hilbert_key, histogram, mark_reached, mesh_cut,
+    morton_cmp,
     morton_key, owned_cells, partition, partition_graph, prefix_assign, profile_ns, profile_reset,
     rank_mask, replicate_graph, score, timer_resolution_ns, CellGraph, CellGrid, MeshCut, Method,
     PartRequest, PartScore, RankMask, DEFAULT_METHOD,

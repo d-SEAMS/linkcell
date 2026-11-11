@@ -1162,3 +1162,79 @@ pub unsafe extern "C" fn lc_partition_weights(
     clear_error();
     0
 }
+
+/// Owned points are 2. Ghosts within `reach` of an owned atom are 1.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `lengths` and `nxyz` are
+/// readable for 3 entries. `assign` is readable for `ncell` ints.
+/// `point_cell` is readable for `n` ints. `hwidth` is readable for 3
+/// counts. `out_hit` is writable for `n` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_within_reach(
+    xyz: *const f64,
+    n: usize,
+    lengths: *const f64,
+    nxyz: *const c_int,
+    assign: *const c_int,
+    ncell: usize,
+    point_cell: *const c_int,
+    hwidth: *const u32,
+    domain: c_int,
+    reach: f64,
+    out_hit: *mut c_int,
+) -> c_int {
+    if xyz.is_null()
+        || lengths.is_null()
+        || nxyz.is_null()
+        || assign.is_null()
+        || point_cell.is_null()
+        || hwidth.is_null()
+        || out_hit.is_null()
+        || domain < 0
+    {
+        return fail_msg("null pointer");
+    }
+    let pts: Vec<[f64; 3]> =
+        unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) }.to_vec();
+    let lengths = unsafe { [*lengths, *lengths.add(1), *lengths.add(2)] };
+    let nxyz = unsafe { [*nxyz, *nxyz.add(1), *nxyz.add(2)] };
+    let hwidth = unsafe { [*hwidth, *hwidth.add(1), *hwidth.add(2)] };
+    let assign_raw = unsafe { std::slice::from_raw_parts(assign, ncell) };
+    let mut owned = Vec::with_capacity(ncell);
+    for &v in assign_raw {
+        if v < 0 {
+            return fail(Error::BadPartition);
+        }
+        owned.push(v as u32);
+    }
+    let cells_raw = unsafe { std::slice::from_raw_parts(point_cell, n) };
+    let mut cells = Vec::with_capacity(n);
+    for &v in cells_raw {
+        if v < 0 {
+            return fail(Error::BadPartition);
+        }
+        cells.push(v as u32);
+    }
+    let hit = match with_threads(|| {
+        crate::mark_reached(
+            &pts,
+            lengths,
+            nxyz,
+            &owned,
+            &cells,
+            hwidth,
+            domain as u32,
+            reach,
+        )
+    }) {
+        Ok(hit) => hit,
+        Err(err) => return fail(err),
+    };
+    for (i, &flag) in hit.iter().enumerate() {
+        unsafe { *out_hit.add(i) = flag as c_int };
+    }
+    clear_error();
+    0
+}

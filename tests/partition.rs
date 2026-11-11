@@ -423,3 +423,24 @@ fn caller_weights_move_the_bisection() {
     }
     assert!(heavy_cells < light_cells);
 }
+
+#[test]
+fn reach_keeps_the_neighbour_and_drops_the_next_cell() {
+    let xyz = vec![[0.2, 0.2, 0.2], [1.2, 0.2, 0.2], [3.2, 0.2, 0.2]];
+    let assign = vec![0u32, 1, 1];
+    let point_cell = vec![0u32, 1, 2];
+    let hit = linkcell::mark_reached(
+        &xyz,
+        [6.0, 4.0, 4.0],
+        [3, 1, 1],
+        &assign,
+        &point_cell,
+        [1, 0, 0],
+        0,
+        1.5,
+    )
+    .unwrap();
+    assert_eq!(hit[0], 2);
+    assert_eq!(hit[1], 1);
+    assert_eq!(hit[2], 0);
+}

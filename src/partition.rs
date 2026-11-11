@@ -364,6 +364,104 @@ pub fn halo(
     Ok(ghosts)
 }
 
+/// Mark points owned by `domain` or within `reach` of one of its atoms.
+///
+/// The cell stencil from `hwidth` is only the candidate list. A point in
+/// a painted cell is kept when its minimum image to an owned atom is at
+/// most `reach`. Owned points are `2`. Reached ghosts are `1`.
+pub fn mark_reached(
+    xyz: &[[f64; 3]],
+    lengths: [f64; 3],
+    nxyz: [i32; 3],
+    assign: &[u32],
+    point_cell: &[u32],
+    hwidth: [u32; 3],
+    domain: u32,
+    reach: f64,
+) -> Result<Vec<u8>, Error> {
+    if xyz.len() != point_cell.len() || !(reach.is_finite() && reach >= 0.0) {
+        return Err(Error::BadGraph);
+    }
+    if nxyz[0] <= 0 || nxyz[1] <= 0 || nxyz[2] <= 0 {
+        return Err(Error::BadGraph);
+    }
+    let nx = nxyz[0] as usize;
+    let ny = nxyz[1] as usize;
+    let nz = nxyz[2] as usize;
+    let ncell = nx
+        .checked_mul(ny)
+        .and_then(|v| v.checked_mul(nz))
+        .ok_or(Error::BadGraph)?;
+    if assign.len() != ncell {
+        return Err(Error::BadGraph);
+    }
+    let mut start = vec![0usize; ncell + 1];
+    for &cell in point_cell {
+        let c = cell as usize;
+        if c < ncell {
+            start[c + 1] += 1;
+        }
+    }
+    for c in 0..ncell {
+        start[c + 1] += start[c];
+    }
+    let mut cursor = start.clone();
+    let mut atoms = vec![0usize; xyz.len()];
+    for (i, &cell) in point_cell.iter().enumerate() {
+        let c = cell as usize;
+        if c < ncell {
+            atoms[cursor[c]] = i;
+            cursor[c] += 1;
+        }
+    }
+    let reach2 = reach * reach;
+    let rad = [hwidth[0] as i32, hwidth[1] as i32, hwidth[2] as i32];
+    let mut hit = vec![0u8; xyz.len()];
+    for (i, &cell) in point_cell.iter().enumerate() {
+        let c = cell as usize;
+        if c >= ncell {
+            continue;
+        }
+        if assign[c] == domain {
+            hit[i] = 2;
+            continue;
+        }
+        let ix = (c % nx) as i32;
+        let iy = ((c / nx) % ny) as i32;
+        let iz = (c / (nx * ny)) as i32;
+        let mut found = false;
+        'search: for dz in -rad[2]..=rad[2] {
+            for dy in -rad[1]..=rad[1] {
+                for dx in -rad[0]..=rad[0] {
+                    let jx = (ix + dx).rem_euclid(nxyz[0]) as usize;
+                    let jy = (iy + dy).rem_euclid(nxyz[1]) as usize;
+                    let jz = (iz + dz).rem_euclid(nxyz[2]) as usize;
+                    let other = (jz * ny + jy) * nx + jx;
+                    if assign[other] != domain {
+                        continue;
+                    }
+                    for &j in &atoms[start[other]..start[other + 1]] {
+                        let mut sum = 0.0;
+                        for d in 0..3 {
+                            let mut delta = xyz[i][d] - xyz[j][d];
+                            delta -= lengths[d] * (delta / lengths[d] + 0.5).floor();
+                            sum += delta * delta;
+                        }
+                        if sum <= reach2 {
+                            found = true;
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        if found {
+            hit[i] = 1;
+        }
+    }
+    Ok(hit)
+}
+
 /// Point counts on the mesh `pairs_within` would use.
 pub fn cell_grid(
     xyz: &[[f64; 3]],

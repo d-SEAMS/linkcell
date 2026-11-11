@@ -448,6 +448,23 @@ int lc_partition_weights(const int *nxyz,
                          int *out_domain);
 
 /**
+ * Owned points of `domain` are 2. Points within `reach` of one of
+ * those atoms are 1. Other points are 0. `hwidth` is the cell stencil
+ * from `lc_halo_width`; it limits the search, it does not keep a cell.
+ */
+int lc_within_reach(const double *xyz,
+                    size_t n,
+                    const double *lengths,
+                    const int *nxyz,
+                    const int *assign,
+                    size_t ncell,
+                    const int *point_cell,
+                    const uint32_t *hwidth,
+                    int domain,
+                    double reach,
+                    int *out_hit);
+
+/**
  * Use `n` Rayon threads for later searches. `n <= 0` means one thread.
  * Safe to call again with a different `n`.
  */
