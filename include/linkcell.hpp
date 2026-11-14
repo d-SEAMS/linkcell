@@ -296,6 +296,50 @@ pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
   return out;
 }
 
+/// [`pairs_within`] with a periodicity mask.
+///
+/// `periodic[k]` false is an open axis. `closed` keeps the cutoff
+/// boundary. `exclude_self_images` drops `i == j`.
+[[nodiscard]] inline std::vector<ShiftedPair>
+pairs_within_pbc(const double *xyz, std::size_t n, const Cell &cell,
+                 const std::array<bool, 3> &periodic, double cutoff,
+                 const int *mask = nullptr, double cell_hint = 0.0,
+                 bool half = false, bool closed = false,
+                 bool exclude_self_images = false) {
+  if (n == 0 || xyz == nullptr) {
+    return {};
+  }
+  const int pbc[3] = {periodic[0] ? 1 : 0, periodic[1] ? 1 : 0,
+                      periodic[2] ? 1 : 0};
+  const lc_cell raw = cell.raw();
+  std::size_t count = 0;
+  const int status = lc_pairs_within_pbc(
+      xyz, detail::to_c_count(n, "n"), &raw, pbc, cutoff, mask, cell_hint,
+      half ? 1 : 0, closed ? 1 : 0, exclude_self_images ? 1 : 0, nullptr, 0,
+      &count);
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg)
+                            : std::string("linkcell: pairs_within_pbc failed"));
+  }
+  if (count == 0) {
+    return {};
+  }
+  std::vector<ShiftedPair> out(count);
+  std::size_t wrote = 0;
+  const int fill = lc_pairs_within_pbc(
+      xyz, detail::to_c_count(n, "n"), &raw, pbc, cutoff, mask, cell_hint,
+      half ? 1 : 0, closed ? 1 : 0, exclude_self_images ? 1 : 0,
+      reinterpret_cast<lc_pair *>(out.data()), count, &wrote);
+  if (fill != 0) {
+    const char *msg = lc_last_error();
+    throw Error(fill, msg ? std::string(msg)
+                          : std::string("linkcell: pairs_within_pbc failed"));
+  }
+  out.resize(wrote);
+  return out;
+}
+
 [[nodiscard]] inline const char *version() noexcept { return lc_version(); }
 
 } // namespace linkcell

@@ -65,6 +65,7 @@ linkcell_cargo = custom_target(
     'Cargo.lock',
     'src/lib.rs',
     'src/knearest.rs',
+    'src/pairs.rs',
     'src/cell.rs',
     'src/error.rs',
     'src/capi.rs',

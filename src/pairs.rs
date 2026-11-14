@@ -118,6 +118,148 @@ pub fn pairs_within(
     Ok(out)
 }
 
+/// [`pairs_within`] with a periodicity mask.
+///
+/// `pbc[k]` false means axis k is open. The open lattice row is replaced
+/// by an orthogonal vector longer than any pair inside the cutoff, so the
+/// minimum image on that axis is the raw difference, and a nonzero shift
+/// on an open axis is dropped. `closed` keeps `dist2 <= cutoff²` as well
+/// as the strict pairs. `exclude_self_images` drops `i == j`, including
+/// a periodic image of the source.
+pub fn pairs_within_pbc(
+    xyz: &[[f64; 3]],
+    rows: [[f64; 3]; 3],
+    origin: [f64; 3],
+    pbc: [bool; 3],
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+    closed: bool,
+    exclude_self_images: bool,
+) -> Result<Vec<Pair>, Error> {
+    let cell = if pbc == [true, true, true] {
+        Cell::from_vectors(rows[0], rows[1], rows[2], origin).map_err(|_| Error::BadBox)?
+    } else {
+        widened_open_axes(rows, origin, xyz, pbc, cutoff)?
+    };
+    let mut rows = match pairs_within(xyz, &cell, cutoff, mask, cell_hint, half) {
+        Ok(rows) => rows,
+        Err(Error::TooManyCells) if pbc != [true, true, true] => {
+            brute_open_axes(xyz, rows, origin, pbc, cutoff, mask, half)?
+        }
+        Err(err) => return Err(err),
+    };
+    if pbc != [true, true, true] {
+        rows.retain(|pair| {
+            pbc.iter()
+                .enumerate()
+                .all(|(axis, periodic)| *periodic || pair.shift[axis] == 0)
+        });
+    }
+    if closed {
+        let limit = cutoff * cutoff;
+        rows.retain(|pair| pair.dist2 <= limit);
+    }
+    if exclude_self_images {
+        rows.retain(|pair| pair.i != pair.j);
+    }
+    Ok(rows)
+}
+
+fn brute_open_axes(
+    xyz: &[[f64; 3]],
+    lattice: [[f64; 3]; 3],
+    origin: [f64; 3],
+    pbc: [bool; 3],
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    half: bool,
+) -> Result<Vec<Pair>, Error> {
+    let _ = origin;
+    let limit = cutoff * cutoff;
+    let mut span = [0i32; 3];
+    for axis in 0..3 {
+        if !pbc[axis] {
+            continue;
+        }
+        let len = (lattice[axis][0] * lattice[axis][0]
+            + lattice[axis][1] * lattice[axis][1]
+            + lattice[axis][2] * lattice[axis][2])
+            .sqrt();
+        span[axis] = if len > 0.0 {
+            ((cutoff / len).ceil() as i32 + 1).clamp(0, 12)
+        } else {
+            0
+        };
+    }
+    let mut out = Vec::new();
+    for i in 0..xyz.len() {
+        if mask.is_some_and(|m| !m[i]) {
+            continue;
+        }
+        for j in 0..xyz.len() {
+            if mask.is_some_and(|m| !m[j]) {
+                continue;
+            }
+            for sa in -span[0]..=span[0] {
+                for sb in -span[1]..=span[1] {
+                    for sc in -span[2]..=span[2] {
+                        let shift = [sa, sb, sc];
+                        if i == j && shift == [0, 0, 0] {
+                            continue;
+                        }
+                        if half && !keep_half(i, j, shift) {
+                            continue;
+                        }
+                        let mut delta = [
+                            xyz[j][0] - xyz[i][0],
+                            xyz[j][1] - xyz[i][1],
+                            xyz[j][2] - xyz[i][2],
+                        ];
+                        for axis in 0..3 {
+                            delta[0] += shift[axis] as f64 * lattice[axis][0];
+                            delta[1] += shift[axis] as f64 * lattice[axis][1];
+                            delta[2] += shift[axis] as f64 * lattice[axis][2];
+                        }
+                        let dist2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+                        if dist2 < limit {
+                            out.push(Pair { i, j, shift, dist2 });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn widened_open_axes(
+    rows_in: [[f64; 3]; 3],
+    origin: [f64; 3],
+    xyz: &[[f64; 3]],
+    pbc: [bool; 3],
+    cutoff: f64,
+) -> Result<Cell, Error> {
+    let mut rows = rows_in;
+    for axis in 0..3 {
+        if pbc[axis] {
+            continue;
+        }
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for point in xyz {
+            lo = lo.min(point[axis]);
+            hi = hi.max(point[axis]);
+        }
+        let span = if lo.is_finite() { (hi - lo).max(0.0) } else { 0.0 };
+        let length = 2.0 * span + 4.0 * cutoff + 10.0;
+        rows[axis] = [0.0, 0.0, 0.0];
+        rows[axis][axis] = length;
+    }
+    Cell::from_vectors(rows[0], rows[1], rows[2], origin).map_err(|_| Error::BadBox)
+}
+
 /// Ask Linux to back the 2 MB-aligned interior of a large buffer this
 /// library allocated with transparent huge pages, so the row stores take
 /// one page walk per 2 MB rather than per 4 KB. It is advice: the system's

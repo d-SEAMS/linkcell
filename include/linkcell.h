@@ -282,6 +282,28 @@ int lc_pairs_within_rows(const double *xyz,
                          size_t *out_count);
 
 /**
+ * [`lc_pairs_within_rows`] with a periodicity mask.
+ *
+ * `pbc[k]` nonzero means axis k is periodic. A null `pbc` is fully
+ * periodic. `closed` nonzero keeps `dist2 <= cutoff * cutoff`.
+ * `exclude_self_images` nonzero drops rows with `i == j`.
+ * Null `out` is a count query.
+ */
+int lc_pairs_within_pbc(const double *xyz,
+                        size_t n,
+                        const struct lc_cell *simbox,
+                        const int *pbc,
+                        double cutoff,
+                        const int *mask,
+                        double cell_hint,
+                        int half,
+                        int closed,
+                        int exclude_self_images,
+                        struct lc_pair *out,
+                        size_t cap,
+                        size_t *out_count);
+
+/**
  * Library version string. Process-static, NUL-terminated. Do not free.
  */
 const char *lc_version(void);

@@ -413,6 +413,108 @@ pub unsafe extern "C" fn lc_pairs_within_rows(
     0
 }
 
+/// [`lc_pairs_within_rows`] with a periodicity mask.
+///
+/// `pbc` is three ints. Nonzero means that axis is periodic. A null
+/// `pbc` is fully periodic. `closed` nonzero keeps `dist2 <= cutoff²`.
+/// `exclude_self_images` nonzero drops `i == j`.
+///
+/// Null `out` is a count query. Otherwise `out` holds `cap` rows.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `simbox` is one `lc_cell`.
+/// `pbc`, if non-null, is three ints. `mask`, if non-null, is `n` ints.
+/// `out_count` is writable. On a fill, `out` is writable for `cap` rows.
+#[no_mangle]
+pub unsafe extern "C" fn lc_pairs_within_pbc(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    pbc: *const c_int,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    half: c_int,
+    closed: c_int,
+    exclude_self_images: c_int,
+    out: *mut lc_pair,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if out_count.is_null() {
+        return fail_msg("null pointer");
+    }
+    if n == 0 {
+        unsafe { *out_count = 0 };
+        clear_error();
+        return 0;
+    }
+    if xyz.is_null() || simbox.is_null() {
+        return fail_msg("null pointer");
+    }
+    let box_c = unsafe { *simbox };
+    let rows = [
+        [box_c.ax, box_c.ay, box_c.az],
+        [box_c.bx, box_c.by, box_c.bz],
+        [box_c.cx, box_c.cy, box_c.cz],
+    ];
+    let origin = [box_c.ox, box_c.oy, box_c.oz];
+    let periodic = if pbc.is_null() {
+        [true, true, true]
+    } else {
+        let flags = unsafe { [*pbc, *pbc.add(1), *pbc.add(2)] };
+        [flags[0] != 0, flags[1] != 0, flags[2] != 0]
+    };
+    let pts = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_vec = if mask.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { std::slice::from_raw_parts(mask, n) }
+                .iter()
+                .map(|v| *v != 0)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let hint = if cell_hint > 0.0 { Some(cell_hint) } else { None };
+    let found = crate::pairs::pairs_within_pbc(
+        pts,
+        rows,
+        origin,
+        periodic,
+        cutoff,
+        mask_vec.as_deref(),
+        hint,
+        half != 0,
+        closed != 0,
+        exclude_self_images != 0,
+    );
+    let rows = match found {
+        Ok(rows) => rows,
+        Err(err) => return fail(err),
+    };
+    unsafe { *out_count = rows.len() };
+    if out.is_null() {
+        clear_error();
+        return 0;
+    }
+    if cap < rows.len() {
+        return fail_msg("pair buffer is shorter than the pair count");
+    }
+    let dest = unsafe { std::slice::from_raw_parts_mut(out, rows.len()) };
+    for (slot, pair) in dest.iter_mut().zip(rows) {
+        *slot = lc_pair {
+            i: pair.i as c_int,
+            j: pair.j as c_int,
+            shift: pair.shift,
+            dist2: pair.dist2,
+        };
+    }
+    clear_error();
+    0
+}
+
 /// Check the inputs, then take the parked search or run a new one.
 unsafe fn pairs_call<'a>(
     xyz: *const f64,
