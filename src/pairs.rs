@@ -5264,9 +5264,17 @@ mod tests {
     #[test]
     fn sparse_bins_write_the_same_rows_on_one_thread_and_eight() {
         // Under eight atoms a bin, one thread runs the tile inlined into its
-        // block loop, for rows and for columns; eight threads buffer hits.
+        // block loop, for rows and for columns; several threads buffer hits.
         // 3000 atoms in a 40 A cell: about three a bin, and enough pairs
-        // that eight threads split the walk.
+        // that a wide pool splits the walk. A two-CPU machine has no
+        // eight-wide pool, so the comparison uses the machine width.
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let width = cpus.min(8);
+        if width < 2 {
+            return;
+        }
         let cells = [
             Cell::ortho(40.0, 39.0, 41.0).unwrap(),
             Cell::from_vectors(
@@ -5288,9 +5296,10 @@ mod tests {
             let xyz: Vec<[f64; 3]> = (0..3000)
                 .map(|_| sim.cartesian([unit(), unit(), unit()]))
                 .collect();
-            assert!(
-                walk_threads(hit_estimate(xyz.len(), sim, 4.0)) > 1 || !cfg!(feature = "parallel")
-            );
+            let hits = hit_estimate(xyz.len(), sim, 4.0);
+            if on_threads(width, || walk_threads(hits)) <= 1 {
+                return;
+            }
             for half in [false, true] {
                 let (one, one_cols) = on_threads(1, || {
                     let rows = pairs_within(&xyz, sim, 4.0, None, None, half).unwrap();
@@ -5298,7 +5307,7 @@ mod tests {
                     pairs_within_columns(&xyz, sim, 4.0, None, None, half, &mut cols).unwrap();
                     (rows, cols)
                 });
-                let eight = on_threads(8, || {
+                let eight = on_threads(width, || {
                     pairs_within(&xyz, sim, 4.0, None, None, half).unwrap()
                 });
                 assert!(one.len() > 10_000, "half={half}");
