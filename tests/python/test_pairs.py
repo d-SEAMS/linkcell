@@ -29,6 +29,46 @@ def test_wrap_pair_keeps_the_caller_shift():
     assert abs(float(d2[row]) - 0.64) < 1e-12
 
 
+def test_open_cluster_is_the_cartesian_half_list():
+    # This frame is not used by any other test, so a stencil left in the
+    # process cache cannot already match it.
+    xyz = np.ascontiguousarray(
+        [[0.05, 0.17, 0.03], [1.11, 0.08, 0.04], [1.19, 0.46, 0.02], [7.4, 0.2, 0.15]],
+        dtype=np.float64,
+    )
+    cutoff = 1.61
+    before = linkcell.stencil_builds()
+    i, j, shift, d2 = _open(xyz, cutoff)
+    built = linkcell.stencil_builds() - before
+    assert built <= 1
+    i2, j2, shift2, d2_2 = _open(xyz, cutoff)
+    assert linkcell.stencil_builds() - before == built
+    assert i.tolist() == i2.tolist()
+    assert j.tolist() == j2.tolist()
+    assert shift.tolist() == shift2.tolist() == [[0, 0, 0]] * len(i)
+    assert d2.tolist() == d2_2.tolist()
+    cut2 = cutoff * cutoff
+    want = set()
+    for a in range(len(xyz)):
+        for b in range(a + 1, len(xyz)):
+            delta = xyz[b] - xyz[a]
+            if float(delta @ delta) < cut2:
+                want.add((a, b))
+    got = {(int(i[t]), int(j[t])) for t in range(len(i))}
+    assert got == want
+    assert all(float(d2[t]) < cut2 for t in range(len(d2)))
+
+
+def _open(xyz, cutoff):
+    i, j, shift, d2 = linkcell.pairs_open(xyz, cutoff)
+    return (
+        np.from_dlpack(i),
+        np.from_dlpack(j),
+        np.from_dlpack(shift),
+        np.from_dlpack(d2),
+    )
+
+
 def test_half_list_is_one_side():
     xyz = np.ascontiguousarray([[0.2, 0.0, 0.0], [9.4, 0.0, 0.0]], dtype=np.float64)
     cell = np.ascontiguousarray([10.0, 10.0, 10.0], dtype=np.float64)
