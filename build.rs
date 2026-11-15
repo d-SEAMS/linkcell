@@ -47,6 +47,12 @@ fn compile_knn_region() -> bool {
         .opt_level(2)
         .warnings(true)
         .extra_warnings(true);
+    // The region coordinates threads and does no arithmetic worth
+    // vectorising. Pin the x86_64 baseline so no host-specific ISA reaches
+    // a path that is not runtime-dispatched.
+    if target_is("CARGO_CFG_TARGET_ARCH", "x86_64") {
+        build.flag("-march=x86-64").flag("-mtune=generic");
+    }
     if let Err(err) = build.try_compile("knnregion") {
         if required {
             panic!("OpenMP k-nearest region: compiling src/knn_region.c failed: {err}");

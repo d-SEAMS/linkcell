@@ -94,7 +94,7 @@ cmake --install build
 ```
 
 ```cmake
-find_package(linkcell 0.3 REQUIRED)
+find_package(linkcell 0.4 REQUIRED)
 target_link_libraries(c_app PRIVATE linkcell::linkcell)
 target_link_libraries(cpp_app PRIVATE linkcell::cpp)
 target_link_libraries(device_app PRIVATE linkcell::gpu)

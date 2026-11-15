@@ -46,7 +46,7 @@ After `cmake --install` into `$PREFIX`:
 ```cmake
 cmake_minimum_required(VERSION 3.22)
 project(app LANGUAGES C)
-find_package(linkcell 0.3 REQUIRED)
+find_package(linkcell 0.4 REQUIRED)
 add_executable(app app.c)
 target_link_libraries(app PRIVATE linkcell::linkcell)
 ```

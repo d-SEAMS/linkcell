@@ -81,3 +81,8 @@ reason = "NEON fold, scan, and pair tile."
 symbol = 'linkcell::.*fold2.*'
 features = ["neon", "asimd"]
 reason = "NEON mesh fold registers."
+
+[[allow]]
+symbol = 'linkcell::skin_simd::(coded_avx|compact_avx512|distance_avx512).*'
+features = ["avx512f", "avx512vl", "avx2", "avx"]
+reason = "Skin-list AVX-512 kernels. Called only when simd::select() returns Path::Avx512."

@@ -231,7 +231,7 @@ fn fill_soa(ptr: *mut u8, len: usize, nontemporal: bool) {
 
 // AVX-512 intrinsics need Rust 1.89; this example is outside the MSRV.
 #[allow(clippy::incompatible_msrv)]
-#[target_feature(enable = "avx512f")]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f"))]
 unsafe fn stream_lines(ptr: *mut u8, n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
