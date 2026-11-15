@@ -1,8 +1,9 @@
 //! CPUs for Rayon workers.
 //!
-//! The caller records the process mask with `lc_set_places` before it
-//! pins itself. Workers then take those cpus instead of inheriting the
-//! caller's single cpu.
+//! The caller records the cpus this process may use with `lc_set_places`
+//! before it pins itself. Workers then take those cpus instead of
+//! inheriting the caller's single cpu. A later call replaces the list;
+//! a pool already built keeps the cpus it was started with.
 
 use std::ffi::c_int;
 #[cfg(feature = "parallel")]
@@ -11,8 +12,9 @@ use std::sync::Mutex;
 
 static PLACES: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
-/// CPUs Rayon workers may use. The first non-empty call wins, so record
-/// the process mask before pinning the caller. `n <= 0` is ignored.
+/// CPUs Rayon workers may use. Replaces any list recorded earlier.
+/// A pool that has already started keeps the cpus it was built with.
+/// `n <= 0` is ignored.
 #[no_mangle]
 pub extern "C" fn lc_set_places(cpus: *const c_int, n: c_int) {
     if cpus.is_null() || n <= 0 {
@@ -20,9 +22,7 @@ pub extern "C" fn lc_set_places(cpus: *const c_int, n: c_int) {
     }
     let incoming = unsafe { std::slice::from_raw_parts(cpus, n as usize) };
     let mut guard = PLACES.lock().unwrap_or_else(|err| err.into_inner());
-    if !guard.is_empty() {
-        return;
-    }
+    guard.clear();
     guard.extend_from_slice(incoming);
 }
 
