@@ -104,10 +104,7 @@ fn halo_radius_is_the_covering_integer() {
         bin_width: [1.0, 1.0, 1.0],
         weight: vec![1; 16],
     };
-    let mut assign = vec![0u32; 16];
-    for c in 0..16 {
-        assign[c] = if c < 8 { 0 } else { 1 };
-    }
+    let assign: Vec<u32> = (0..16).map(|c| if c < 8 { 0 } else { 1 }).collect();
     let ghosts = halo(&grid, &assign, 0, [0, 1, 0]).unwrap();
     assert!(ghosts.iter().all(|&c| assign[c as usize] == 1));
     assert!(!ghosts.is_empty());
@@ -145,11 +142,11 @@ fn brute_cut(graph: &CellGraph, parts: u32, balance_num: u64, balance_den: u64) 
         let mut assign = vec![0u32; n];
         let mut cursor = mask;
         let mut part_w = vec![0u64; parts as usize];
-        for cell in 0..n {
+        for (slot, &w) in assign.iter_mut().zip(&graph.grid.weight) {
             let domain = (cursor % parts as u64) as u32;
             cursor /= parts as u64;
-            assign[cell] = domain;
-            part_w[domain as usize] += graph.grid.weight[cell];
+            *slot = domain;
+            part_w[domain as usize] += w;
         }
         let legal = part_w.iter().all(|&w| {
             total == 0
@@ -318,7 +315,7 @@ fn rcb_on_cell_counts_matches_the_pair_graph() {
     let (num, den) = derived_balance(&graph.grid.weight, 8);
     let total: u64 = graph.grid.weight.iter().sum();
     let cap = (u128::from(total) * u128::from(num)) / (8 * u128::from(den));
-    let mut part = vec![0u64; 8];
+    let mut part = [0u64; 8];
     for (c, &d) in from_counts.iter().enumerate() {
         part[d as usize] += graph.grid.weight[c];
     }

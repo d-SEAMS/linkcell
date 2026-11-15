@@ -221,7 +221,6 @@ fn time_columns(xyz: &[[f64; 3]], cell: &Cell, masks: &[Vec<bool>], parts: u32) 
         joins
             .into_iter()
             .map(|join| join.join().expect("columns"))
-            .map(|(ns, rows)| (ns, rows))
             .fold((0u64, 0u64), |(slow, bytes), (ns, rows)| {
                 let col = 2 * std::mem::size_of::<i32>()
                     + std::mem::size_of::<[i32; 3]>()

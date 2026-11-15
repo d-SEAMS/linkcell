@@ -81,7 +81,8 @@ fn main() {
     // PERF_TYPE_HARDWARE cache-misses is config 3. LLC read-miss is the
     // cache event (level 2, op read, result miss).
     let (fd_miss, err_miss) = perf_open(0, 3);
-    let llc = 2u64 | (0u64 << 8) | (1u64 << 16);
+    // Cache level 2, op read (0 << 8), result miss (1 << 16).
+    let llc = 2u64 | (1u64 << 16);
     let (fd_llc, err_llc) = perf_open(3, llc);
     println!("perf hw_cache_misses fd={fd_miss} errno={err_miss}");
     println!("perf llc_read_miss fd={fd_llc} errno={err_llc}");
@@ -228,6 +229,8 @@ fn fill_soa(ptr: *mut u8, len: usize, nontemporal: bool) {
     }
 }
 
+// AVX-512 intrinsics need Rust 1.89; this example is outside the MSRV.
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "avx512f")]
 unsafe fn stream_lines(ptr: *mut u8, n: usize) {
     #[cfg(target_arch = "x86_64")]
