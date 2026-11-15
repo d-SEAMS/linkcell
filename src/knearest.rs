@@ -713,7 +713,7 @@ fn dispatch<const MODE: u8>(
     };
     let ncell = mesh.offsets.len() - 1;
     let span = (nx as usize).saturating_mul(ny as usize);
-    run_z_slabs(ncell, span, 64, |c| job(c));
+    run_z_slabs(ncell, span, 64, job);
 }
 
 /// Bins a side of the source blocks of [`dispatch_blocks`] for this mesh:

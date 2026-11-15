@@ -12,6 +12,10 @@
 //! feature. Distributed Scotch is the `ptscotch` feature. Both are off
 //! unless compiled in.
 
+// The kernels take the grid, the geometry and the part bounds as separate
+// arguments, as the recursive splits pass them down.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
@@ -348,8 +352,8 @@ pub fn halo(
     let nx = grid.nx;
     let ny = grid.ny;
     let nz = grid.nz;
-    for c in 0..n {
-        if assign[c] != domain {
+    for (c, &owner) in assign.iter().enumerate().take(n) {
+        if owner != domain {
             continue;
         }
         let (ix, iy, iz) = unravel(c, nx, ny);
@@ -1233,46 +1237,6 @@ fn contract(
     (coarse, ccoords, coarse_of)
 }
 
-fn rcb_on(
-    graph: &CellGraph,
-    coords: &[(f64, f64, f64)],
-    parts: u32,
-    refine_cuts: bool,
-    ratio: (u64, u64),
-) -> Vec<u32> {
-    let n = graph.grid.ncell();
-    let t_pack = Instant::now();
-    let mut x = vec![0.0; n];
-    let mut y = vec![0.0; n];
-    let mut z = vec![0.0; n];
-    for (i, p) in coords.iter().enumerate() {
-        x[i] = p.0;
-        y[i] = p.1;
-        z[i] = p.2;
-    }
-    let geom = RcbGeom {
-        x,
-        y,
-        z,
-        w: graph.grid.weight.clone(),
-    };
-    let mut ids: Vec<u32> = (0..n as u32).collect();
-    let mut out = vec![0u32; n];
-    PACK_NS.fetch_add(t_pack.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
-    let phase = rcb_slice(
-        &mut ids,
-        parts,
-        0,
-        &geom,
-        SendPtr(out.as_mut_ptr()),
-        graph,
-        refine_cuts,
-        ratio,
-    );
-    record_phase(phase);
-    out
-}
-
 fn ptscotch_assign(graph: &CellGraph, parts: u32, ratio: (u64, u64)) -> Result<Vec<u32>, Error> {
     #[cfg(not(feature = "ptscotch"))]
     {
@@ -1501,9 +1465,9 @@ fn curve_assign(graph: &CellGraph, parts: u32, method: Method) -> Result<Vec<u32
         Method::Hilbert | Method::HilbertFm => {
             let bits = hilbert_bits(graph.grid.nx, graph.grid.ny, graph.grid.nz);
             let mut keys = vec![0u64; n];
-            for c in 0..n {
+            for (c, key) in keys.iter_mut().enumerate() {
                 let (x, y, z) = unravel(c, graph.grid.nx, graph.grid.ny);
-                keys[c] = hilbert_key(x as u32, y as u32, z as u32, bits);
+                *key = hilbert_key(x as u32, y as u32, z as u32, bits);
             }
             order.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]).then(a.cmp(&b)));
         }
@@ -1861,9 +1825,7 @@ fn weighted_cut_bins(
     }
     let (cut_b, before_w, before_n) = cut_bin.unwrap_or((bins, before_w, before_n));
     let cut_c = min_c + cut_b as i64;
-    let take = if cut_b >= bins {
-        0
-    } else if owner_of(before_w, 0, total, parts) >= parts_l {
+    let take = if cut_b >= bins || owner_of(before_w, 0, total, parts) >= parts_l {
         0
     } else {
         bin_take(ids, geom, axis, cut_c, before_w, total, parts, parts_l)
@@ -2427,6 +2389,7 @@ fn descend(
             },
         );
         let wall = t_join.elapsed().as_nanos() as u64;
+        #[allow(clippy::needless_return)]
         return join_measured(a, b, wall);
     }
     #[cfg(not(feature = "parallel"))]
@@ -3208,7 +3171,10 @@ fn under_balance(weight: u64, total: u64, parts: u32, ratio: (u64, u64)) -> bool
 }
 
 fn bins_needed(length: f64, width: f64) -> Result<u32, Error> {
-    if !(length > 0.0) || !(width > 0.0) {
+    // A NaN length or width fails `> 0.0` and needs no bins.
+    if length.partial_cmp(&0.0) != Some(Ordering::Greater)
+        || width.partial_cmp(&0.0) != Some(Ordering::Greater)
+    {
         return Ok(0);
     }
     let q = length / width;
@@ -3432,13 +3398,13 @@ pub fn hilbert_key(x: u32, y: u32, z: u32, bits: u32) -> u64 {
         }
         q >>= 1;
     }
-    for i in 0..3 {
-        p[i] ^= t;
+    for v in &mut p {
+        *v ^= t;
     }
     let mut key = 0u64;
     for b in (0..bits).rev() {
-        for i in 0..3 {
-            key = (key << 1) | u64::from((p[i] >> b) & 1);
+        for v in &p {
+            key = (key << 1) | u64::from((v >> b) & 1);
         }
     }
     key

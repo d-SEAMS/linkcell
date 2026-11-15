@@ -995,6 +995,7 @@ fn park(key: &PairKey<'_>, found: crate::pairs::Found) {
     PARKED_PAIRS.with(|slot| *slot.borrow_mut() = Some(parked));
 }
 
+#[allow(clippy::type_complexity)]
 unsafe fn load_frame<'a>(
     xyz: *const f64,
     n: usize,
