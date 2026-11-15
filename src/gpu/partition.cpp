@@ -89,10 +89,44 @@ uint32_t owner_of(uint64_t before, uint64_t weight, uint64_t total, uint32_t par
   if (total == 0 || parts == 0) {
     return 0;
   }
+#if defined(__SIZEOF_INT128__)
   unsigned __int128 num =
       (static_cast<unsigned __int128>(2) * before + weight) * parts;
   unsigned __int128 den = static_cast<unsigned __int128>(2) * total;
   uint32_t owner = static_cast<uint32_t>(num / den);
+#else
+  // No 128-bit integer (MSVC): the same quotient from a two-word
+  // numerator and a 65-bit denominator, by restoring long division.
+  uint64_t a_lo = before << 1;
+  uint64_t a_hi = before >> 63;
+  const uint64_t a_sum = a_lo + weight;
+  a_hi += a_sum < a_lo ? 1 : 0;
+  a_lo = a_sum;
+  // (a_hi:a_lo) * parts, a_hi is at most 2, parts below 2^32.
+  const uint64_t lo_lo = (a_lo & 0xffffffffu) * parts;
+  const uint64_t lo_hi = (a_lo >> 32) * parts;
+  uint64_t n_lo = lo_lo + (lo_hi << 32);
+  uint64_t n_hi = a_hi * parts + (lo_hi >> 32) + (n_lo < lo_lo ? 1 : 0);
+  const uint64_t d_lo = total << 1;
+  const uint64_t d_hi = total >> 63;
+  uint64_t r_hi = 0;
+  uint64_t r_lo = 0;
+  uint64_t q = 0;
+  for (int bit = 127; bit >= 0; --bit) {
+    const uint64_t in = bit >= 64 ? (n_hi >> (bit - 64)) & 1u : (n_lo >> bit) & 1u;
+    r_hi = (r_hi << 1) | (r_lo >> 63);
+    r_lo = (r_lo << 1) | in;
+    if (r_hi > d_hi || (r_hi == d_hi && r_lo >= d_lo)) {
+      const uint64_t borrow = r_lo < d_lo ? 1 : 0;
+      r_lo -= d_lo;
+      r_hi -= d_hi + borrow;
+      if (bit < 64) {
+        q |= uint64_t{1} << bit;
+      }
+    }
+  }
+  uint32_t owner = q >= parts ? parts : static_cast<uint32_t>(q);
+#endif
   if (owner >= parts) {
     owner = parts - 1;
   }
