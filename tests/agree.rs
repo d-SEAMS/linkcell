@@ -824,3 +824,17 @@ fn exact_distance_ties_keep_the_smaller_index() {
         assert_eq!(brute[2].dist2, vec![1.0]);
     }
 }
+
+#[test]
+fn block_face_tie_keeps_the_smaller_index() {
+    // Both neighbours sit at distance 5 from source 2. Point 0 is on the
+    // gathered block's face, so the block answer must not win the tie.
+    let cell = Cell::ortho(40.0, 40.0, 40.0).unwrap();
+    let xyz = [[7.5, 2.5, 2.5], [5.5, 6.5, 2.5], [2.5, 2.5, 2.5]];
+    let linked = knearest(&xyz, &cell, 1, None, Some(2.5)).unwrap();
+    let brute = knearest_brute(&xyz, &cell, 1, None).unwrap();
+    assert_eq!(linked[2].indices, vec![0]);
+    assert_eq!(brute[2].indices, vec![0]);
+    assert_eq!(linked[2].dist2, vec![25.0]);
+    assert_eq!(brute[2].dist2, vec![25.0]);
+}

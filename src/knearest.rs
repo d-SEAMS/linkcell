@@ -867,7 +867,7 @@ fn select_one_block<const MODE: u8>(
                         scan_at(path, cand, pi, i, heap);
                     }
                     let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
-                    if heap.full() && heap.worst() <= bound {
+                    if heap.full() && heap.worst() < bound {
                         heap.write_sorted(row, row_d2);
                     } else {
                         walk_source::<MODE>(
@@ -891,7 +891,7 @@ fn select_one_block<const MODE: u8>(
 /// [`dispatch`] by blocks of `side` bins a side: a block's sources share
 /// one candidate list, the occupants of the `side + 2` bins a side around
 /// the block with their images, gathered once. When a source's k-th
-/// neighbour is within the plane bound of the gathered bins, the answer
+/// neighbour is closer than the plane bound of the gathered bins, the answer
 /// is among the candidates: every other point lies strictly past one of
 /// those planes. Distances are formed as [`visit_cell`] forms them and
 /// the heap keeps the same k, so every row is the shell walk's; a source
