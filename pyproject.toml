@@ -24,9 +24,9 @@ dependencies = []
 test = ["pytest>=8.0", "numpy>=1.26"]
 
 [project.urls]
-Homepage = "https://github.com/d-SEAMS/linkcell"
+Homepage = "https://d-seams.github.io/linkcell/"
 Repository = "https://github.com/d-SEAMS/linkcell"
-Documentation = "https://docs.rs/linkcell"
+Documentation = "https://d-seams.github.io/linkcell/"
 
 [tool.maturin]
 manifest-path = "python/Cargo.toml"
