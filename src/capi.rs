@@ -142,7 +142,20 @@ pub extern "C" fn lc_set_continuation(
 /// GPU library calls this from a static initializer when it is loaded. A
 /// null `f` removes it, and the device partition then reports no device.
 #[no_mangle]
-pub extern "C" fn lc_set_gpu_curve_split(f: Option<crate::partition::DeviceCurveFn>) {
+pub extern "C" fn lc_set_gpu_curve_split(
+    f: Option<
+        unsafe extern "C" fn(
+            atom_bin: *const u32,
+            natom: usize,
+            coords: *const u32,
+            ncell: usize,
+            parts: u32,
+            assign: *mut u32,
+            out_weight: *mut u64,
+            method: u8,
+        ) -> i32,
+    >,
+) {
     crate::partition::register_device_curve(f);
 }
 

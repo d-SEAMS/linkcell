@@ -3471,7 +3471,11 @@ unsafe fn call_device_curve(
     // SAFETY: only register_device_curve stores a nonzero value, and it
     // stores a DeviceCurveFn.
     let f: DeviceCurveFn = unsafe { std::mem::transmute::<usize, DeviceCurveFn>(raw) };
-    unsafe { f(atom_bin, natom, coords, ncell, parts, assign, out_weight, method) }
+    unsafe {
+        f(
+            atom_bin, natom, coords, ncell, parts, assign, out_weight, method,
+        )
+    }
 }
 
 /// C ABI method code. Unknown codes are [`Error::BadPartition`].
