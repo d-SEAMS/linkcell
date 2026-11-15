@@ -521,7 +521,9 @@ fn frame_points<'py>(
     let xyz_buf = take_f64(xyz)?;
     let (pts, _n, n_frames) = parse_xyz(&xyz_buf)?;
     if n_frames != 1 {
-        return Err(PyValueError::new_err("xyz must be one frame of shape (n, 3)"));
+        return Err(PyValueError::new_err(
+            "xyz must be one frame of shape (n, 3)",
+        ));
     }
     Ok((pts, sim))
 }

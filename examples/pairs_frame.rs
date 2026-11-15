@@ -75,9 +75,7 @@ fn main() {
         xyz.len(),
         pairs.len()
     );
-    println!(
-        "pop shape=frame-{n} threads={threads} n={n} reps={reps} wall_ns={wall_ns}"
-    );
+    println!("pop shape=frame-{n} threads={threads} n={n} reps={reps} wall_ns={wall_ns}");
     if std::env::var("PAIRS_SPLIT").ok().as_deref() == Some("1") {
         for _ in 0..3 {
             let ncount = pairs_within_count(&xyz, &cell, 4.0, None, None, false).expect("count");

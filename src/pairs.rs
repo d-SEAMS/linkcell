@@ -3662,9 +3662,7 @@ unsafe fn avx512_fused<
     // A bin longer than the buffer keeps the one-source loop.
     const QUAD: usize = 4;
     const QUAD_CAP: usize = 192;
-    let quad = !block.tri
-        && block.i_hi - block.i_lo >= QUAD
-        && j_hi - block.j_lo <= QUAD_CAP;
+    let quad = !block.tri && block.i_hi - block.i_lo >= QUAD && j_hi - block.j_lo <= QUAD_CAP;
     let cull_box = !block.tri && c.cull && nvec >= CULL_RUNS;
     /// One target run against `ns` sources. Distances use the same
     /// products as [`direct_vec`].
@@ -3727,7 +3725,7 @@ unsafe fn avx512_fused<
                     let m = ($cnt[k] - h).min(8);
                     let d2v = _mm512_loadu_pd(($d2b[k].as_ptr() as *const f64).add(h));
                     let jids = _mm256_loadu_si256(
-                        ($idb[k].as_ptr() as *const i32).add(h) as *const __m256i,
+                        ($idb[k].as_ptr() as *const i32).add(h) as *const __m256i
                     );
                     let mask = ((1u32 << m) - 1) as u8;
                     emit!(mask, iu, d2v, jids);

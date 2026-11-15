@@ -37,7 +37,12 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+            .unwrap_or_else(|_| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap()
+            });
         *guard = Some(Slot { n, pool });
     }
     guard.as_ref().unwrap().pool.install(work)
@@ -47,11 +52,7 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
 /// on the calling thread. `n < 0` selects one thread.
 #[no_mangle]
 pub extern "C" fn lc_set_threads(n: c_int) {
-    let n = if n < 0 {
-        1
-    } else {
-        n as usize
-    };
+    let n = if n < 0 { 1 } else { n as usize };
     WANTED_THREADS.store(n, Ordering::Relaxed);
 }
 
@@ -1025,7 +1026,11 @@ unsafe fn load_frame<'a>(
         let raw = unsafe { std::slice::from_raw_parts(mask, n) };
         Some(raw.iter().map(|&v| v != 0).collect())
     };
-    let hint = if cell_hint > 0.0 { Some(cell_hint) } else { None };
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
     Ok((pts, sim, mask_vec, hint))
 }
 
@@ -1077,11 +1082,10 @@ pub unsafe extern "C" fn lc_cell_grid(
     if out_ncell.is_null() {
         return fail_msg("null pointer");
     }
-    let (pts, sim, mask_vec, hint) =
-        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
-            Ok(v) => v,
-            Err(rc) => return rc,
-        };
+    let (pts, sim, mask_vec, hint) = match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
     let grid = match crate::cell_grid(pts, &sim, cutoff, mask_vec.as_deref(), hint) {
         Ok(grid) => grid,
         Err(err) => return fail(err),
@@ -1138,11 +1142,10 @@ pub unsafe extern "C" fn lc_cell_graph(
     if out_ncell.is_null() || out_arcs.is_null() {
         return fail_msg("null pointer");
     }
-    let (pts, sim, mask_vec, hint) =
-        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
-            Ok(v) => v,
-            Err(rc) => return rc,
-        };
+    let (pts, sim, mask_vec, hint) = match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
     let graph = match crate::cell_graph(pts, &sim, cutoff, mask_vec.as_deref(), hint) {
         Ok(graph) => graph,
         Err(err) => return fail(err),
@@ -1216,11 +1219,10 @@ pub unsafe extern "C" fn lc_partition(
     if parts == 0 || parts > u32::MAX as usize {
         return fail(Error::BadPartition);
     }
-    let (pts, sim, mask_vec, hint) =
-        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
-            Ok(v) => v,
-            Err(rc) => return rc,
-        };
+    let (pts, sim, mask_vec, hint) = match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
     let method = match crate::partition::method_from_c(method) {
         Ok(method) => method,
         Err(err) => return fail(err),
@@ -1391,11 +1393,10 @@ pub unsafe extern "C" fn lc_mesh_cut(
     if parts == 0 || parts > u32::MAX as usize {
         return fail(Error::BadPartition);
     }
-    let (pts, sim, mask_vec, hint) =
-        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
-            Ok(v) => v,
-            Err(rc) => return rc,
-        };
+    let (pts, sim, mask_vec, hint) = match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
     let method = match crate::partition::method_from_c(method) {
         Ok(method) => method,
         Err(err) => return fail(err),

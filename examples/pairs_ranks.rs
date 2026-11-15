@@ -9,9 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use linkcell::{
-    cell_grid, halo, halo_width, pairs_within, partition, Cell, Method, PartRequest,
-};
+use linkcell::{cell_grid, halo, halo_width, pairs_within, partition, Cell, Method, PartRequest};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
