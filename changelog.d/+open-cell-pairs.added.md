@@ -1,1 +1,0 @@
-Open clusters use occupied Cartesian bins. An open axis is not padded into a periodic box, and the partner stencil is rebuilt only when the bounding bins change. `lc_stencil_builds` counts builds. `pairs_open` is the Cartesian half list.
