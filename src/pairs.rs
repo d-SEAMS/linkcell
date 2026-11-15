@@ -601,9 +601,9 @@ fn walk_threads(hits: usize) -> usize {
 
 /// glibc drops a large free buffer (`MADV_DONTNEED`) and the next cutoff
 /// list faults every page. Keep those pages on the heap. The knobs are
-/// `M_TRIM_THRESHOLD` and `M_MMAP_THRESHOLD`.
+/// `M_TRIM_THRESHOLD` and `M_MMAP_THRESHOLD`. musl has no `mallopt`.
 fn retain_pair_pages() {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::sync::Once;
         static ONCE: Once = Once::new();
