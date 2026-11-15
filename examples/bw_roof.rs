@@ -87,8 +87,9 @@ mod linux {
         let (fd_llc, err_llc) = perf_open(3, llc);
         println!("perf hw_cache_misses fd={fd_miss} errno={err_miss}");
         println!("perf llc_read_miss fd={fd_llc} errno={err_llc}");
-        let line = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list")
-            .unwrap_or_default();
+        let line =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list")
+                .unwrap_or_default();
         println!("l3_shared_cpu_list {}", line.trim());
         let nodes = std::fs::read_dir("/sys/devices/system/node")
             .map(|d| {
@@ -249,7 +250,6 @@ mod linux {
             let _ = (ptr, n);
         }
     }
-
 }
 
 #[cfg(target_os = "linux")]

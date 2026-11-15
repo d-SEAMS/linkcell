@@ -12,8 +12,8 @@ mod linux {
     use std::time::Instant;
 
     use linkcell::{
-        halo_width, mesh_cut, owned_cells, pairs_within_columns, pairs_within_into, rank_mask, Cell,
-        Method, Pair, PairColumns, PartRequest,
+        halo_width, mesh_cut, owned_cells, pairs_within_columns, pairs_within_into, rank_mask,
+        Cell, Method, Pair, PairColumns, PartRequest,
     };
 
     fn env_usize(key: &str, default: usize) -> usize {
@@ -98,7 +98,8 @@ mod linux {
                             rank_mask(&cut.grid, &cut.assign, &cut.point_cell, cells, rank, width);
                         let paint_ns = t_paint.elapsed().as_nanos() as u64;
                         let bytes: Vec<u8> = view.mask.iter().map(|m| u8::from(*m)).collect();
-                        fs::write(dir.join(format!("mask-{parts}-{rank}.bin")), &bytes).expect("mask");
+                        fs::write(dir.join(format!("mask-{parts}-{rank}.bin")), &bytes)
+                            .expect("mask");
                         (view, paint_ns)
                     }));
                 }
@@ -212,7 +213,8 @@ mod linux {
                 joins.push(scope.spawn(move || {
                     pin((rank as usize) % ncores);
                     let mut cols = PairColumns::default();
-                    let _ = pairs_within_columns(xyz, cell, 4.0, Some(mask), None, false, &mut cols);
+                    let _ =
+                        pairs_within_columns(xyz, cell, 4.0, Some(mask), None, false, &mut cols);
                     let t = Instant::now();
                     pairs_within_columns(xyz, cell, 4.0, Some(mask), None, false, &mut cols)
                         .expect("columns");
@@ -268,7 +270,6 @@ mod linux {
         fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
         fn sched_getcpu() -> i32;
     }
-
 }
 
 #[cfg(target_os = "linux")]
