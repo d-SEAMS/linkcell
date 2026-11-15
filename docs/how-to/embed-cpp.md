@@ -68,5 +68,14 @@ A general parallelepiped cell is `linkcell::Cell::from_vectors(a, b, c, origin)`
 `mask` is an optional `const int *` of length `n` (nonzero keeps the point).
 `cell_hint <= 0` selects the default bin edge.
 
+An open cluster is `linkcell::pairs_open`.
+The rows are the Cartesian half list.
+`linkcell::pairs_within_pbc` takes a periodicity mask, and `linkcell::stencil_builds()` counts partner stencils that were built.
+
+```cpp
+const auto rows = linkcell::pairs_open(xyz, n, 2.5);
+const auto builds = linkcell::stencil_builds();
+```
+
 Signatures: [C ABI](../reference/c-api.md).
 First program: [two points](../tutorials/two-points.md).

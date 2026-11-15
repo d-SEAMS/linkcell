@@ -188,6 +188,10 @@ Map: [docs/index.md](docs/index.md).
 - The cell is a general parallelepiped: three lattice vectors plus an origin.
   Orthorhombic boxes are `Cell::ortho` / `lc_cell_ortho`.
   Binning is in fractional space, so a sheared dump is not treated as orthogonal.
+- An open axis is not padded into a periodic box.
+  `pairs_open` / `lc_pairs_open` bins the occupied Cartesian cells and returns the half list (`i < j`, shift zero).
+  The partner stencil is rebuilt only when those bounding bins change, and `lc_stencil_builds` counts the builds.
+  `pairs_within_pbc` is the same list with a periodicity mask; a fully periodic mask is `pairs_within`.
 - Points fold into the primary cell once.
   Each source then grows a rectangular box of neighbour cells, one direction at a time.
   Pair distances are a Cartesian subtract plus that cell's lattice translation (`dist2_shifted` and `lattice_shift`), the vesin / LAMMPS ghost construction.

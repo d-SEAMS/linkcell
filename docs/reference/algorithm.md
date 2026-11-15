@@ -67,6 +67,14 @@ On Linux the pair buffer stays on the heap, so a repeated call reuses those page
 The C, C++, and Python entries are that list (`lc_pairs_within`, `linkcell::pairs_within`, `linkcell.pairs_within`).
 A cutoff neighbour list is this call.
 
+An open axis has no image.
+`pairs_open` bins the occupied Cartesian cells and returns the half list (`i < j`, shift zero).
+The partner stencil is rebuilt when the bounding bins change and kept while atoms move inside them.
+`lc_stencil_builds` counts the builds.
+Padding the open axis into a periodic box instead makes that stencil follow the bounding span.
+`pairs_within_pbc` is the same walk with a periodicity mask.
+A fully periodic mask is `pairs_within`.
+
 The bins are one fold, one count per key, a scan, and a fill of the slot columns in bin order: positions, positions relative to the bin corner, their squared length, and the atom index.
 The fold writes position and key columns, with the key formed in registers from the eight-wide fold; the scan steps bin indices rather than dividing; then the atom numbers are sorted by key and every slot column is filled front to back, so the random accesses are reads of the fold.
 For 4096 atoms on one thread the bins take 0.038 ms (0.044 ms shuffled), against 0.061 and 0.082 ms with the key formed per lane and a scatter into the slot columns.

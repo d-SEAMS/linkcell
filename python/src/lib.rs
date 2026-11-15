@@ -12,8 +12,8 @@ use dlpk::sys::{
 use dlpk::DLPackTensor;
 use linkcell::{
     cell_graph, cell_grid, halo, halo_width, knearest_into_d2, knearest_into_many, lc_cell,
-    pairs_within_columns, partition, Cell, Method, NeighborCalc, PairColumns, PartRequest,
-    VesinOptions,
+    pairs_open, pairs_within_columns, pairs_within_pbc, partition, stencil_builds, Cell, Method,
+    NeighborCalc, PairColumns, PartRequest, PbcQuery, VesinOptions,
 };
 use ndarray::{Array1, Array2, Array3};
 
@@ -704,6 +704,147 @@ fn halo_py<'py>(
     to_pydlpack(py, Array1::from_vec(ids))
 }
 
+fn pack_columns<'py>(py: Python<'py>, cols: PairColumns) -> PyResult<PairPack> {
+    let n_pairs = cols.len();
+    let shift = {
+        let mut rows = std::mem::ManuallyDrop::new(cols.shift);
+        unsafe {
+            Vec::from_raw_parts(
+                rows.as_mut_ptr().cast::<i32>(),
+                rows.len() * 3,
+                rows.capacity() * 3,
+            )
+        }
+    };
+    let i_a = Array1::from_vec(cols.i);
+    let j_a = Array1::from_vec(cols.j);
+    let s_a = Array2::from_shape_vec((n_pairs, 3), shift)
+        .map_err(|e| PyRuntimeError::new_err(format!("shape: {e}")))?;
+    let d_a = Array1::from_vec(cols.dist2);
+    Ok((
+        to_pydlpack(py, i_a)?,
+        to_pydlpack(py, j_a)?,
+        to_pydlpack(py, s_a)?,
+        to_pydlpack(py, d_a)?,
+    ))
+}
+
+fn columns_of(rows: Vec<linkcell::Pair>) -> PyResult<PairColumns> {
+    let mut cols = PairColumns::default();
+    cols.i.reserve(rows.len());
+    cols.j.reserve(rows.len());
+    cols.shift.reserve(rows.len());
+    cols.dist2.reserve(rows.len());
+    for pair in rows {
+        if pair.i > i32::MAX as usize || pair.j > i32::MAX as usize {
+            return Err(PyRuntimeError::new_err("pair index overflows int32"));
+        }
+        cols.i.push(pair.i as i32);
+        cols.j.push(pair.j as i32);
+        cols.shift.push(pair.shift);
+        cols.dist2.push(pair.dist2);
+    }
+    Ok(cols)
+}
+
+/// Cartesian half pair list of an open cluster.
+///
+/// `xyz` is float64 `(n, 3)`. Each row has `i < j`, shift zero, and
+/// squared distance strictly below `cutoff` squared. Returns
+/// `(i, j, S, dist2)` in the same layout as [`pairs_within`].
+#[pyfunction]
+#[pyo3(name = "pairs_open", signature = (xyz, cutoff, cell_hint=None))]
+fn pairs_open_py<'py>(
+    py: Python<'py>,
+    xyz: &Bound<'py, PyAny>,
+    cutoff: f64,
+    cell_hint: Option<f64>,
+) -> PyResult<PairPack> {
+    if peek_cuda(xyz)? {
+        return Err(PyValueError::new_err(
+            "pairs_open reads host tensors; move xyz to the CPU",
+        ));
+    }
+    let xyz_buf = take_f64(xyz)?;
+    let (pts, _n, n_frames) = parse_xyz(&xyz_buf)?;
+    if n_frames != 1 {
+        return Err(PyValueError::new_err(
+            "pairs_open takes one frame; xyz shape is (n, 3)",
+        ));
+    }
+    let hint = cell_hint.filter(|h| *h > 0.0);
+    let rows = py
+        .detach(|| pairs_open(&pts, cutoff, hint))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    pack_columns(py, columns_of(rows)?)
+}
+
+/// Cutoff pairs with a periodicity mask.
+///
+/// `periodic` is a bool or three bools. False is an open axis. A fully
+/// periodic mask is [`pairs_within`]. Returns `(i, j, S, dist2)`.
+#[pyfunction]
+#[pyo3(
+    name = "pairs_within_pbc",
+    signature = (xyz, cell, periodic, cutoff, mask=None, cell_hint=None, half=false, closed=false, exclude_self_images=false)
+)]
+fn pairs_within_pbc_py<'py>(
+    py: Python<'py>,
+    xyz: &Bound<'py, PyAny>,
+    cell: &Bound<'py, PyAny>,
+    periodic: &Bound<'py, PyAny>,
+    cutoff: f64,
+    mask: Option<&Bound<'py, PyAny>>,
+    cell_hint: Option<f64>,
+    half: bool,
+    closed: bool,
+    exclude_self_images: bool,
+) -> PyResult<PairPack> {
+    if peek_cuda(xyz)? {
+        return Err(PyValueError::new_err(
+            "pairs_within_pbc reads host tensors; move xyz to the CPU",
+        ));
+    }
+    let periodic = periodic_flags(periodic)?;
+    let xyz_buf = take_f64(xyz)?;
+    let (pts, n, n_frames) = parse_xyz(&xyz_buf)?;
+    if n_frames != 1 {
+        return Err(PyValueError::new_err(
+            "pairs_within_pbc takes one frame; xyz shape is (n, 3)",
+        ));
+    }
+    let cell_buf = take_f64(cell)?;
+    let sim = match parse_cell(&cell_buf) {
+        Ok((sim, _)) => sim,
+        Err(_) if periodic == [false, false, false] => {
+            Cell::ortho(1.0, 1.0, 1.0).map_err(|e| PyValueError::new_err(e.to_string()))?
+        }
+        Err(err) => return Err(err),
+    };
+    let mask_vec = match mask {
+        None => None,
+        Some(m) => Some(take_mask(m, n)?),
+    };
+    let hint = cell_hint.filter(|h| *h > 0.0);
+    let mut query = PbcQuery::new(periodic, cutoff)
+        .cell_hint(hint)
+        .half(half)
+        .closed(closed)
+        .exclude_self_images(exclude_self_images);
+    query.mask = mask_vec.as_deref();
+    let rows = py
+        .detach(|| pairs_within_pbc(&pts, &sim, &query))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    pack_columns(py, columns_of(rows)?)
+}
+
+/// Partner stencils built in this process. A reused stencil does not count.
+#[pyfunction]
+#[pyo3(name = "stencil_builds")]
+fn stencil_builds_py() -> u64 {
+    stencil_builds()
+}
+
 #[pyfunction]
 fn gpu_available() -> bool {
     gpu::available()
@@ -882,6 +1023,9 @@ fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(partition_py, m)?)?;
     m.add_function(wrap_pyfunction!(halo_width_py, m)?)?;
     m.add_function(wrap_pyfunction!(halo_py, m)?)?;
+    m.add_function(wrap_pyfunction!(pairs_open_py, m)?)?;
+    m.add_function(wrap_pyfunction!(pairs_within_pbc_py, m)?)?;
+    m.add_function(wrap_pyfunction!(stencil_builds_py, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
     m.add_class::<PyNeighborList>()?;
     m.add_class::<PyDLPack>()?;

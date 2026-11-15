@@ -66,6 +66,7 @@ linkcell_cargo = custom_target(
     'src/lib.rs',
     'src/knearest.rs',
     'src/bins.rs',
+    'src/open_cell.rs',
     'src/cell.rs',
     'src/error.rs',
     'src/capi.rs',

@@ -140,6 +140,7 @@ mod bins;
 mod cell;
 mod error;
 mod knearest;
+mod open_cell;
 mod pairs;
 mod partition;
 mod pop;
@@ -170,6 +171,7 @@ pub use partition::{
     rank_mask, replicate_graph, score, timer_resolution_ns, CellGraph, CellGrid, MeshCut, Method,
     PartRequest, PartScore, RankMask, DEFAULT_METHOD,
 };
+pub use open_cell::{cell_for_pbc, pairs_open, pairs_within_pbc, stencil_builds, PbcQuery};
 pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
     reset as pop_reset, snapshot as pop_snapshot,
