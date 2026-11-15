@@ -406,7 +406,7 @@ pub(super) fn run(
         parts.counts.resize(ncell, 0);
     }
     let mut mesh = assemble(parts, nbin, widths);
-    let side = super::block_side(&mesh, nbin);
+    let side = super::block_side(mesh.occupants.len(), nbin);
     let (n_select, blocks, side_i) = if let Some(side) = side {
         let blocks = [
             (nbin[0] + side - 1) / side,

@@ -15,7 +15,7 @@ use crate::Error;
 /// Below this many active points the mesh stays serial. The cubic hot
 /// path is 4096 points, and a parallel histogram there costs more than
 /// the fold. The fused team query starts at the same count.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", linkcell_openmp))]
 pub(crate) const PARALLEL_MESH: usize = 8_192;
 
 const MAX_CELLS: i64 = 16_777_216;
@@ -137,11 +137,6 @@ impl Mesh {
             buf.folded.resize(n, [0.0; 3]);
             buf.key.resize(n, 0);
         }
-
-        #[cfg(feature = "parallel")]
-        let parallel = n_active >= PARALLEL_MESH && crate::pool_width() > 1;
-        #[cfg(not(feature = "parallel"))]
-        let parallel = false;
         if buf.offsets.len() != ncell + 1 {
             buf.offsets.clear();
             buf.offsets.resize(ncell + 1, 0);
@@ -153,81 +148,49 @@ impl Mesh {
         buf.counts.resize(ncell, 0);
         buf.next_slot.resize(ncell, 0);
 
-        if parallel {
-            #[cfg(feature = "parallel")]
-            {
-                bin_parallel(
-                    xyz,
-                    simbox,
-                    ids,
-                    [nx, ny, nz],
-                    MeshScratch {
-                        frac: &mut buf.frac,
-                        folded: &mut buf.folded,
-                        key: &mut buf.key,
-                    },
-                );
-                count_parallel(ids, &buf.key, &mut buf.counts);
-                prefix_parallel(&buf.counts, &mut buf.offsets);
-                scatter_parallel(
-                    ids,
-                    &buf.key,
-                    &buf.offsets,
-                    &mut buf.next_slot,
-                    SlotOut {
-                        frac: &buf.frac,
-                        folded: &buf.folded,
-                        occupants: &mut buf.occupants,
-                        slot_frac: &mut buf.slot_frac,
-                        slot_folded: &mut buf.slot_folded,
-                    },
-                );
-            }
-        } else {
-            let _pop = crate::pop::JobTimer::new();
-            let mut start = 0usize;
-            if let Active::All(len) = ids {
-                let path = crate::simd::select();
-                let counts = &mut buf.counts;
-                start = fold_mesh_at(
-                    path,
-                    simbox,
-                    xyz,
-                    [nx, ny, nz],
-                    0,
-                    len,
-                    (&mut buf.frac, &mut buf.folded, &mut buf.key),
-                    |c| counts[c] += 1,
-                );
-            }
-            for slot in start..n_active {
-                let i = ids.get(slot);
-                let s = simbox.fractional(xyz[i]);
-                let b = [
-                    bin_coord(s[0], nx),
-                    bin_coord(s[1], ny),
-                    bin_coord(s[2], nz),
-                ];
-                let c = flat_cell(b, [nx, ny, nz]);
-                buf.frac[i] = s;
-                buf.folded[i] = simbox.cartesian(s);
-                buf.key[i] = c as u32;
-                buf.counts[c] += 1;
-            }
-            buf.offsets[0] = 0;
-            for c in 0..ncell {
-                buf.offsets[c + 1] = buf.offsets[c] + buf.counts[c];
-            }
-            buf.next_slot.copy_from_slice(&buf.offsets[..ncell]);
-            for slot in 0..n_active {
-                let i = ids.get(slot);
-                let c = buf.key[i] as usize;
-                let dest = buf.next_slot[c];
-                buf.occupants[dest] = i;
-                buf.slot_frac[dest] = buf.frac[i];
-                buf.slot_folded[dest] = buf.folded[i];
-                buf.next_slot[c] = dest + 1;
-            }
+        let _pop = crate::pop::JobTimer::new();
+        let mut start = 0usize;
+        if let Active::All(len) = ids {
+            let path = crate::simd::select();
+            let counts = &mut buf.counts;
+            start = fold_mesh_at(
+                path,
+                simbox,
+                xyz,
+                [nx, ny, nz],
+                0,
+                len,
+                (&mut buf.frac, &mut buf.folded, &mut buf.key),
+                |c| counts[c] += 1,
+            );
+        }
+        for slot in start..n_active {
+            let i = ids.get(slot);
+            let s = simbox.fractional(xyz[i]);
+            let b = [
+                bin_coord(s[0], nx),
+                bin_coord(s[1], ny),
+                bin_coord(s[2], nz),
+            ];
+            let c = flat_cell(b, [nx, ny, nz]);
+            buf.frac[i] = s;
+            buf.folded[i] = simbox.cartesian(s);
+            buf.key[i] = c as u32;
+            buf.counts[c] += 1;
+        }
+        buf.offsets[0] = 0;
+        for c in 0..ncell {
+            buf.offsets[c + 1] = buf.offsets[c] + buf.counts[c];
+        }
+        buf.next_slot.copy_from_slice(&buf.offsets[..ncell]);
+        for slot in 0..n_active {
+            let i = ids.get(slot);
+            let c = buf.key[i] as usize;
+            let dest = buf.next_slot[c];
+            buf.occupants[dest] = i;
+            buf.slot_frac[dest] = buf.frac[i];
+            buf.slot_folded[dest] = buf.folded[i];
+            buf.next_slot[c] = dest + 1;
         }
 
         Ok(Self {
@@ -262,6 +225,308 @@ impl Mesh {
     /// the space diagonal in cell heights.
     pub(crate) fn image_reach(&self) -> i32 {
         self.nx.max(self.ny).max(self.nz) / 2 + 2
+    }
+}
+
+/// Points per [`MeshStages::fold`] chunk.
+const FOLD_CHUNK: usize = 4096;
+
+/// A pointer the stages of one region share. Each stage writes indices
+/// no other chunk of that stage writes.
+#[derive(Clone, Copy)]
+struct Raw<T>(*mut T);
+
+unsafe impl<T> Send for Raw<T> {}
+unsafe impl<T> Sync for Raw<T> {}
+
+/// [`Mesh::build`] as stages of one [`crate::team`] region: [`fold`]
+/// per chunk of points, [`prefix`] once, [`scatter`] per run of bins.
+/// The bins, slots, and occupant order are the serial build's: each run
+/// of bins is placed by one worker walking the points in order.
+///
+/// [`fold`]: MeshStages::fold
+/// [`prefix`]: MeshStages::prefix
+/// [`scatter`]: MeshStages::scatter
+pub(crate) struct MeshStages<'a> {
+    mesh: Mesh,
+    xyz: &'a [[f64; 3]],
+    simbox: &'a Cell,
+    ids: Active<'a>,
+    path: crate::simd::Path,
+    parts: usize,
+    frac: Raw<[f64; 3]>,
+    folded: Raw<[f64; 3]>,
+    key: Raw<u32>,
+    counts: Raw<usize>,
+    offsets: Raw<usize>,
+    next: Raw<usize>,
+    occupants: Raw<usize>,
+    slot_frac: Raw<[f64; 3]>,
+    slot_folded: Raw<[f64; 3]>,
+    cuts: Raw<usize>,
+    _cuts: Vec<usize>,
+}
+
+impl<'a> MeshStages<'a> {
+    /// Size the buffers. `parts` is the number of scatter runs.
+    pub(crate) fn new(
+        xyz: &'a [[f64; 3]],
+        simbox: &'a Cell,
+        active: Option<&'a [usize]>,
+        edge: f64,
+        parts: usize,
+    ) -> Result<Self, Error> {
+        let ids = match active {
+            Some(list) => Active::List(list),
+            None => Active::All(xyz.len()),
+        };
+        let widths = simbox.widths();
+        let nx = bins_1d(widths[0], edge)?;
+        let ny = bins_1d(widths[1], edge)?;
+        let nz = bins_1d(widths[2], edge)?;
+        let ncell = (i64::from(nx))
+            .checked_mul(i64::from(ny))
+            .and_then(|v| v.checked_mul(i64::from(nz)))
+            .filter(|&v| v > 0 && v <= MAX_CELLS)
+            .ok_or(Error::TooManyCells)? as usize;
+        let n = xyz.len();
+        let n_active = ids.len();
+        let mut buf = take_recycled();
+        if buf.frac.len() != n {
+            buf.frac.resize(n, [0.0; 3]);
+            buf.folded.resize(n, [0.0; 3]);
+            buf.key.resize(n, 0);
+        }
+        if buf.offsets.len() != ncell + 1 {
+            buf.offsets.clear();
+            buf.offsets.resize(ncell + 1, 0);
+        }
+        buf.occupants.resize(n_active, 0);
+        buf.slot_frac.resize(n_active, [0.0; 3]);
+        buf.slot_folded.resize(n_active, [0.0; 3]);
+        buf.counts.clear();
+        buf.counts.resize(ncell, 0);
+        buf.next_slot.resize(ncell, 0);
+        let mut mesh = Mesh {
+            nx,
+            ny,
+            nz,
+            widths,
+            frac: buf.frac,
+            folded: buf.folded,
+            slot_frac: buf.slot_frac,
+            slot_folded: buf.slot_folded,
+            key: buf.key,
+            offsets: buf.offsets,
+            occupants: buf.occupants,
+            counts: buf.counts,
+            next_slot: buf.next_slot,
+            hist: buf.hist,
+        };
+        let parts = parts.clamp(1, 32).min(ncell);
+        let mut cuts = vec![0usize; parts + 1];
+        Ok(MeshStages {
+            xyz,
+            simbox,
+            ids,
+            path: crate::simd::select(),
+            parts,
+            frac: Raw(mesh.frac.as_mut_ptr()),
+            folded: Raw(mesh.folded.as_mut_ptr()),
+            key: Raw(mesh.key.as_mut_ptr()),
+            counts: Raw(mesh.counts.as_mut_ptr()),
+            offsets: Raw(mesh.offsets.as_mut_ptr()),
+            next: Raw(mesh.next_slot.as_mut_ptr()),
+            occupants: Raw(mesh.occupants.as_mut_ptr()),
+            slot_frac: Raw(mesh.slot_frac.as_mut_ptr()),
+            slot_folded: Raw(mesh.slot_folded.as_mut_ptr()),
+            cuts: Raw(cuts.as_mut_ptr()),
+            _cuts: cuts,
+            mesh,
+        })
+    }
+
+    /// Bins per axis.
+    pub(crate) fn nbin(&self) -> [i32; 3] {
+        [self.mesh.nx, self.mesh.ny, self.mesh.nz]
+    }
+
+    pub(crate) fn widths(&self) -> [f64; 3] {
+        self.mesh.widths
+    }
+
+    pub(crate) fn ncell(&self) -> usize {
+        self.mesh.counts.len()
+    }
+
+    pub(crate) fn n_active(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub(crate) fn fold_chunks(&self) -> usize {
+        (self.ids.len() + FOLD_CHUNK - 1) / FOLD_CHUNK
+    }
+
+    pub(crate) fn scatter_chunks(&self) -> usize {
+        self.parts
+    }
+
+    /// Fractional, folded, and bin of the points of chunk `c`, each bin
+    /// counted with an atomic add.
+    pub(crate) fn fold(&self, c: usize) {
+        let n_active = self.ids.len();
+        let lo = c * FOLD_CHUNK;
+        let hi = (lo + FOLD_CHUNK).min(n_active);
+        if lo >= hi {
+            return;
+        }
+        let nbin = self.nbin();
+        let [nx, ny, nz] = nbin;
+        // SAFETY: `counts` has `ncell` entries and `AtomicUsize` has the
+        // layout of `usize`; every write in this stage is atomic.
+        let counts = unsafe {
+            std::slice::from_raw_parts(
+                self.counts.0 as *const std::sync::atomic::AtomicUsize,
+                self.ncell(),
+            )
+        };
+        let add = |b: usize| {
+            counts[b].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let simbox = self.simbox;
+        match self.ids {
+            Active::All(_) => {
+                let len = hi - lo;
+                let p = &self.xyz[lo..hi];
+                // SAFETY: chunk `c` owns points `lo..hi` of these arrays.
+                let (f, fold, b) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(self.frac.0.add(lo), len),
+                        std::slice::from_raw_parts_mut(self.folded.0.add(lo), len),
+                        std::slice::from_raw_parts_mut(self.key.0.add(lo), len),
+                    )
+                };
+                let start = fold_mesh_at(
+                    self.path,
+                    simbox,
+                    p,
+                    nbin,
+                    0,
+                    len,
+                    (&mut *f, &mut *fold, &mut *b),
+                    add,
+                );
+                for t in start..len {
+                    let s = simbox.fractional(p[t]);
+                    let cell = flat_cell(
+                        [
+                            bin_coord(s[0], nx),
+                            bin_coord(s[1], ny),
+                            bin_coord(s[2], nz),
+                        ],
+                        nbin,
+                    );
+                    f[t] = s;
+                    fold[t] = simbox.cartesian(s);
+                    b[t] = cell as u32;
+                    add(cell);
+                }
+            }
+            Active::List(list) => {
+                for &i in &list[lo..hi] {
+                    let s = simbox.fractional(self.xyz[i]);
+                    let cell = flat_cell(
+                        [
+                            bin_coord(s[0], nx),
+                            bin_coord(s[1], ny),
+                            bin_coord(s[2], nz),
+                        ],
+                        nbin,
+                    );
+                    // SAFETY: the list holds each point once.
+                    unsafe {
+                        self.frac.0.add(i).write(s);
+                        self.folded.0.add(i).write(simbox.cartesian(s));
+                        self.key.0.add(i).write(cell as u32);
+                    }
+                    add(cell);
+                }
+            }
+        }
+    }
+
+    /// Bin offsets, and the runs of bins each [`MeshStages::scatter`]
+    /// chunk owns: about `n / parts` points each.
+    pub(crate) fn prefix(&self) {
+        let ncell = self.ncell();
+        let n_active = self.ids.len();
+        // SAFETY: one chunk; the fold stage has finished.
+        let (counts, offsets, cuts) = unsafe {
+            (
+                std::slice::from_raw_parts(self.counts.0, ncell),
+                std::slice::from_raw_parts_mut(self.offsets.0, ncell + 1),
+                std::slice::from_raw_parts_mut(self.cuts.0, self.parts + 1),
+            )
+        };
+        let mut acc = 0usize;
+        for c in 0..ncell {
+            offsets[c] = acc;
+            acc += counts[c];
+        }
+        offsets[ncell] = acc;
+        cuts[0] = 0;
+        for t in 1..self.parts {
+            let want = n_active * t / self.parts;
+            let c = offsets[..ncell].partition_point(|&o| o < want);
+            cuts[t] = c.max(cuts[t - 1]);
+        }
+        cuts[self.parts] = ncell;
+    }
+
+    /// Place the points of run `t` of bins, in point order.
+    pub(crate) fn scatter(&self, t: usize) {
+        let ncell = self.ncell();
+        // SAFETY: the prefix stage has finished; run `t` owns bins
+        // `lo..hi`, the next free slot of each, and their slots.
+        let (lo, hi, offsets, key, frac, folded) = unsafe {
+            let cuts = std::slice::from_raw_parts(self.cuts.0, self.parts + 1);
+            let n = self.xyz.len();
+            (
+                cuts[t],
+                cuts[t + 1],
+                std::slice::from_raw_parts(self.offsets.0, ncell + 1),
+                std::slice::from_raw_parts(self.key.0, n),
+                std::slice::from_raw_parts(self.frac.0, n),
+                std::slice::from_raw_parts(self.folded.0, n),
+            )
+        };
+        if lo >= hi {
+            return;
+        }
+        let own = unsafe { std::slice::from_raw_parts_mut(self.next.0.add(lo), hi - lo) };
+        own.copy_from_slice(&offsets[lo..hi]);
+        let mut place = |i: usize| {
+            let c = key[i] as usize;
+            if c >= lo && c < hi {
+                let dest = own[c - lo];
+                own[c - lo] = dest + 1;
+                // SAFETY: slot `dest` lies in this run's bins.
+                unsafe {
+                    self.occupants.0.add(dest).write(i);
+                    self.slot_frac.0.add(dest).write(frac[i]);
+                    self.slot_folded.0.add(dest).write(folded[i]);
+                }
+            }
+        };
+        match self.ids {
+            Active::All(n) => (0..n).for_each(&mut place),
+            Active::List(list) => list.iter().for_each(|&i| place(i)),
+        }
+    }
+
+    /// The mesh, for reads after the scatter stage.
+    pub(crate) fn mesh(&self) -> &Mesh {
+        &self.mesh
     }
 }
 
@@ -347,257 +612,6 @@ impl Active<'_> {
             Active::List(list) => list[slot],
         }
     }
-}
-
-/// Raw pointer shared across rayon jobs. Each job writes a distinct index.
-#[cfg(feature = "parallel")]
-#[derive(Clone, Copy)]
-struct SyncPtr<T>(*mut T);
-
-#[cfg(feature = "parallel")]
-unsafe impl<T> Send for SyncPtr<T> {}
-#[cfg(feature = "parallel")]
-unsafe impl<T> Sync for SyncPtr<T> {}
-
-#[cfg(feature = "parallel")]
-impl<T> SyncPtr<T> {
-    /// # Safety
-    /// `index` selects a slot no other job writes for the duration of this call.
-    unsafe fn write(self, index: usize, value: T) {
-        self.0.add(index).write(value);
-    }
-}
-
-#[cfg(feature = "parallel")]
-struct MeshScratch<'a> {
-    frac: &'a mut [[f64; 3]],
-    folded: &'a mut [[f64; 3]],
-    key: &'a mut [u32],
-}
-
-/// The scatter's outputs: each slot's occupant and its coordinates.
-#[cfg(feature = "parallel")]
-struct SlotOut<'a> {
-    frac: &'a [[f64; 3]],
-    folded: &'a [[f64; 3]],
-    occupants: &'a mut [usize],
-    slot_frac: &'a mut [[f64; 3]],
-    slot_folded: &'a mut [[f64; 3]],
-}
-
-/// Workers that each own a run of bins in [`count_parallel`] and
-/// [`scatter_parallel`]. Each reads every key, so the count is capped.
-#[cfg(feature = "parallel")]
-fn owners(ncell: usize) -> usize {
-    crate::pool_width().clamp(1, 32).min(ncell.max(1))
-}
-
-/// `counts[c]` is the number of points in bin `c`. Worker `t` owns the
-/// `t`-th equal run of bins and reads every key, so no two workers write
-/// one counter. Atomic counters shared cache lines between workers: the
-/// points of one chunk fall in bins that the next chunk also fills.
-#[cfg(feature = "parallel")]
-fn count_parallel(ids: Active<'_>, key: &[u32], counts: &mut [usize]) {
-    use rayon::prelude::*;
-    let ncell = counts.len();
-    let owners = owners(ncell);
-    let run = ((ncell + owners - 1) / owners).max(1);
-    let n_active = ids.len();
-    counts.par_chunks_mut(run).enumerate().for_each(|(t, own)| {
-        let _timer = crate::pop::JobTimer::new();
-        let lo = t * run;
-        let hi = lo + own.len();
-        match ids {
-            Active::All(_) => {
-                for &c in key {
-                    let c = c as usize;
-                    if c >= lo && c < hi {
-                        own[c - lo] += 1;
-                    }
-                }
-            }
-            Active::List(list) => {
-                for &i in &list[..n_active] {
-                    let c = key[i] as usize;
-                    if c >= lo && c < hi {
-                        own[c - lo] += 1;
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// `offsets[c]` is the sum of the counts before bin `c`, in parallel over
-/// runs of bins.
-#[cfg(feature = "parallel")]
-fn prefix_parallel(counts: &[usize], offsets: &mut [usize]) {
-    use rayon::prelude::*;
-    let ncell = counts.len();
-    let run = (ncell / (4 * crate::pool_width()).max(1)).max(1 << 12);
-    let sums: Vec<usize> = counts.par_chunks(run).map(|c| c.iter().sum()).collect();
-    let mut base = Vec::with_capacity(sums.len());
-    let mut acc = 0usize;
-    for s in &sums {
-        base.push(acc);
-        acc += s;
-    }
-    offsets[ncell] = acc;
-    offsets[..ncell]
-        .par_chunks_mut(run)
-        .zip(counts.par_chunks(run))
-        .zip(base.par_iter())
-        .for_each(|((out, h), &b)| {
-            let mut a = b;
-            for (o, h) in out.iter_mut().zip(h) {
-                *o = a;
-                a += h;
-            }
-        });
-}
-
-#[cfg(feature = "parallel")]
-fn bin_parallel(
-    xyz: &[[f64; 3]],
-    simbox: &Cell,
-    ids: Active<'_>,
-    nbin: [i32; 3],
-    scratch: MeshScratch<'_>,
-) {
-    use rayon::prelude::*;
-
-    let [nx, ny, nz] = nbin;
-    let n_active = ids.len();
-
-    match ids {
-        Active::All(_) => {
-            const CHUNK: usize = 4096;
-            let path = crate::simd::select();
-            scratch
-                .frac
-                .par_chunks_mut(CHUNK)
-                .zip(scratch.folded.par_chunks_mut(CHUNK))
-                .zip(scratch.key.par_chunks_mut(CHUNK))
-                .zip(xyz.par_chunks(CHUNK))
-                .for_each_init(crate::pop::JobTimer::new, |_timer, (((f, fold), b), p)| {
-                    let len = p.len();
-                    let start = fold_mesh_at(
-                        path,
-                        simbox,
-                        p,
-                        nbin,
-                        0,
-                        len,
-                        (&mut *f, &mut *fold, &mut *b),
-                        |_| {},
-                    );
-                    for t in start..len {
-                        let s = simbox.fractional(p[t]);
-                        let c = flat_cell(
-                            [
-                                bin_coord(s[0], nx),
-                                bin_coord(s[1], ny),
-                                bin_coord(s[2], nz),
-                            ],
-                            nbin,
-                        );
-                        f[t] = s;
-                        fold[t] = simbox.cartesian(s);
-                        b[t] = c as u32;
-                    }
-                });
-        }
-        Active::List(_) => {
-            // SAFETY: `ids` does not repeat an index, so each `frac[i]`
-            // is written by one iteration.
-            let frac_ptr = SyncPtr(scratch.frac.as_mut_ptr());
-            let folded_ptr = SyncPtr(scratch.folded.as_mut_ptr());
-            let key_ptr = SyncPtr(scratch.key.as_mut_ptr());
-            (0..n_active).into_par_iter().for_each_init(
-                crate::pop::JobTimer::new,
-                |_timer, slot| {
-                    let i = ids.get(slot);
-                    let s = simbox.fractional(xyz[i]);
-                    let c = flat_cell(
-                        [
-                            bin_coord(s[0], nx),
-                            bin_coord(s[1], ny),
-                            bin_coord(s[2], nz),
-                        ],
-                        nbin,
-                    );
-                    // SAFETY: `ids` lists each point once, so these writes do not alias.
-                    unsafe {
-                        frac_ptr.write(i, s);
-                        folded_ptr.write(i, simbox.cartesian(s));
-                        key_ptr.write(i, c as u32);
-                    }
-                },
-            );
-        }
-    }
-}
-
-/// Place the points in their bins, with each slot's coordinates. Worker
-/// `t` owns a run of bins holding about `n / owners` points and walks
-/// the points in order, so every bin lists its points in the order of
-/// `ids`, as the serial scatter does, with no atomic counter and no sort.
-#[cfg(feature = "parallel")]
-fn scatter_parallel(
-    ids: Active<'_>,
-    key: &[u32],
-    offsets: &[usize],
-    next: &mut [usize],
-    out: SlotOut<'_>,
-) {
-    use rayon::prelude::*;
-
-    let ncell = offsets.len() - 1;
-    let n_active = ids.len();
-    let parts = owners(ncell);
-    let mut cuts = Vec::with_capacity(parts + 1);
-    cuts.push(0usize);
-    for t in 1..parts {
-        let want = n_active * t / parts;
-        let c = offsets[..ncell].partition_point(|&o| o < want);
-        cuts.push(c.max(*cuts.last().unwrap()));
-    }
-    cuts.push(ncell);
-    let mut runs = Vec::with_capacity(parts);
-    let mut rest = next;
-    for t in 0..parts {
-        let (head, tail) = rest.split_at_mut(cuts[t + 1] - cuts[t]);
-        runs.push((cuts[t], head));
-        rest = tail;
-    }
-    let occ = SyncPtr(out.occupants.as_mut_ptr());
-    let sf = SyncPtr(out.slot_frac.as_mut_ptr());
-    let sfo = SyncPtr(out.slot_folded.as_mut_ptr());
-    let (frac, folded) = (out.frac, out.folded);
-    runs.into_par_iter().for_each(|(lo, own)| {
-        let _timer = crate::pop::JobTimer::new();
-        let hi = lo + own.len();
-        own.copy_from_slice(&offsets[lo..hi]);
-        let mut place = |i: usize| {
-            let c = key[i] as usize;
-            if c >= lo && c < hi {
-                let dest = own[c - lo];
-                own[c - lo] = dest + 1;
-                // SAFETY: slots `offsets[lo]..offsets[hi]` belong to this
-                // worker's bins alone, and each bin hands out each of its
-                // slots once.
-                unsafe {
-                    occ.write(dest, i);
-                    sf.write(dest, frac[i]);
-                    sfo.write(dest, folded[i]);
-                }
-            }
-        };
-        match ids {
-            Active::All(n) => (0..n).for_each(&mut place),
-            Active::List(list) => list[..n_active].iter().for_each(|&i| place(i)),
-        }
-    });
 }
 
 fn bins_1d(width: f64, edge: f64) -> Result<i32, Error> {
@@ -1287,11 +1301,11 @@ mod tests {
         assert_eq!(listed_occ, all);
     }
 
-    /// Every pool width bins the points as one thread does: the same
-    /// offsets, the same occupants in ascending order within each bin,
-    /// and the same slot coordinates, for clustered points in shuffled
-    /// order, with and without an active list, and with more bins than
-    /// points.
+    /// The staged build bins the points as the serial build does at every
+    /// width: the same offsets, the same occupants in ascending order
+    /// within each bin, and the same slot coordinates, for clustered points
+    /// in shuffled order, with and without an active list, and with more
+    /// bins than points.
     #[cfg(feature = "parallel")]
     #[test]
     fn every_pool_width_bins_like_one_thread() {
@@ -1307,28 +1321,54 @@ mod tests {
             xyz.swap(i, j);
         }
         let list: Vec<usize> = (0..xyz.len()).filter(|i| i % 3 != 1).collect();
+        let take = |mesh: &Mesh| {
+            (
+                mesh.offsets.clone(),
+                mesh.occupants.clone(),
+                mesh.slot_frac
+                    .iter()
+                    .copied()
+                    .map(bits3)
+                    .collect::<Vec<_>>(),
+                mesh.slot_folded
+                    .iter()
+                    .copied()
+                    .map(bits3)
+                    .collect::<Vec<_>>(),
+            )
+        };
         let build = |width: usize, active: Option<&[usize]>, edge: f64| {
+            if width == 1 {
+                return take(&Mesh::build(&xyz, &cell, active, edge).unwrap());
+            }
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(width)
                 .build()
                 .unwrap();
-            pool.install(|| {
-                let mesh = Mesh::build(&xyz, &cell, active, edge).unwrap();
-                (
-                    mesh.offsets.clone(),
-                    mesh.occupants.clone(),
-                    mesh.slot_frac
-                        .iter()
-                        .copied()
-                        .map(bits3)
-                        .collect::<Vec<_>>(),
-                    mesh.slot_folded
-                        .iter()
-                        .copied()
-                        .map(bits3)
-                        .collect::<Vec<_>>(),
-                )
-            })
+            let stages = MeshStages::new(&xyz, &cell, active, edge, width).unwrap();
+            let fold = |_: &mut (), c: usize| stages.fold(c);
+            let prefix = |_: &mut (), _: usize| stages.prefix();
+            let scatter = |_: &mut (), t: usize| stages.scatter(t);
+            let spawn = |job: Box<dyn FnOnce() + Send + 'static>| pool.spawn(job);
+            crate::team::run(
+                width,
+                Some(&spawn),
+                &[
+                    crate::team::Stage {
+                        chunks: stages.fold_chunks(),
+                        run: &fold,
+                    },
+                    crate::team::Stage {
+                        chunks: 1,
+                        run: &prefix,
+                    },
+                    crate::team::Stage {
+                        chunks: stages.scatter_chunks(),
+                        run: &scatter,
+                    },
+                ],
+            );
+            take(stages.mesh())
         };
         for edge in [3.0, 0.9] {
             for active in [None, Some(&list[..])] {
