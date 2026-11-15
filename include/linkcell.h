@@ -252,15 +252,6 @@ int lc_cell_grid(const double *xyz,
  */
 void lc_for_slabs(int n, void *ctx, void (*cb)(void*, int, int));
 
-extern int32_t lc_gpu_curve_split(const uint32_t *atom_bin,
-                                  size_t natom,
-                                  const uint32_t *coords,
-                                  size_t ncell,
-                                  uint32_t parts,
-                                  uint32_t *assign,
-                                  uint64_t *out_weight,
-                                  uint8_t method);
-
 /**
  * Ghost cells of `domain`. A null `out_ghost` queries `*out_count`.
  *
@@ -670,6 +661,20 @@ extern int32_t lc_scotch_part(int32_t n,
  * returns.
  */
 void lc_set_continuation(void *ctx, void (*cb)(void*));
+
+/**
+ * Install the device curve split used by the `device` partition. The
+ * GPU library calls this from a static initializer when it is loaded. A
+ * null `f` removes it, and the device partition then reports no device.
+ */
+void lc_set_gpu_curve_split(int32_t (*f)(const uint32_t *atom_bin,
+                                         size_t natom,
+                                         const uint32_t *coords,
+                                         size_t ncell,
+                                         uint32_t parts,
+                                         uint32_t *assign,
+                                         uint64_t *out_weight,
+                                         uint8_t method));
 
 /**
  * Choose the Rayon width for later searches. `n == 0` runs the search
