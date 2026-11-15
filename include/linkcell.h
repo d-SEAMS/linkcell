@@ -86,15 +86,6 @@ typedef uint8_t Method;
 #endif // __cplusplus
 
 /**
- * Wall time of one bisection subtree.
- *
- * `select`, `fm`, and `pack` are sequential on a single branch. A join
- * keeps the slower child when more than one thread is in the pool, and
- * adds the children when the join is serial.
- */
-typedef struct Phase Phase;
-
-/**
  * Periodic parallelepiped. Lattice vectors are a, b, c (same as vesin rows).
  */
 typedef struct lc_cell {
@@ -364,27 +355,6 @@ int lc_knearest_many(const double *xyz,
                      int *out_nn,
                      double *out_d2);
 
-extern void lc_knn_one_region(void *ctx,
-                              int32_t pin,
-                              int64_t n_points,
-                              int64_t n_bins,
-                              int64_t n_blocks,
-                              Phase bin,
-                              Phase count,
-                              Phase scan_base,
-                              Phase scan,
-                              Phase fill,
-                              Phase select,
-                              int32_t *team);
-
-/**
- * C ABI for the same join, so a `dlclose` of this image can stop the team
- * first. The image destructor calls the implementation directly.
- */
-void lc_knn_shutdown(void);
-
-extern void lc_knn_shutdown_impl(void);
-
 /**
  * Thread-local last-error string from this thread's most recent
  * [`lc_knearest`].
@@ -432,8 +402,6 @@ int lc_mesh_cut(const double *xyz,
  * Width selected by [`lc_set_threads`], or the global pool when unset.
  */
 int lc_num_threads(void);
-
-extern int32_t lc_omp_max_threads(void);
 
 /**
  * Owned points are 2. Points in a cell painted from the owned walk are 1.
