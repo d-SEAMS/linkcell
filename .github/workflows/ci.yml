@@ -8,8 +8,13 @@ on:
       - "fix/**"
       - "feat/**"
       - "ci/**"
+      - "release/**"
     tags: ['v*']
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   fmt:

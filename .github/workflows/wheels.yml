@@ -8,6 +8,7 @@ on:
       - "fix/**"
       - "feat/**"
       - "ci/**"
+      - "release/**"
     tags: ["v*"]
   pull_request:
     paths:
