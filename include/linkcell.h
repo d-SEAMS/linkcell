@@ -704,6 +704,31 @@ void lc_set_threads(int n);
 uint64_t lc_stencil_builds(void);
 
 /**
+ * Run `nstages` stages in one parallel region on the pool selected by
+ * [`lc_set_threads`], the caller one of the workers (see `team`). Stage
+ * `s` is `chunks[s]` calls of `fn_(ctx, s, chunk, worker)`, in any order
+ * and on any worker; every chunk of a stage returns before any chunk of
+ * the next starts. `worker` is fixed for one worker thread during the
+ * call and below [`lc_team_width`], so it can index per-worker scratch.
+ * No worker that has not started holds up a stage or the return.
+ *
+ * # Safety
+ *
+ * `chunks` is readable for `nstages` sizes. `fn_` does not unwind and
+ * may be called from any thread of the pool until the call returns.
+ */
+int lc_team_run(size_t nstages,
+                const size_t *chunks,
+                void (*fn_)(void*, size_t, size_t, size_t),
+                void *ctx);
+
+/**
+ * Workers an [`lc_team_run`] started now may use: the `worker` index it
+ * passes is below this.
+ */
+size_t lc_team_width(void);
+
+/**
  * Library version string. Process-static, NUL-terminated. Do not free.
  */
 const char *lc_version(void);

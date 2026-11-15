@@ -119,12 +119,15 @@ fn work<S: Default>(shared: &Shared<S>) {
 
 /// Run `stages` in order on `width` workers, the caller one of them.
 /// Every chunk of a stage finishes before any chunk of the next starts.
-/// One worker, or no pool, runs everything on the caller.
+/// No more workers start than the largest stage has chunks; one worker,
+/// or no pool, runs everything on the caller.
 pub(crate) fn run<S: Default + 'static>(
     width: usize,
     spawn: Option<Spawn<'_>>,
     stages: &[Stage<'_, S>],
 ) {
+    let most = stages.iter().map(|s| s.chunks).max().unwrap_or(0);
+    let width = width.min(most);
     let spawn = match spawn {
         Some(spawn) if width > 1 => spawn,
         _ => {
