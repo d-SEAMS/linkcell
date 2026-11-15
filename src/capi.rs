@@ -86,6 +86,7 @@ fn default_width() -> usize {
 
 /// Width stored by [`lc_set_threads`]. Zero means the caller did not
 /// choose, and the search keeps its default iterator.
+#[cfg(feature = "parallel")]
 pub(crate) fn search_width() -> usize {
     WANTED_THREADS.load(Ordering::Relaxed)
 }
@@ -161,19 +162,20 @@ pub extern "C" fn lc_for_slabs(
                 unsafe { std::mem::transmute(cb_bits) };
             cb(ctx, begin, end);
         };
-        let width = WANTED_THREADS.load(Ordering::Relaxed);
-        if width <= 1 || cfg!(not(feature = "parallel")) {
-            call(0, n);
-            return;
-        }
+        #[cfg(not(feature = "parallel"))]
+        call(0, n);
         #[cfg(feature = "parallel")]
-        rayon::broadcast(move |worker| {
-            let workers = worker.num_threads().max(1);
-            let t = worker.index();
-            let begin = (n as usize) * t / workers;
-            let end = (n as usize) * (t + 1) / workers;
-            call(begin as c_int, end as c_int);
-        });
+        if WANTED_THREADS.load(Ordering::Relaxed) <= 1 {
+            call(0, n);
+        } else {
+            rayon::broadcast(move |worker| {
+                let workers = worker.num_threads().max(1);
+                let t = worker.index();
+                let begin = (n as usize) * t / workers;
+                let end = (n as usize) * (t + 1) / workers;
+                call(begin as c_int, end as c_int);
+            });
+        }
     });
 }
 
