@@ -646,9 +646,9 @@ void lc_set_gpu_curve_split(int32_t (*f)(const uint32_t *atom_bin,
                                          uint8_t method));
 
 /**
- * CPUs Rayon workers may use. Replaces any list recorded earlier.
- * A pool that has already started keeps the cpus it was built with.
- * `n <= 0` is ignored.
+ * CPUs Rayon workers may use. Every worker may run on any of them.
+ * Replaces any list recorded earlier. A pool that has already started
+ * keeps the cpus it was built with. `n <= 0` is ignored.
  */
 void lc_set_places(const int *cpus, int n);
 

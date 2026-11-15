@@ -126,6 +126,7 @@ exclude = [
     "VesinOptions",
     "NeighborCalc",
     "lc_vesin_neighbors",
+    "sched_getaffinity",
     "lc_vesin_free",
     "Phase",
     "lc_knn_one_region",
