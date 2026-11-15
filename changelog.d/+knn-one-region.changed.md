@@ -1,0 +1,3 @@
+An unmasked k-nearest query of at least 8192 points bins, counts, scans, fills, and selects on one OpenMP team. Each thread keeps its own histogram and scratch. Phase edges wait on linkcell's own futex. The team is joined from a library destructor when the image is unloaded or the process exits, and the next query rebuilds it when `omp_get_max_threads()` has changed. The library does not change the process OpenMP wait policy.
+Packed rows match the previous walk bit for bit.
+`pin_knearest_to_least_loaded` optionally places those workers on the least-loaded CPUs. It is off unless the caller asks, and it does not read an environment variable.

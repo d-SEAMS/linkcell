@@ -60,7 +60,10 @@
 //!
 //! # Features
 //!
-//! `parallel` (rayon over sources) is on by default for wall-clock.
+//! `parallel` is on by default. An unmasked k-nearest query of at least
+//! 8192 points runs in one OpenMP region when this build has it: bin,
+//! count, scan, fill, and select, with a private histogram and scratch
+//! on each thread. Masked and smaller queries use rayon.
 //! `--no-default-features` drops rayon and serializes the walk (re-enable
 //! `capi` if the C ABI is still required). The per-source k-heap
 //! (`KHeap`) stays on the stack for `k <= 16`; larger `k` spills to the
@@ -158,7 +161,8 @@ pub use cell::{
 };
 pub use error::Error;
 pub use knearest::{
-    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Neighbors,
+    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many,
+    knearest_team_threads, pin_knearest_to_least_loaded, shutdown_knearest_team, Neighbors,
 };
 pub use pairs::{
     pairs_within, pairs_within_columns, pairs_within_count, pairs_within_into, Pair, PairColumns,
