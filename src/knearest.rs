@@ -374,9 +374,9 @@ fn write_one(
             return Err(Error::BufferSize);
         }
     }
-    out_nn.fill(-1);
+    fill_rows(out_nn, -1);
     if let Some(d2) = out_d2.as_mut() {
-        d2.fill(f64::NAN);
+        fill_rows(d2, f64::NAN);
     }
     #[cfg(feature = "timing")]
     if crate::simd::coarse_timing_enabled() {
@@ -386,6 +386,18 @@ fn write_one(
         return result;
     }
     execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
+}
+
+/// Every slot to `value`. A large output is filled by the pool: on one
+/// thread it was a serial pass over `n * k` slots before the search.
+fn fill_rows<T: Copy + Send + Sync>(out: &mut [T], value: T) {
+    #[cfg(feature = "parallel")]
+    if out.len() >= 1 << 18 && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        out.par_chunks_mut(1 << 15).for_each(|c| c.fill(value));
+        return;
+    }
+    out.fill(value);
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
