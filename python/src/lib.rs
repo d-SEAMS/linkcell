@@ -512,7 +512,7 @@ fn periodic_flags(obj: &Bound<'_, PyAny>) -> PyResult<[bool; 3]> {
 
 /// vesin-compatible calculator. `compute` returns one DLPack tensor per
 /// letter of `quantities` (`i`, `j`, `P`, `S`, `d`, `D`).
-#[pyclass(name = "NeighborList")]
+#[pyclass(name = "NeighborList", subclass)]
 struct PyNeighborList {
     cutoff: f64,
     full: bool,
