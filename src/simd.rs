@@ -12,8 +12,7 @@
 //! the fold and the scan: those kernels multiply and add separately.
 //! Pair screening may use FMA inside the margin test. No fused
 //! multiply-add reaches a stored value. The floor in the fold is
-//! minimage's `floor_fast` for this architecture: truncation on x86_64,
-//! `f64::floor` elsewhere.
+//! minimage's `floor_fast`: truncation on every architecture.
 
 use std::cell::Cell;
 use std::sync::OnceLock;

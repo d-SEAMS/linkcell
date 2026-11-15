@@ -73,8 +73,8 @@
 //! separate multiplies and adds, in the scalar order, so every stored
 //! value matches the scalar path bit for bit. Pair screening may use
 //! FMA inside its margin test. The value it stores is the direct sum
-//! of squares. The fold floor is minimage `floor_fast` for this
-//! architecture. `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or
+//! of squares. The fold floor is minimage `floor_fast`, truncation on
+//! every architecture. `LINKCELL_SIMD` forces `scalar`, `avx2`, `avx512`, or
 //! `neon`. [`simd_path`] reports the path in use. Neighbour rows, pair
 //! rows, and the fold are bitwise identical across thread counts. The
 //! `timing` feature exports `SimdTiming` for benchmark counters.

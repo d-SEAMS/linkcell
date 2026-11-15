@@ -36,10 +36,9 @@ Comput. Phys. Commun. 184, 2641 (2013), doi:10.1016/j.cpc.2013.06.003,
 applied to this tile: a short sum of terms no larger than the squares
 of the coordinates, the shift, and the cutoff.
 
-The fold floor is minimage `floor_fast` for this architecture.
-Truncation toward zero on x86_64 keeps an input of -0. `f64::floor`
-elsewhere maps that input to +0. Paths on one machine match each other.
-They do not match across that architecture split.
+The fold floor is minimage `floor_fast`, truncation toward zero on
+every architecture, so an input of -0 stays -0 in the fraction. Paths
+match each other on one machine and across x86_64 and aarch64.
 
 ## What is not dispatched
 

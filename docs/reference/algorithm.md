@@ -100,10 +100,9 @@ the bin truncation, and `H`), so every position and bin is the same
 bits as `Cell::fractional` and `Cell::cartesian`. The sums are separate
 multiplies and adds: a fused multiply-add would round once and would
 not match. AVX2 is selected only when FMA is present. The kernels do
-not enable FMA. The floor inside `wrap01` is minimage `floor_fast` for
-this architecture: truncation toward zero on x86_64, and `f64::floor`
-elsewhere. On x86_64 an input of -0 stays -0 in the fraction. The
-previous AVX-512 round toward -inf mapped that input to +0.
+not enable FMA. The floor inside `wrap01` is minimage `floor_fast`:
+truncation toward zero on every architecture. An input of -0 stays -0
+in the fraction on the scalar, AVX2, AVX-512 and NEON paths.
 `LINKCELL_SIMD` (`scalar`, `avx2`, `avx512`, `neon`) forces
 a path the CPU can run. `simd_path` reports that path for the fold,
 the k-nearest scan, and cutoff pairs. AVX-512 is selected only when

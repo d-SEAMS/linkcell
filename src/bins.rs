@@ -982,9 +982,9 @@ fn fold_mesh_avx2(
 #[inline]
 unsafe fn fold2(f: &Fold8, base: *const f64) -> ([[f64; 2]; 3], [[f64; 2]; 3], [[i32; 2]; 3]) {
     use std::arch::aarch64::{
-        float64x2_t, vaddq_f64, vbslq_f64, vcgeq_f64, vcombine_f64, vcvtq_s64_f64, vdivq_f64,
-        vdupq_n_f64, vget_high_f64, vget_low_f64, vgetq_lane_s64, vld1q_f64, vmulq_f64, vrndmq_f64,
-        vst1q_f64, vsubq_f64,
+        float64x2_t, vaddq_f64, vbslq_f64, vceqq_f64, vcgeq_f64, vcgtq_f64, vcombine_f64,
+        vcvtq_s64_f64, vdivq_f64, vdupq_n_f64, vget_high_f64, vget_low_f64, vgetq_lane_s64,
+        vld1q_f64, vmulq_f64, vrndq_f64, vst1q_f64, vsubq_f64,
     };
     let a = vld1q_f64(base);
     let b = vld1q_f64(base.add(2));
@@ -996,12 +996,15 @@ unsafe fn fold2(f: &Fold8, base: *const f64) -> ([[f64; 2]; 3], [[f64; 2]; 3], [
     let one = bc(1.0);
     let zero = vdupq_n_f64(0.0);
     let (o, w, h, hinv, nbin) = (f.origin, f.widths, f.h, f.hinv, f.n);
-    // `wrap01` follows minimage `floor_fast` off x86_64, which is
-    // `f64::floor` (toward -inf, `vrndmq`). Truncation would keep an
-    // input of `-0` in the fraction. Scalar on this arch produces `+0`.
-    // A result that rounds to one is zero.
+    // `wrap01` follows minimage `floor_fast`, which truncates on every
+    // architecture: trunc toward zero (`vrndq`), `-0` becomes `+0`, then
+    // one less when that trunc is above the input. An input of `-0`
+    // keeps a fraction of `-0`. A result that rounds to one is zero.
     let wrap01 = |s: float64x2_t| {
-        let t = vsubq_f64(s, vrndmq_f64(s));
+        let trunc = vrndq_f64(s);
+        let trunc = vbslq_f64(vceqq_f64(trunc, zero), zero, trunc);
+        let floor = vbslq_f64(vcgtq_f64(trunc, s), vsubq_f64(trunc, one), trunc);
+        let t = vsubq_f64(s, floor);
         vbslq_f64(vcgeq_f64(t, one), zero, t)
     };
     let d = [
@@ -1326,18 +1329,13 @@ mod tests {
     }
 
     /// `s = -0`, a tiny negative, one ulp below 1, `2^52`, and NaN.
-    /// Each wide path must match scalar `floor_fast` on this arch.
+    /// Each wide path must match scalar `floor_fast`.
     #[test]
     fn fold_edges_match_scalar_on_every_path() {
         let cell = crate::Cell::ortho(1.0, 1.0, 1.0).unwrap();
         let neg0 = -0.0f64;
         let frac = cell.fractional([neg0, 0.0, 0.0]);
-        let expect_neg0 = if cfg!(target_arch = "x86_64") {
-            neg0.to_bits()
-        } else {
-            0.0f64.to_bits()
-        };
-        assert_eq!(frac[0].to_bits(), expect_neg0);
+        assert_eq!(frac[0].to_bits(), neg0.to_bits());
         let tiny = -1.0e-20;
         let below1 = f64::from_bits(1.0f64.to_bits() - 1);
         let big = 4_503_599_627_370_496.0;
