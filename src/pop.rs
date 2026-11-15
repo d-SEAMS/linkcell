@@ -144,6 +144,28 @@ fn add_slot(slot_id: usize, ns: u64) {
     }
 }
 
+/// Record `ns` of useful work on worker `slot`.
+///
+/// The fused k-nearest region calls this with the OpenMP slot, which is
+/// not a rayon worker. No-op until [`engage`] or `LINKCELL_POP`.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+pub(crate) fn add_useful(slot: usize, ns: u64) {
+    if enabled() {
+        add_slot(slot, ns);
+    }
+}
+
+/// How many worker slots [`snapshot`] keeps.
+///
+/// The fused query sets this to the OpenMP team. A later [`prepare`]
+/// overwrites it with the rayon pool size.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+pub(crate) fn set_threads(n: usize) {
+    if enabled() {
+        NTHREADS.store(n.clamp(1, MAX_THREADS), Ordering::Relaxed);
+    }
+}
+
 /// Useful nanoseconds on each worker, in slot order.
 ///
 /// Empty until [`engage`] or `LINKCELL_POP`.
