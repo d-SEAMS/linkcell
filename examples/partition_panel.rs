@@ -955,10 +955,10 @@ fn main() {
             });
         }
         if z_obs.len() == reps {
-            push_ext_row(&mut rows, &system.name, "zoltan-rcb", &z_obs, ranks);
+            push_ext_row(&mut rows, system.name, "zoltan-rcb", &z_obs, ranks);
         }
         if p_obs.len() == reps {
-            push_ext_row(&mut rows, &system.name, "ptscotch", &p_obs, ranks);
+            push_ext_row(&mut rows, system.name, "ptscotch", &p_obs, ranks);
         }
         if !ladder
             && std::env::var("LINKCELL_ONLY_METHOD")
