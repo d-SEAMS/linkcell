@@ -25,6 +25,7 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+      - run: python3 scripts/check-llms-txt.py
 
   header-check:
     runs-on: ubuntu-latest
