@@ -36,18 +36,18 @@ fn compile_knn_region() -> bool {
     let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".to_string());
     let obj = out_dir.join("knn_region.o");
     let archive = out_dir.join("libknnregion.a");
+    // x86-64 baseline. The host gcc otherwise vectorises this file to
+    // AVX2 and BMI2, which the ISA audit rejects. The region only
+    // schedules; the wider code is not part of the build.
+    let mut args = vec![
+        "-c", "-O2", "-fPIC", "-fopenmp", "-pthread", "-Wall", "-Wextra",
+    ];
+    if std::env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("x86_64") {
+        args.extend(["-march=x86-64", "-fno-tree-vectorize"]);
+    }
+    args.extend(["src/knn_region.c", "-o"]);
     let compiled = std::process::Command::new(&cc)
-        .args([
-            "-c",
-            "-O2",
-            "-fPIC",
-            "-fopenmp",
-            "-pthread",
-            "-Wall",
-            "-Wextra",
-            "src/knn_region.c",
-            "-o",
-        ])
+        .args(&args)
         .arg(&obj)
         .status()
         .map(|status| status.success())
