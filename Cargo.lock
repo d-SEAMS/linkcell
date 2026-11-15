@@ -109,7 +109,7 @@ dependencies = [
 [[package]]
 name = "minimage"
 version = "0.2.0"
-source = "git+https://github.com/lode-org/minimage.git?rev=3abded515f2e3d0af40d8816a533a2941b1a36cf#3abded515f2e3d0af40d8816a533a2941b1a36cf"
+source = "git+https://github.com/lode-org/minimage.git?rev=b8fa9ab8d09297abf91bdc59964ce8ce9c87b96c#b8fa9ab8d09297abf91bdc59964ce8ce9c87b96c"
 
 [[package]]
 name = "ndarray"
