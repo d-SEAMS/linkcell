@@ -61,6 +61,10 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
   A k-nearest search on another thread no longer runs a callback it did not set.
 - linkcell links against musl: the glibc `mallopt` page knobs are set only on
   glibc targets.
+- A k-nearest block search keeps the smaller index when a neighbour on the gathered block face ties the k-th distance, as the shell walk does.
+- An open-axis pair query whose bin reach does not fit in `i32` returns `TooManyImages` instead of overflowing.
+- The device partition finds the GPU curve split through `lc_set_gpu_curve_split`, which the GPU library calls when it loads, so the crate links on macOS and with MSVC without a weak stub.
+- `include/linkcell.h` no longer carries the vesin entry points (they are in `include/linkcell_vesin.h`) or the internal OpenMP schedule.
 
 ## [0.3.11] - 2026-10-09
 
