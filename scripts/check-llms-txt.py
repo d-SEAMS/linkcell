@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
-"""Fail when llms.txt misses a docs page or links a file that does not exist."""
+"""Fail when llms.txt misses a docs page or links a page or file that does not exist."""
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PREFIX = "https://github.com/d-SEAMS/linkcell/blob/main/"
+BLOB = "https://github.com/d-SEAMS/linkcell/blob/main/"
+SITE = "https://d-seams.github.io/linkcell/"
 
 
 def main():
     text = (ROOT / "llms.txt").read_text()
-    linked = {m.group(1) for m in re.finditer(re.escape(PREFIX) + r"([^)\s]+)", text)}
-    errors = [f"llms.txt links missing file {p}" for p in sorted(linked) if not (ROOT / p).is_file()]
+    errors = []
+    pages = set()
+    for m in re.finditer(re.escape(SITE) + r"([^)\s]*)", text):
+        rel = m.group(1).rstrip("/")
+        if rel.startswith("api/"):
+            continue
+        page = "docs/" + (rel or "index") + ".md"
+        if not (ROOT / page).is_file():
+            errors.append(f"llms.txt links {m.group(0)} but {page} does not exist")
+        pages.add(page)
+    for m in re.finditer(re.escape(BLOB) + r"([^)\s]+)", text):
+        if not (ROOT / m.group(1)).is_file():
+            errors.append(f"llms.txt links missing file {m.group(1)}")
     for page in sorted((ROOT / "docs").rglob("*.md")):
         rel = page.relative_to(ROOT).as_posix()
-        if rel not in linked:
+        if rel.startswith("docs/assets/"):
+            continue
+        if rel not in pages:
             errors.append(f"llms.txt does not list {rel}")
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print(f"llms.txt lists {len(linked)} files")
+    print(f"llms.txt lists {len(pages)} pages")
     return 0
 
 
