@@ -107,15 +107,26 @@ include = [
     "lc_knearest_d2",
     "lc_knearest_many",
     "lc_pairs_within",
-    "lc_cell_grid",
-    "lc_cell_graph",
-    "lc_partition",
-    "lc_halo_width",
-    "lc_halo",
     "lc_last_error",
     "lc_version",
 ]
-exclude = ["lc_cell_ortho", "Cell", "Error", "Neighbors", "KHeap", "lc_tune_set", "lc_tune_pairs", "VesinDevice", "VesinNeighborList", "VesinOptions", "lc_vesin_neighbors", "lc_vesin_free"]
+# Vesin types and entry points are the hand-written include/linkcell_vesin.h.
+# cbindgen would otherwise append them to include/linkcell.h.
+exclude = [
+    "lc_cell_ortho",
+    "Cell",
+    "Error",
+    "Neighbors",
+    "KHeap",
+    "lc_tune_set",
+    "lc_tune_pairs",
+    "VesinDevice",
+    "VesinNeighborList",
+    "VesinOptions",
+    "NeighborCalc",
+    "lc_vesin_neighbors",
+    "lc_vesin_free",
+]
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
 
 [export.rename]
