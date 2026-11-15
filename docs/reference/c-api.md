@@ -83,6 +83,30 @@ the box, `cutoff`, `mask`, `cell_hint`, `half`) writes the rows from
 it without searching again; any other call drops it. A fill that
 writes keeps nothing, so a count-then-fill pair is one search.
 
+```c
+uint64_t lc_stencil_builds(void);
+
+int lc_pairs_open(const double *xyz, size_t n, double cutoff,
+                  double cell_hint, lc_pair *out, size_t cap,
+                  size_t *out_count);
+
+int lc_pairs_within_pbc(const double *xyz, size_t n, const lc_cell *simbox,
+                        const int *pbc, double cutoff, const int *mask,
+                        double cell_hint, int half, int closed,
+                        int exclude_self_images, lc_pair *out, size_t cap,
+                        size_t *out_count);
+```
+
+`lc_pairs_open` is the Cartesian half list of an open cluster: `i < j`,
+shift zero, squared distance strictly below `cutoff * cutoff`.
+`lc_pairs_within_pbc` is that list with a periodicity mask.
+`pbc[k]` nonzero keeps axis `k` periodic. A null `pbc` is fully
+periodic and is `lc_pairs_within_rows`. An open axis is binned on the
+occupied Cartesian cells. It is not padded into a periodic box.
+`lc_stencil_builds` counts partner stencils that were built. A stencil
+that is reused, because the atoms stayed inside the same bounding bins,
+does not increment it.
+
 ## Errors and version
 
 ```c

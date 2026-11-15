@@ -34,7 +34,7 @@ pub struct Pair {
     pub dist2: f64,
 }
 
-fn keep_half(i: usize, j: usize, shift: [i32; 3]) -> bool {
+pub(crate) fn keep_half(i: usize, j: usize, shift: [i32; 3]) -> bool {
     if i != j {
         return i < j;
     }
@@ -776,13 +776,15 @@ fn build_partners(
             }
         }
     }
-    PartnerList {
+    let list = PartnerList {
         key,
         off,
         items,
         s_max,
         d_max,
-    }
+    };
+    crate::open_cell::note_stencil_build();
+    list
 }
 
 #[derive(Default)]

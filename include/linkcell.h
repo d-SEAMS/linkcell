@@ -211,6 +211,28 @@ int lc_knearest_many(const double *xyz,
 const char *lc_last_error(void);
 
 /**
+ * Cartesian half pair list of an open cluster.
+ *
+ * Every axis is open. Each row has `i < j`, shift `(0, 0, 0)`, and
+ * `dist2` strictly below `cutoff` squared. Null `out` queries
+ * `*out_count`. A short buffer sets `*out_count` and returns nonzero
+ * without writing. The bins are the occupied Cartesian cells and are
+ * reused until those bounding bins change.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `out_count` is writable.
+ * On a fill, `out` is writable for `cap` rows.
+ */
+int lc_pairs_open(const double *xyz,
+                  size_t n,
+                  double cutoff,
+                  double cell_hint,
+                  struct lc_pair *out,
+                  size_t cap,
+                  size_t *out_count);
+
+/**
  * Cutoff pairs with the vesin / tonari shift `S`.
  *
  * Each row is one atom-image: `out_i[t]`, `out_j[t]`,
@@ -254,6 +276,40 @@ int lc_pairs_within(const double *xyz,
                     size_t *out_count);
 
 /**
+ * [`lc_pairs_within_rows`] with a periodicity mask.
+ *
+ * `pbc` is three ints. Nonzero means that axis is periodic. A null
+ * `pbc` is fully periodic. An open axis is binned on the occupied
+ * Cartesian cells and is not padded into a periodic box. `closed`
+ * nonzero keeps `dist2 <= cutoff²` on an open or mixed cell.
+ * `exclude_self_images` nonzero drops `i == j`.
+ *
+ * Null `out` is a count query. Otherwise `out` holds `cap` rows.
+ * A query or a short buffer keeps its rows on the calling thread for
+ * the next call with the same inputs bit for bit.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
+ * periodic, points at one `lc_cell`. `pbc`, if non-null, is three
+ * ints. `mask`, if non-null, is `n` ints. `out_count` is writable.
+ * On a fill, `out` is writable for `cap` rows.
+ */
+int lc_pairs_within_pbc(const double *xyz,
+                        size_t n,
+                        const struct lc_cell *simbox,
+                        const int *pbc,
+                        double cutoff,
+                        const int *mask,
+                        double cell_hint,
+                        int half,
+                        int closed,
+                        int exclude_self_images,
+                        struct lc_pair *out,
+                        size_t cap,
+                        size_t *out_count);
+
+/**
  * [`lc_pairs_within`] with one array of [`lc_pair`] rows.
  *
  * Null `out` is a query: `*out_count` receives the row count and the
@@ -280,6 +336,14 @@ int lc_pairs_within_rows(const double *xyz,
                          struct lc_pair *out,
                          size_t cap,
                          size_t *out_count);
+
+/**
+ * How many partner stencils have been built in this process.
+ *
+ * A reused stencil does not increment the count. The periodic list and
+ * the open-cell list share the counter.
+ */
+uint64_t lc_stencil_builds(void);
 
 /**
  * Library version string. Process-static, NUL-terminated. Do not free.

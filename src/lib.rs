@@ -140,6 +140,7 @@ mod bins;
 mod cell;
 mod error;
 mod knearest;
+mod open_cell;
 mod pairs;
 mod pop;
 mod replica;
@@ -158,6 +159,7 @@ pub use error::Error;
 pub use knearest::{
     knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Neighbors,
 };
+pub use open_cell::{cell_for_pbc, pairs_open, pairs_within_pbc, stencil_builds, PbcQuery};
 pub use pairs::{pairs_within, pairs_within_columns, Pair, PairColumns};
 pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
