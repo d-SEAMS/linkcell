@@ -22,6 +22,7 @@
 
 use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
 use crate::cell::Cell;
+use crate::team::Stage;
 use crate::Error;
 
 fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
@@ -374,30 +375,28 @@ fn write_one(
             return Err(Error::BufferSize);
         }
     }
-    fill_rows(out_nn, -1);
-    if let Some(d2) = out_d2.as_mut() {
-        fill_rows(d2, f64::NAN);
-    }
+    #[cfg(feature = "timing")]
+    let started = std::time::Instant::now();
+    let found = execute(
+        xyz,
+        simbox,
+        k,
+        mask,
+        cell_hint,
+        out_nn,
+        out_d2.as_deref_mut(),
+    );
     #[cfg(feature = "timing")]
     if crate::simd::coarse_timing_enabled() {
-        let started = std::time::Instant::now();
-        let result = execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2);
         crate::simd::add_knn_ns(started.elapsed().as_nanos());
-        return result;
     }
-    execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
-}
-
-/// Every slot to `value`. A large output is filled by the pool: on one
-/// thread it was a serial pass over `n * k` slots before the search.
-fn fill_rows<T: Copy + Send + Sync>(out: &mut [T], value: T) {
-    #[cfg(feature = "parallel")]
-    if out.len() >= 1 << 18 && rayon::current_num_threads() > 1 {
-        use rayon::prelude::*;
-        out.par_chunks_mut(1 << 15).for_each(|c| c.fill(value));
-        return;
+    if found.is_err() {
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
     }
-    out.fill(value);
+    found
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
@@ -547,6 +546,20 @@ fn force_legacy() -> bool {
     }
 }
 
+/// Per-worker buffers of one search region.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    cand: Candidates,
+    heap: Option<KHeap>,
+}
+
+/// Units of the scan (blocks or bins) per chunk: about sixteen chunks a
+/// worker, so a worker the scheduler parks holds a small share.
+fn scan_chunk(units: usize, width: usize) -> usize {
+    (units / (16 * width.max(1))).max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -554,7 +567,7 @@ fn execute(
     mask: Option<&[bool]>,
     cell_hint: Option<f64>,
     out_nn: &mut [i32],
-    out_d2: Option<&mut [f64]>,
+    mut out_d2: Option<&mut [f64]>,
 ) -> Result<(), Error> {
     if k == 0 {
         return Err(Error::ZeroK);
@@ -573,6 +586,10 @@ fn execute(
         None => n,
     };
     if n_active <= 1 {
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
         return Ok(());
     }
     crate::pop::prepare();
@@ -594,75 +611,177 @@ fn execute(
     let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
     #[cfg(all(feature = "parallel", linkcell_openmp))]
     if active_owned.is_none()
+        && !crate::team::installed()
+        && !crate::on_caller()
         && !force_legacy()
         && (xyz.len() >= bins::PARALLEL_MESH || force_fused())
     {
+        // The region writes only the slots it finds.
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
         return fused::run(xyz, &walk, k, edge, out_nn, out_d2);
     }
-    let mesh = {
-        #[cfg(feature = "timing")]
-        {
-            if crate::simd::coarse_timing_enabled() {
-                let started = std::time::Instant::now();
-                let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
-                crate::simd::add_mesh_ns(started.elapsed().as_nanos());
-                mesh
-            } else {
-                Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
+    let nn = RowsOut(out_nn.as_mut_ptr());
+    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
+    let mode = match (walk.is_ortho(), walk.is_restricted()) {
+        (true, _) => 0u8,
+        (false, true) => 1,
+        (false, false) => 2,
+    };
+    crate::team::with_current(|width, spawn| {
+        if width <= 1 || spawn.is_none() {
+            if let Some(m) = mask {
+                for (i, &on) in m.iter().enumerate() {
+                    if !on {
+                        // SAFETY: row `i` of an `n * k` output.
+                        unsafe {
+                            nn.row(i, k).fill(-1);
+                            if let Some(d) = dd {
+                                d.row(i, k).fill(f64::NAN);
+                            }
+                        }
+                    }
+                }
             }
+            let mesh = timed_mesh(|| Mesh::build(xyz, &walk, active_owned.as_deref(), edge))?;
+            let nbin = [mesh.nx, mesh.ny, mesh.nz];
+            let geom = geom_of(&walk, nbin, mesh.widths);
+            let max_reach = reach_of(&walk, &geom, mesh.image_reach());
+            let side = block_side(mesh.occupants.len(), nbin);
+            let (units, _) = scan_units(nbin, side);
+            let mut scratch = Scratch::default();
+            match mode {
+                0 => serial_scan::<0>(
+                    &mesh,
+                    &geom,
+                    k,
+                    max_reach,
+                    side,
+                    nn,
+                    dd,
+                    units,
+                    &mut scratch,
+                ),
+                1 => serial_scan::<1>(
+                    &mesh,
+                    &geom,
+                    k,
+                    max_reach,
+                    side,
+                    nn,
+                    dd,
+                    units,
+                    &mut scratch,
+                ),
+                _ => serial_scan::<2>(
+                    &mesh,
+                    &geom,
+                    k,
+                    max_reach,
+                    side,
+                    nn,
+                    dd,
+                    units,
+                    &mut scratch,
+                ),
+            }
+            drop(mesh);
+            return Ok(());
         }
-        #[cfg(not(feature = "timing"))]
-        {
-            Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
-        }
-    };
-    let nbin = [mesh.nx, mesh.ny, mesh.nz];
-    let widths = mesh.widths;
-    let cell_min = (widths[0] / f64::from(mesh.nx))
-        .min(widths[1] / f64::from(mesh.ny))
-        .min(widths[2] / f64::from(mesh.nz));
-    let need = (box_diameter(&walk) / cell_min).ceil();
-    let max_reach = if need.is_finite() && need < 1.0e7 {
-        (need as i32).saturating_add(3).max(mesh.image_reach())
-    } else {
-        mesh.image_reach()
-    };
-    let geom = Geom {
+        let stages = bins::MeshStages::new(xyz, &walk, active_owned.as_deref(), edge, width)?;
+        let nbin = stages.nbin();
+        let geom = geom_of(&walk, nbin, stages.widths());
+        let max_reach = reach_of(
+            &walk,
+            &geom,
+            nbin.iter().copied().max().unwrap_or(1) / 2 + 2,
+        );
+        let side = block_side(stages.n_active(), nbin);
+        let (units, _) = scan_units(nbin, side);
+        let per = scan_chunk(units, width);
+        let fold_chunks = stages.fold_chunks();
+        let fold = |_: &mut Scratch, c: usize| {
+            let _timer = crate::pop::JobTimer::new();
+            stages.fold(c);
+            let lo = n * c / fold_chunks;
+            let hi = n * (c + 1) / fold_chunks;
+            if let Some(m) = mask {
+                for i in (lo..hi).filter(|&i| !m[i]) {
+                    // SAFETY: chunk `c` alone fills masked rows `lo..hi`.
+                    unsafe {
+                        nn.row(i, k).fill(-1);
+                        if let Some(d) = dd {
+                            d.row(i, k).fill(f64::NAN);
+                        }
+                    }
+                }
+            }
+        };
+        let prefix = |_: &mut Scratch, _: usize| stages.prefix();
+        let scatter = |_: &mut Scratch, t: usize| {
+            let _timer = crate::pop::JobTimer::new();
+            stages.scatter(t);
+        };
+        let mesh = stages.mesh();
+        let geom = &geom;
+        let path = crate::simd::select();
+        let scan = move |s: &mut Scratch, c: usize| {
+            let _timer = crate::pop::JobTimer::new();
+            let lo = c * per;
+            let hi = (lo + per).min(units);
+            match mode {
+                0 => scan_range::<0>(mesh, geom, k, max_reach, side, nn, dd, lo..hi, path, s),
+                1 => scan_range::<1>(mesh, geom, k, max_reach, side, nn, dd, lo..hi, path, s),
+                _ => scan_range::<2>(mesh, geom, k, max_reach, side, nn, dd, lo..hi, path, s),
+            }
+        };
+        let list: Vec<Stage<'_, Scratch>> = vec![
+            Stage {
+                chunks: fold_chunks,
+                run: &fold,
+            },
+            Stage {
+                chunks: 1,
+                run: &prefix,
+            },
+            Stage {
+                chunks: stages.scatter_chunks(),
+                run: &scatter,
+            },
+            Stage {
+                chunks: (units + per - 1) / per,
+                run: &scan,
+            },
+        ];
+        crate::team::run(width, spawn, &list);
+        Ok(())
+    })
+}
+
+fn timed_mesh(build: impl FnOnce() -> Result<Mesh, Error>) -> Result<Mesh, Error> {
+    #[cfg(feature = "timing")]
+    if crate::simd::coarse_timing_enabled() {
+        let started = std::time::Instant::now();
+        let mesh = build()?;
+        crate::simd::add_mesh_ns(started.elapsed().as_nanos());
+        return Ok(mesh);
+    }
+    build()
+}
+
+fn geom_of(walk: &Cell, nbin: [i32; 3], widths: [f64; 3]) -> Geom {
+    Geom {
         cols: [walk.a(), walk.b(), walk.c()],
         lengths: walk.widths(),
         nbin,
         widths,
-    };
-    match (
-        block_side(&mesh, nbin),
-        walk.is_ortho(),
-        walk.is_restricted(),
-    ) {
-        (Some(side), true, _) => {
-            dispatch_blocks::<0>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
-        }
-        (Some(side), false, true) => {
-            dispatch_blocks::<1>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
-        }
-        (Some(side), false, false) => {
-            dispatch_blocks::<2>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
-        }
-        (None, true, _) => dispatch::<0>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
-        (None, false, true) => dispatch::<1>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
-        (None, false, false) => dispatch::<2>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
     }
-    #[cfg(feature = "parallel")]
-    {
-        TEAM.store(crate::pool_width(), std::sync::atomic::Ordering::Relaxed);
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        TEAM.store(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(())
 }
 
 /// Shell walk of every source in bin `c`.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
 fn walk_cell<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
@@ -701,49 +820,128 @@ fn walk_cells<const MODE: u8>(
     }
 }
 
-fn dispatch<const MODE: u8>(
+fn reach_of(walk: &Cell, geom: &Geom, image_reach: i32) -> i32 {
+    let [nx, ny, nz] = geom.nbin;
+    let widths = geom.widths;
+    let cell_min = (widths[0] / f64::from(nx))
+        .min(widths[1] / f64::from(ny))
+        .min(widths[2] / f64::from(nz));
+    let need = (box_diameter(walk) / cell_min).ceil();
+    if need.is_finite() && need < 1.0e7 {
+        (need as i32).saturating_add(3).max(image_reach)
+    } else {
+        image_reach
+    }
+}
+
+/// Scan units, blocks of `side` bins or single bins, and the blocks per
+/// axis.
+fn scan_units(nbin: [i32; 3], side: Option<i32>) -> (usize, [i32; 3]) {
+    let [nx, ny, nz] = nbin;
+    match side {
+        Some(side) => {
+            let blocks = [
+                (nx + side - 1) / side,
+                (ny + side - 1) / side,
+                (nz + side - 1) / side,
+            ];
+            ((blocks[0] * blocks[1] * blocks[2]) as usize, blocks)
+        }
+        None => ((nx as usize) * (ny as usize) * (nz as usize), nbin),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serial_scan<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
     k: usize,
     max_reach: i32,
-    mask: Option<&[bool]>,
-    out_nn: &mut [i32],
-    out_d2: Option<&mut [f64]>,
+    side: Option<i32>,
+    nn: RowsOut<i32>,
+    dd: Option<RowsOut<f64>>,
+    units: usize,
+    scratch: &mut Scratch,
 ) {
-    // Masked points are not in the mesh, so every slot is an active source.
-    let _ = mask;
-    // Sources go in bin order: consecutive sources are neighbours, so their
-    // shells share cache lines whatever order the caller's points came in.
-    // Source `i` writes its own row, `out[i * k ..]`.
-    let nn = RowsOut(out_nn.as_mut_ptr());
-    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
-    let [nx, ny, _] = geom.nbin;
-    let cell = |c: usize| {
-        let c = c as i32;
-        [c % nx, (c / nx) % ny, c / (nx * ny)]
-    };
-    let job = |c: usize| {
-        walk_cell::<MODE>(mesh, geom, k, max_reach, cell(c), c, (nn, dd));
-    };
-    let ncell = mesh.offsets.len() - 1;
-    let span = (nx as usize).saturating_mul(ny as usize);
-    run_z_slabs(ncell, span, 64, job);
+    let _timer = crate::pop::JobTimer::new();
+    let path = crate::simd::select();
+    scan_range::<MODE>(
+        mesh,
+        geom,
+        k,
+        max_reach,
+        side,
+        nn,
+        dd,
+        0..units,
+        path,
+        scratch,
+    );
 }
 
-/// Bins a side of the source blocks of [`dispatch_blocks`] for this mesh:
+/// Scan units `range`: blocks through [`scan_block`] when `side` is set,
+/// bins through the shell walk otherwise.
+#[allow(clippy::too_many_arguments)]
+fn scan_range<const MODE: u8>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    side: Option<i32>,
+    nn: RowsOut<i32>,
+    dd: Option<RowsOut<f64>>,
+    range: std::ops::Range<usize>,
+    path: crate::simd::Path,
+    scratch: &mut Scratch,
+) {
+    match side {
+        Some(side) => {
+            let (_, blocks) = scan_units(geom.nbin, Some(side));
+            let Scratch { cand, heap, .. } = scratch;
+            let heap = heap.get_or_insert_with(|| KHeap::new(k));
+            for blk in range {
+                scan_block::<MODE>(
+                    mesh, geom, k, max_reach, side, blocks, path, nn, dd, cand, heap, blk,
+                );
+            }
+        }
+        None => {
+            let [nx, ny, _] = geom.nbin;
+            for c in range {
+                let ci = c as i32;
+                let bin = [ci % nx, (ci / nx) % ny, ci / (nx * ny)];
+                for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+                    let i = mesh.occupants[slot];
+                    // Safety: each source owns row `i` of both outputs, and the
+                    // caller sized them to `n * k`.
+                    let (row, mut row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+                    clear_row(row, row_d2.as_deref_mut());
+                    walk_source::<MODE>(mesh, geom, k, max_reach, bin, slot, row, row_d2, None);
+                }
+            }
+        }
+    }
+}
+
+/// Every slot of a row unused: the search writes the found prefix.
+#[inline(always)]
+fn clear_row(row: &mut [i32], d2: Option<&mut [f64]>) {
+    row.fill(-1);
+    if let Some(d2) = d2 {
+        d2.fill(f64::NAN);
+    }
+}
+
+/// Bins a side of the source blocks of [`scan_block`] for this mesh:
 /// two when bins hold few points, so eight bins share one gather, and one
 /// otherwise. `None` when a candidate box would wrap onto itself.
-fn block_side(mesh: &Mesh, nbin: [i32; 3]) -> Option<i32> {
+fn block_side(n_active: usize, nbin: [i32; 3]) -> Option<i32> {
     #[cfg(test)]
     if NO_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let ncell = nbin.iter().map(|&n| n as usize).product::<usize>().max(1);
-    let side = if mesh.occupants.len() < 4 * ncell {
-        2
-    } else {
-        1
-    };
+    let side = if n_active < 4 * ncell { 2 } else { 1 };
     nbin.iter().all(|&n| n >= side + 2).then_some(side)
 }
 
@@ -769,6 +967,7 @@ struct Candidates {
 
 /// Shared inputs for one block scan. The candidate list and heap stay
 /// per thread.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
 struct BlockScan<'a> {
     mesh: &'a Mesh,
     geom: &'a Geom,
@@ -783,6 +982,7 @@ struct BlockScan<'a> {
 }
 
 /// One block of the shared-candidate scan. `blk` is the block index.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
 fn select_one_block<const MODE: u8>(
     scan: &BlockScan<'_>,
     cand: &mut Candidates,
@@ -889,8 +1089,8 @@ fn select_one_block<const MODE: u8>(
     }
 }
 
-/// [`dispatch`] by blocks of `side` bins a side: a block's sources share
-/// one candidate list, the occupants of the `side + 2` bins a side around
+/// One block of `side` bins a side: a block's sources share one
+/// candidate list, the occupants of the `side + 2` bins a side around
 /// the block with their images, gathered once. When a source's k-th
 /// neighbour is closer than the plane bound of the gathered bins, the answer
 /// is among the candidates: every other point lies strictly past one of
@@ -899,160 +1099,108 @@ fn select_one_block<const MODE: u8>(
 /// the bound does not settle resumes the shell walk from its heap, which
 /// holds its 3 x 3 x 3 bins already.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_blocks<const MODE: u8>(
+#[inline(always)]
+fn scan_block<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
     k: usize,
     max_reach: i32,
     side: i32,
-    out_nn: &mut [i32],
-    out_d2: Option<&mut [f64]>,
+    blocks: [i32; 3],
+    path: crate::simd::Path,
+    nn: RowsOut<i32>,
+    dd: Option<RowsOut<f64>>,
+    cand: &mut Candidates,
+    heap: &mut KHeap,
+    blk: usize,
 ) {
-    let nn = RowsOut(out_nn.as_mut_ptr());
-    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
     let [nx, ny, nz] = geom.nbin;
-    let blocks = [
-        (nx + side - 1) / side,
-        (ny + side - 1) / side,
-        (nz + side - 1) / side,
-    ];
-    let nblock = (blocks[0] * blocks[1] * blocks[2]) as usize;
-    let path = crate::simd::select();
     #[cfg(feature = "timing")]
     let time_scan = crate::simd::scan_timing_enabled();
-    #[cfg(not(feature = "timing"))]
-    let time_scan = false;
-    let scan = BlockScan {
-        mesh,
-        geom,
-        k,
-        max_reach,
-        side,
-        blocks,
-        path,
-        time_scan,
-        nn,
-        dd,
-    };
-    let job = move |cand: &mut Candidates, heap: &mut KHeap, blk: usize| {
-        select_one_block::<MODE>(&scan, cand, heap, blk);
-    };
-    let span = (blocks[0] as usize).saturating_mul(blocks[1] as usize);
-    run_block_slabs(nblock, span, k, job);
-}
-
-/// One candidate list and one heap per worker, then the blocks of that
-/// worker's z-slab. See [`run_z_slabs`].
-fn run_block_slabs<F>(nblock: usize, z_span: usize, k: usize, job: F)
-where
-    F: Fn(&mut Candidates, &mut KHeap, usize) + Sync,
-{
-    #[cfg(not(feature = "parallel"))]
-    let _ = z_span;
-    #[cfg(feature = "parallel")]
-    {
-        let width = requested_threads();
-        if width != 1 {
-            if width > 1 {
-                let span = z_span.max(1);
-                rayon::broadcast(|ctx| {
-                    let _timer = crate::pop::JobTimer::new();
-                    let mut cand = Candidates::default();
-                    let mut heap = KHeap::new(k);
-                    let workers = ctx.num_threads().max(1);
-                    let t = ctx.index();
-                    let layers = nblock.saturating_add(span - 1) / span;
-                    let z0 = layers * t / workers;
-                    let z1 = layers * (t + 1) / workers;
-                    let begin = z0.saturating_mul(span);
-                    let end = z1.saturating_mul(span).min(nblock);
-                    for blk in begin..end {
-                        job(&mut cand, &mut heap, blk);
-                    }
-                });
-                return;
+    let blk = blk as i32;
+    let x0 = side * (blk % blocks[0]);
+    let y0 = side * ((blk / blocks[0]) % blocks[1]);
+    let z0 = side * (blk / (blocks[0] * blocks[1]));
+    cand.x.clear();
+    cand.y.clear();
+    cand.z.clear();
+    cand.id.clear();
+    let interior =
+        x0 >= 1 && y0 >= 1 && z0 >= 1 && x0 + side < nx && y0 + side < ny && z0 + side < nz;
+    for dz in -1..=side {
+        for dy in -1..=side {
+            // Inside the box a row of bins is one run of slots with no
+            // shift: `p + 0` is `p`.
+            if interior {
+                let row = ((z0 + dz) * ny + (y0 + dy)) * nx + x0;
+                let (lo, hi) = (
+                    mesh.offsets[(row - 1) as usize],
+                    mesh.offsets[(row + side + 1) as usize],
+                );
+                for slot in lo..hi {
+                    let p = mesh.slot_folded[slot];
+                    cand.x.push(p[0]);
+                    cand.y.push(p[1]);
+                    cand.z.push(p[2]);
+                    cand.id.push(mesh.occupants[slot] as u64);
+                }
+                continue;
             }
-            use rayon::prelude::*;
-            (0..nblock).into_par_iter().with_min_len(8).for_each_init(
-                || {
-                    (
-                        crate::pop::JobTimer::new(),
-                        Candidates::default(),
-                        KHeap::new(k),
-                    )
-                },
-                |(_timer, cand, heap), blk| job(cand, heap, blk),
-            );
-            return;
+            for dx in -1..=side {
+                let (cell, na, nb, nc) = mesh.locate(x0 + dx, y0 + dy, z0 + dz);
+                let shift = image_shift::<MODE>(geom, na, nb, nc);
+                for slot in mesh.offsets[cell]..mesh.offsets[cell + 1] {
+                    let p = mesh.slot_folded[slot];
+                    cand.x.push(p[0] + shift[0]);
+                    cand.y.push(p[1] + shift[1]);
+                    cand.z.push(p[2] + shift[2]);
+                    cand.id.push(mesh.occupants[slot] as u64);
+                }
+            }
         }
     }
-    let _timer = crate::pop::JobTimer::new();
-    let mut cand = Candidates::default();
-    let mut heap = KHeap::new(k);
-    for blk in 0..nblock {
-        job(&mut cand, &mut heap, blk);
-    }
-}
-
-/// How many workers `lc_set_threads` asked for. Zero means the caller
-/// left the default iterator in place.
-#[cfg(feature = "parallel")]
-fn requested_threads() -> usize {
-    #[cfg(feature = "capi")]
-    {
-        crate::capi::search_width()
-    }
-    #[cfg(not(feature = "capi"))]
-    {
-        0
-    }
-}
-
-/// Visit `0..count` in spatial slabs.
-///
-/// The index is x-fastest, so `z_span` indices are one z layer. A width
-/// of one runs the layers on the calling thread. A wider pool gives each
-/// worker one contiguous run of layers and the AVX scan stays inside
-/// that worker. Width zero keeps the default Rayon iterator, chunked by
-/// `min_len`, which is what the Rust callers use.
-fn run_z_slabs<F>(count: usize, z_span: usize, min_len: usize, job: F)
-where
-    F: Fn(usize) + Sync,
-{
-    #[cfg(not(feature = "parallel"))]
-    let _ = (z_span, min_len);
-    #[cfg(feature = "parallel")]
-    {
-        let width = requested_threads();
-        if width != 1 {
-            if width > 1 {
-                let span = z_span.max(1);
-                rayon::broadcast(|ctx| {
-                    let _timer = crate::pop::JobTimer::new();
-                    let workers = ctx.num_threads().max(1);
-                    let t = ctx.index();
-                    let layers = count.saturating_add(span - 1) / span;
-                    let z0 = layers * t / workers;
-                    let z1 = layers * (t + 1) / workers;
-                    let begin = z0.saturating_mul(span);
-                    let end = z1.saturating_mul(span).min(count);
-                    for index in begin..end {
-                        job(index);
+    let planes = box_planes([x0, y0, z0], side, geom);
+    for iz in z0..(z0 + side).min(nz) {
+        for iy in y0..(y0 + side).min(ny) {
+            for ix in x0..(x0 + side).min(nx) {
+                let c = ((iz * ny + iy) * nx + ix) as usize;
+                for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+                    let i = mesh.occupants[slot];
+                    // Safety: each source owns row `i` of both outputs,
+                    // and the caller sized them to `n * k`.
+                    let (row, mut row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+                    clear_row(row, row_d2.as_deref_mut());
+                    heap.clear();
+                    let pi = mesh.slot_folded[slot];
+                    #[cfg(feature = "timing")]
+                    if time_scan {
+                        let started = std::time::Instant::now();
+                        scan_at(path, cand, pi, i, heap);
+                        crate::simd::add_scan_ns(started.elapsed().as_nanos());
+                    } else {
+                        scan_at(path, cand, pi, i, heap);
                     }
-                });
-                return;
+                    #[cfg(not(feature = "timing"))]
+                    scan_at(path, cand, pi, i, heap);
+                    let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
+                    if heap.full() && heap.worst() < bound {
+                        heap.write_sorted(row, row_d2);
+                    } else {
+                        walk_source::<MODE>(
+                            mesh,
+                            geom,
+                            k,
+                            max_reach,
+                            [ix, iy, iz],
+                            slot,
+                            row,
+                            row_d2,
+                            Some(heap.clone()),
+                        );
+                    }
+                }
             }
-            use rayon::prelude::*;
-            (0..count)
-                .into_par_iter()
-                .with_min_len(min_len)
-                .for_each_init(crate::pop::JobTimer::new, |_timer, index| job(index));
-            return;
         }
-    }
-    let _timer = crate::pop::JobTimer::new();
-    for index in 0..count {
-        job(index);
     }
 }
 

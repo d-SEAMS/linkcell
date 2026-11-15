@@ -152,6 +152,7 @@ mod replica;
 mod simd;
 mod skin;
 mod skin_simd;
+mod team;
 #[cfg(feature = "capi")]
 mod vesin_abi;
 #[cfg(feature = "capi")]

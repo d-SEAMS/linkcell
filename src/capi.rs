@@ -25,6 +25,15 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
 }
 
 #[cfg(feature = "parallel")]
+struct Slot {
+    n: usize,
+    pool: rayon::ThreadPool,
+}
+
+#[cfg(feature = "parallel")]
+static CACHE: std::sync::Mutex<Option<Slot>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "parallel")]
 fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     let n = WANTED_THREADS.load(Ordering::Relaxed);
     if n == 0 {
@@ -36,11 +45,6 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     if rayon::current_thread_index().is_some() && rayon::current_num_threads() == n {
         return work();
     }
-    struct Slot {
-        n: usize,
-        pool: rayon::ThreadPool,
-    }
-    static CACHE: std::sync::Mutex<Option<Slot>> = std::sync::Mutex::new(None);
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     if guard.as_ref().map(|slot| slot.n) != Some(n) {
         *guard = None;
@@ -48,6 +52,34 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
         *guard = Some(Slot { n, pool });
     }
     guard.as_ref().unwrap().pool.install(work)
+}
+
+/// Run a k-nearest search on the calling thread, with the workers of the
+/// pool [`lc_set_threads`] chose joining it (see `team`). The caller does
+/// not hand the search to a pool thread and sleep: it is one of the
+/// workers, and the call returns when the last stage closes.
+#[cfg(not(feature = "parallel"))]
+fn with_team<R>(work: impl FnOnce() -> R) -> R {
+    work()
+}
+
+#[cfg(feature = "parallel")]
+fn with_team<R>(work: impl FnOnce() -> R) -> R {
+    let n = WANTED_THREADS.load(Ordering::Relaxed);
+    if n == 0 || (rayon::current_thread_index().is_some() && rayon::current_num_threads() == n) {
+        return work();
+    }
+    if n == 1 {
+        return crate::run_on_caller(|| crate::team::install(1, &|job| job(), work));
+    }
+    let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if guard.as_ref().map(|slot| slot.n) != Some(n) {
+        *guard = None;
+        let pool = crate::place::build_pool(n);
+        *guard = Some(Slot { n, pool });
+    }
+    let pool = &guard.as_ref().unwrap().pool;
+    crate::team::install(n, &|job| pool.spawn(job), work)
 }
 
 /// Choose the Rayon width for later searches. `n == 0` leaves it unset:
@@ -81,13 +113,6 @@ fn default_width() -> usize {
     {
         1
     }
-}
-
-/// Width stored by [`lc_set_threads`]. Zero means the caller did not
-/// choose, and the search keeps its default iterator.
-#[cfg(feature = "parallel")]
-pub(crate) fn search_width() -> usize {
-    WANTED_THREADS.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy)]
@@ -437,7 +462,7 @@ pub unsafe extern "C" fn lc_knearest_many(
         Some(&mut d2_store[..])
     };
     let cont = take_continuation();
-    let err = with_threads(|| {
+    let err = with_team(|| {
         let found = if n_frames == 1 {
             crate::knearest_into_d2(pts, &sim, k, mask_vec.as_deref(), hint, nn, d2)
         } else {
