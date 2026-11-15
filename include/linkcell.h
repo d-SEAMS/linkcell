@@ -9,9 +9,6 @@
  *   - lc_knearest_many is the frame-major batch (n_frames * n * k).
  *   - lc_pairs_within writes caller-owned i, j, shift, dist2 rows.
  *     Null outputs query the row count.
- *   - lc_cell_grid, lc_cell_graph, and lc_partition write caller-owned
- *     cell buffers. A null weight or domain pointer queries the count.
- *   - lc_halo_width writes three bin radii. lc_halo writes ghost ids.
  *   - lc_last_error returns a thread-local pointer. Do not free. The
  *     pointer is invalid after the next lc_knearest on the same thread.
  *     lc_version does not read or write the slot.
@@ -38,6 +35,64 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+/**
+ * How [`partition_graph`] cuts the cell graph.
+ */
+enum Method
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+    /**
+     * Morton order, then a weighted prefix split.
+     */
+    Morton = 0,
+    /**
+     * Hilbert order, then a weighted prefix split.
+     */
+    Hilbert = 1,
+    /**
+     * Weighted recursive coordinate bisection.
+     */
+    Rcb = 2,
+    /**
+     * Hilbert prefix split, then Fiduccia-Mattheyses.
+     */
+    HilbertFm = 3,
+    /**
+     * Recursive coordinate bisection, then Fiduccia-Mattheyses.
+     */
+    RcbFm = 4,
+    /**
+     * Serial Scotch `SCOTCH_graphPart`, feature `scotch` only.
+     */
+    Scotch = 5,
+    /**
+     * Heavy-edge coarsening, coarse bisection, refinement on the way back.
+     */
+    Multi = 6,
+    /**
+     * PT-Scotch `SCOTCH_dgraphPart`, feature `ptscotch` only.
+     */
+    PtScotch = 7,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum Method Method;
+#else
+typedef uint8_t Method;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Wall time of one bisection subtree.
+ *
+ * `select`, `fm`, and `pack` are sequential on a single branch. A join
+ * keeps the slower child when more than one thread is in the pool, and
+ * adds the children when the join is serial.
+ */
+typedef struct Phase Phase;
 
 /**
  * Periodic parallelepiped. Lattice vectors are a, b, c (same as vesin rows).
@@ -116,9 +171,126 @@ typedef struct lc_pair {
     double dist2;
 } lc_pair;
 
+/**
+ * Default method.
+ *
+ * The panel sums edge cuts over the five systems. The default is the
+ * native method with the smallest sum among those that stay within
+ * the balance bound on every system. A tie breaks toward the smaller
+ * sum of median wall times.
+ */
+#define DEFAULT_METHOD RcbFm
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Periodic cell adjacency. Edge weights are pair counts from
+ * `lc_pairs_within` with `half` set.
+ *
+ * A null `out_weight` queries `*out_ncell` and `*out_arcs` and
+ * returns 0. Otherwise every output buffer is required. `cap_weight`
+ * is the cell capacity and `cap_arcs` is the arc capacity.
+ * `out_offsets` has length `ncell + 1`.
+ *
+ * # Safety
+ *
+ * Same point contract as [`lc_cell_grid`]. On a fill, `out_offsets`
+ * is writable for `ncell + 1` counts, `out_neighbor` and `out_edge`
+ * for `out_arcs` entries.
+ */
+int lc_cell_graph(const double *xyz,
+                  size_t n,
+                  const struct lc_cell *simbox,
+                  double cutoff,
+                  const int *mask,
+                  double cell_hint,
+                  int *out_nxyz,
+                  double *out_width,
+                  uint64_t *out_weight,
+                  uint32_t *out_offsets,
+                  uint32_t *out_neighbor,
+                  uint64_t *out_edge,
+                  size_t cap_weight,
+                  size_t cap_arcs,
+                  size_t *out_ncell,
+                  size_t *out_arcs);
+
+/**
+ * Point counts on the linked-cell mesh.
+ *
+ * `out_nxyz` receives `nx, ny, nz`. `out_width` receives the three bin
+ * widths. `out_weight` receives one count per cell, in the order
+ * `((iz * ny) + iy) * nx + ix`. A null `out_weight` is a query:
+ * `*out_ncell` is the cell count and the return is 0.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `simbox` points at one
+ * `lc_cell`. `mask`, if non-null, is readable for `n` ints.
+ * `out_ncell` is writable. On a fill, `out_nxyz` is writable for 3
+ * ints, `out_width` for 3 doubles, and `out_weight` for `*out_ncell`
+ * counts.
+ */
+int lc_cell_grid(const double *xyz,
+                 size_t n,
+                 const struct lc_cell *simbox,
+                 double cutoff,
+                 const int *mask,
+                 double cell_hint,
+                 int *out_nxyz,
+                 double *out_width,
+                 uint64_t *out_weight,
+                 size_t cap,
+                 size_t *out_ncell);
+
+/**
+ * Run `cb(ctx, begin, end)` over disjoint spans of `0..n` on the pool
+ * selected by [`lc_set_threads`]. One thread runs the whole span on the
+ * caller. The spans cover `0..n` exactly once.
+ */
+void lc_for_slabs(int n, void *ctx, void (*cb)(void*, int, int));
+
+extern int32_t lc_gpu_curve_split(const uint32_t *atom_bin,
+                                  size_t natom,
+                                  const uint32_t *coords,
+                                  size_t ncell,
+                                  uint32_t parts,
+                                  uint32_t *assign,
+                                  uint64_t *out_weight,
+                                  uint8_t method);
+
+/**
+ * Ghost cells of `domain`. A null `out_ghost` queries `*out_count`.
+ *
+ * # Safety
+ *
+ * `nxyz` is readable for 3 ints. `assign` is readable for `ncell`
+ * ints. `width` is readable for 3 counts. On a fill, `out_ghost` is
+ * writable for `*out_count` ints.
+ */
+int lc_halo(const int *nxyz,
+            const int *assign,
+            size_t ncell,
+            int domain,
+            const uint32_t *width,
+            int *out_ghost,
+            size_t cap,
+            size_t *out_count);
+
+/**
+ * Bin radii for `cutoff * depth`. `out_width` receives three counts.
+ *
+ * # Safety
+ *
+ * `bin_width` is readable for 3 doubles. `out_width` is writable for
+ * 3 counts.
+ */
+int lc_halo_width(double cutoff,
+                  uint32_t depth,
+                  const double *bin_width,
+                  uint32_t *out_width);
 
 /**
  * k-nearest neighbours for `n` points.
@@ -201,6 +373,27 @@ int lc_knearest_many(const double *xyz,
                      int *out_nn,
                      double *out_d2);
 
+extern void lc_knn_one_region(void *ctx,
+                              int32_t pin,
+                              int64_t n_points,
+                              int64_t n_bins,
+                              int64_t n_blocks,
+                              Phase bin,
+                              Phase count,
+                              Phase scan_base,
+                              Phase scan,
+                              Phase fill,
+                              Phase select,
+                              int32_t *team);
+
+/**
+ * C ABI for the same join, so a `dlclose` of this image can stop the team
+ * first. The image destructor calls the implementation directly.
+ */
+void lc_knn_shutdown(void);
+
+extern void lc_knn_shutdown_impl(void);
+
 /**
  * Thread-local last-error string from this thread's most recent
  * [`lc_knearest`].
@@ -212,6 +405,65 @@ int lc_knearest_many(const double *xyz,
  * the next `lc_knearest` on this thread. Do not free it.
  */
 const char *lc_last_error(void);
+
+/**
+ * Domain of each cell and the bin of each point, from one mesh cut.
+ *
+ * `method` and `balance` follow [`lc_partition`]. A null `out_domain`
+ * queries `*out_ncell` and does not write. On a fill, `out_nxyz` is
+ * three ints, `out_width` is three bin widths, `out_domain` is one
+ * domain per cell, and `out_point_cell` is one bin per point.
+ *
+ * # Safety
+ *
+ * Same point contract as [`lc_cell_grid`]. On a fill, `out_domain` is
+ * writable for `*out_ncell` ints and `out_point_cell` for `n` ints.
+ */
+int lc_mesh_cut(const double *xyz,
+                size_t n,
+                const struct lc_cell *simbox,
+                double cutoff,
+                const int *mask,
+                double cell_hint,
+                size_t parts,
+                uint8_t method,
+                double balance,
+                int device,
+                int *out_nxyz,
+                double *out_width,
+                int *out_domain,
+                int *out_point_cell,
+                size_t cap_cell,
+                size_t cap_point,
+                size_t *out_ncell);
+
+/**
+ * Width selected by [`lc_set_threads`], or the global pool when unset.
+ */
+int lc_num_threads(void);
+
+extern int32_t lc_omp_max_threads(void);
+
+/**
+ * Owned points are 2. Points in a cell painted from the owned walk are 1.
+ *
+ * The stencil is the one [`crate::rank_mask`] paints while it visits the
+ * cells of `domain`. `width` is three bin radii.
+ *
+ * # Safety
+ *
+ * `nxyz` is readable for 3 ints. `assign` is readable for `ncell` ints.
+ * `point_cell` is readable for `n` ints. `width` is readable for 3
+ * counts. `out_hit` is writable for `n` ints.
+ */
+int lc_owned_mask(const int *nxyz,
+                  const int *assign,
+                  size_t ncell,
+                  const int *point_cell,
+                  size_t n,
+                  int domain,
+                  const uint32_t *width,
+                  int *out_hit);
 
 /**
  * Cartesian half pair list of an open cluster.
@@ -341,80 +593,20 @@ int lc_pairs_within_rows(const double *xyz,
                          size_t *out_count);
 
 /**
- * Point counts on the linked-cell mesh.
- *
- * `out_nxyz` receives `nx, ny, nz`. `out_width` receives the three
- * bin widths. `out_weight` receives one count per cell, in the order
- * `((iz * ny) + iy) * nx + ix`. A null `out_weight` is a query:
- * `*out_ncell` is the cell count and the return is 0.
- *
- * # Safety
- *
- * `xyz` is readable for `n * 3` doubles. `simbox` points at one
- * `lc_cell`. `mask`, if non-null, is readable for `n` ints.
- * `out_ncell` is writable. On a fill, `out_nxyz` is writable for 3
- * ints, `out_width` for 3 doubles, and `out_weight` for `*out_ncell`
- * counts.
- */
-int lc_cell_grid(const double *xyz,
-                 size_t n,
-                 const struct lc_cell *simbox,
-                 double cutoff,
-                 const int *mask,
-                 double cell_hint,
-                 int *out_nxyz,
-                 double *out_width,
-                 uint64_t *out_weight,
-                 size_t cap,
-                 size_t *out_ncell);
-
-/**
- * Periodic cell adjacency. Edge weights are pair counts from
- * `lc_pairs_within` with `half` set.
- *
- * A null `out_weight` queries `*out_ncell` and `*out_arcs` and
- * returns 0. Otherwise every output buffer is required.
- * `out_offsets` has length `ncell + 1`.
- *
- * # Safety
- *
- * Same point contract as `lc_cell_grid`. On a fill, `out_offsets`
- * is writable for `ncell + 1` counts, and `out_neighbor` and
- * `out_edge` for `*out_arcs` entries.
- */
-int lc_cell_graph(const double *xyz,
-                  size_t n,
-                  const struct lc_cell *simbox,
-                  double cutoff,
-                  const int *mask,
-                  double cell_hint,
-                  int *out_nxyz,
-                  double *out_width,
-                  uint64_t *out_weight,
-                  uint32_t *out_offsets,
-                  uint32_t *out_neighbor,
-                  uint64_t *out_edge,
-                  size_t cap_weight,
-                  size_t cap_arcs,
-                  size_t *out_ncell,
-                  size_t *out_arcs);
-
-/**
  * Domain id of each cell.
  *
  * `method` is 0 Morton, 1 Hilbert, 2 recursive coordinate bisection,
  * 3 Hilbert plus Fiduccia-Mattheyses, 4 bisection plus that pass,
  * 5 Scotch, 6 multilevel, 7 PT-Scotch. `balance <= 0` selects
  * `1 + parts * w_max / total`, where `w_max` is the heaviest cell
- * weight and `total` is the sum of the cell weights. That is the
- * tightest bound a cell-aligned cut can promise. `device` nonzero runs
- * the curve split on the CUDA device and returns nonzero when that
- * device is absent. A null `out_domain` queries `*out_ncell`.
+ * weight and `total` is the sum of the cell weights. `device` nonzero runs the
+ * curve split on the CUDA device and returns nonzero when that device
+ * is absent. A null `out_domain` queries `*out_ncell`.
  *
  * # Safety
  *
- * Same point contract as `lc_cell_grid`. On a fill, `out_domain`
- * is writable for `*out_ncell` ints.
+ * Same point contract as [`lc_cell_grid`]. On a fill, `out_domain` is
+ * writable for `ncell` ints.
  */
 int lc_partition(const double *xyz,
                  size_t n,
@@ -431,69 +623,17 @@ int lc_partition(const double *xyz,
                  size_t *out_ncell);
 
 /**
- * Bin radii for `cutoff * depth`. `out_width` receives three counts.
- *
- * # Safety
- *
- * `bin_width` is readable for 3 doubles. `out_width` is writable
- * for 3 counts.
- */
-int lc_halo_width(double cutoff,
-                  uint32_t depth,
-                  const double *bin_width,
-                  uint32_t *out_width);
-
-/**
- * Ghost cells of `domain`. A null `out_ghost` queries `*out_count`.
- *
- * # Safety
- *
- * `nxyz` is readable for 3 ints. `assign` is readable for `ncell`
- * ints. `width` is readable for 3 counts. On a fill, `out_ghost` is
- * writable for `*out_count` ints.
- */
-int lc_halo(const int *nxyz,
-            const int *assign,
-            size_t ncell,
-            int domain,
-            const uint32_t *width,
-            int *out_ghost,
-            size_t cap,
-            size_t *out_count);
-
-/**
- * Domain of each cell and the bin of each point, from one mesh cut.
- *
- * `method` and `balance` follow `lc_partition`. A null `out_domain`
- * queries `*out_ncell`. On a fill, `out_nxyz` is three ints,
- * `out_width` is three bin widths, `out_domain` is one domain per
- * cell, and `out_point_cell` is one bin per point.
- */
-int lc_mesh_cut(const double *xyz,
-                size_t n,
-                const struct lc_cell *simbox,
-                double cutoff,
-                const int *mask,
-                double cell_hint,
-                size_t parts,
-                uint8_t method,
-                double balance,
-                int device,
-                int *out_nxyz,
-                double *out_width,
-                int *out_domain,
-                int *out_point_cell,
-                size_t cap_cell,
-                size_t cap_point,
-                size_t *out_ncell);
-
-/**
  * Domain of each cell from caller-supplied weights.
  *
  * `nxyz` is `nx, ny, nz`. `weight` has one count per cell, in the
  * order `((iz * ny) + iy) * nx + ix`. `method` and `balance` follow
- * `lc_partition`. A plain bisection reads these weights and not the
+ * [`lc_partition`]. A plain bisection reads the weights and not the
  * pair arcs. `out_domain` receives one domain per cell.
+ *
+ * # Safety
+ *
+ * `nxyz` is readable for 3 ints. `weight` is readable for `ncell`
+ * counts. `out_domain` is writable for `ncell` ints.
  */
 int lc_partition_weights(const int *nxyz,
                          const uint64_t *weight,
@@ -503,10 +643,60 @@ int lc_partition_weights(const int *nxyz,
                          double balance,
                          int *out_domain);
 
+extern int32_t lc_ptscotch_part(int32_t n,
+                                const int32_t *offsets,
+                                const int32_t *edges,
+                                const int32_t *vwgt,
+                                const int32_t *ewgt,
+                                int32_t parts,
+                                double imbalance,
+                                int32_t *part,
+                                double *seconds_max);
+
+extern int32_t lc_scotch_part(int32_t n,
+                              const int32_t *offsets,
+                              const int32_t *edges,
+                              const int32_t *vwgt,
+                              const int32_t *ewgt,
+                              int32_t parts,
+                              double imbalance,
+                              int32_t *part);
+
 /**
- * Owned points of `domain` are 2. Points within `reach` of one of
- * those atoms are 1. Other points are 0. `hwidth` is the cell stencil
- * from `lc_halo_width`; it limits the search, it does not keep a cell.
+ * Run `cb` at the end of the next `lc_knearest`, still inside its pool.
+ * A null `cb` clears it. The search clears nothing by itself: the caller
+ * drops the hook when the call returns.
+ */
+void lc_set_continuation(void *ctx, void (*cb)(void*));
+
+/**
+ * Choose the Rayon width for later searches. `n == 0` runs the search
+ * on the calling thread. `n < 0` selects one thread.
+ */
+void lc_set_threads(int n);
+
+/**
+ * How many partner stencils have been built in this process.
+ *
+ * A reused stencil does not increment the count. The periodic list and
+ * the open-cell list share the counter.
+ */
+uint64_t lc_stencil_builds(void);
+
+/**
+ * Library version string. Process-static, NUL-terminated. Do not free.
+ */
+const char *lc_version(void);
+
+/**
+ * Owned points are 2. Ghosts within `reach` of an owned atom are 1.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `lengths` and `nxyz` are
+ * readable for 3 entries. `assign` is readable for `ncell` ints.
+ * `point_cell` is readable for `n` ints. `hwidth` is readable for 3
+ * counts. `out_hit` is writable for `n` ints.
  */
 int lc_within_reach(const double *xyz,
                     size_t n,
@@ -519,41 +709,6 @@ int lc_within_reach(const double *xyz,
                     int domain,
                     double reach,
                     int *out_hit);
-
-/**
- * Owned points of `domain` are 2. Points in a cell painted while
- * walking that domain's cells are 1. Other points are 0. `width` is
- * the stencil from `lc_halo_width`. The paint is `rank_mask`.
- */
-int lc_owned_mask(const int *nxyz,
-                  const int *assign,
-                  size_t ncell,
-                  const int *point_cell,
-                  size_t n,
-                  int domain,
-                  const uint32_t *width,
-                  int *out_hit);
-
-/**
- * Use `n` Rayon threads for later searches. `n == 0` runs on the calling
- * thread. `n < 0` means one thread. Safe to call again with a different `n`.
- */
-/** `n == 0` runs the next search on the calling thread. `n < 0` selects one thread. */
-void lc_set_threads(int n);
-
-/** Width last passed to `lc_set_threads`, or the global pool when unset. */
-int lc_num_threads(void);
- * How many partner stencils have been built in this process.
- *
- * A reused stencil does not increment the count. The periodic list and
- * the open-cell list share the counter.
- */
-uint64_t lc_stencil_builds(void);
-
-/**
- * Library version string. Process-static, NUL-terminated. Do not free.
- */
-const char *lc_version(void);
 
 #ifdef __cplusplus
 }  // extern "C"
