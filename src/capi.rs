@@ -79,34 +79,44 @@ struct Continuation {
     cb: usize,
 }
 
-/// A callback the in-flight search runs before its pool goes idle, so
-/// the CSR merge does not pay a second wake. Unset between searches.
-static CONTINUATION: Mutex<Option<Continuation>> = Mutex::new(None);
+thread_local! {
+    /// A callback the calling thread's next search runs before its pool
+    /// goes idle, so the CSR merge does not pay a second wake. Each thread
+    /// sets and clears its own hook, so concurrent searches on different
+    /// threads never run each other's callback.
+    // `const { ... }` is newer than this crate's 1.70 floor.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static CONTINUATION: std::cell::Cell<Option<Continuation>> = std::cell::Cell::new(None);
+}
 
-fn run_continuation() {
-    let copied = {
-        let guard = CONTINUATION.lock().unwrap_or_else(|err| err.into_inner());
-        *guard
-    };
-    let Some(cont) = copied else {
+/// The hook the calling thread set, read before the search enters the pool.
+fn take_continuation() -> Option<Continuation> {
+    CONTINUATION.with(|slot| slot.get())
+}
+
+fn run_continuation(cont: Option<Continuation>) {
+    let Some(cont) = cont else {
         return;
     };
     let cb: extern "C" fn(*mut std::ffi::c_void) = unsafe { std::mem::transmute(cont.cb) };
     cb(cont.ctx as *mut std::ffi::c_void);
 }
 
-/// Run `cb` at the end of the next `lc_knearest`, still inside its pool.
-/// A null `cb` clears it. The search clears nothing by itself: the caller
-/// drops the hook when the call returns.
+/// Run `cb` at the end of this thread's next `lc_knearest`, still inside
+/// its pool. A null `cb` clears it. The hook belongs to the calling
+/// thread; a search started on another thread does not run it. The search
+/// clears nothing by itself: the caller drops the hook when the call
+/// returns.
 #[no_mangle]
 pub extern "C" fn lc_set_continuation(
     ctx: *mut std::ffi::c_void,
     cb: Option<extern "C" fn(*mut std::ffi::c_void)>,
 ) {
-    let mut guard = CONTINUATION.lock().unwrap_or_else(|err| err.into_inner());
-    *guard = cb.map(|cb| Continuation {
-        ctx: ctx as usize,
-        cb: cb as usize,
+    CONTINUATION.with(|slot| {
+        slot.set(cb.map(|cb| Continuation {
+            ctx: ctx as usize,
+            cb: cb as usize,
+        }))
     });
 }
 
@@ -386,6 +396,7 @@ pub unsafe extern "C" fn lc_knearest_many(
         d2_store = unsafe { std::slice::from_raw_parts_mut(out_d2, need) };
         Some(&mut d2_store[..])
     };
+    let cont = take_continuation();
     let err = with_threads(|| {
         let found = if n_frames == 1 {
             crate::knearest_into_d2(pts, &sim, k, mask_vec.as_deref(), hint, nn, d2)
@@ -393,7 +404,7 @@ pub unsafe extern "C" fn lc_knearest_many(
             crate::knearest_into_many(pts, n, n_frames, &sim, k, mask_vec.as_deref(), hint, nn, d2)
         };
         if found.is_ok() {
-            run_continuation();
+            run_continuation(cont);
         }
         found
     });

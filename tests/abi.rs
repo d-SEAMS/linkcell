@@ -722,3 +722,58 @@ fn c_pair_layouts_keep_the_input_image_shift() {
         }
     }
 }
+
+extern "C" fn count_hook(ctx: *mut std::ffi::c_void) {
+    // SAFETY: the test passes a pointer to an AtomicUsize that outlives every search.
+    let hits = unsafe { &*(ctx as *const std::sync::atomic::AtomicUsize) };
+    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A continuation set on one thread runs only at the end of that thread's
+/// own searches, never inside a search started on another thread.
+#[test]
+fn continuation_runs_only_on_the_thread_that_set_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const SEARCHES: usize = 200;
+    let xyz: Vec<[f64; 3]> = (0..512)
+        .map(|i| {
+            let i = i as f64;
+            [(i * 0.37) % 8.0, (i * 0.61) % 8.0, (i * 0.83) % 8.0]
+        })
+        .collect();
+    let packed = pack_xyz(&xyz);
+    let hits: Vec<AtomicUsize> = (0..2).map(|_| AtomicUsize::new(0)).collect();
+    std::thread::scope(|s| {
+        for (t, slot) in hits.iter().enumerate() {
+            let packed = &packed;
+            s.spawn(move || {
+                let box_c = ortho_c(8.0, 8.0, 8.0);
+                let ctx = slot as *const AtomicUsize as *mut std::ffi::c_void;
+                linkcell::lc_set_continuation(ctx, Some(count_hook));
+                let mut out = vec![-1; 512 * 4];
+                for _ in 0..SEARCHES {
+                    let rc = unsafe {
+                        lc_knearest(packed.as_ptr(), 512, &box_c, 4, std::ptr::null(), 0.0, out.as_mut_ptr())
+                    };
+                    assert_eq!(rc, 0, "thread {t}");
+                }
+                linkcell::lc_set_continuation(std::ptr::null_mut(), None);
+            });
+        }
+        // A third thread searches with no hook of its own.
+        let packed = &packed;
+        s.spawn(move || {
+            let box_c = ortho_c(8.0, 8.0, 8.0);
+            let mut out = vec![-1; 512 * 4];
+            for _ in 0..SEARCHES {
+                let rc = unsafe {
+                    lc_knearest(packed.as_ptr(), 512, &box_c, 4, std::ptr::null(), 0.0, out.as_mut_ptr())
+                };
+                assert_eq!(rc, 0, "hookless thread");
+            }
+        });
+    });
+    for (t, slot) in hits.iter().enumerate() {
+        assert_eq!(slot.load(Ordering::SeqCst), SEARCHES, "thread {t} hook count");
+    }
+}
