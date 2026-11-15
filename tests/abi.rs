@@ -753,7 +753,15 @@ fn continuation_runs_only_on_the_thread_that_set_it() {
                 let mut out = vec![-1; 512 * 4];
                 for _ in 0..SEARCHES {
                     let rc = unsafe {
-                        lc_knearest(packed.as_ptr(), 512, &box_c, 4, std::ptr::null(), 0.0, out.as_mut_ptr())
+                        lc_knearest(
+                            packed.as_ptr(),
+                            512,
+                            &box_c,
+                            4,
+                            std::ptr::null(),
+                            0.0,
+                            out.as_mut_ptr(),
+                        )
                     };
                     assert_eq!(rc, 0, "thread {t}");
                 }
@@ -767,13 +775,25 @@ fn continuation_runs_only_on_the_thread_that_set_it() {
             let mut out = vec![-1; 512 * 4];
             for _ in 0..SEARCHES {
                 let rc = unsafe {
-                    lc_knearest(packed.as_ptr(), 512, &box_c, 4, std::ptr::null(), 0.0, out.as_mut_ptr())
+                    lc_knearest(
+                        packed.as_ptr(),
+                        512,
+                        &box_c,
+                        4,
+                        std::ptr::null(),
+                        0.0,
+                        out.as_mut_ptr(),
+                    )
                 };
                 assert_eq!(rc, 0, "hookless thread");
             }
         });
     });
     for (t, slot) in hits.iter().enumerate() {
-        assert_eq!(slot.load(Ordering::SeqCst), SEARCHES, "thread {t} hook count");
+        assert_eq!(
+            slot.load(Ordering::SeqCst),
+            SEARCHES,
+            "thread {t} hook count"
+        );
     }
 }
