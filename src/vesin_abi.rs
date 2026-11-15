@@ -284,8 +284,8 @@ impl NeighborCalc {
         n_atoms: usize,
     ) -> Result<(), Error> {
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_atoms];
-        for k in 0..cols.len() {
-            let i = cols.i[k] as usize;
+        for (k, &i_raw) in cols.i.iter().enumerate() {
+            let i = i_raw as usize;
             if i >= n_atoms {
                 return Err(Error::Overflow);
             }
