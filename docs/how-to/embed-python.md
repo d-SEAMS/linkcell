@@ -36,6 +36,11 @@ device; the host only reads the four launch ints (`nx`, `ny`,
 `linkcell.gpu_available()` is true when the driver and nvrtc load
 (gpulite, no CUDA SDK at build time).
 
+An open cluster is `pairs_open(xyz, cutoff)`. The return is
+`(i, j, S, dist2)` with `i < j` and shift zero.
+`pairs_within_pbc` takes a periodicity mask.
+`stencil_builds()` counts partner stencils that were built.
+
 Wheels:
 
 - `abi3-py312`: one wheel per platform, GIL CPython 3.12+

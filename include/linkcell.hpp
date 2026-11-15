@@ -15,6 +15,7 @@ extern "C" {
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -291,6 +292,95 @@ pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
     const char *msg = lc_last_error();
     throw Error(fill, msg ? std::string(msg)
                           : std::string("linkcell: pairs_within failed"));
+  }
+  out.resize(wrote);
+  return out;
+}
+
+/// How many partner stencils have been built in this process.
+[[nodiscard]] inline std::uint64_t stencil_builds() noexcept {
+  return lc_stencil_builds();
+}
+
+/// Cartesian half pair list of an open cluster.
+///
+/// Each row has `i < j`, shift zero, and squared distance strictly
+/// below `cutoff * cutoff`. Bins are the occupied Cartesian cells and
+/// are reused until those bounding bins change.
+[[nodiscard]] inline std::vector<ShiftedPair>
+pairs_open(const double *xyz, std::size_t n, double cutoff,
+           double cell_hint = 0.0) {
+  if (n == 0 || xyz == nullptr) {
+    return {};
+  }
+  static_assert(sizeof(ShiftedPair) == sizeof(lc_pair) &&
+                    alignof(ShiftedPair) == alignof(lc_pair),
+                "ShiftedPair must match lc_pair");
+  std::size_t count = 0;
+  const int status = lc_pairs_open(xyz, detail::to_c_count(n, "n"), cutoff,
+                                   cell_hint, nullptr, 0, &count);
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg)
+                            : std::string("linkcell: pairs_open failed"));
+  }
+  if (count == 0) {
+    return {};
+  }
+  std::vector<ShiftedPair> out(count);
+  std::size_t wrote = 0;
+  const int fill =
+      lc_pairs_open(xyz, detail::to_c_count(n, "n"), cutoff, cell_hint,
+                    reinterpret_cast<lc_pair *>(out.data()), count, &wrote);
+  if (fill != 0) {
+    const char *msg = lc_last_error();
+    throw Error(fill, msg ? std::string(msg)
+                          : std::string("linkcell: pairs_open failed"));
+  }
+  out.resize(wrote);
+  return out;
+}
+
+/// [`pairs_within`] with a periodicity mask.
+///
+/// `periodic[k]` false is an open axis. `closed` keeps the cutoff
+/// boundary on an open or mixed cell. `exclude_self_images` drops
+/// `i == j`.
+[[nodiscard]] inline std::vector<ShiftedPair>
+pairs_within_pbc(const double *xyz, std::size_t n, const Cell &cell,
+                 const std::array<bool, 3> &periodic, double cutoff,
+                 const int *mask = nullptr, double cell_hint = 0.0,
+                 bool half = false, bool closed = false,
+                 bool exclude_self_images = false) {
+  if (n == 0 || xyz == nullptr) {
+    return {};
+  }
+  const int pbc[3] = {periodic[0] ? 1 : 0, periodic[1] ? 1 : 0,
+                      periodic[2] ? 1 : 0};
+  const lc_cell raw = cell.raw();
+  std::size_t count = 0;
+  const int status = lc_pairs_within_pbc(
+      xyz, detail::to_c_count(n, "n"), &raw, pbc, cutoff, mask, cell_hint,
+      half ? 1 : 0, closed ? 1 : 0, exclude_self_images ? 1 : 0, nullptr, 0,
+      &count);
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg)
+                            : std::string("linkcell: pairs_within_pbc failed"));
+  }
+  if (count == 0) {
+    return {};
+  }
+  std::vector<ShiftedPair> out(count);
+  std::size_t wrote = 0;
+  const int fill = lc_pairs_within_pbc(
+      xyz, detail::to_c_count(n, "n"), &raw, pbc, cutoff, mask, cell_hint,
+      half ? 1 : 0, closed ? 1 : 0, exclude_self_images ? 1 : 0,
+      reinterpret_cast<lc_pair *>(out.data()), count, &wrote);
+  if (fill != 0) {
+    const char *msg = lc_last_error();
+    throw Error(fill, msg ? std::string(msg)
+                          : std::string("linkcell: pairs_within_pbc failed"));
   }
   out.resize(wrote);
   return out;

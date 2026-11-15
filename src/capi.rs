@@ -413,6 +413,265 @@ pub unsafe extern "C" fn lc_pairs_within_rows(
     0
 }
 
+/// How many partner stencils have been built in this process.
+///
+/// A reused stencil does not increment the count. The periodic list and
+/// the open-cell list share the counter.
+#[no_mangle]
+pub extern "C" fn lc_stencil_builds() -> u64 {
+    crate::stencil_builds()
+}
+
+/// Cartesian half pair list of an open cluster.
+///
+/// Every axis is open. Each row has `i < j`, shift `(0, 0, 0)`, and
+/// `dist2` strictly below `cutoff` squared. Null `out` queries
+/// `*out_count`. A short buffer sets `*out_count` and returns nonzero
+/// without writing. The bins are the occupied Cartesian cells and are
+/// reused until those bounding bins change.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `out_count` is writable.
+/// On a fill, `out` is writable for `cap` rows.
+#[no_mangle]
+pub unsafe extern "C" fn lc_pairs_open(
+    xyz: *const f64,
+    n: usize,
+    cutoff: f64,
+    cell_hint: f64,
+    out: *mut lc_pair,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    let periodic = [0, 0, 0];
+    unsafe {
+        lc_pairs_within_pbc(
+            xyz,
+            n,
+            std::ptr::null(),
+            periodic.as_ptr(),
+            cutoff,
+            std::ptr::null(),
+            cell_hint,
+            1,
+            0,
+            0,
+            out,
+            cap,
+            out_count,
+        )
+    }
+}
+
+/// [`lc_pairs_within_rows`] with a periodicity mask.
+///
+/// `pbc` is three ints. Nonzero means that axis is periodic. A null
+/// `pbc` is fully periodic. An open axis is binned on the occupied
+/// Cartesian cells and is not padded into a periodic box. `closed`
+/// nonzero keeps `dist2 <= cutoff²` on an open or mixed cell.
+/// `exclude_self_images` nonzero drops `i == j`.
+///
+/// Null `out` is a count query. Otherwise `out` holds `cap` rows.
+/// A query or a short buffer keeps its rows on the calling thread for
+/// the next call with the same inputs bit for bit.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
+/// periodic, points at one `lc_cell`. `pbc`, if non-null, is three
+/// ints. `mask`, if non-null, is `n` ints. `out_count` is writable.
+/// On a fill, `out` is writable for `cap` rows.
+#[no_mangle]
+pub unsafe extern "C" fn lc_pairs_within_pbc(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    pbc: *const c_int,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    half: c_int,
+    closed: c_int,
+    exclude_self_images: c_int,
+    out: *mut lc_pair,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if out_count.is_null() {
+        return fail_msg("null pointer");
+    }
+    let periodic = if pbc.is_null() {
+        [true, true, true]
+    } else {
+        let flags = unsafe { [*pbc, *pbc.add(1), *pbc.add(2)] };
+        [flags[0] != 0, flags[1] != 0, flags[2] != 0]
+    };
+    if n == 0 {
+        unsafe { *out_count = 0 };
+        clear_error();
+        return 0;
+    }
+    if xyz.is_null() || (periodic != [false, false, false] && simbox.is_null()) {
+        return fail_msg("null pointer");
+    }
+    if n > c_int::MAX as usize || n > (isize::MAX as usize) / 3 {
+        return fail(Error::Overflow);
+    }
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
+    let pts = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_raw: Option<&[c_int]> = if mask.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(mask, n) })
+    };
+    let key = OpenKey {
+        xyz: xyz_bits(pts),
+        periodic,
+        cutoff: cutoff.to_bits(),
+        mask: mask_raw.map(|m| m.iter().map(|&v| v != 0).collect()),
+        cell_hint: hint.map(f64::to_bits),
+        half: half != 0,
+        closed: closed != 0,
+        exclude_self: exclude_self_images != 0,
+        box_bits: if periodic == [false, false, false] || simbox.is_null() {
+            [0; 12]
+        } else {
+            box_bits(unsafe { &*simbox })
+        },
+    };
+    let rows = if let Some(parked) = take_open(&key) {
+        parked
+    } else {
+        match open_rows(pts, simbox, periodic, cutoff, mask_raw, hint, &key) {
+            Ok(rows) => rows,
+            Err(code) => return code,
+        }
+    };
+    unsafe { *out_count = rows.len() };
+    if out.is_null() {
+        park_open(key, rows);
+        clear_error();
+        return 0;
+    }
+    if cap < rows.len() {
+        let len = rows.len();
+        park_open(key, rows);
+        let _ = len;
+        return fail_msg("pair buffer is shorter than the pair count");
+    }
+    let dest = unsafe { std::slice::from_raw_parts_mut(out, rows.len()) };
+    dest.copy_from_slice(&rows);
+    clear_error();
+    0
+}
+
+struct OpenKey {
+    xyz: Vec<u64>,
+    periodic: [bool; 3],
+    cutoff: u64,
+    mask: Option<Vec<bool>>,
+    cell_hint: Option<u64>,
+    half: bool,
+    closed: bool,
+    exclude_self: bool,
+    box_bits: [u64; 12],
+}
+
+struct ParkedOpen {
+    key: OpenKey,
+    rows: Vec<lc_pair>,
+}
+
+thread_local! {
+    static PARKED_OPEN: RefCell<Option<ParkedOpen>> = const { RefCell::new(None) };
+}
+
+fn xyz_bits(xyz: &[[f64; 3]]) -> Vec<u64> {
+    let mut bits = Vec::with_capacity(xyz.len() * 3);
+    for point in xyz {
+        bits.push(point[0].to_bits());
+        bits.push(point[1].to_bits());
+        bits.push(point[2].to_bits());
+    }
+    bits
+}
+
+fn take_open(key: &OpenKey) -> Option<Vec<lc_pair>> {
+    let parked = PARKED_OPEN.with(|slot| slot.borrow_mut().take())?;
+    let same = parked.key.periodic == key.periodic
+        && parked.key.cutoff == key.cutoff
+        && parked.key.cell_hint == key.cell_hint
+        && parked.key.half == key.half
+        && parked.key.closed == key.closed
+        && parked.key.exclude_self == key.exclude_self
+        && parked.key.box_bits == key.box_bits
+        && parked.key.mask == key.mask
+        && parked.key.xyz == key.xyz;
+    if same {
+        Some(parked.rows)
+    } else {
+        None
+    }
+}
+
+fn park_open(key: OpenKey, rows: Vec<lc_pair>) {
+    PARKED_OPEN.with(|slot| {
+        *slot.borrow_mut() = Some(ParkedOpen { key, rows });
+    });
+}
+
+fn open_rows(
+    pts: &[[f64; 3]],
+    simbox: *const lc_cell,
+    periodic: [bool; 3],
+    cutoff: f64,
+    mask: Option<&[c_int]>,
+    hint: Option<f64>,
+    key: &OpenKey,
+) -> Result<Vec<lc_pair>, c_int> {
+    let cell = if periodic == [false, false, false] {
+        Cell::ortho(1.0, 1.0, 1.0).map_err(|err| fail(err.into()))?
+    } else {
+        let raw = unsafe { *simbox };
+        crate::cell_for_pbc(
+            [
+                [raw.ax, raw.ay, raw.az],
+                [raw.bx, raw.by, raw.bz],
+                [raw.cx, raw.cy, raw.cz],
+            ],
+            [raw.ox, raw.oy, raw.oz],
+            periodic,
+        )
+        .map_err(fail)?
+    };
+    let mask_vec: Option<Vec<bool>> = mask.map(|m| m.iter().map(|&v| v != 0).collect());
+    let mut query = crate::PbcQuery::new(periodic, cutoff)
+        .cell_hint(hint)
+        .half(key.half)
+        .closed(key.closed)
+        .exclude_self_images(key.exclude_self);
+    query.mask = mask_vec.as_deref();
+    let found = crate::pairs_within_pbc(pts, &cell, &query).map_err(fail)?;
+    let mut rows = Vec::with_capacity(found.len());
+    for pair in found {
+        if pair.i > c_int::MAX as usize || pair.j > c_int::MAX as usize {
+            return Err(fail(Error::Overflow));
+        }
+        rows.push(lc_pair {
+            i: pair.i as c_int,
+            j: pair.j as c_int,
+            shift: pair.shift,
+            dist2: pair.dist2,
+        });
+    }
+    Ok(rows)
+}
+
 /// Check the inputs, then take the parked search or run a new one.
 unsafe fn pairs_call<'a>(
     xyz: *const f64,

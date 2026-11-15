@@ -78,6 +78,14 @@ The C, C++, and Python entries are that list (`lc_pairs_within`,
 `linkcell::pairs_within`, `linkcell.pairs_within`). A cutoff
 neighbour list is this call.
 
+An open axis has no image. `pairs_open` bins the occupied Cartesian
+cells and returns the half list (`i < j`, shift zero). The partner
+stencil is rebuilt when the bounding bins change and kept while atoms
+move inside them. `lc_stencil_builds` counts the builds. Padding the
+open axis into a periodic box instead makes that stencil follow the
+bounding span. `pairs_within_pbc` is the same walk with a periodicity
+mask. A fully periodic mask is `pairs_within`.
+
 The bins are one fold, one count per key, a scan, and a fill of the
 slot columns in bin order: positions, positions relative to the bin
 corner, their squared length, and the atom index. The fold writes

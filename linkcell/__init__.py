@@ -3,19 +3,24 @@
 Arrays are DLPack. Pass any ``__dlpack__()`` object (numpy, torch,
 jax, cupy, metatomic) for ``xyz`` and ``cell``. ``knearest`` returns
 ``(indices, dist2)``. ``pairs_within`` returns ``(i, j, S, dist2)``,
-the cutoff list. Use ``numpy.from_dlpack`` or ``torch.from_dlpack``
-on each tensor.
+the cutoff list. ``pairs_open`` is the Cartesian half list of an open
+cluster. ``stencil_builds`` counts partner stencils that were built.
+Use ``numpy.from_dlpack`` or ``torch.from_dlpack`` on each tensor.
 """
 
 from linkcell._lib import NeighborList as _NeighborList
-from linkcell._lib import __version__, gpu_available, knearest, pairs_within
+from linkcell._lib import __version__, gpu_available, knearest, pairs_open, pairs_within
+from linkcell._lib import pairs_within_pbc, stencil_builds
 
 __all__ = [
     "NeighborList",
     "__version__",
     "gpu_available",
     "knearest",
+    "pairs_open",
     "pairs_within",
+    "pairs_within_pbc",
+    "stencil_builds",
 ]
 
 
