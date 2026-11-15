@@ -111,7 +111,8 @@ include = [
     "lc_version",
 ]
 # Vesin types and entry points are the hand-written include/linkcell_vesin.h.
-# cbindgen would otherwise append them to include/linkcell.h.
+# The OpenMP region is an internal schedule, not part of include/linkcell.h.
+# cbindgen would otherwise append both sets to that header.
 exclude = [
     "lc_cell_ortho",
     "Cell",
@@ -126,6 +127,11 @@ exclude = [
     "NeighborCalc",
     "lc_vesin_neighbors",
     "lc_vesin_free",
+    "Phase",
+    "lc_knn_one_region",
+    "lc_knn_shutdown",
+    "lc_knn_shutdown_impl",
+    "lc_omp_max_threads",
 ]
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
 
