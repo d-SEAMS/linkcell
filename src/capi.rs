@@ -44,15 +44,7 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     if guard.as_ref().map(|slot| slot.n) != Some(n) {
         *guard = None;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .unwrap_or_else(|_| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .build()
-                    .unwrap()
-            });
+        let pool = crate::place::build_pool(n);
         *guard = Some(Slot { n, pool });
     }
     guard.as_ref().unwrap().pool.install(work)

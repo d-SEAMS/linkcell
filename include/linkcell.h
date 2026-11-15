@@ -646,6 +646,12 @@ void lc_set_gpu_curve_split(int32_t (*f)(const uint32_t *atom_bin,
                                          uint8_t method));
 
 /**
+ * CPUs Rayon workers may use. The first non-empty call wins, so record
+ * the process mask before pinning the caller. `n <= 0` is ignored.
+ */
+void lc_set_places(const int *cpus, int n);
+
+/**
  * Choose the Rayon width for later searches. `n == 0` leaves it unset:
  * the search starts on the calling thread with Rayon's and OpenMP's own
  * widths. `n == 1` runs the whole search on the calling thread and

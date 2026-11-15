@@ -146,6 +146,7 @@ mod knearest;
 mod open_cell;
 mod pairs;
 mod partition;
+mod place;
 mod pop;
 mod replica;
 mod simd;
