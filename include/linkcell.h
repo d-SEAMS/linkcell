@@ -465,9 +465,24 @@ int lc_within_reach(const double *xyz,
                     int *out_hit);
 
 /**
- * Use `n` Rayon threads for later searches. `n <= 0` means one thread.
- * Safe to call again with a different `n`.
+ * Owned points of `domain` are 2. Points in a cell painted while
+ * walking that domain's cells are 1. Other points are 0. `width` is
+ * the stencil from `lc_halo_width`. The paint is `rank_mask`.
  */
+int lc_owned_mask(const int *nxyz,
+                  const int *assign,
+                  size_t ncell,
+                  const int *point_cell,
+                  size_t n,
+                  int domain,
+                  const uint32_t *width,
+                  int *out_hit);
+
+/**
+ * Use `n` Rayon threads for later searches. `n == 0` runs on the calling
+ * thread. `n < 0` means one thread. Safe to call again with a different `n`.
+ */
+/** `n == 0` runs the next search on the calling thread. `n < 0` selects one thread. */
 void lc_set_threads(int n);
 
 /** Width last passed to `lc_set_threads`, or the global pool when unset. */

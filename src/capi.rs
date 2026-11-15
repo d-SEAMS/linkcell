@@ -10,43 +10,48 @@ use std::sync::Mutex;
 
 use crate::{Cell, Error};
 
-/// How many Rayon threads the next search should use. Zero means the
-/// process-wide pool, which is what `RAYON_NUM_THREADS` built.
+/// How many Rayon threads the next search should use. Zero or one runs
+/// on the calling thread.
 static WANTED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-fn pool_of(n: usize) -> &'static rayon::ThreadPool {
-    static CACHE: Mutex<Vec<(usize, &'static rayon::ThreadPool)>> = Mutex::new(Vec::new());
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, pool)) = guard.iter().find(|(k, _)| *k == n) {
-        return *pool;
-    }
-    let pool = Box::leak(Box::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
-    ));
-    guard.push((n, pool));
-    pool
-}
-
-/// Run `work` on a pool of the requested width so `current_num_threads`
-/// inside linkcell matches that width. A width of one is the serial walk.
+/// One pool for the process. A different width drops the previous pool
+/// before the new one starts, so two widths never run together. The
+/// workers sleep on a condvar between searches (rayon's idle path),
+/// which is the passive wait.
 fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     let n = WANTED_THREADS.load(Ordering::Relaxed);
-    if n == 0 {
+    if n <= 1 {
         return work();
     }
     if rayon::current_thread_index().is_some() && rayon::current_num_threads() == n {
         return work();
     }
-    pool_of(n).install(work)
+    struct Slot {
+        n: usize,
+        pool: rayon::ThreadPool,
+    }
+    static CACHE: Mutex<Option<Slot>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if guard.as_ref().map(|slot| slot.n) != Some(n) {
+        *guard = None;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        *guard = Some(Slot { n, pool });
+    }
+    guard.as_ref().unwrap().pool.install(work)
 }
 
-/// Choose the Rayon width for later searches. `n <= 0` selects one thread.
+/// Choose the Rayon width for later searches. `n == 0` runs the search
+/// on the calling thread. `n < 0` selects one thread.
 #[no_mangle]
 pub extern "C" fn lc_set_threads(n: c_int) {
-    let n = if n < 1 { 1 } else { n as usize };
+    let n = if n < 0 {
+        1
+    } else {
+        n as usize
+    };
     WANTED_THREADS.store(n, Ordering::Relaxed);
 }
 
@@ -458,11 +463,15 @@ pub unsafe extern "C" fn lc_pairs_within_rows(
         park(&key, found);
         return fail_msg("pair buffer is shorter than the pair count");
     }
-    // Safety: the caller gave `cap >= rows` rows.
+    // Safety: the caller gave `cap >= rows` rows. The fill runs on the
+    // same pool as the search. `in_pool` would otherwise open the global
+    // Rayon pool beside it.
     let rows_out = RowOut(out);
-    crate::pairs::in_pool(found.rows(), move || {
-        let out = rows_out.get();
-        unsafe { found.write_rows(out, |i, j, shift, dist2| lc_pair { i, j, shift, dist2 }) }
+    with_threads(move || {
+        crate::pairs::in_pool(found.rows(), move || {
+            let out = rows_out.get();
+            unsafe { found.write_rows(out, |i, j, shift, dist2| lc_pair { i, j, shift, dist2 }) }
+        })
     });
     clear_error();
     0
@@ -1234,6 +1243,97 @@ pub unsafe extern "C" fn lc_within_reach(
     };
     for (i, &flag) in hit.iter().enumerate() {
         unsafe { *out_hit.add(i) = flag as c_int };
+    }
+    clear_error();
+    0
+}
+
+/// Owned points are 2. Points in a cell painted from the owned walk are 1.
+///
+/// The stencil is the one [`crate::rank_mask`] paints while it visits the
+/// cells of `domain`. `width` is three bin radii.
+///
+/// # Safety
+///
+/// `nxyz` is readable for 3 ints. `assign` is readable for `ncell` ints.
+/// `point_cell` is readable for `n` ints. `width` is readable for 3
+/// counts. `out_hit` is writable for `n` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_owned_mask(
+    nxyz: *const c_int,
+    assign: *const c_int,
+    ncell: usize,
+    point_cell: *const c_int,
+    n: usize,
+    domain: c_int,
+    width: *const u32,
+    out_hit: *mut c_int,
+) -> c_int {
+    if nxyz.is_null()
+        || assign.is_null()
+        || point_cell.is_null()
+        || width.is_null()
+        || out_hit.is_null()
+        || domain < 0
+    {
+        return fail_msg("null pointer");
+    }
+    let nxyz = unsafe { [*nxyz, *nxyz.add(1), *nxyz.add(2)] };
+    if nxyz[0] <= 0 || nxyz[1] <= 0 || nxyz[2] <= 0 {
+        return fail(Error::BadGraph);
+    }
+    let expect = (nxyz[0] as usize)
+        .saturating_mul(nxyz[1] as usize)
+        .saturating_mul(nxyz[2] as usize);
+    if expect != ncell {
+        return fail(Error::BadGraph);
+    }
+    let assign_raw = unsafe { std::slice::from_raw_parts(assign, ncell) };
+    let mut owned_assign = Vec::with_capacity(ncell);
+    let mut owned_cells = Vec::new();
+    for (cell, &v) in assign_raw.iter().enumerate() {
+        if v < 0 {
+            return fail(Error::BadPartition);
+        }
+        let domain_id = v as u32;
+        if domain_id == domain as u32 {
+            owned_cells.push(cell as u32);
+        }
+        owned_assign.push(domain_id);
+    }
+    let cells_raw = unsafe { std::slice::from_raw_parts(point_cell, n) };
+    let mut point_bins = Vec::with_capacity(n);
+    for &v in cells_raw {
+        if v < 0 || v as usize >= ncell {
+            return fail(Error::BadPartition);
+        }
+        point_bins.push(v as u32);
+    }
+    let width = unsafe { [*width, *width.add(1), *width.add(2)] };
+    let grid = crate::CellGrid {
+        nx: nxyz[0],
+        ny: nxyz[1],
+        nz: nxyz[2],
+        bin_width: [1.0; 3],
+        weight: vec![0; ncell],
+    };
+    let view = crate::rank_mask(
+        &grid,
+        &owned_assign,
+        &point_bins,
+        &owned_cells,
+        domain as u32,
+        width,
+    );
+    for (i, &painted) in view.mask.iter().enumerate() {
+        let flag = if !painted {
+            0
+        } else if owned_assign[point_bins[i] as usize] == domain as u32 {
+            2
+        } else {
+            1
+        };
+        unsafe { *out_hit.add(i) = flag };
     }
     clear_error();
     0
