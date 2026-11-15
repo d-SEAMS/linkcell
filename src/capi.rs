@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use crate::{Cell, Error};
 
@@ -36,7 +35,7 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
         n: usize,
         pool: rayon::ThreadPool,
     }
-    static CACHE: Mutex<Option<Slot>> = Mutex::new(None);
+    static CACHE: std::sync::Mutex<Option<Slot>> = std::sync::Mutex::new(None);
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     if guard.as_ref().map(|slot| slot.n) != Some(n) {
         *guard = None;

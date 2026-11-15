@@ -933,6 +933,8 @@ fn run_block_slabs<F>(nblock: usize, z_span: usize, k: usize, job: F)
 where
     F: Fn(&mut Candidates, &mut KHeap, usize) + Sync,
 {
+    #[cfg(not(feature = "parallel"))]
+    let _ = z_span;
     #[cfg(feature = "parallel")]
     {
         let width = requested_threads();
@@ -980,6 +982,7 @@ where
 
 /// How many workers `lc_set_threads` asked for. Zero means the caller
 /// left the default iterator in place.
+#[cfg(feature = "parallel")]
 fn requested_threads() -> usize {
     #[cfg(feature = "capi")]
     {
@@ -1002,6 +1005,8 @@ fn run_z_slabs<F>(count: usize, z_span: usize, min_len: usize, job: F)
 where
     F: Fn(usize) + Sync,
 {
+    #[cfg(not(feature = "parallel"))]
+    let _ = (z_span, min_len);
     #[cfg(feature = "parallel")]
     {
         let width = requested_threads();
