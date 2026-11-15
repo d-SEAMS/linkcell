@@ -81,3 +81,18 @@ reason = "NEON fold, scan, and pair tile."
 symbol = 'linkcell::.*fold2.*'
 features = ["neon", "asimd"]
 reason = "NEON mesh fold registers."
+
+[[allow]]
+symbol = 'linkcell::skin_simd::coded_avx.*'
+features = ["avx512f", "avx512vl", "avx2", "avx"]
+reason = "Skin shift filter. Eight codes at a time, only after AVX-512 is selected."
+
+[[allow]]
+symbol = 'linkcell::skin_simd::compact_avx512.*'
+features = ["avx512f", "avx512vl", "avx2", "avx"]
+reason = "Skin list compaction. Only after AVX-512 is selected."
+
+[[allow]]
+symbol = 'linkcell::skin_simd::distance_avx512.*'
+features = ["avx512f", "avx512vl", "avx2", "avx"]
+reason = "Skin distance screen. Only after AVX-512 is selected."
