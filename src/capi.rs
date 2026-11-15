@@ -66,6 +66,88 @@ pub extern "C" fn lc_num_threads() -> c_int {
     }
 }
 
+/// Width stored by [`lc_set_threads`]. Zero means the caller did not
+/// choose, and the search keeps its default iterator.
+pub(crate) fn search_width() -> usize {
+    WANTED_THREADS.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+struct Continuation {
+    ctx: usize,
+    cb: usize,
+}
+
+/// A callback the in-flight search runs before its pool goes idle, so
+/// the CSR merge does not pay a second wake. Unset between searches.
+static CONTINUATION: Mutex<Option<Continuation>> = Mutex::new(None);
+
+fn run_continuation() {
+    let copied = {
+        let guard = CONTINUATION.lock().unwrap_or_else(|err| err.into_inner());
+        *guard
+    };
+    let Some(cont) = copied else {
+        return;
+    };
+    let cb: extern "C" fn(*mut std::ffi::c_void) = unsafe { std::mem::transmute(cont.cb) };
+    cb(cont.ctx as *mut std::ffi::c_void);
+}
+
+/// Run `cb` at the end of the next `lc_knearest`, still inside its pool.
+/// A null `cb` clears it. The search clears nothing by itself: the caller
+/// drops the hook when the call returns.
+#[no_mangle]
+pub extern "C" fn lc_set_continuation(
+    ctx: *mut std::ffi::c_void,
+    cb: Option<extern "C" fn(*mut std::ffi::c_void)>,
+) {
+    let mut guard = CONTINUATION.lock().unwrap_or_else(|err| err.into_inner());
+    *guard = cb.map(|cb| Continuation {
+        ctx: ctx as usize,
+        cb: cb as usize,
+    });
+}
+
+/// Run `cb(ctx, begin, end)` over disjoint spans of `0..n` on the pool
+/// selected by [`lc_set_threads`]. One thread runs the whole span on the
+/// caller. The spans cover `0..n` exactly once.
+#[no_mangle]
+pub extern "C" fn lc_for_slabs(
+    n: c_int,
+    ctx: *mut std::ffi::c_void,
+    cb: Option<extern "C" fn(*mut std::ffi::c_void, c_int, c_int)>,
+) {
+    let Some(cb) = cb else {
+        return;
+    };
+    if n <= 0 {
+        return;
+    }
+    let ctx_bits = ctx as usize;
+    let cb_bits = cb as usize;
+    with_threads(move || {
+        let call = |begin: c_int, end: c_int| {
+            let ctx = ctx_bits as *mut std::ffi::c_void;
+            let cb: extern "C" fn(*mut std::ffi::c_void, c_int, c_int) =
+                unsafe { std::mem::transmute(cb_bits) };
+            cb(ctx, begin, end);
+        };
+        let width = WANTED_THREADS.load(Ordering::Relaxed);
+        if width <= 1 {
+            call(0, n);
+            return;
+        }
+        rayon::broadcast(move |worker| {
+            let workers = worker.num_threads().max(1);
+            let t = worker.index();
+            let begin = (n as usize) * t / workers;
+            let end = (n as usize) * (t + 1) / workers;
+            call(begin as c_int, end as c_int);
+        });
+    });
+}
+
 /// Periodic parallelepiped. Lattice vectors are a, b, c (same as vesin rows).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -304,11 +386,15 @@ pub unsafe extern "C" fn lc_knearest_many(
         Some(&mut d2_store[..])
     };
     let err = with_threads(|| {
-        if n_frames == 1 {
+        let found = if n_frames == 1 {
             crate::knearest_into_d2(pts, &sim, k, mask_vec.as_deref(), hint, nn, d2)
         } else {
             crate::knearest_into_many(pts, n, n_frames, &sim, k, mask_vec.as_deref(), hint, nn, d2)
+        };
+        if found.is_ok() {
+            run_continuation();
         }
+        found
     });
     if let Err(e) = err {
         set_error(&e.to_string());

@@ -579,21 +579,8 @@ fn dispatch<const MODE: u8>(
         }
     };
     let ncell = mesh.offsets.len() - 1;
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        (0..ncell)
-            .into_par_iter()
-            .with_min_len(64)
-            .for_each_init(crate::pop::JobTimer::new, |_timer, c| job(c));
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let _timer = crate::pop::JobTimer::new();
-        for c in 0..ncell {
-            job(c);
-        }
-    }
+    let span = (nx as usize).saturating_mul(ny as usize);
+    run_z_slabs(ncell, span, 64, |c| job(c));
 }
 
 /// Bins a side of the source blocks of [`dispatch_blocks`] for this mesh:
@@ -750,28 +737,117 @@ fn dispatch_blocks<const MODE: u8>(
             }
         }
     };
+    let span = (blocks[0] as usize).saturating_mul(blocks[1] as usize);
+    run_block_slabs(nblock, span, k, job);
+}
+
+/// One candidate list and one heap per worker, then the blocks of that
+/// worker's z-slab. See [`run_z_slabs`].
+fn run_block_slabs<F>(nblock: usize, z_span: usize, k: usize, job: F)
+where
+    F: Fn(&mut Candidates, &mut KHeap, usize) + Sync,
+{
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        (0..nblock).into_par_iter().with_min_len(8).for_each_init(
-            || {
-                (
-                    crate::pop::JobTimer::new(),
-                    Candidates::default(),
-                    KHeap::new(k),
-                )
-            },
-            |(_timer, cand, heap), blk| job(cand, heap, blk),
-        );
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let _timer = crate::pop::JobTimer::new();
-        let mut cand = Candidates::default();
-        let mut heap = KHeap::new(k);
-        for blk in 0..nblock {
-            job(&mut cand, &mut heap, blk);
+        let width = requested_threads();
+        if width != 1 {
+            if width > 1 {
+                let span = z_span.max(1);
+                rayon::broadcast(|ctx| {
+                    let _timer = crate::pop::JobTimer::new();
+                    let mut cand = Candidates::default();
+                    let mut heap = KHeap::new(k);
+                    let workers = ctx.num_threads().max(1);
+                    let t = ctx.index();
+                    let layers = nblock.saturating_add(span - 1) / span;
+                    let z0 = layers * t / workers;
+                    let z1 = layers * (t + 1) / workers;
+                    let begin = z0.saturating_mul(span);
+                    let end = z1.saturating_mul(span).min(nblock);
+                    for blk in begin..end {
+                        job(&mut cand, &mut heap, blk);
+                    }
+                });
+                return;
+            }
+            use rayon::prelude::*;
+            (0..nblock).into_par_iter().with_min_len(8).for_each_init(
+                || {
+                    (
+                        crate::pop::JobTimer::new(),
+                        Candidates::default(),
+                        KHeap::new(k),
+                    )
+                },
+                |(_timer, cand, heap), blk| job(cand, heap, blk),
+            );
+            return;
         }
+    }
+    let _timer = crate::pop::JobTimer::new();
+    let mut cand = Candidates::default();
+    let mut heap = KHeap::new(k);
+    for blk in 0..nblock {
+        job(&mut cand, &mut heap, blk);
+    }
+}
+
+/// How many workers `lc_set_threads` asked for. Zero means the caller
+/// left the default iterator in place.
+fn requested_threads() -> usize {
+    #[cfg(feature = "capi")]
+    {
+        crate::capi::search_width()
+    }
+    #[cfg(not(feature = "capi"))]
+    {
+        0
+    }
+}
+
+/// Visit `0..count` in spatial slabs.
+///
+/// The index is x-fastest, so `z_span` indices are one z layer. A width
+/// of one runs the layers on the calling thread. A wider pool gives each
+/// worker one contiguous run of layers and the AVX scan stays inside
+/// that worker. Width zero keeps the default Rayon iterator, chunked by
+/// `min_len`, which is what the Rust callers use.
+fn run_z_slabs<F>(count: usize, z_span: usize, min_len: usize, job: F)
+where
+    F: Fn(usize) + Sync,
+{
+    #[cfg(feature = "parallel")]
+    {
+        let width = requested_threads();
+        if width != 1 {
+            if width > 1 {
+                let span = z_span.max(1);
+                rayon::broadcast(|ctx| {
+                    let _timer = crate::pop::JobTimer::new();
+                    let workers = ctx.num_threads().max(1);
+                    let t = ctx.index();
+                    let layers = count.saturating_add(span - 1) / span;
+                    let z0 = layers * t / workers;
+                    let z1 = layers * (t + 1) / workers;
+                    let begin = z0.saturating_mul(span);
+                    let end = z1.saturating_mul(span).min(count);
+                    for index in begin..end {
+                        job(index);
+                    }
+                });
+                return;
+            }
+            use rayon::prelude::*;
+            (0..count)
+                .into_par_iter()
+                .with_min_len(min_len)
+                .for_each_init(crate::pop::JobTimer::new, |_timer, index| job(index));
+            return;
+        }
+    }
+    let _timer = crate::pop::JobTimer::new();
+    for index in 0..count {
+        job(index);
     }
 }
 
