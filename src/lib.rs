@@ -163,7 +163,7 @@ pub use cell::{
 };
 pub use error::Error;
 pub use knearest::{
-    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many,
+    knearest, knearest_brute, knearest_csr, knearest_into, knearest_into_d2, knearest_into_many,
     knearest_team_threads, pin_knearest_to_least_loaded, shutdown_knearest_team, Neighbors,
 };
 pub use open_cell::{cell_for_pbc, pairs_open, pairs_within_pbc, stencil_builds, PbcQuery};

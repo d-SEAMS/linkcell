@@ -481,6 +481,104 @@ pub unsafe extern "C" fn lc_knearest_many(
     0
 }
 
+/// The k-nearest graph of `n` points as CSR.
+///
+/// Inputs are those of [`lc_knearest`]. Row `i` of the nominations is
+/// its `k` nearest, nearest first. With `mutual` nonzero, row `i` holds
+/// every `j` that row `i` lists and that lists `i`: the lower indices
+/// ascending, then the higher ones nearest first. Otherwise each edge
+/// comes from one nomination slot `s = i * k + t`: the lower index's
+/// when both rows list each other, the only one that names it when one
+/// does. A row holds its edges in slot order: edges from lower rows
+/// ascending, then its own nearest first, then edges from higher rows
+/// ascending.
+///
+/// `out_offsets` is caller-owned, `n + 1` ints. `alloc(ctx, total)` is
+/// called once, from any thread of the search, and returns `total`
+/// writable ints for the columns; null fails the call. The search, the
+/// degrees, and the fill run in one parallel region.
+///
+/// # Safety
+///
+/// Same pointer contract as [`lc_knearest`]. `out_offsets` is writable
+/// for `n + 1` ints. `alloc` returns null or `total` writable ints and
+/// does not unwind.
+#[no_mangle]
+pub unsafe extern "C" fn lc_knearest_csr(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    k: usize,
+    mask: *const c_int,
+    cell_hint: f64,
+    mutual: c_int,
+    out_offsets: *mut c_int,
+    alloc: Option<extern "C" fn(*mut std::ffi::c_void, usize) -> *mut c_int>,
+    ctx: *mut std::ffi::c_void,
+) -> c_int {
+    if n == 0 {
+        return fail(Error::Empty);
+    }
+    if k == 0 {
+        return fail(Error::ZeroK);
+    }
+    let Some(alloc) = alloc else {
+        return fail_msg("null pointer");
+    };
+    if xyz.is_null() || simbox.is_null() || out_offsets.is_null() {
+        return fail_msg("null pointer");
+    }
+    let Some(need) = n.checked_mul(k) else {
+        return fail(Error::Overflow);
+    };
+    if n > (isize::MAX as usize) / 3 || need > (isize::MAX as usize) / std::mem::size_of::<c_int>()
+    {
+        return fail(Error::Overflow);
+    }
+    let box_c = unsafe { *simbox };
+    let sim = match Cell::from_vectors(
+        [box_c.ax, box_c.ay, box_c.az],
+        [box_c.bx, box_c.by, box_c.bz],
+        [box_c.cx, box_c.cy, box_c.cz],
+        [box_c.ox, box_c.oy, box_c.oz],
+    ) {
+        Ok(b) => b,
+        Err(e) => return fail_msg(&e.to_string()),
+    };
+    let pts: &[[f64; 3]] = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_vec: Option<Vec<bool>> = if mask.is_null() {
+        None
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(mask, n) };
+        Some(raw.iter().map(|&v| v != 0).collect())
+    };
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
+    let offsets = unsafe { std::slice::from_raw_parts_mut(out_offsets, n + 1) };
+    let ctx_bits = ctx as usize;
+    let get = move |total: usize| alloc(ctx_bits as *mut std::ffi::c_void, total);
+    let found = with_team(|| {
+        crate::knearest::knearest_graph(
+            pts,
+            &sim,
+            k,
+            mask_vec.as_deref(),
+            hint,
+            mutual != 0,
+            offsets,
+            &get,
+        )
+    });
+    if let Err(e) = found {
+        return fail(e);
+    }
+    clear_error();
+    0
+}
+
 /// Cutoff pairs with the vesin / tonari shift `S`.
 ///
 /// Each row is one atom-image: `out_i[t]`, `out_j[t]`,
