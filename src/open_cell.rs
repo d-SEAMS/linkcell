@@ -501,7 +501,9 @@ fn build_stencil(
     let ncell = frame.off.len() - 1;
     let edge = frame.edge;
     let reach = (query.cutoff / edge).ceil();
-    if !reach.is_finite() || reach > i32::MAX as f64 {
+    // `reach as i32 + 2` is the stencil pad. A value past `i32::MAX - 2`
+    // overflows that add in debug and wraps the image window in release.
+    if !reach.is_finite() || reach > (i32::MAX - 2) as f64 {
         return Err(Error::TooManyImages);
     }
     let reach = reach as i32 + 2;

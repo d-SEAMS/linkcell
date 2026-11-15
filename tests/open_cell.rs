@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use linkcell::{
     cell_for_pbc, lc_cell, lc_pair, pairs_open, pairs_within, pairs_within_pbc, stencil_builds,
-    Cell, PbcQuery,
+    Cell, Error, PbcQuery,
 };
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -129,6 +129,17 @@ fn four_hundred_moves_keep_the_open_stencil() {
         0,
         "the walk stays inside the Cartesian bin of edge 8, so the bounding bins do not change"
     );
+}
+
+#[test]
+fn open_reach_past_the_image_cast_is_too_many_images() {
+    let err = pairs_open(
+        &[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]],
+        2_147_483_646.0,
+        Some(1.0),
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::TooManyImages);
 }
 
 #[test]
