@@ -1692,6 +1692,7 @@ fn crossing_weight(group: &[u32], graph: &CellGraph, side: &[u8]) -> u64 {
     crossed
 }
 
+#[cfg(feature = "parallel")]
 fn work_chunk(n: usize) -> usize {
     let threads = {
         #[cfg(feature = "parallel")]
@@ -2130,6 +2131,7 @@ struct Phase {
     schedule: u64,
 }
 
+#[cfg(feature = "parallel")]
 fn phase_wall(phase: Phase) -> u64 {
     phase
         .select
@@ -2145,6 +2147,7 @@ fn record_phase(phase: Phase) {
     SCHEDULE_NS.fetch_add(phase.schedule, AtomicOrdering::Relaxed);
 }
 
+#[cfg(feature = "parallel")]
 fn join_measured(a: Phase, b: Phase, wall: u64) -> Phase {
     let sum_w = phase_wall(a).saturating_add(phase_wall(b));
     let max_w = phase_wall(a).max(phase_wall(b));
