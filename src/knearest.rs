@@ -12,10 +12,12 @@
 //!
 //! [`knearest`] returns one [`Neighbors`] row per point. [`knearest_into`]
 //! writes packed `n * k` indices (`-1` unused). [`knearest_into_d2`]
-//! also writes the matching squared distances (`NaN` unused). Sources run under
-//! rayon when the `parallel` feature is on (the default); build with
-//! `--no-default-features` to serialize. At 8192 active points and above,
-//! that feature also builds the mesh in parallel. The per-source `KHeap` stays
+//! also writes the matching squared distances (`NaN` unused). With the
+//! `parallel` feature (the default) an unmasked query of at least 8192
+//! points runs in one OpenMP region on Linux: bin, count, scan, fill, and
+//! select, each thread with its own histogram and scratch. Masked queries,
+//! smaller queries, and builds without that region still walk under rayon.
+//! `--no-default-features` serializes the walk. The per-source `KHeap` stays
 //! on the stack for `k <= 16`.
 
 use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
@@ -440,11 +442,92 @@ pub fn knearest(
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
 struct Geom {
     cols: [[f64; 3]; 3],
     lengths: [f64; 3],
     nbin: [i32; 3],
     widths: [f64; 3],
+}
+
+/// Threads in the last k-nearest team. Zero before the first query.
+static TEAM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Opt-in placement of the OpenMP team. Off unless a caller asks.
+static PIN_LEAST_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Place the k-nearest OpenMP workers on the least-loaded CPUs.
+///
+/// Off by default. A query does not read CPU counters or change affinity
+/// until this is set, and it does not consult an environment variable.
+/// Turning it off restores each worker to the mask it had before the pin.
+/// Builds without the OpenMP query store the flag and leave placement alone.
+pub fn pin_knearest_to_least_loaded(enabled: bool) {
+    PIN_LEAST_LOADED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Threads that ran the last k-nearest query.
+///
+/// Zero before the first query. This is the OpenMP team when that region
+/// ran, and the rayon pool size otherwise. The OpenMP team is resized to
+/// `omp_get_max_threads()` on the next query when that value changes.
+pub fn knearest_team_threads() -> usize {
+    TEAM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Join the standing k-nearest team.
+///
+/// The image destructor does this on unload and on process exit. Calling
+/// it directly joins the workers before a `dlclose` and leaves no thread
+/// behind. A later query starts a new team. Safe to call more than once.
+pub fn shutdown_knearest_team() {
+    #[cfg(all(feature = "parallel", linkcell_openmp))]
+    unsafe {
+        lc_knn_shutdown_impl();
+    }
+}
+
+/// C ABI for the same join, so a `dlclose` of this image can stop the team
+/// first. The image destructor calls the implementation directly.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+#[no_mangle]
+pub extern "C" fn lc_knn_shutdown() {
+    unsafe { lc_knn_shutdown_impl() }
+}
+
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+extern "C" {
+    fn lc_knn_shutdown_impl();
+}
+
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+thread_local! {
+    static FORCE_FUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+fn force_fused() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_FUSED.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+fn force_legacy() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_LEGACY.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn execute(
@@ -492,6 +575,13 @@ fn execute(
     };
     let edge = bins::target_edge(&walk, cell_hint, 3.0);
     let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
+    #[cfg(all(feature = "parallel", linkcell_openmp))]
+    if active_owned.is_none()
+        && !force_legacy()
+        && (xyz.len() >= bins::PARALLEL_MESH || force_fused())
+    {
+        return fused::run(xyz, &walk, k, edge, out_nn, out_d2);
+    }
     let mesh = {
         #[cfg(feature = "timing")]
         {
@@ -544,7 +634,57 @@ fn execute(
         (None, false, true) => dispatch::<1>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
         (None, false, false) => dispatch::<2>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
     }
+    #[cfg(feature = "parallel")]
+    {
+        TEAM.store(
+            rayon::current_num_threads(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        TEAM.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
+}
+
+/// Shell walk of every source in bin `c`.
+fn walk_cell<const MODE: u8>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    bin: [i32; 3],
+    c: usize,
+    out: (RowsOut<i32>, Option<RowsOut<f64>>),
+) {
+    let (nn, dd) = out;
+    for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+        let i = mesh.occupants[slot];
+        // Safety: each source owns row `i` of both outputs, and the caller
+        // sized them to `n * k`. No other slot writes that row.
+        let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+        walk_source::<MODE>(mesh, geom, k, max_reach, bin, slot, row, row_d2, None);
+    }
+}
+
+/// Shell walk of the cells in `begin..end`.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+fn walk_cells<const MODE: u8>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    out: (RowsOut<i32>, Option<RowsOut<f64>>),
+    begin: usize,
+    end: usize,
+) {
+    let [nx, ny, _] = geom.nbin;
+    for c in begin..end {
+        let c32 = c as i32;
+        let bin = [c32 % nx, (c32 / nx) % ny, c32 / (nx * ny)];
+        walk_cell::<MODE>(mesh, geom, k, max_reach, bin, c, out);
+    }
 }
 
 fn dispatch<const MODE: u8>(
@@ -569,14 +709,7 @@ fn dispatch<const MODE: u8>(
         [c % nx, (c / nx) % ny, c / (nx * ny)]
     };
     let job = |c: usize| {
-        let bin = cell(c);
-        for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
-            let i = mesh.occupants[slot];
-            // Safety: each source owns row `i` of both outputs, and the
-            // caller sized them to `n * k`.
-            let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
-            walk_source::<MODE>(mesh, geom, k, max_reach, bin, slot, row, row_d2, None);
-        }
+        walk_cell::<MODE>(mesh, geom, k, max_reach, cell(c), c, (nn, dd));
     };
     let ncell = mesh.offsets.len() - 1;
     #[cfg(feature = "parallel")]
@@ -633,6 +766,128 @@ struct Candidates {
     d2: Vec<f64>,
 }
 
+/// Shared inputs for one block scan. The candidate list and heap stay
+/// per thread.
+struct BlockScan<'a> {
+    mesh: &'a Mesh,
+    geom: &'a Geom,
+    k: usize,
+    max_reach: i32,
+    side: i32,
+    blocks: [i32; 3],
+    path: crate::simd::Path,
+    time_scan: bool,
+    nn: RowsOut<i32>,
+    dd: Option<RowsOut<f64>>,
+}
+
+/// One block of the shared-candidate scan. `blk` is the block index.
+fn select_one_block<const MODE: u8>(
+    scan: &BlockScan<'_>,
+    cand: &mut Candidates,
+    heap: &mut KHeap,
+    blk: usize,
+) {
+    let mesh = scan.mesh;
+    let geom = scan.geom;
+    let k = scan.k;
+    let max_reach = scan.max_reach;
+    let side = scan.side;
+    let blocks = scan.blocks;
+    let path = scan.path;
+    let time_scan = scan.time_scan;
+    let nn = scan.nn;
+    let dd = scan.dd;
+    let [nx, ny, nz] = geom.nbin;
+    let blk = blk as i32;
+    let x0 = side * (blk % blocks[0]);
+    let y0 = side * ((blk / blocks[0]) % blocks[1]);
+    let z0 = side * (blk / (blocks[0] * blocks[1]));
+    cand.x.clear();
+    cand.y.clear();
+    cand.z.clear();
+    cand.id.clear();
+    let interior =
+        x0 >= 1 && y0 >= 1 && z0 >= 1 && x0 + side < nx && y0 + side < ny && z0 + side < nz;
+    for dz in -1..=side {
+        for dy in -1..=side {
+            // Inside the box a row of bins is one run of slots with no
+            // shift: `p + 0` is `p`.
+            if interior {
+                let row = ((z0 + dz) * ny + (y0 + dy)) * nx + x0;
+                let (lo, hi) = (
+                    mesh.offsets[(row - 1) as usize],
+                    mesh.offsets[(row + side + 1) as usize],
+                );
+                for slot in lo..hi {
+                    let p = mesh.slot_folded[slot];
+                    cand.x.push(p[0]);
+                    cand.y.push(p[1]);
+                    cand.z.push(p[2]);
+                    cand.id.push(mesh.occupants[slot] as u64);
+                }
+                continue;
+            }
+            for dx in -1..=side {
+                let (cell, na, nb, nc) = mesh.locate(x0 + dx, y0 + dy, z0 + dz);
+                let shift = image_shift::<MODE>(geom, na, nb, nc);
+                for slot in mesh.offsets[cell]..mesh.offsets[cell + 1] {
+                    let p = mesh.slot_folded[slot];
+                    cand.x.push(p[0] + shift[0]);
+                    cand.y.push(p[1] + shift[1]);
+                    cand.z.push(p[2] + shift[2]);
+                    cand.id.push(mesh.occupants[slot] as u64);
+                }
+            }
+        }
+    }
+    let planes = box_planes([x0, y0, z0], side, geom);
+    for iz in z0..(z0 + side).min(nz) {
+        for iy in y0..(y0 + side).min(ny) {
+            for ix in x0..(x0 + side).min(nx) {
+                let c = ((iz * ny + iy) * nx + ix) as usize;
+                for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+                    let i = mesh.occupants[slot];
+                    // Safety: each source owns row `i` of both outputs,
+                    // and the caller sized them to `n * k`.
+                    let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+                    heap.clear();
+                    let pi = mesh.slot_folded[slot];
+                    #[cfg(feature = "timing")]
+                    if time_scan {
+                        let started = std::time::Instant::now();
+                        scan_at(path, cand, pi, i, heap);
+                        crate::simd::add_scan_ns(started.elapsed().as_nanos());
+                    } else {
+                        scan_at(path, cand, pi, i, heap);
+                    }
+                    #[cfg(not(feature = "timing"))]
+                    {
+                        let _ = time_scan;
+                        scan_at(path, cand, pi, i, heap);
+                    }
+                    let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
+                    if heap.full() && heap.worst() <= bound {
+                        heap.write_sorted(row, row_d2);
+                    } else {
+                        walk_source::<MODE>(
+                            mesh,
+                            geom,
+                            k,
+                            max_reach,
+                            [ix, iy, iz],
+                            slot,
+                            row,
+                            row_d2,
+                            Some(heap.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// [`dispatch`] by blocks of `side` bins a side: a block's sources share
 /// one candidate list, the occupants of the `side + 2` bins a side around
 /// the block with their images, gathered once. When a source's k-th
@@ -664,91 +919,22 @@ fn dispatch_blocks<const MODE: u8>(
     let path = crate::simd::select();
     #[cfg(feature = "timing")]
     let time_scan = crate::simd::scan_timing_enabled();
+    #[cfg(not(feature = "timing"))]
+    let time_scan = false;
+    let scan = BlockScan {
+        mesh,
+        geom,
+        k,
+        max_reach,
+        side,
+        blocks,
+        path,
+        time_scan,
+        nn,
+        dd,
+    };
     let job = move |cand: &mut Candidates, heap: &mut KHeap, blk: usize| {
-        let blk = blk as i32;
-        let x0 = side * (blk % blocks[0]);
-        let y0 = side * ((blk / blocks[0]) % blocks[1]);
-        let z0 = side * (blk / (blocks[0] * blocks[1]));
-        cand.x.clear();
-        cand.y.clear();
-        cand.z.clear();
-        cand.id.clear();
-        let interior =
-            x0 >= 1 && y0 >= 1 && z0 >= 1 && x0 + side < nx && y0 + side < ny && z0 + side < nz;
-        for dz in -1..=side {
-            for dy in -1..=side {
-                // Inside the box a row of bins is one run of slots with no
-                // shift: `p + 0` is `p`.
-                if interior {
-                    let row = ((z0 + dz) * ny + (y0 + dy)) * nx + x0;
-                    let (lo, hi) = (
-                        mesh.offsets[(row - 1) as usize],
-                        mesh.offsets[(row + side + 1) as usize],
-                    );
-                    for slot in lo..hi {
-                        let p = mesh.slot_folded[slot];
-                        cand.x.push(p[0]);
-                        cand.y.push(p[1]);
-                        cand.z.push(p[2]);
-                        cand.id.push(mesh.occupants[slot] as u64);
-                    }
-                    continue;
-                }
-                for dx in -1..=side {
-                    let (cell, na, nb, nc) = mesh.locate(x0 + dx, y0 + dy, z0 + dz);
-                    let shift = image_shift::<MODE>(geom, na, nb, nc);
-                    for slot in mesh.offsets[cell]..mesh.offsets[cell + 1] {
-                        let p = mesh.slot_folded[slot];
-                        cand.x.push(p[0] + shift[0]);
-                        cand.y.push(p[1] + shift[1]);
-                        cand.z.push(p[2] + shift[2]);
-                        cand.id.push(mesh.occupants[slot] as u64);
-                    }
-                }
-            }
-        }
-        let planes = box_planes([x0, y0, z0], side, geom);
-        for iz in z0..(z0 + side).min(nz) {
-            for iy in y0..(y0 + side).min(ny) {
-                for ix in x0..(x0 + side).min(nx) {
-                    let c = ((iz * ny + iy) * nx + ix) as usize;
-                    for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
-                        let i = mesh.occupants[slot];
-                        // Safety: each source owns row `i` of both outputs,
-                        // and the caller sized them to `n * k`.
-                        let (row, row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
-                        heap.clear();
-                        let pi = mesh.slot_folded[slot];
-                        #[cfg(feature = "timing")]
-                        if time_scan {
-                            let started = std::time::Instant::now();
-                            scan_at(path, cand, pi, i, heap);
-                            crate::simd::add_scan_ns(started.elapsed().as_nanos());
-                        } else {
-                            scan_at(path, cand, pi, i, heap);
-                        }
-                        #[cfg(not(feature = "timing"))]
-                        scan_at(path, cand, pi, i, heap);
-                        let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
-                        if heap.full() && heap.worst() <= bound {
-                            heap.write_sorted(row, row_d2);
-                        } else {
-                            walk_source::<MODE>(
-                                mesh,
-                                geom,
-                                k,
-                                max_reach,
-                                [ix, iy, iz],
-                                slot,
-                                row,
-                                row_d2,
-                                Some(heap.clone()),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        select_one_block::<MODE>(&scan, cand, heap, blk);
     };
     #[cfg(feature = "parallel")]
     {
@@ -1375,6 +1561,10 @@ pub fn knearest_brute(
     Ok(out)
 }
 
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+#[path = "knn_fused.rs"]
+mod fused;
+
 #[cfg(test)]
 mod scale_mesh_tests {
     use super::*;
@@ -1774,5 +1964,335 @@ mod scale_mesh_tests {
                 pairs: pair_rows,
             }
         })
+    }
+}
+
+/// The fused region against brute force and the rayon walk.
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+mod fused_agree {
+    use super::{knearest_brute, knearest_into_d2, FORCE_FUSED, FORCE_LEGACY};
+    use crate::Cell;
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn unit(state: &mut u64) -> f64 {
+        (lcg(state) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    fn periodic(cell: &Cell, n: usize, seed: u64) -> Vec<[f64; 3]> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| cell.cartesian([unit(&mut state), unit(&mut state), unit(&mut state)]))
+            .collect()
+    }
+
+    /// A cloud in the middle of the box. Images are a full edge away.
+    fn open_cloud(cell: &Cell, n: usize, seed: u64) -> Vec<[f64; 3]> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                cell.cartesian([
+                    0.40 + 0.20 * unit(&mut state),
+                    0.40 + 0.20 * unit(&mut state),
+                    0.40 + 0.20 * unit(&mut state),
+                ])
+            })
+            .collect()
+    }
+
+    fn buffers(xyz: &[[f64; 3]], cell: &Cell, k: usize, hint: Option<f64>) -> (Vec<i32>, Vec<u64>) {
+        let mut nn = vec![7i32; xyz.len() * k];
+        let mut d2 = vec![1.0; xyz.len() * k];
+        knearest_into_d2(xyz, cell, k, None, hint, &mut nn, Some(&mut d2)).unwrap();
+        (nn, d2.into_iter().map(|v| v.to_bits()).collect())
+    }
+
+    fn assert_same(label: &str, got: &(Vec<i32>, Vec<u64>), want: &(Vec<i32>, Vec<u64>)) {
+        assert_eq!(got.0, want.0, "{label} indices");
+        assert_eq!(got.1, want.1, "{label} dist2 bits");
+    }
+
+    fn with_fused<T>(body: impl FnOnce() -> T) -> T {
+        FORCE_FUSED.with(|cell| cell.set(true));
+        let out = body();
+        FORCE_FUSED.with(|cell| cell.set(false));
+        out
+    }
+
+    fn with_legacy<T>(body: impl FnOnce() -> T) -> T {
+        FORCE_LEGACY.with(|cell| cell.set(true));
+        let out = body();
+        FORCE_LEGACY.with(|cell| cell.set(false));
+        out
+    }
+
+    fn cells(span: f64) -> Vec<Cell> {
+        vec![
+            Cell::ortho(span, span * 0.9, span * 1.15).unwrap(),
+            Cell::from_vectors(
+                [span, 0.0, 0.0],
+                [span * 0.15, span * 0.95, 0.0],
+                [span * -0.05, span * 0.08, span * 1.05],
+                [0.0; 3],
+            )
+            .unwrap(),
+        ]
+    }
+
+    #[test]
+    fn fused_matches_brute_and_legacy_on_periodic_and_open_boxes() {
+        let shapes = [
+            (
+                "periodic",
+                periodic as fn(&Cell, usize, u64) -> Vec<[f64; 3]>,
+            ),
+            ("open", open_cloud),
+        ];
+        for (shape, build) in shapes {
+            for cell in cells(36.0) {
+                for &(n, k, seed, hint) in &[
+                    (48usize, 1usize, 0x11u64, None),
+                    (96, 4, 0x22, Some(2.5)),
+                    (160, 17, 0x33, Some(4.0)),
+                    (320, 4, 0x44, Some(3.0)),
+                    (7, 10, 0x55, None),
+                ] {
+                    let mut xyz = build(&cell, n, seed);
+                    // A point outside the primary cell still folds in.
+                    if n > 3 {
+                        xyz[1][0] += cell.a()[0];
+                        xyz[2][1] -= cell.b()[1];
+                    }
+                    // Two coincident sites.
+                    if n > 8 {
+                        xyz[5] = xyz[4];
+                    }
+                    let label = format!("{shape} n={n} k={k} seed={seed} hint={hint:?}");
+                    let fused = with_fused(|| buffers(&xyz, &cell, k, hint));
+                    let legacy = with_legacy(|| buffers(&xyz, &cell, k, hint));
+                    let brute = knearest_brute(&xyz, &cell, k, None).unwrap();
+                    assert_same(&format!("{label} fused vs legacy"), &fused, &legacy);
+                    let mut brute_nn = vec![-1i32; n * k];
+                    let mut brute_d2 = vec![f64::NAN; n * k];
+                    for (i, row) in brute.iter().enumerate() {
+                        for (t, (&j, &d)) in row.indices.iter().zip(&row.dist2).enumerate() {
+                            brute_nn[i * k + t] = j as i32;
+                            brute_d2[i * k + t] = d;
+                        }
+                    }
+                    assert_eq!(fused.0, brute_nn, "{label} fused vs brute indices");
+                    for (i, (&bits, brute_d)) in fused.1.iter().zip(&brute_d2).enumerate() {
+                        let got = f64::from_bits(bits);
+                        let scale = 1.0 + got.abs().max(brute_d.abs());
+                        assert!(
+                            (got.is_nan() && brute_d.is_nan())
+                                || (got - brute_d).abs() <= 1e-12 * scale,
+                            "{label} fused vs brute dist2 [{i}]: {got} vs {brute_d}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_unmasked_query_uses_the_region_and_matches_legacy() {
+        let cell = Cell::ortho(48.0, 47.0, 49.5).unwrap();
+        let mut state = 0xabcdu64;
+        let xyz: Vec<[f64; 3]> = (0..9_000)
+            .map(|_| cell.cartesian([unit(&mut state), unit(&mut state), unit(&mut state)]))
+            .collect();
+        let fused = buffers(&xyz, &cell, 4, Some(3.0));
+        let legacy = with_legacy(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_same("n=9000", &fused, &legacy);
+        assert!(
+            super::knearest_team_threads() >= 1,
+            "team {}",
+            super::knearest_team_threads()
+        );
+    }
+
+    fn task_count() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .map(|dir| dir.count())
+            .unwrap_or(0)
+    }
+
+    fn wait_tasks(want: usize) -> usize {
+        let mut last = task_count();
+        for _ in 0..100 {
+            if last <= want {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            last = task_count();
+        }
+        last
+    }
+
+    fn task_names() -> String {
+        let mut names = String::new();
+        let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+            return names;
+        };
+        for entry in dir.flatten() {
+            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            names.push_str(&entry.file_name().to_string_lossy());
+            names.push(':');
+            names.push_str(comm.trim());
+            names.push('\n');
+        }
+        names
+    }
+
+    /// Child process: the team follows `omp_set_num_threads`, and shutdown
+    /// joins it. When `liblinkcell.so` is beside the build, also query
+    /// through that image and `dlclose` it.
+    #[test]
+    fn team_follows_omp_set_num_threads_and_joins_on_shutdown() {
+        if std::env::var_os("LC_TEAM_PROBE").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(&exe)
+                .arg(
+                    "knearest::fused_agree::team_follows_omp_set_num_threads_and_joins_on_shutdown",
+                )
+                .args(["--exact", "--test-threads", "1", "--nocapture"])
+                .env("LC_TEAM_PROBE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "probe status {:?}\n{}{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        extern "C" {
+            fn omp_set_num_threads(n: i32);
+            fn omp_get_max_threads() -> i32;
+        }
+        let before = task_count();
+        let saved = unsafe { omp_get_max_threads() }.max(1);
+        unsafe { omp_set_num_threads(2) };
+        let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
+        let xyz = periodic(&cell, 64, 9);
+        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_eq!(super::knearest_team_threads(), 2);
+        let mid = task_count();
+        assert!(
+            mid >= before + 2,
+            "team not running: before {before} mid {mid}"
+        );
+        super::shutdown_knearest_team();
+        let after = wait_tasks(before);
+        assert_eq!(
+            after,
+            before,
+            "shutdown left threads: before {before} after {after}\n{}",
+            task_names()
+        );
+        unsafe { omp_set_num_threads(saved) };
+        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_eq!(super::knearest_team_threads(), saved as usize);
+        super::shutdown_knearest_team();
+        let after = wait_tasks(before);
+        assert_eq!(
+            after,
+            before,
+            "second shutdown left threads: before {before} after {after}\n{}",
+            task_names()
+        );
+
+        let so = std::env::current_exe().ok().and_then(|mut exe| {
+            for _ in 0..6 {
+                exe.pop();
+                let candidate = exe.join("liblinkcell.so");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        });
+        if let Some(so) = so {
+            unload_cdylib(&so, before);
+        }
+    }
+
+    fn unload_cdylib(so: &std::path::Path, before: usize) {
+        use std::os::raw::{c_char, c_int, c_void};
+        extern "C" {
+            fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            fn dlclose(handle: *mut c_void) -> c_int;
+        }
+        const RTLD_NOW: c_int = 2;
+        let path = std::ffi::CString::new(so.to_str().unwrap()).unwrap();
+        let handle = unsafe { dlopen(path.as_ptr(), RTLD_NOW) };
+        assert!(!handle.is_null(), "dlopen {}", so.display());
+        let name = std::ffi::CString::new("lc_knearest").unwrap();
+        let sym = unsafe { dlsym(handle, name.as_ptr()) };
+        assert!(!sym.is_null(), "dlsym lc_knearest");
+        type Knn = unsafe extern "C" fn(
+            *const f64,
+            usize,
+            *const f64,
+            usize,
+            *const c_int,
+            f64,
+            *mut c_int,
+        ) -> c_int;
+        let knearest: Knn = unsafe { std::mem::transmute(sym) };
+        let n = 8192usize;
+        let mut xyz = vec![0.0f64; n * 3];
+        for i in 0..n {
+            xyz[i * 3] = (i % 20) as f64;
+            xyz[i * 3 + 1] = ((i / 20) % 20) as f64;
+            xyz[i * 3 + 2] = (i / 400) as f64;
+        }
+        let cell = [
+            40.0, 0.0, 0.0, 0.0, 40.0, 0.0, 0.0, 0.0, 40.0, 0.0, 0.0, 0.0,
+        ];
+        let mut out = vec![-1i32; n * 2];
+        let rc = unsafe {
+            knearest(
+                xyz.as_ptr(),
+                n,
+                cell.as_ptr(),
+                2,
+                std::ptr::null(),
+                3.0,
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "cdylib query");
+        assert!(task_count() > before, "cdylib team did not start");
+        let stop_name = std::ffi::CString::new("lc_knn_shutdown").unwrap();
+        let stop_sym = unsafe { dlsym(handle, stop_name.as_ptr()) };
+        assert!(!stop_sym.is_null(), "dlsym lc_knn_shutdown");
+        let stop: unsafe extern "C" fn() = unsafe { std::mem::transmute(stop_sym) };
+        unsafe { stop() };
+        let stopped = wait_tasks(before);
+        assert_eq!(
+            stopped,
+            before,
+            "cdylib shutdown left threads\n{}",
+            task_names()
+        );
+        let closed = unsafe { dlclose(handle) };
+        assert_eq!(closed, 0, "dlclose");
+        let left = wait_tasks(before);
+        assert_eq!(
+            left,
+            before,
+            "dlclose leaked the team: before {before} after {left}\n{}",
+            task_names()
+        );
     }
 }

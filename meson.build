@@ -84,6 +84,7 @@ if host_machine.system() == 'linux'
   rust_sys += [
     cc.find_library('dl', required: true),
     cc.find_library('m', required: true),
+    cc.find_library('gomp', required: true),
   ]
 elif host_machine.system() == 'darwin'
   rust_sys += [cc.find_library('m', required: true)]

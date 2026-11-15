@@ -14,9 +14,9 @@ use crate::Error;
 
 /// Below this many active points the mesh stays serial. The cubic hot
 /// path is 4096 points, and a parallel histogram there costs more than
-/// the fold.
+/// the fold. The fused OpenMP query starts at the same count.
 #[cfg(feature = "parallel")]
-const PARALLEL_MESH: usize = 8_192;
+pub(crate) const PARALLEL_MESH: usize = 8_192;
 
 const MAX_CELLS: i64 = 16_777_216;
 /// Shrink a cutoff slab so a rounded-up plane cannot drop a pair.
@@ -24,17 +24,17 @@ const CERT_REL: f64 = 1.0e-8;
 const CERT_ABS: f64 = 1.0e-12;
 
 #[derive(Default)]
-struct Recycled {
-    frac: Vec<[f64; 3]>,
-    folded: Vec<[f64; 3]>,
-    slot_frac: Vec<[f64; 3]>,
-    slot_folded: Vec<[f64; 3]>,
-    key: Vec<u32>,
-    offsets: Vec<usize>,
-    occupants: Vec<usize>,
-    counts: Vec<usize>,
-    cursor: Vec<usize>,
-    hist: Vec<std::sync::atomic::AtomicUsize>,
+pub(crate) struct Recycled {
+    pub(crate) frac: Vec<[f64; 3]>,
+    pub(crate) folded: Vec<[f64; 3]>,
+    pub(crate) slot_frac: Vec<[f64; 3]>,
+    pub(crate) slot_folded: Vec<[f64; 3]>,
+    pub(crate) key: Vec<u32>,
+    pub(crate) offsets: Vec<usize>,
+    pub(crate) occupants: Vec<usize>,
+    pub(crate) counts: Vec<usize>,
+    pub(crate) cursor: Vec<usize>,
+    pub(crate) hist: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 thread_local! {
@@ -43,7 +43,7 @@ thread_local! {
     static MESH_POOL: RefCell<Option<Recycled>> = RefCell::new(None);
 }
 
-fn take_recycled() -> Recycled {
+pub(crate) fn take_recycled() -> Recycled {
     MESH_POOL.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
@@ -73,12 +73,12 @@ pub(crate) struct Mesh {
     pub(crate) slot_frac: Vec<[f64; 3]>,
     pub(crate) slot_folded: Vec<[f64; 3]>,
     /// Flat bin of each point, in point order.
-    key: Vec<u32>,
+    pub(crate) key: Vec<u32>,
     pub(crate) offsets: Vec<usize>,
     pub(crate) occupants: Vec<usize>,
-    counts: Vec<usize>,
-    cursor: Vec<usize>,
-    hist: Vec<std::sync::atomic::AtomicUsize>,
+    pub(crate) counts: Vec<usize>,
+    pub(crate) cursor: Vec<usize>,
+    pub(crate) hist: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for Mesh {
@@ -754,6 +754,55 @@ pub(crate) unsafe fn fold8_regs(
 
 /// The three per-point arrays of a mesh: fractional, folded, flat bin.
 type MeshOut<'a> = (&'a mut [[f64; 3]], &'a mut [[f64; 3]], &'a mut [u32]);
+
+/// Fold one thread's chunk into the matching slices and that thread's histogram.
+///
+/// `xyz` and `out` cover only this chunk, in the same order. `hist` is the
+/// full bin count. `path` was chosen on the calling thread.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+pub(crate) fn fold_chunk(
+    simbox: &Cell,
+    xyz: &[[f64; 3]],
+    nbin: [i32; 3],
+    out: MeshOut<'_>,
+    hist: &mut [usize],
+    path: crate::simd::Path,
+) {
+    let n = xyz.len();
+    let [nx, ny, nz] = nbin;
+    let (frac, folded, key) = out;
+    let start = fold_mesh_at(path, simbox, xyz, nbin, 0, n, (frac, folded, key), |c| {
+        hist[c] += 1
+    });
+    for i in start..n {
+        let s = simbox.fractional(xyz[i]);
+        let b = [
+            bin_coord(s[0], nx),
+            bin_coord(s[1], ny),
+            bin_coord(s[2], nz),
+        ];
+        let c = flat_cell(b, nbin);
+        frac[i] = s;
+        folded[i] = simbox.cartesian(s);
+        key[i] = c as u32;
+        hist[c] += 1;
+    }
+}
+
+/// Bin counts and perpendicular widths for `edge`.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
+pub(crate) fn grid(simbox: &Cell, edge: f64) -> Result<([i32; 3], [f64; 3], usize), Error> {
+    let widths = simbox.widths();
+    let nx = bins_1d(widths[0], edge)?;
+    let ny = bins_1d(widths[1], edge)?;
+    let nz = bins_1d(widths[2], edge)?;
+    let ncell = (i64::from(nx))
+        .checked_mul(i64::from(ny))
+        .and_then(|v| v.checked_mul(i64::from(nz)))
+        .filter(|&v| v > 0 && v <= MAX_CELLS)
+        .ok_or(Error::TooManyCells)? as usize;
+    Ok(([nx, ny, nz], widths, ncell))
+}
 
 /// Fold `xyz[lo..hi]` with `path`, and add each bin to `count`.
 /// Returns the first index left for the scalar fold.
