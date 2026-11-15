@@ -663,9 +663,11 @@ extern int32_t lc_scotch_part(int32_t n,
                               int32_t *part);
 
 /**
- * Run `cb` at the end of the next `lc_knearest`, still inside its pool.
- * A null `cb` clears it. The search clears nothing by itself: the caller
- * drops the hook when the call returns.
+ * Run `cb` at the end of this thread's next `lc_knearest`, still inside
+ * its pool. A null `cb` clears it. The hook belongs to the calling
+ * thread; a search started on another thread does not run it. The search
+ * clears nothing by itself: the caller drops the hook when the call
+ * returns.
  */
 void lc_set_continuation(void *ctx, void (*cb)(void*));
 
