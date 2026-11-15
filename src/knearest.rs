@@ -24,6 +24,8 @@ use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
 use crate::cell::Cell;
 use crate::team::Stage;
 use crate::Error;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::Mutex;
 
 fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
     simbox.dist2_euclidean(p, q)
@@ -385,6 +387,8 @@ fn write_one(
         cell_hint,
         out_nn,
         out_d2.as_deref_mut(),
+        None,
+        &[],
     );
     #[cfg(feature = "timing")]
     if crate::simd::coarse_timing_enabled() {
@@ -397,6 +401,322 @@ fn write_one(
         }
     }
     found
+}
+
+/// A pointer the chunks of one region share; each chunk writes slots no
+/// other chunk of its stage writes.
+#[derive(Clone, Copy)]
+struct Shared<T>(*mut T);
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+
+impl<T> Shared<T> {
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
+/// Rows of the graph stages per chunk.
+const GRAPH_ROWS: usize = 2048;
+
+/// Buffers of [`knearest_graph`], kept for the next call.
+#[derive(Default)]
+struct GraphBufs {
+    nom: Vec<i32>,
+    accepted: Vec<u8>,
+    lo: Vec<AtomicU32>,
+    hi: Vec<AtomicU32>,
+    left: Vec<AtomicU32>,
+    start: Vec<u32>,
+}
+
+static GRAPH_POOL: Mutex<Option<GraphBufs>> = Mutex::new(None);
+
+/// `true` when row `j` of the packed nominations lists `i`.
+#[inline(always)]
+fn lists(nom: &[i32], k: usize, j: usize, i: i32) -> bool {
+    nom[j * k..(j + 1) * k].contains(&i)
+}
+
+/// The k-nearest graph as CSR, built in the search's region.
+///
+/// Row `i` of the nominations is its `k` nearest, nearest first. With
+/// `mutual`, row `i` holds every `j` that row `i` lists and that lists
+/// `i`: the lower indices ascending, then the higher ones nearest first.
+/// Otherwise an edge comes from the nomination slot `s = i * k + t` of
+/// the lower index when both rows list each other, and from the only
+/// slot that names it when one does; row `i` holds its edges in slot
+/// order: the edges from lower rows ascending, then its own nearest
+/// first, then the edges from higher rows ascending.
+///
+/// `offsets` has `n + 1` entries. `alloc(total)` is called once, from
+/// any worker, and returns `total` writable ints for the columns, or
+/// null ([`Error::BufferSize`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn knearest_graph(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    mutual: bool,
+    offsets: &mut [i32],
+    alloc: &(dyn Fn(usize) -> *mut i32 + Sync),
+) -> Result<(), Error> {
+    let n = xyz.len();
+    if offsets.len() != n + 1 {
+        return Err(Error::BufferSize);
+    }
+    let Some(nk) = n.checked_mul(k) else {
+        return Err(Error::Overflow);
+    };
+    if n > i32::MAX as usize {
+        return Err(Error::Overflow);
+    }
+    let mut bufs = GRAPH_POOL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()
+        .unwrap_or_default();
+    bufs.nom.resize(nk, -1);
+    bufs.accepted.resize(nk, 0);
+    bufs.start.resize(n, 0);
+    for v in [&mut bufs.lo, &mut bufs.hi, &mut bufs.left] {
+        v.truncate(n);
+        v.resize_with(n, || AtomicU32::new(0));
+    }
+    let failed = AtomicBool::new(false);
+    let overflow = AtomicBool::new(false);
+    let cols = AtomicPtr::new(std::ptr::null_mut::<i32>());
+    let result = {
+        let GraphBufs {
+            nom,
+            accepted,
+            lo,
+            hi,
+            left,
+            start,
+        } = &mut bufs;
+        let nom_p = Shared(nom.as_mut_ptr());
+        let acc_p = Shared(accepted.as_mut_ptr());
+        let start_p = Shared(start.as_mut_ptr());
+        let off_p = Shared(offsets.as_mut_ptr());
+        let (lo, hi, left) = (&lo[..], &hi[..], &left[..]);
+        // SAFETY (every stage below): the scan has written every row of
+        // `nom` before the first graph stage starts, and chunk `c` owns
+        // rows `c * GRAPH_ROWS ..` of `accepted`, `start`, and `offsets`.
+        let nom_ro = move || unsafe { std::slice::from_raw_parts(nom_p.get(), nk) };
+        let rows = |c: usize| c * GRAPH_ROWS..((c + 1) * GRAPH_ROWS).min(n);
+        let chunks = (n + GRAPH_ROWS - 1) / GRAPH_ROWS;
+        let prep = |r: std::ops::Range<usize>| {
+            for i in r {
+                lo[i].store(0, Ordering::Relaxed);
+                hi[i].store(0, Ordering::Relaxed);
+            }
+        };
+        let degree = |_: &mut Scratch, c: usize| {
+            let nom = nom_ro();
+            for i in rows(c) {
+                let row = &nom[i * k..(i + 1) * k];
+                let mut own = 0u32;
+                for (t, &j) in row.iter().enumerate() {
+                    let take = j >= 0
+                        && (j as usize) < n
+                        && j as usize != i
+                        && if mutual {
+                            lists(nom, k, j as usize, i as i32)
+                        } else {
+                            (i as i32) < j || !lists(nom, k, j as usize, i as i32)
+                        };
+                    if !mutual {
+                        unsafe { acc_p.get().add(i * k + t).write(u8::from(take)) };
+                    }
+                    if !take {
+                        continue;
+                    }
+                    own += 1;
+                    if !mutual {
+                        if (i as i32) < j {
+                            lo[j as usize].fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            hi[j as usize].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                unsafe { start_p.get().add(i).write(own) };
+            }
+        };
+        let prefix = |_: &mut Scratch, _: usize| {
+            // SAFETY: one chunk; the degree stage has finished.
+            let (off, start) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(off_p.get(), n + 1),
+                    std::slice::from_raw_parts_mut(start_p.get(), n),
+                )
+            };
+            let mut acc = 0u64;
+            for i in 0..n {
+                off[i] = acc as i32;
+                let own = u64::from(start[i]);
+                if mutual {
+                    acc += own;
+                } else {
+                    let l = lo[i].load(Ordering::Relaxed);
+                    let h = hi[i].load(Ordering::Relaxed);
+                    start[i] = (acc + u64::from(l)) as u32;
+                    left[i].store(l + h, Ordering::Relaxed);
+                    acc += u64::from(l) + own + u64::from(h);
+                }
+                if acc > i32::MAX as u64 {
+                    overflow.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+            off[n] = acc as i32;
+            let p = alloc(acc as usize);
+            if p.is_null() && acc > 0 {
+                failed.store(true, Ordering::Relaxed);
+                return;
+            }
+            cols.store(p, Ordering::Relaxed);
+        };
+        let fill = |s: &mut Scratch, c: usize| {
+            let out = cols.load(Ordering::Relaxed);
+            if out.is_null() {
+                return;
+            }
+            let nom = nom_ro();
+            // SAFETY: the prefix stage has finished; `out` holds
+            // `offsets[n]` ints and each write below lands in a slot of
+            // one row that no other write fills.
+            let off = unsafe { std::slice::from_raw_parts(off_p.get(), n + 1) };
+            let start = unsafe { std::slice::from_raw_parts(start_p.get(), n) };
+            let keep = |i: usize, j: i32| {
+                j >= 0 && (j as usize) < n && j as usize != i && lists(nom, k, j as usize, i as i32)
+            };
+            if mutual {
+                for i in rows(c) {
+                    let row = &nom[i * k..(i + 1) * k];
+                    let low = &mut s.rows;
+                    low.clear();
+                    low.extend(
+                        row.iter()
+                            .copied()
+                            .filter(|&j| (j as usize) < i && keep(i, j)),
+                    );
+                    low.sort_unstable();
+                    let mut put = off[i] as usize;
+                    for &j in low.iter() {
+                        unsafe { out.add(put).write(j) };
+                        put += 1;
+                    }
+                    for &j in row {
+                        if j as usize > i && keep(i, j) {
+                            unsafe { out.add(put).write(j) };
+                            put += 1;
+                        }
+                    }
+                }
+                return;
+            }
+            // SAFETY: the degree stage has finished.
+            let acc = unsafe { std::slice::from_raw_parts(acc_p.get(), nk) };
+            let finish = |j: usize| {
+                let own = acc[j * k..(j + 1) * k].iter().filter(|&&a| a != 0).count();
+                let (b, m, e) = (off[j] as usize, start[j] as usize, off[j + 1] as usize);
+                // SAFETY: every edge from another row into row `j` is
+                // written (`left` reached zero), and row `j`'s own edges
+                // lie between these two runs.
+                unsafe {
+                    std::slice::from_raw_parts_mut(out.add(b), m - b).sort_unstable();
+                    std::slice::from_raw_parts_mut(out.add(m + own), e - m - own).sort_unstable();
+                }
+            };
+            for i in rows(c) {
+                let mut put = start[i] as usize;
+                for t in 0..k {
+                    if acc[i * k + t] == 0 {
+                        continue;
+                    }
+                    let j = nom[i * k + t] as usize;
+                    unsafe { out.add(put).write(j as i32) };
+                    put += 1;
+                    let at = if i < j {
+                        off[j] as usize + lo[j].fetch_sub(1, Ordering::Relaxed) as usize - 1
+                    } else {
+                        off[j + 1] as usize - hi[j].fetch_sub(1, Ordering::Relaxed) as usize
+                    };
+                    unsafe { out.add(at).write(i as i32) };
+                    if left[j].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        finish(j);
+                    }
+                }
+            }
+        };
+        let tail = [
+            Stage {
+                chunks,
+                run: &degree,
+            },
+            Stage {
+                chunks: 1,
+                run: &prefix,
+            },
+            Stage { chunks, run: &fill },
+        ];
+        let nn = unsafe { std::slice::from_raw_parts_mut(nom_p.get(), nk) };
+        execute(
+            xyz,
+            simbox,
+            k,
+            mask,
+            cell_hint,
+            nn,
+            None,
+            Some(&prep),
+            &tail,
+        )
+    };
+    *GRAPH_POOL.lock().unwrap_or_else(|err| err.into_inner()) = Some(bufs);
+    result?;
+    if overflow.load(Ordering::Relaxed) {
+        return Err(Error::Overflow);
+    }
+    if failed.load(Ordering::Relaxed) {
+        return Err(Error::BufferSize);
+    }
+    Ok(())
+}
+
+/// The k-nearest graph as CSR `(offsets, columns)`; see the C entry
+/// `lc_knearest_csr` for the row order.
+pub fn knearest_csr(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    mutual: bool,
+) -> Result<(Vec<i32>, Vec<i32>), Error> {
+    let mut offsets = vec![0i32; xyz.len() + 1];
+    let cols = Mutex::new(Vec::<i32>::new());
+    let alloc = |total: usize| {
+        let mut guard = cols.lock().unwrap_or_else(|err| err.into_inner());
+        guard.resize(total, 0);
+        guard.as_mut_ptr()
+    };
+    knearest_graph(
+        xyz,
+        simbox,
+        k,
+        mask,
+        cell_hint,
+        mutual,
+        &mut offsets,
+        &alloc,
+    )?;
+    let cols = cols.into_inner().unwrap_or_else(|err| err.into_inner());
+    Ok((offsets, cols))
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
@@ -551,6 +871,8 @@ fn force_legacy() -> bool {
 pub(crate) struct Scratch {
     cand: Candidates,
     heap: Option<KHeap>,
+    /// Row scratch for stages appended to the search.
+    pub(crate) rows: Vec<i32>,
 }
 
 /// Units of the scan (blocks or bins) per chunk: about sixteen chunks a
@@ -568,6 +890,8 @@ fn execute(
     cell_hint: Option<f64>,
     out_nn: &mut [i32],
     mut out_d2: Option<&mut [f64]>,
+    prep: Option<&(dyn Fn(std::ops::Range<usize>) + Sync)>,
+    tail: &[Stage<'_, Scratch>],
 ) -> Result<(), Error> {
     if k == 0 {
         return Err(Error::ZeroK);
@@ -590,6 +914,10 @@ fn execute(
         if let Some(d2) = out_d2.as_mut() {
             d2.fill(f64::NAN);
         }
+        if let Some(prep) = prep {
+            prep(0..n);
+        }
+        crate::team::run(1, None, tail);
         return Ok(());
     }
     crate::pop::prepare();
@@ -611,6 +939,8 @@ fn execute(
     let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
     #[cfg(all(feature = "parallel", linkcell_openmp))]
     if active_owned.is_none()
+        && prep.is_none()
+        && tail.is_empty()
         && !crate::team::installed()
         && !crate::on_caller()
         && !force_legacy()
@@ -644,6 +974,9 @@ fn execute(
                         }
                     }
                 }
+            }
+            if let Some(prep) = prep {
+                prep(0..n);
             }
             let mesh = timed_mesh(|| Mesh::build(xyz, &walk, active_owned.as_deref(), edge))?;
             let nbin = [mesh.nx, mesh.ny, mesh.nz];
@@ -688,6 +1021,7 @@ fn execute(
                 ),
             }
             drop(mesh);
+            crate::team::run(1, None, tail);
             return Ok(());
         }
         let stages = bins::MeshStages::new(xyz, &walk, active_owned.as_deref(), edge, width)?;
@@ -707,6 +1041,9 @@ fn execute(
             stages.fold(c);
             let lo = n * c / fold_chunks;
             let hi = n * (c + 1) / fold_chunks;
+            if let Some(prep) = prep {
+                prep(lo..hi);
+            }
             if let Some(m) = mask {
                 for i in (lo..hi).filter(|&i| !m[i]) {
                     // SAFETY: chunk `c` alone fills masked rows `lo..hi`.
@@ -737,7 +1074,7 @@ fn execute(
                 _ => scan_range::<2>(mesh, geom, k, max_reach, side, nn, dd, lo..hi, path, s),
             }
         };
-        let list: Vec<Stage<'_, Scratch>> = vec![
+        let mut list: Vec<Stage<'_, Scratch>> = vec![
             Stage {
                 chunks: fold_chunks,
                 run: &fold,
@@ -755,6 +1092,10 @@ fn execute(
                 run: &scan,
             },
         ];
+        list.extend(tail.iter().map(|t| Stage {
+            chunks: t.chunks,
+            run: t.run,
+        }));
         crate::team::run(width, spawn, &list);
         Ok(())
     })
@@ -2878,5 +3219,150 @@ mod fused_agree {
         assert_eq!(team_stacks(), Vec::<usize>::new(), "stacks after shutdown");
         drop(release);
         holder.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    /// The graph from the nominations one slot at a time: an accepted slot
+    /// `(i, t) -> j` appends `j` to row `i` and `i` to row `j`. Mutual rows
+    /// are the lower partners ascending, then the higher ones in row order.
+    #[cfg(feature = "parallel")]
+    fn reference(nom: &[i32], n: usize, k: usize, mutual: bool) -> (Vec<i32>, Vec<i32>) {
+        let listed = |j: usize, i: usize| nom[j * k..(j + 1) * k].contains(&(i as i32));
+        let mut rows = vec![Vec::new(); n];
+        if mutual {
+            for (i, row) in rows.iter_mut().enumerate() {
+                let keep: Vec<i32> = nom[i * k..(i + 1) * k]
+                    .iter()
+                    .copied()
+                    .filter(|&j| j >= 0 && (j as usize) != i && listed(j as usize, i))
+                    .collect();
+                let mut low: Vec<i32> =
+                    keep.iter().copied().filter(|&j| (j as usize) < i).collect();
+                low.sort_unstable();
+                row.extend(low);
+                row.extend(keep.iter().copied().filter(|&j| (j as usize) > i));
+            }
+        } else {
+            for i in 0..n {
+                for t in 0..k {
+                    let j = nom[i * k + t];
+                    if j < 0 || j as usize == i {
+                        continue;
+                    }
+                    let j = j as usize;
+                    if i < j || !listed(j, i) {
+                        rows[i].push(j as i32);
+                        rows[j].push(i as i32);
+                    }
+                }
+            }
+        }
+        let mut offsets = vec![0i32];
+        let mut cols = Vec::new();
+        for row in rows {
+            cols.extend(row);
+            offsets.push(cols.len() as i32);
+        }
+        (offsets, cols)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn points(n: usize, cell: &Cell, state: &mut u64) -> Vec<[f64; 3]> {
+        let mut next = || {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            (*state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let s = [next(), next(), next()];
+                let (a, b, c) = (cell.a(), cell.b(), cell.c());
+                std::array::from_fn(|x| s[0] * a[x] + s[1] * b[x] + s[2] * c[x])
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "parallel")]
+    fn in_pool<R: Send>(width: usize, f: impl FnOnce() -> R + Send) -> R {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .build()
+            .unwrap()
+            .install(f)
+    }
+
+    /// Every width, cell shape, mask, and k gives the graph the
+    /// nominations define, row for row.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn csr_rows_follow_the_nominations_at_every_width() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let cells = [
+            Cell::ortho(41.0, 37.0, 45.0).unwrap(),
+            Cell::from_vectors(
+                [40.0, 0.0, 0.0],
+                [6.0, 38.0, 0.0],
+                [-5.0, 4.0, 42.0],
+                [0.0; 3],
+            )
+            .unwrap(),
+            Cell::from_vectors(
+                [30.0, 9.0, 2.0],
+                [-4.0, 33.0, 7.0],
+                [3.0, -6.0, 36.0],
+                [1.0, 2.0, 3.0],
+            )
+            .unwrap(),
+        ];
+        for cell in &cells {
+            let xyz = points(9_000, cell, &mut state);
+            let mask: Vec<bool> = (0..xyz.len()).map(|i| i % 7 != 3).collect();
+            for k in [1usize, 4, 12] {
+                for masked in [false, true] {
+                    let m = masked.then_some(&mask[..]);
+                    let mut nom = vec![0i32; xyz.len() * k];
+                    knearest_into(&xyz, cell, k, m, Some(3.0), &mut nom).unwrap();
+                    for mutual in [false, true] {
+                        let want = reference(&nom, xyz.len(), k, mutual);
+                        for width in [1usize, 2, 3, 8] {
+                            let got = in_pool(width, || {
+                                knearest_csr(&xyz, cell, k, m, Some(3.0), mutual).unwrap()
+                            });
+                            assert!(
+                                got == want,
+                                "k={k} masked={masked} mutual={mutual} width={width}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One or no active point, and a box of two, leave every row empty
+    /// or give the single pair.
+    #[test]
+    fn csr_of_tiny_inputs() {
+        let cell = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let one = [[1.0, 1.0, 1.0]];
+        assert_eq!(
+            knearest_csr(&one, &cell, 3, None, None, false).unwrap(),
+            (vec![0, 0], vec![])
+        );
+        let two = [[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]];
+        let off = [false, true];
+        assert_eq!(
+            knearest_csr(&two, &cell, 3, Some(&off), None, true).unwrap(),
+            (vec![0, 0, 0], vec![])
+        );
+        assert_eq!(
+            knearest_csr(&two, &cell, 3, None, None, false).unwrap(),
+            (vec![0, 1, 2], vec![1, 0])
+        );
     }
 }

@@ -314,6 +314,41 @@ int lc_knearest(const double *xyz,
                 int *out_nn);
 
 /**
+ * The k-nearest graph of `n` points as CSR.
+ *
+ * Inputs are those of [`lc_knearest`]. Row `i` of the nominations is
+ * its `k` nearest, nearest first. With `mutual` nonzero, row `i` holds
+ * every `j` that row `i` lists and that lists `i`: the lower indices
+ * ascending, then the higher ones nearest first. Otherwise each edge
+ * comes from one nomination slot `s = i * k + t`: the lower index's
+ * when both rows list each other, the only one that names it when one
+ * does. A row holds its edges in slot order: edges from lower rows
+ * ascending, then its own nearest first, then edges from higher rows
+ * ascending.
+ *
+ * `out_offsets` is caller-owned, `n + 1` ints. `alloc(ctx, total)` is
+ * called once, from any thread of the search, and returns `total`
+ * writable ints for the columns; null fails the call. The search, the
+ * degrees, and the fill run in one parallel region.
+ *
+ * # Safety
+ *
+ * Same pointer contract as [`lc_knearest`]. `out_offsets` is writable
+ * for `n + 1` ints. `alloc` returns null or `total` writable ints and
+ * does not unwind.
+ */
+int lc_knearest_csr(const double *xyz,
+                    size_t n,
+                    const struct lc_cell *simbox,
+                    size_t k,
+                    const int *mask,
+                    double cell_hint,
+                    int mutual,
+                    int *out_offsets,
+                    int *(*alloc)(void*, size_t),
+                    void *ctx);
+
+/**
  * Like [`lc_knearest`], and write squared distances into `out_d2`.
  *
  * `out_d2` is caller-owned, length `n * k`. Unused slots are `NaN`.

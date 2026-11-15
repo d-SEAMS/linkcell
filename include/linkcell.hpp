@@ -220,6 +220,46 @@ inline void knearest_into_many(const double *xyz, std::size_t n,
   detail::call_c(xyz, n, cell, k, out, mask, cell_hint, out_d2, n_frames);
 }
 
+/// The k-nearest graph as CSR into `offsets` (n + 1) and `cols`; see
+/// `lc_knearest_csr` for the row order. `mask` is nullptr or n ints.
+inline void knearest_csr(const double *xyz, std::size_t n, const Cell &cell,
+                         std::size_t k, bool mutual, std::vector<int> &offsets,
+                         std::vector<int> &cols, const int *mask = nullptr,
+                         double cell_hint = 0.0) {
+  if (n == 0) {
+    throw Error("no points");
+  }
+  if (k == 0) {
+    throw Error("k must be at least 1");
+  }
+  if (xyz == nullptr) {
+    throw Error("null pointer");
+  }
+  offsets.resize(n + 1);
+  struct Sink {
+    std::vector<int> *cols;
+    static int *grow(void *raw, std::size_t total) noexcept {
+      auto *self = static_cast<Sink *>(raw);
+      try {
+        self->cols->resize(total);
+      } catch (...) {
+        return nullptr;
+      }
+      return self->cols->data();
+    }
+  } sink{&cols};
+  const lc_cell raw = cell.raw();
+  const int status =
+      lc_knearest_csr(xyz, detail::to_c_count(n, "n"), &raw,
+                      detail::to_c_count(k, "k"), mask, cell_hint, mutual ? 1 : 0,
+                      offsets.data(), &Sink::grow, &sink);
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg)
+                            : std::string("linkcell: knearest_csr failed"));
+  }
+}
+
 /// One allocation of n * k indices. `neighbour(i, j)` is the j-th
 /// neighbour of i, or -1.
 [[nodiscard]] inline Neighbours
