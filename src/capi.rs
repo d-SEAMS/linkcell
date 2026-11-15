@@ -18,6 +18,12 @@ static WANTED_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// before the new one starts, so two widths never run together. The
 /// workers sleep on a condvar between searches (rayon's idle path),
 /// which is the passive wait.
+#[cfg(not(feature = "parallel"))]
+fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    work()
+}
+
+#[cfg(feature = "parallel")]
 fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     let n = WANTED_THREADS.load(Ordering::Relaxed);
     if n <= 1 {
@@ -61,9 +67,21 @@ pub extern "C" fn lc_set_threads(n: c_int) {
 pub extern "C" fn lc_num_threads() -> c_int {
     let n = WANTED_THREADS.load(Ordering::Relaxed);
     if n == 0 {
-        rayon::current_num_threads() as c_int
+        default_width() as c_int
     } else {
         n as c_int
+    }
+}
+
+/// Width of the global Rayon pool, or one thread without `parallel`.
+fn default_width() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::current_num_threads()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
     }
 }
 
@@ -145,10 +163,11 @@ pub extern "C" fn lc_for_slabs(
             cb(ctx, begin, end);
         };
         let width = WANTED_THREADS.load(Ordering::Relaxed);
-        if width <= 1 {
+        if width <= 1 || cfg!(not(feature = "parallel")) {
             call(0, n);
             return;
         }
+        #[cfg(feature = "parallel")]
         rayon::broadcast(move |worker| {
             let workers = worker.num_threads().max(1);
             let t = worker.index();
