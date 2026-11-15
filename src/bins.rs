@@ -138,7 +138,7 @@ impl Mesh {
         }
 
         #[cfg(feature = "parallel")]
-        let parallel = n_active >= PARALLEL_MESH;
+        let parallel = n_active >= PARALLEL_MESH && rayon::current_num_threads() > 1;
         #[cfg(not(feature = "parallel"))]
         let parallel = false;
         if buf.offsets.len() != ncell + 1 {

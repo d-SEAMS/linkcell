@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=../src/gpu/knearest.cpp");
     println!("cargo:rerun-if-changed=../src/gpu/capi.cpp");
+    println!("cargo:rerun-if-changed=../src/gpu/partition.cpp");
     println!("cargo:rerun-if-changed=../include/linkcell_gpu.h");
     println!("cargo:rerun-if-changed=../include/linkcell_gpu.hpp");
     println!("cargo:rerun-if-changed=../include/linkcell.hpp");
@@ -20,6 +21,7 @@ fn main() {
         .include(root.join("third_party/gpulite"))
         .file(root.join("src/gpu/knearest.cpp"))
         .file(root.join("src/gpu/capi.cpp"))
+        .file(root.join("src/gpu/partition.cpp"))
         .warnings(false);
     if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
         build.flag_if_supported("-fPIC");

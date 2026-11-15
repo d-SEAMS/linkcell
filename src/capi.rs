@@ -5,8 +5,148 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::{Cell, Error};
+
+/// How many Rayon threads the next search should use. Zero or one runs
+/// on the calling thread.
+static WANTED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// One pool for the process. A different width drops the previous pool
+/// before the new one starts, so two widths never run together. The
+/// workers sleep on a condvar between searches (rayon's idle path),
+/// which is the passive wait.
+fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    let n = WANTED_THREADS.load(Ordering::Relaxed);
+    if n <= 1 {
+        return work();
+    }
+    if rayon::current_thread_index().is_some() && rayon::current_num_threads() == n {
+        return work();
+    }
+    struct Slot {
+        n: usize,
+        pool: rayon::ThreadPool,
+    }
+    static CACHE: Mutex<Option<Slot>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if guard.as_ref().map(|slot| slot.n) != Some(n) {
+        *guard = None;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        *guard = Some(Slot { n, pool });
+    }
+    guard.as_ref().unwrap().pool.install(work)
+}
+
+/// Choose the Rayon width for later searches. `n == 0` runs the search
+/// on the calling thread. `n < 0` selects one thread.
+#[no_mangle]
+pub extern "C" fn lc_set_threads(n: c_int) {
+    let n = if n < 0 {
+        1
+    } else {
+        n as usize
+    };
+    WANTED_THREADS.store(n, Ordering::Relaxed);
+}
+
+/// Width selected by [`lc_set_threads`], or the global pool when unset.
+#[no_mangle]
+pub extern "C" fn lc_num_threads() -> c_int {
+    let n = WANTED_THREADS.load(Ordering::Relaxed);
+    if n == 0 {
+        rayon::current_num_threads() as c_int
+    } else {
+        n as c_int
+    }
+}
+
+/// Width stored by [`lc_set_threads`]. Zero means the caller did not
+/// choose, and the search keeps its default iterator.
+pub(crate) fn search_width() -> usize {
+    WANTED_THREADS.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+struct Continuation {
+    ctx: usize,
+    cb: usize,
+}
+
+/// A callback the in-flight search runs before its pool goes idle, so
+/// the CSR merge does not pay a second wake. Unset between searches.
+static CONTINUATION: Mutex<Option<Continuation>> = Mutex::new(None);
+
+fn run_continuation() {
+    let copied = {
+        let guard = CONTINUATION.lock().unwrap_or_else(|err| err.into_inner());
+        *guard
+    };
+    let Some(cont) = copied else {
+        return;
+    };
+    let cb: extern "C" fn(*mut std::ffi::c_void) = unsafe { std::mem::transmute(cont.cb) };
+    cb(cont.ctx as *mut std::ffi::c_void);
+}
+
+/// Run `cb` at the end of the next `lc_knearest`, still inside its pool.
+/// A null `cb` clears it. The search clears nothing by itself: the caller
+/// drops the hook when the call returns.
+#[no_mangle]
+pub extern "C" fn lc_set_continuation(
+    ctx: *mut std::ffi::c_void,
+    cb: Option<extern "C" fn(*mut std::ffi::c_void)>,
+) {
+    let mut guard = CONTINUATION.lock().unwrap_or_else(|err| err.into_inner());
+    *guard = cb.map(|cb| Continuation {
+        ctx: ctx as usize,
+        cb: cb as usize,
+    });
+}
+
+/// Run `cb(ctx, begin, end)` over disjoint spans of `0..n` on the pool
+/// selected by [`lc_set_threads`]. One thread runs the whole span on the
+/// caller. The spans cover `0..n` exactly once.
+#[no_mangle]
+pub extern "C" fn lc_for_slabs(
+    n: c_int,
+    ctx: *mut std::ffi::c_void,
+    cb: Option<extern "C" fn(*mut std::ffi::c_void, c_int, c_int)>,
+) {
+    let Some(cb) = cb else {
+        return;
+    };
+    if n <= 0 {
+        return;
+    }
+    let ctx_bits = ctx as usize;
+    let cb_bits = cb as usize;
+    with_threads(move || {
+        let call = |begin: c_int, end: c_int| {
+            let ctx = ctx_bits as *mut std::ffi::c_void;
+            let cb: extern "C" fn(*mut std::ffi::c_void, c_int, c_int) =
+                unsafe { std::mem::transmute(cb_bits) };
+            cb(ctx, begin, end);
+        };
+        let width = WANTED_THREADS.load(Ordering::Relaxed);
+        if width <= 1 {
+            call(0, n);
+            return;
+        }
+        rayon::broadcast(move |worker| {
+            let workers = worker.num_threads().max(1);
+            let t = worker.index();
+            let begin = (n as usize) * t / workers;
+            let end = (n as usize) * (t + 1) / workers;
+            call(begin as c_int, end as c_int);
+        });
+    });
+}
 
 /// Periodic parallelepiped. Lattice vectors are a, b, c (same as vesin rows).
 #[repr(C)]
@@ -245,11 +385,17 @@ pub unsafe extern "C" fn lc_knearest_many(
         d2_store = unsafe { std::slice::from_raw_parts_mut(out_d2, need) };
         Some(&mut d2_store[..])
     };
-    let err = if n_frames == 1 {
-        crate::knearest_into_d2(pts, &sim, k, mask_vec.as_deref(), hint, nn, d2)
-    } else {
-        crate::knearest_into_many(pts, n, n_frames, &sim, k, mask_vec.as_deref(), hint, nn, d2)
-    };
+    let err = with_threads(|| {
+        let found = if n_frames == 1 {
+            crate::knearest_into_d2(pts, &sim, k, mask_vec.as_deref(), hint, nn, d2)
+        } else {
+            crate::knearest_into_many(pts, n, n_frames, &sim, k, mask_vec.as_deref(), hint, nn, d2)
+        };
+        if found.is_ok() {
+            run_continuation();
+        }
+        found
+    });
     if let Err(e) = err {
         set_error(&e.to_string());
         return 1;
@@ -403,11 +549,15 @@ pub unsafe extern "C" fn lc_pairs_within_rows(
         park(&key, found);
         return fail_msg("pair buffer is shorter than the pair count");
     }
-    // Safety: the caller gave `cap >= rows` rows.
+    // Safety: the caller gave `cap >= rows` rows. The fill runs on the
+    // same pool as the search. `in_pool` would otherwise open the global
+    // Rayon pool beside it.
     let rows_out = RowOut(out);
-    crate::pairs::in_pool(found.rows(), move || {
-        let out = rows_out.get();
-        unsafe { found.write_rows(out, |i, j, shift, dist2| lc_pair { i, j, shift, dist2 }) }
+    with_threads(move || {
+        crate::pairs::in_pool(found.rows(), move || {
+            let out = rows_out.get();
+            unsafe { found.write_rows(out, |i, j, shift, dist2| lc_pair { i, j, shift, dist2 }) }
+        })
     });
     clear_error();
     0
@@ -466,8 +616,10 @@ unsafe fn pairs_call<'a>(
         return Ok((key, found));
     }
     let mask_vec: Option<Vec<bool>> = mask_raw.map(|m| m.iter().map(|&v| v != 0).collect());
-    let found = crate::pairs::in_pool(crate::pairs::hit_estimate(n, &sim, cutoff), || {
-        crate::pairs::search(pts, &sim, cutoff, mask_vec.as_deref(), hint, half != 0)
+    let found = with_threads(|| {
+        crate::pairs::in_pool(crate::pairs::hit_estimate(n, &sim, cutoff), || {
+            crate::pairs::search(pts, &sim, cutoff, mask_vec.as_deref(), hint, half != 0)
+        })
     });
     match found {
         Ok(found) => Ok((key, found)),
@@ -581,4 +733,694 @@ fn park(key: &PairKey<'_>, found: crate::pairs::Found) {
         found,
     };
     PARKED_PAIRS.with(|slot| *slot.borrow_mut() = Some(parked));
+}
+
+unsafe fn load_frame<'a>(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    mask: *const c_int,
+    cell_hint: f64,
+) -> Result<(&'a [[f64; 3]], Cell, Option<Vec<bool>>, Option<f64>), c_int> {
+    if n == 0 {
+        return Err(fail(Error::Empty));
+    }
+    if xyz.is_null() || simbox.is_null() {
+        return Err(fail_msg("null pointer"));
+    }
+    if n > c_int::MAX as usize || n > (isize::MAX as usize) / 3 {
+        return Err(fail(Error::Overflow));
+    }
+    let box_c = unsafe { *simbox };
+    let sim = Cell::from_vectors(
+        [box_c.ax, box_c.ay, box_c.az],
+        [box_c.bx, box_c.by, box_c.bz],
+        [box_c.cx, box_c.cy, box_c.cz],
+        [box_c.ox, box_c.oy, box_c.oz],
+    )
+    .map_err(|err| fail(err.into()))?;
+    let pts: &'a [[f64; 3]] = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_vec = if mask.is_null() {
+        None
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(mask, n) };
+        Some(raw.iter().map(|&v| v != 0).collect())
+    };
+    let hint = if cell_hint > 0.0 { Some(cell_hint) } else { None };
+    Ok((pts, sim, mask_vec, hint))
+}
+
+fn write_grid_head(grid: &crate::CellGrid, out_nxyz: *mut c_int, out_width: *mut f64) {
+    if !out_nxyz.is_null() {
+        unsafe {
+            *out_nxyz = grid.nx;
+            *out_nxyz.add(1) = grid.ny;
+            *out_nxyz.add(2) = grid.nz;
+        }
+    }
+    if !out_width.is_null() {
+        unsafe {
+            *out_width = grid.bin_width[0];
+            *out_width.add(1) = grid.bin_width[1];
+            *out_width.add(2) = grid.bin_width[2];
+        }
+    }
+}
+
+/// Point counts on the linked-cell mesh.
+///
+/// `out_nxyz` receives `nx, ny, nz`. `out_width` receives the three bin
+/// widths. `out_weight` receives one count per cell, in the order
+/// `((iz * ny) + iy) * nx + ix`. A null `out_weight` is a query:
+/// `*out_ncell` is the cell count and the return is 0.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `simbox` points at one
+/// `lc_cell`. `mask`, if non-null, is readable for `n` ints.
+/// `out_ncell` is writable. On a fill, `out_nxyz` is writable for 3
+/// ints, `out_width` for 3 doubles, and `out_weight` for `*out_ncell`
+/// counts.
+#[no_mangle]
+pub unsafe extern "C" fn lc_cell_grid(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    out_nxyz: *mut c_int,
+    out_width: *mut f64,
+    out_weight: *mut u64,
+    cap: usize,
+    out_ncell: *mut usize,
+) -> c_int {
+    if out_ncell.is_null() {
+        return fail_msg("null pointer");
+    }
+    let (pts, sim, mask_vec, hint) =
+        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+    let grid = match crate::cell_grid(pts, &sim, cutoff, mask_vec.as_deref(), hint) {
+        Ok(grid) => grid,
+        Err(err) => return fail(err),
+    };
+    let ncell = grid.ncell();
+    unsafe { *out_ncell = ncell };
+    if out_weight.is_null() {
+        clear_error();
+        return 0;
+    }
+    if cap < ncell || out_nxyz.is_null() || out_width.is_null() {
+        return fail_msg("cell grid buffer is shorter than the cell count");
+    }
+    write_grid_head(&grid, out_nxyz, out_width);
+    unsafe {
+        std::ptr::copy_nonoverlapping(grid.weight.as_ptr(), out_weight, ncell);
+    }
+    clear_error();
+    0
+}
+
+/// Periodic cell adjacency. Edge weights are pair counts from
+/// `lc_pairs_within` with `half` set.
+///
+/// A null `out_weight` queries `*out_ncell` and `*out_arcs` and
+/// returns 0. Otherwise every output buffer is required. `cap_weight`
+/// is the cell capacity and `cap_arcs` is the arc capacity.
+/// `out_offsets` has length `ncell + 1`.
+///
+/// # Safety
+///
+/// Same point contract as [`lc_cell_grid`]. On a fill, `out_offsets`
+/// is writable for `ncell + 1` counts, `out_neighbor` and `out_edge`
+/// for `out_arcs` entries.
+#[no_mangle]
+pub unsafe extern "C" fn lc_cell_graph(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    out_nxyz: *mut c_int,
+    out_width: *mut f64,
+    out_weight: *mut u64,
+    out_offsets: *mut u32,
+    out_neighbor: *mut u32,
+    out_edge: *mut u64,
+    cap_weight: usize,
+    cap_arcs: usize,
+    out_ncell: *mut usize,
+    out_arcs: *mut usize,
+) -> c_int {
+    if out_ncell.is_null() || out_arcs.is_null() {
+        return fail_msg("null pointer");
+    }
+    let (pts, sim, mask_vec, hint) =
+        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+    let graph = match crate::cell_graph(pts, &sim, cutoff, mask_vec.as_deref(), hint) {
+        Ok(graph) => graph,
+        Err(err) => return fail(err),
+    };
+    let ncell = graph.grid.ncell();
+    let arcs = graph.neighbor.len();
+    unsafe {
+        *out_ncell = ncell;
+        *out_arcs = arcs;
+    }
+    if out_weight.is_null() {
+        clear_error();
+        return 0;
+    }
+    if cap_weight < ncell
+        || cap_arcs < arcs
+        || out_nxyz.is_null()
+        || out_width.is_null()
+        || out_offsets.is_null()
+        || out_neighbor.is_null()
+        || out_edge.is_null()
+    {
+        return fail_msg("cell graph buffer is shorter than the graph");
+    }
+    write_grid_head(&graph.grid, out_nxyz, out_width);
+    unsafe {
+        std::ptr::copy_nonoverlapping(graph.grid.weight.as_ptr(), out_weight, ncell);
+        std::ptr::copy_nonoverlapping(graph.offsets.as_ptr(), out_offsets, ncell + 1);
+        if arcs > 0 {
+            std::ptr::copy_nonoverlapping(graph.neighbor.as_ptr(), out_neighbor, arcs);
+            std::ptr::copy_nonoverlapping(graph.edge_weight.as_ptr(), out_edge, arcs);
+        }
+    }
+    clear_error();
+    0
+}
+
+/// Domain id of each cell.
+///
+/// `method` is 0 Morton, 1 Hilbert, 2 recursive coordinate bisection,
+/// 3 Hilbert plus Fiduccia-Mattheyses, 4 bisection plus that pass,
+/// 5 Scotch, 6 multilevel, 7 PT-Scotch. `balance <= 0` selects
+/// `1 + parts * w_max / total`, where `w_max` is the heaviest cell
+/// weight and `total` is the sum of the cell weights. `device` nonzero runs the
+/// curve split on the CUDA device and returns nonzero when that device
+/// is absent. A null `out_domain` queries `*out_ncell`.
+///
+/// # Safety
+///
+/// Same point contract as [`lc_cell_grid`]. On a fill, `out_domain` is
+/// writable for `ncell` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_partition(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    parts: usize,
+    method: u8,
+    balance: f64,
+    device: c_int,
+    out_domain: *mut c_int,
+    cap: usize,
+    out_ncell: *mut usize,
+) -> c_int {
+    if out_ncell.is_null() {
+        return fail_msg("null pointer");
+    }
+    if parts == 0 || parts > u32::MAX as usize {
+        return fail(Error::BadPartition);
+    }
+    let (pts, sim, mask_vec, hint) =
+        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+    let method = match crate::partition::method_from_c(method) {
+        Ok(method) => method,
+        Err(err) => return fail(err),
+    };
+    let balance = if balance <= 0.0 { None } else { Some(balance) };
+    let request = crate::PartRequest {
+        parts: parts as u32,
+        method,
+        balance,
+        device: device != 0,
+    };
+    let assign = match crate::partition(pts, &sim, cutoff, mask_vec.as_deref(), hint, request) {
+        Ok(assign) => assign,
+        Err(err) => return fail(err),
+    };
+    unsafe { *out_ncell = assign.len() };
+    if out_domain.is_null() {
+        clear_error();
+        return 0;
+    }
+    if cap < assign.len() {
+        return fail_msg("partition buffer is shorter than the cell count");
+    }
+    for (i, &domain) in assign.iter().enumerate() {
+        if domain > c_int::MAX as u32 {
+            return fail(Error::Overflow);
+        }
+        unsafe { *out_domain.add(i) = domain as c_int };
+    }
+    clear_error();
+    0
+}
+
+/// Bin radii for `cutoff * depth`. `out_width` receives three counts.
+///
+/// # Safety
+///
+/// `bin_width` is readable for 3 doubles. `out_width` is writable for
+/// 3 counts.
+#[no_mangle]
+pub unsafe extern "C" fn lc_halo_width(
+    cutoff: f64,
+    depth: u32,
+    bin_width: *const f64,
+    out_width: *mut u32,
+) -> c_int {
+    if bin_width.is_null() || out_width.is_null() {
+        return fail_msg("null pointer");
+    }
+    let width = unsafe { [*bin_width, *bin_width.add(1), *bin_width.add(2)] };
+    match crate::halo_width(cutoff, depth, width) {
+        Ok(radius) => {
+            unsafe {
+                *out_width = radius[0];
+                *out_width.add(1) = radius[1];
+                *out_width.add(2) = radius[2];
+            }
+            clear_error();
+            0
+        }
+        Err(err) => fail(err),
+    }
+}
+
+/// Ghost cells of `domain`. A null `out_ghost` queries `*out_count`.
+///
+/// # Safety
+///
+/// `nxyz` is readable for 3 ints. `assign` is readable for `ncell`
+/// ints. `width` is readable for 3 counts. On a fill, `out_ghost` is
+/// writable for `*out_count` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_halo(
+    nxyz: *const c_int,
+    assign: *const c_int,
+    ncell: usize,
+    domain: c_int,
+    width: *const u32,
+    out_ghost: *mut c_int,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if nxyz.is_null() || assign.is_null() || width.is_null() || out_count.is_null() {
+        return fail_msg("null pointer");
+    }
+    if domain < 0 {
+        return fail(Error::BadPartition);
+    }
+    let nxyz = unsafe { [*nxyz, *nxyz.add(1), *nxyz.add(2)] };
+    if nxyz[0] <= 0 || nxyz[1] <= 0 || nxyz[2] <= 0 {
+        return fail(Error::BadGraph);
+    }
+    let expect = (nxyz[0] as usize)
+        .saturating_mul(nxyz[1] as usize)
+        .saturating_mul(nxyz[2] as usize);
+    if expect != ncell {
+        return fail(Error::BadGraph);
+    }
+    let raw = unsafe { std::slice::from_raw_parts(assign, ncell) };
+    let mut owned = Vec::with_capacity(ncell);
+    for &v in raw {
+        if v < 0 {
+            return fail(Error::BadPartition);
+        }
+        owned.push(v as u32);
+    }
+    let grid = crate::CellGrid {
+        nx: nxyz[0],
+        ny: nxyz[1],
+        nz: nxyz[2],
+        bin_width: [0.0; 3],
+        weight: vec![0; ncell],
+    };
+    let radius = unsafe { [*width, *width.add(1), *width.add(2)] };
+    let ghosts = match crate::halo(&grid, &owned, domain as u32, radius) {
+        Ok(ghosts) => ghosts,
+        Err(err) => return fail(err),
+    };
+    unsafe { *out_count = ghosts.len() };
+    if out_ghost.is_null() {
+        clear_error();
+        return 0;
+    }
+    if cap < ghosts.len() {
+        return fail_msg("halo buffer is shorter than the ghost count");
+    }
+    for (i, &cell) in ghosts.iter().enumerate() {
+        unsafe { *out_ghost.add(i) = cell as c_int };
+    }
+    clear_error();
+    0
+}
+
+/// Domain of each cell and the bin of each point, from one mesh cut.
+///
+/// `method` and `balance` follow [`lc_partition`]. A null `out_domain`
+/// queries `*out_ncell` and does not write. On a fill, `out_nxyz` is
+/// three ints, `out_width` is three bin widths, `out_domain` is one
+/// domain per cell, and `out_point_cell` is one bin per point.
+///
+/// # Safety
+///
+/// Same point contract as [`lc_cell_grid`]. On a fill, `out_domain` is
+/// writable for `*out_ncell` ints and `out_point_cell` for `n` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_mesh_cut(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    parts: usize,
+    method: u8,
+    balance: f64,
+    device: c_int,
+    out_nxyz: *mut c_int,
+    out_width: *mut f64,
+    out_domain: *mut c_int,
+    out_point_cell: *mut c_int,
+    cap_cell: usize,
+    cap_point: usize,
+    out_ncell: *mut usize,
+) -> c_int {
+    if out_ncell.is_null() {
+        return fail_msg("null pointer");
+    }
+    if parts == 0 || parts > u32::MAX as usize {
+        return fail(Error::BadPartition);
+    }
+    let (pts, sim, mask_vec, hint) =
+        match unsafe { load_frame(xyz, n, simbox, mask, cell_hint) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+    let method = match crate::partition::method_from_c(method) {
+        Ok(method) => method,
+        Err(err) => return fail(err),
+    };
+    let request = crate::PartRequest {
+        parts: parts as u32,
+        method,
+        balance: if balance <= 0.0 { None } else { Some(balance) },
+        device: device != 0,
+    };
+    let cut = match with_threads(|| {
+        crate::mesh_cut(pts, &sim, cutoff, mask_vec.as_deref(), hint, request)
+    }) {
+        Ok(cut) => cut,
+        Err(err) => return fail(err),
+    };
+    let ncell = cut.assign.len();
+    unsafe { *out_ncell = ncell };
+    if out_domain.is_null() {
+        clear_error();
+        return 0;
+    }
+    if out_nxyz.is_null()
+        || out_width.is_null()
+        || out_point_cell.is_null()
+        || cap_cell < ncell
+        || cap_point < n
+    {
+        return fail_msg("mesh cut buffer is shorter than the cell count");
+    }
+    write_grid_head(&cut.grid, out_nxyz, out_width);
+    for (i, &domain) in cut.assign.iter().enumerate() {
+        if domain > c_int::MAX as u32 {
+            return fail(Error::Overflow);
+        }
+        unsafe { *out_domain.add(i) = domain as c_int };
+    }
+    for (i, &cell) in cut.point_cell.iter().enumerate() {
+        if cell > c_int::MAX as u32 {
+            return fail(Error::Overflow);
+        }
+        unsafe { *out_point_cell.add(i) = cell as c_int };
+    }
+    clear_error();
+    0
+}
+
+/// Domain of each cell from caller-supplied weights.
+///
+/// `nxyz` is `nx, ny, nz`. `weight` has one count per cell, in the
+/// order `((iz * ny) + iy) * nx + ix`. `method` and `balance` follow
+/// [`lc_partition`]. A plain bisection reads the weights and not the
+/// pair arcs. `out_domain` receives one domain per cell.
+///
+/// # Safety
+///
+/// `nxyz` is readable for 3 ints. `weight` is readable for `ncell`
+/// counts. `out_domain` is writable for `ncell` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_partition_weights(
+    nxyz: *const c_int,
+    weight: *const u64,
+    ncell: usize,
+    parts: usize,
+    method: u8,
+    balance: f64,
+    out_domain: *mut c_int,
+) -> c_int {
+    if nxyz.is_null() || weight.is_null() || out_domain.is_null() {
+        return fail_msg("null pointer");
+    }
+    if parts == 0 || parts > u32::MAX as usize {
+        return fail(Error::BadPartition);
+    }
+    let nxyz = unsafe { [*nxyz, *nxyz.add(1), *nxyz.add(2)] };
+    if nxyz[0] <= 0 || nxyz[1] <= 0 || nxyz[2] <= 0 {
+        return fail(Error::BadGraph);
+    }
+    let expect = (nxyz[0] as usize)
+        .saturating_mul(nxyz[1] as usize)
+        .saturating_mul(nxyz[2] as usize);
+    if expect != ncell {
+        return fail(Error::BadGraph);
+    }
+    let method = match crate::partition::method_from_c(method) {
+        Ok(method) => method,
+        Err(err) => return fail(err),
+    };
+    let raw = unsafe { std::slice::from_raw_parts(weight, ncell) };
+    let graph = crate::CellGraph {
+        grid: crate::CellGrid {
+            nx: nxyz[0],
+            ny: nxyz[1],
+            nz: nxyz[2],
+            bin_width: [1.0; 3],
+            weight: raw.to_vec(),
+        },
+        offsets: vec![0u32; ncell + 1],
+        neighbor: Vec::new(),
+        edge_weight: Vec::new(),
+    };
+    let request = crate::PartRequest {
+        parts: parts as u32,
+        method,
+        balance: if balance <= 0.0 { None } else { Some(balance) },
+        device: false,
+    };
+    let assign = match with_threads(|| crate::partition_graph(&graph, request)) {
+        Ok(assign) => assign,
+        Err(err) => return fail(err),
+    };
+    for (i, &domain) in assign.iter().enumerate() {
+        if domain > c_int::MAX as u32 {
+            return fail(Error::Overflow);
+        }
+        unsafe { *out_domain.add(i) = domain as c_int };
+    }
+    clear_error();
+    0
+}
+
+/// Owned points are 2. Ghosts within `reach` of an owned atom are 1.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `lengths` and `nxyz` are
+/// readable for 3 entries. `assign` is readable for `ncell` ints.
+/// `point_cell` is readable for `n` ints. `hwidth` is readable for 3
+/// counts. `out_hit` is writable for `n` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_within_reach(
+    xyz: *const f64,
+    n: usize,
+    lengths: *const f64,
+    nxyz: *const c_int,
+    assign: *const c_int,
+    ncell: usize,
+    point_cell: *const c_int,
+    hwidth: *const u32,
+    domain: c_int,
+    reach: f64,
+    out_hit: *mut c_int,
+) -> c_int {
+    if xyz.is_null()
+        || lengths.is_null()
+        || nxyz.is_null()
+        || assign.is_null()
+        || point_cell.is_null()
+        || hwidth.is_null()
+        || out_hit.is_null()
+        || domain < 0
+    {
+        return fail_msg("null pointer");
+    }
+    let pts: Vec<[f64; 3]> =
+        unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) }.to_vec();
+    let lengths = unsafe { [*lengths, *lengths.add(1), *lengths.add(2)] };
+    let nxyz = unsafe { [*nxyz, *nxyz.add(1), *nxyz.add(2)] };
+    let hwidth = unsafe { [*hwidth, *hwidth.add(1), *hwidth.add(2)] };
+    let assign_raw = unsafe { std::slice::from_raw_parts(assign, ncell) };
+    let mut owned = Vec::with_capacity(ncell);
+    for &v in assign_raw {
+        if v < 0 {
+            return fail(Error::BadPartition);
+        }
+        owned.push(v as u32);
+    }
+    let cells_raw = unsafe { std::slice::from_raw_parts(point_cell, n) };
+    let mut cells = Vec::with_capacity(n);
+    for &v in cells_raw {
+        if v < 0 {
+            return fail(Error::BadPartition);
+        }
+        cells.push(v as u32);
+    }
+    let hit = match with_threads(|| {
+        crate::mark_reached(
+            &pts,
+            lengths,
+            nxyz,
+            &owned,
+            &cells,
+            hwidth,
+            domain as u32,
+            reach,
+        )
+    }) {
+        Ok(hit) => hit,
+        Err(err) => return fail(err),
+    };
+    for (i, &flag) in hit.iter().enumerate() {
+        unsafe { *out_hit.add(i) = flag as c_int };
+    }
+    clear_error();
+    0
+}
+
+/// Owned points are 2. Points in a cell painted from the owned walk are 1.
+///
+/// The stencil is the one [`crate::rank_mask`] paints while it visits the
+/// cells of `domain`. `width` is three bin radii.
+///
+/// # Safety
+///
+/// `nxyz` is readable for 3 ints. `assign` is readable for `ncell` ints.
+/// `point_cell` is readable for `n` ints. `width` is readable for 3
+/// counts. `out_hit` is writable for `n` ints.
+#[no_mangle]
+pub unsafe extern "C" fn lc_owned_mask(
+    nxyz: *const c_int,
+    assign: *const c_int,
+    ncell: usize,
+    point_cell: *const c_int,
+    n: usize,
+    domain: c_int,
+    width: *const u32,
+    out_hit: *mut c_int,
+) -> c_int {
+    if nxyz.is_null()
+        || assign.is_null()
+        || point_cell.is_null()
+        || width.is_null()
+        || out_hit.is_null()
+        || domain < 0
+    {
+        return fail_msg("null pointer");
+    }
+    let nxyz = unsafe { [*nxyz, *nxyz.add(1), *nxyz.add(2)] };
+    if nxyz[0] <= 0 || nxyz[1] <= 0 || nxyz[2] <= 0 {
+        return fail(Error::BadGraph);
+    }
+    let expect = (nxyz[0] as usize)
+        .saturating_mul(nxyz[1] as usize)
+        .saturating_mul(nxyz[2] as usize);
+    if expect != ncell {
+        return fail(Error::BadGraph);
+    }
+    let assign_raw = unsafe { std::slice::from_raw_parts(assign, ncell) };
+    let mut owned_assign = Vec::with_capacity(ncell);
+    let mut owned_cells = Vec::new();
+    for (cell, &v) in assign_raw.iter().enumerate() {
+        if v < 0 {
+            return fail(Error::BadPartition);
+        }
+        let domain_id = v as u32;
+        if domain_id == domain as u32 {
+            owned_cells.push(cell as u32);
+        }
+        owned_assign.push(domain_id);
+    }
+    let cells_raw = unsafe { std::slice::from_raw_parts(point_cell, n) };
+    let mut point_bins = Vec::with_capacity(n);
+    for &v in cells_raw {
+        if v < 0 || v as usize >= ncell {
+            return fail(Error::BadPartition);
+        }
+        point_bins.push(v as u32);
+    }
+    let width = unsafe { [*width, *width.add(1), *width.add(2)] };
+    let grid = crate::CellGrid {
+        nx: nxyz[0],
+        ny: nxyz[1],
+        nz: nxyz[2],
+        bin_width: [1.0; 3],
+        weight: vec![0; ncell],
+    };
+    let view = crate::rank_mask(
+        &grid,
+        &owned_assign,
+        &point_bins,
+        &owned_cells,
+        domain as u32,
+        width,
+    );
+    for (i, &painted) in view.mask.iter().enumerate() {
+        let flag = if !painted {
+            0
+        } else if owned_assign[point_bins[i] as usize] == domain as u32 {
+            2
+        } else {
+            1
+        };
+        unsafe { *out_hit.add(i) = flag };
+    }
+    clear_error();
+    0
 }

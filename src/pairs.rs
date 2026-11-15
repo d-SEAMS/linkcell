@@ -118,6 +118,52 @@ pub fn pairs_within(
     Ok(out)
 }
 
+/// How many rows [`pairs_within`] would write, without writing them.
+///
+/// The tile still plans the bins and tests every candidate. It does not
+/// store a `Pair` row, so the time is the search rather than the row
+/// stream. The count matches `pairs_within(...).len()` for the same
+/// arguments.
+pub fn pairs_within_count(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+) -> Result<usize, Error> {
+    let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512, feature = "parallel"))]
+    if let Some(words) = plan.fused().filter(|_| knobs::fused()) {
+        return Ok(plan.count_rows(&words));
+    }
+    Ok(plan.search().rows())
+}
+
+/// Write [`pairs_within`] into `out`, keeping its allocation.
+///
+/// A rank that calls this twice reuses the pages from the first call.
+/// A fresh `Vec` on every call is unmapped and faulted again, which on
+/// a half-frame list costs more than walking the pairs.
+pub fn pairs_within_into(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+    out: &mut Vec<Pair>,
+) -> Result<(), Error> {
+    let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    if let Some(words) = plan.fused().filter(|_| knobs::fused()) {
+        plan.fused_into_vec(&words, out);
+        return Ok(());
+    }
+    *out = plan.search().into_pairs();
+    Ok(())
+}
+
 /// Ask Linux to back the 2 MB-aligned interior of a large buffer this
 /// library allocated with transparent huge pages, so the row stores take
 /// one page walk per 2 MB rather than per 4 KB. It is advice: the system's
@@ -288,7 +334,7 @@ pub(crate) fn in_pool<R: Send>(hits: usize, work: impl FnOnce() -> R + Send) -> 
 /// cuts that volume when a cell would otherwise hold many atoms. `8` is
 /// the cell-visit cost in units of one candidate check. A caller `cell_hint`
 /// still wins: [`bins::target_edge`] uses the hint whenever it is positive.
-fn default_edge(simbox: &Cell, n: usize, cutoff: f64) -> f64 {
+pub(crate) fn default_edge(simbox: &Cell, n: usize, cutoff: f64) -> f64 {
     const VISIT_COST: f64 = 8.0;
     let mut per = n as f64;
     for width in simbox.widths() {
@@ -613,8 +659,13 @@ fn retain_pair_pages() {
                 extern "C" {
                     fn mallopt(param: i32, value: i32) -> i32;
                 }
+                // M_TRIM_THRESHOLD: keep a freed pair buffer on the heap.
+                // M_MMAP_MAX: a large row buffer otherwise comes from mmap
+                // and disappears on free, so the next call faults every
+                // page. Zero mmap slots keeps the buffer in the arena,
+                // including a rank thread that allocates its own.
                 let _ = mallopt(-1, -1);
-                let _ = mallopt(-3, 256 << 20);
+                let _ = mallopt(-4, 0);
             }
         });
     }
@@ -2244,7 +2295,11 @@ fn prefetch<T>(p: *const T) {
     // Safety: a prefetch never faults and changes nothing the program
     // can read, wherever it points.
     unsafe {
-        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
+        // The row stream is written once. A plain prefetch brings the line
+        // in shared, and the store then waits on a second fetch for
+        // ownership. This host has PREFETCHW (`3dnowprefetch`), so the
+        // line arrives exclusive and the store does not fetch it again.
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>(p as *const i8)
     };
     #[cfg(not(target_arch = "x86_64"))]
     let _ = p;
@@ -3267,13 +3322,12 @@ unsafe fn avx512_fused<
         __m256i, _mm256_cmp_epu32_mask, _mm256_cmpeq_epi32_mask, _mm256_loadu_si256,
         _mm256_mask_blend_epi32, _mm256_maskz_compress_epi32, _mm256_maskz_loadu_epi32,
         _mm256_set1_epi32, _mm256_storeu_si256, _mm512_add_pd, _mm512_castpd_si512,
-        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_fmadd_pd, _mm512_loadu_pd,
-        _mm512_loadu_si512, _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask,
-        _mm512_mask_set1_epi32, _mm512_mask_storeu_epi64, _mm512_maskz_compress_pd,
-        _mm512_maskz_loadu_pd, _mm512_mul_pd, _mm512_permutex2var_epi32, _mm512_permutexvar_epi32,
-        _mm512_permutexvar_pd, _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32,
-        _mm512_setr_epi64, _mm512_storeu_pd, _mm512_storeu_si512, _mm512_sub_pd, _CMP_LT_OQ,
-        _MM_CMPINT_LT,
+        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_loadu_pd, _mm512_loadu_si512,
+        _mm512_mask_blend_epi32, _mm512_mask_cmp_pd_mask, _mm512_mask_set1_epi32,
+        _mm512_mask_storeu_epi64, _mm512_maskz_compress_pd, _mm512_maskz_loadu_pd, _mm512_mul_pd,
+        _mm512_permutex2var_epi32, _mm512_permutexvar_epi32, _mm512_permutexvar_pd,
+        _mm512_set1_epi32, _mm512_set1_pd, _mm512_setr_epi32, _mm512_setr_epi64, _mm512_storeu_pd,
+        _mm512_storeu_si512, _mm512_sub_pd, _CMP_LT_OQ, _MM_CMPINT_LT,
     };
     let [sx, sy, sz] = block.shift;
     let [ox, oy, oz] = block.delta;
@@ -3306,8 +3360,7 @@ unsafe fn avx512_fused<
             six,
         ),
     ];
-    let cut_lo = _mm512_set1_pd(cut2 - margin);
-    let cut_hi = cut2 + margin;
+    let cut_exact = _mm512_set1_pd(cut2);
     let mut n = out.n;
     // Half list: a target with the source's own index, which only a
     // periodic image of the source's own bin holds, keeps the forward row
@@ -3339,112 +3392,6 @@ unsafe fn avx512_fused<
         )),
     );
 
-    // One hit decided by the direct formula: both rows (one for a half
-    // list), exactly.
-    macro_rules! put_one {
-        ($iu:expr, $j:expr, $d2:expr) => {{
-            let (a, b, d) = ($iu, $j, $d2);
-            if MODE == COUNT {
-                let _ = (a, b, d);
-                n += if HALF { 1 } else { 2 };
-            } else if HALF {
-                let (i, j, s) = if keep_half(a as usize, b as usize, shift_s) {
-                    (a, b, shift_s)
-                } else {
-                    (b, a, neg)
-                };
-                if COLS {
-                    *out.ci.add(n) = i as i32;
-                    *out.cj.add(n) = j as i32;
-                    *out.cd.add(n) = d;
-                    let so = out.cs.add(3 * n);
-                    *so = s[0];
-                    *so.add(1) = s[1];
-                    *so.add(2) = s[2];
-                } else {
-                    let row = (out.rows as *mut std::mem::MaybeUninit<Pair>).add(n);
-                    (*row).write(Pair {
-                        i: i as usize,
-                        j: j as usize,
-                        shift: s,
-                        dist2: d,
-                    });
-                }
-                n += 1;
-            } else {
-                if COLS {
-                    *out.ci.add(n) = a as i32;
-                    *out.cj.add(n) = b as i32;
-                    *out.cd.add(n) = d;
-                    *out.ci.add(n + 1) = b as i32;
-                    *out.cj.add(n + 1) = a as i32;
-                    *out.cd.add(n + 1) = d;
-                    let so = out.cs.add(3 * n);
-                    *so = shift_s[0];
-                    *so.add(1) = shift_s[1];
-                    *so.add(2) = shift_s[2];
-                    *so.add(3) = neg[0];
-                    *so.add(4) = neg[1];
-                    *so.add(5) = neg[2];
-                } else {
-                    let row = (out.rows as *mut std::mem::MaybeUninit<Pair>).add(n);
-                    let (i, j) = (a as usize, b as usize);
-                    (*row).write(Pair {
-                        i,
-                        j,
-                        shift: shift_s,
-                        dist2: d,
-                    });
-                    (*row.add(1)).write(Pair {
-                        i: j,
-                        j: i,
-                        shift: neg,
-                        dist2: d,
-                    });
-                }
-                n += 2;
-            }
-        }};
-    }
-    macro_rules! direct {
-        ($s:expr, $slot:expr, $mask:expr) => {{
-            let s = $s;
-            let iu = *c.id.add(s);
-            let px = *c.x.add(s) - sx;
-            let py = *c.y.add(s) - sy;
-            let pz = *c.z.add(s) - sz;
-            let mut bits: u32 = u32::from($mask);
-            while bits != 0 {
-                let slot = $slot + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let dx = *c.x.add(slot) - px;
-                let dy = *c.y.add(slot) - py;
-                let dz = *c.z.add(slot) - pz;
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < cut2 {
-                    put_one!(iu, *c.id.add(slot), d2);
-                }
-            }
-        }};
-    }
-    macro_rules! source {
-        ($s:expr) => {{
-            let s = $s;
-            let px = *c.rx.add(s) + ox;
-            let py = *c.ry.add(s) + oy;
-            let pz = *c.rz.add(s) + oz;
-            let pp = px * px + py * py + pz * pz;
-            (
-                *c.id.add(s),
-                _mm512_set1_pd(-2.0 * px),
-                _mm512_set1_pd(-2.0 * py),
-                _mm512_set1_pd(-2.0 * pz),
-                _mm512_set1_pd(pp),
-                _mm512_set1_pd(cut_hi - pp),
-            )
-        }};
-    }
-    // The kept lanes `lo` of one source: compress, then whole registers.
     macro_rules! emit {
         ($lo:expr, $iu:expr, $d2v:expr, $jids:expr) => {{
             let lo: u8 = $lo;
@@ -3677,24 +3624,15 @@ unsafe fn avx512_fused<
             )
         }};
     }
+    // One exact distance, the same products as the scalar walk. The
+    // expanded box test used to run first and then recompute this.
     macro_rules! lanes {
-        ($s:expr, $slot:expr, $tm:expr, $src:expr, $jx:expr, $jy:expr, $jz:expr, $jr:expr, $jids:expr) => {{
-            let (iu, ax, ay, az, pp, thr) = $src;
-            let t = _mm512_fmadd_pd(
-                $jz,
-                az,
-                _mm512_fmadd_pd($jy, ay, _mm512_fmadd_pd($jx, ax, $jr)),
-            );
-            let hi: u8 = _mm512_mask_cmp_pd_mask($tm, t, thr, _CMP_LT_OQ);
-            if hi != 0 {
-                let d2_exp = _mm512_add_pd(t, pp);
-                let lo: u8 = _mm512_mask_cmp_pd_mask(hi, d2_exp, cut_lo, _CMP_LT_OQ);
-                if lo == hi {
-                    let d2v = direct_vec!($s, $slot, $tm);
-                    emit!(lo, iu, d2v, $jids);
-                } else {
-                    direct!($s, $slot, hi);
-                }
+        ($s:expr, $slot:expr, $tm:expr, $jids:expr) => {{
+            let d2v = direct_vec!($s, $slot, $tm);
+            let lo: u8 = _mm512_mask_cmp_pd_mask($tm, d2v, cut_exact, _CMP_LT_OQ);
+            if lo != 0 {
+                let iu = *c.id.add($s);
+                emit!(lo, iu, d2v, $jids);
             }
         }};
     }
@@ -3702,22 +3640,11 @@ unsafe fn avx512_fused<
         ($slot:expr, $j_hi:expr) => {{
             let slot = $slot;
             if slot + 8 <= $j_hi {
-                (
-                    0xffu8,
-                    _mm512_loadu_pd(c.rx.add(slot)),
-                    _mm512_loadu_pd(c.ry.add(slot)),
-                    _mm512_loadu_pd(c.rz.add(slot)),
-                    _mm512_loadu_pd(c.r2.add(slot)),
-                    _mm256_loadu_si256(c.id.add(slot) as *const __m256i),
-                )
+                (0xffu8, _mm256_loadu_si256(c.id.add(slot) as *const __m256i))
             } else {
                 let tm: u8 = ((1u32 << ($j_hi - slot)) - 1) as u8;
                 (
                     tm,
-                    _mm512_maskz_loadu_pd(tm, c.rx.add(slot)),
-                    _mm512_maskz_loadu_pd(tm, c.ry.add(slot)),
-                    _mm512_maskz_loadu_pd(tm, c.rz.add(slot)),
-                    _mm512_maskz_loadu_pd(tm, c.r2.add(slot)),
                     _mm256_maskz_loadu_epi32(tm, c.id.add(slot) as *const i32),
                 )
             }
@@ -3725,36 +3652,156 @@ unsafe fn avx512_fused<
     }
     let j_hi = block.j_hi;
     let nvec = (j_hi - block.j_lo + 7) / 8;
-    // One source at a time, then its targets in slot order. That is the
-    // scalar walk's order. Four sources at once would interleave hits.
+    // Hits of one source stay together, in slot order, which is the
+    // scalar walk's order. A run of four sources shares one target load.
+    // The bin coordinates are three columns, and reading them once per
+    // source misses L1 once a bin leaves the 48 KB data cache. Hits are
+    // buffered, then written source by source, so the rows stay in order.
+    // A bin longer than the buffer keeps the one-source loop.
+    const QUAD: usize = 4;
+    const QUAD_CAP: usize = 192;
+    let quad = !block.tri
+        && block.i_hi - block.i_lo >= QUAD
+        && j_hi - block.j_lo <= QUAD_CAP;
     let cull_box = !block.tri && c.cull && nvec >= CULL_RUNS;
-    if cull_box {
+    /// One target run against `ns` sources. Distances use the same
+    /// products as [`direct_vec`].
+    macro_rules! quad_hits {
+        ($s0:expr, $ns:expr, $slot:expr, $cnt:expr, $idb:expr, $d2b:expr) => {{
+            let slot = $slot;
+            let (tm, jx, jy, jz, jids) = if slot + 8 <= j_hi {
+                (
+                    0xffu8,
+                    _mm512_loadu_pd(c.x.add(slot)),
+                    _mm512_loadu_pd(c.y.add(slot)),
+                    _mm512_loadu_pd(c.z.add(slot)),
+                    _mm256_loadu_si256(c.id.add(slot) as *const __m256i),
+                )
+            } else {
+                let tm: u8 = ((1u32 << (j_hi - slot)) - 1) as u8;
+                (
+                    tm,
+                    _mm512_maskz_loadu_pd(tm, c.x.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.y.add(slot)),
+                    _mm512_maskz_loadu_pd(tm, c.z.add(slot)),
+                    _mm256_maskz_loadu_epi32(tm, c.id.add(slot) as *const i32),
+                )
+            };
+            for k in 0..$ns {
+                let sk = $s0 + k;
+                let px = *c.x.add(sk) - sx;
+                let py = *c.y.add(sk) - sy;
+                let pz = *c.z.add(sk) - sz;
+                let dx = _mm512_sub_pd(jx, _mm512_set1_pd(px));
+                let dy = _mm512_sub_pd(jy, _mm512_set1_pd(py));
+                let dz = _mm512_sub_pd(jz, _mm512_set1_pd(pz));
+                let d2v = _mm512_add_pd(
+                    _mm512_add_pd(_mm512_mul_pd(dx, dx), _mm512_mul_pd(dy, dy)),
+                    _mm512_mul_pd(dz, dz),
+                );
+                let lo: u8 = _mm512_mask_cmp_pd_mask(tm, d2v, cut_exact, _CMP_LT_OQ);
+                if lo != 0 {
+                    let knt = lo.count_ones() as usize;
+                    let at = $cnt[k];
+                    _mm512_storeu_pd(
+                        ($d2b[k].as_mut_ptr() as *mut f64).add(at),
+                        _mm512_maskz_compress_pd(lo, d2v),
+                    );
+                    _mm256_storeu_si256(
+                        ($idb[k].as_mut_ptr() as *mut i32).add(at) as *mut _,
+                        _mm256_maskz_compress_epi32(lo, jids),
+                    );
+                    $cnt[k] = at + knt;
+                }
+            }
+        }};
+    }
+    macro_rules! quad_flush {
+        ($s0:expr, $ns:expr, $cnt:expr, $idb:expr, $d2b:expr) => {{
+            for k in 0..$ns {
+                let iu = *c.id.add($s0 + k);
+                let mut h = 0usize;
+                while h < $cnt[k] {
+                    let m = ($cnt[k] - h).min(8);
+                    let d2v = _mm512_loadu_pd(($d2b[k].as_ptr() as *const f64).add(h));
+                    let jids = _mm256_loadu_si256(
+                        ($idb[k].as_ptr() as *const i32).add(h) as *const __m256i,
+                    );
+                    let mask = ((1u32 << m) - 1) as u8;
+                    emit!(mask, iu, d2v, jids);
+                    h += m;
+                }
+            }
+        }};
+    }
+    if quad && cull_box {
+        let cut_box = _mm512_set1_pd(cut2 + 2.0 * margin);
+        let zero = std::arch::x86_64::_mm512_setzero_pd();
+        let mut s = block.i_lo;
+        while s + QUAD <= block.i_hi {
+            let mut cnt = [0usize; QUAD];
+            // Written before they are read. Zeroing them would be a second
+            // store stream the size of the bin.
+            let mut idb = [std::mem::MaybeUninit::<[i32; QUAD_CAP + 8]>::uninit(); QUAD];
+            let mut d2b = [std::mem::MaybeUninit::<[f64; QUAD_CAP + 8]>::uninit(); QUAD];
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                quad_hits!(s, QUAD, slot, cnt, idb, d2b);
+            });
+            quad_flush!(s, QUAD, cnt, idb, d2b);
+            s += QUAD;
+        }
+        for s in s..block.i_hi {
+            near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
+            });
+        }
+    } else if cull_box {
         let cut_box = _mm512_set1_pd(cut2 + 2.0 * margin);
         let zero = std::arch::x86_64::_mm512_setzero_pd();
         for s in block.i_lo..block.i_hi {
-            let s0 = source!(s);
             near_runs!(c, block, nvec, ox, oy, oz, cut_box, zero, s, slot, {
-                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
-                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
             });
+        }
+    } else if quad {
+        let mut s = block.i_lo;
+        while s + QUAD <= block.i_hi {
+            let mut cnt = [0usize; QUAD];
+            let mut idb = [std::mem::MaybeUninit::<[i32; QUAD_CAP + 8]>::uninit(); QUAD];
+            let mut d2b = [std::mem::MaybeUninit::<[f64; QUAD_CAP + 8]>::uninit(); QUAD];
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                quad_hits!(s, QUAD, slot, cnt, idb, d2b);
+                slot += 8;
+            }
+            quad_flush!(s, QUAD, cnt, idb, d2b);
+            s += QUAD;
+        }
+        for s in s..block.i_hi {
+            let mut slot = block.j_lo;
+            while slot < j_hi {
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
+                slot += 8;
+            }
         }
     } else if !block.tri {
         for s in block.i_lo..block.i_hi {
-            let s0 = source!(s);
             let mut slot = block.j_lo;
             while slot < j_hi {
-                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
-                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
                 slot += 8;
             }
         }
     } else {
         for s in block.i_lo..block.i_hi {
-            let s0 = source!(s);
             let mut slot = s + 1;
             while slot < j_hi {
-                let (tm, jx, jy, jz, jr, jids) = load!(slot, j_hi);
-                lanes!(s, slot, tm, s0, jx, jy, jz, jr, jids);
+                let (tm, jids) = load!(slot, j_hi);
+                lanes!(s, slot, tm, jids);
                 slot += 8;
             }
         }
@@ -3845,6 +3892,33 @@ impl Plan {
         // Safety: every row below `n` is written.
         unsafe { out.set_len(n) };
         out
+    }
+
+    /// [`pairs_within_into`]: fill `out`, growing it only when it is short.
+    fn fused_into_vec(&self, words: &RowWords, out: &mut Vec<Pair>) {
+        let _timer = crate::pop::JobTimer::new();
+        let guess = self.fused_guess();
+        out.clear();
+        if out.capacity() < guess {
+            out.reserve(guess - out.len());
+        }
+        advise_huge(out);
+        let ahead = ahead(out.capacity(), std::mem::size_of::<Pair>());
+        let n = self.fused_sink::<false, _>(words, out, ahead);
+        // Safety: every row below `n` is written.
+        unsafe { out.set_len(n) };
+    }
+
+    /// [`pairs_within_count`]: the tile's row count, with no row stored.
+    #[cfg(feature = "parallel")]
+    fn count_rows(&self, words: &RowWords) -> usize {
+        let mut counter = Counter;
+        let all = (0, self.grid.offsets.len() - 1, 0);
+        if self.half {
+            self.fused_side::<false, true, COUNT, _>(words, &mut counter, false, all)
+        } else {
+            self.fused_side::<false, false, COUNT, _>(words, &mut counter, false, all)
+        }
     }
 
     /// The tile kernel over every block into `sink`, for a full or a half
@@ -4305,12 +4379,59 @@ impl Walk<'_> {
     /// A denser shell grows the buffer.
     fn guess_hits(&self, n_src: usize) -> usize {
         let w = self.grid.widths;
-        let volume = (w[0] * w[1] * w[2]).max(1.0e-30);
+        let full = (w[0] * w[1] * w[2]).max(1.0e-30);
         let radius = self.cut2.sqrt();
         let shell = 4.1887902047863905 * radius * radius * radius;
         let n = self.grid.atoms().max(1) as f64;
-        let neighbors = (n * shell / volume).ceil().max(1.0);
+        // A rank's atoms fill a block of bins, not the whole cell. The
+        // gas count uses that block's volume, so the row buffer covers
+        // the list on the first allocation.
+        let volume = full * self.occupied_fraction();
+        let neighbors = (n * shell / volume).ceil().max(1.0).min(n);
         ((n_src as f64) * neighbors * 0.5 * 1.25) as usize
+    }
+
+    /// Share of the cell that holds at least one atom, from the bin
+    /// bounding box. One means the atoms span every axis.
+    fn occupied_fraction(&self) -> f64 {
+        let nx = self.grid.n[0];
+        let ny = self.grid.n[1];
+        let nz = self.grid.n[2];
+        if nx <= 0 || ny <= 0 || nz <= 0 {
+            return 1.0;
+        }
+        let ncell = (nx as usize) * (ny as usize) * (nz as usize);
+        let off = &self.grid.offsets;
+        if off.len() != ncell + 1 {
+            return 1.0;
+        }
+        let mut min = [i32::MAX; 3];
+        let mut max = [i32::MIN; 3];
+        let mut any = false;
+        for c in 0..ncell {
+            if off[c + 1] == off[c] {
+                continue;
+            }
+            any = true;
+            let ix = (c % nx as usize) as i32;
+            let iy = ((c / nx as usize) % ny as usize) as i32;
+            let iz = (c / (nx as usize * ny as usize)) as i32;
+            min[0] = min[0].min(ix);
+            min[1] = min[1].min(iy);
+            min[2] = min[2].min(iz);
+            max[0] = max[0].max(ix);
+            max[1] = max[1].max(iy);
+            max[2] = max[2].max(iz);
+        }
+        if !any {
+            return 1.0;
+        }
+        let span = [
+            (max[0] - min[0] + 1) as f64 / f64::from(nx),
+            (max[1] - min[1] + 1) as f64 / f64::from(ny),
+            (max[2] - min[2] + 1) as f64 / f64::from(nz),
+        ];
+        (span[0] * span[1] * span[2]).clamp(1.0 / ncell as f64, 1.0)
     }
 
     fn fill_range(&self, start: usize, end: usize) -> Scratch {
@@ -5143,9 +5264,17 @@ mod tests {
     #[test]
     fn sparse_bins_write_the_same_rows_on_one_thread_and_eight() {
         // Under eight atoms a bin, one thread runs the tile inlined into its
-        // block loop, for rows and for columns; eight threads buffer hits.
+        // block loop, for rows and for columns; several threads buffer hits.
         // 3000 atoms in a 40 A cell: about three a bin, and enough pairs
-        // that eight threads split the walk.
+        // that a wide pool splits the walk. A two-CPU machine has no
+        // eight-wide pool, so the comparison uses the machine width.
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let width = cpus.min(8);
+        if width < 2 {
+            return;
+        }
         let cells = [
             Cell::ortho(40.0, 39.0, 41.0).unwrap(),
             Cell::from_vectors(
@@ -5167,9 +5296,10 @@ mod tests {
             let xyz: Vec<[f64; 3]> = (0..3000)
                 .map(|_| sim.cartesian([unit(), unit(), unit()]))
                 .collect();
-            assert!(
-                walk_threads(hit_estimate(xyz.len(), sim, 4.0)) > 1 || !cfg!(feature = "parallel")
-            );
+            let hits = hit_estimate(xyz.len(), sim, 4.0);
+            if on_threads(width, || walk_threads(hits)) <= 1 {
+                return;
+            }
             for half in [false, true] {
                 let (one, one_cols) = on_threads(1, || {
                     let rows = pairs_within(&xyz, sim, 4.0, None, None, half).unwrap();
@@ -5177,7 +5307,7 @@ mod tests {
                     pairs_within_columns(&xyz, sim, 4.0, None, None, half, &mut cols).unwrap();
                     (rows, cols)
                 });
-                let eight = on_threads(8, || {
+                let eight = on_threads(width, || {
                     pairs_within(&xyz, sim, 4.0, None, None, half).unwrap()
                 });
                 assert!(one.len() > 10_000, "half={half}");

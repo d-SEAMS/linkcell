@@ -1,13 +1,14 @@
 # Embed linkcell from C++
 
-`include/linkcell.hpp` is a C++17 RAII header over `linkcell.h`. It
-does not add a second CPU library. Link the same package target a C
-consumer links.
+`include/linkcell.hpp` is a C++17 Resource Acquisition Is Initialization (RAII) header over `linkcell.h`.
+The header wraps that one CPU library.
+Link the same package target a C consumer links.
 
-`linkcell::knearest` returns an owning packed `Neighbours`.
-`knearest_into` writes a caller-owned `int *` and takes `out_len`,
-which must be `n * k`. Neither returns `std::vector<std::vector<int>>`.
-Unused slots are `-1`. Failure throws `linkcell::Error`.
+The CPU library header call `linkcell::knearest` returns an owning packed `Neighbours` for that package target.
+`knearest_into` writes a caller-owned `int *` and takes `out_len`, which must be `n * k`.
+Neither returns `std::vector<std::vector<int>>`.
+Unused slots are `-1`.
+Failure throws `linkcell::Error`.
 
 ## Meson wrap
 
@@ -30,8 +31,7 @@ add_executable(app app.cpp)
 target_link_libraries(app PRIVATE linkcell::cpp)
 ```
 
-`linkcell::cpp` links the C ABI and requires C++17. `linkcell::linkcell`
-has no C++ language requirement and remains usable by C-only projects.
+`linkcell::cpp` links the C ABI and requires C++17. `linkcell::linkcell` has no C++ language requirement and remains usable by C-only projects.
 `tests/cmake-consumer/` exercises both patterns against an installed prefix.
 
 ## Call
@@ -46,10 +46,9 @@ int j = nn.neighbour(0, 0);
 double r2 = nn.dist2(0, 0);
 ```
 
-Device k-nearest (`linkcell_gpu.hpp`) takes device pointers and writes
-the same packed buffer. Link `linkcell_gpu_dep` in Meson,
-`linkcell::gpu` in CMake, or `linkcell-gpu` with pkg-config. A
-device-packed cell (3 / 9 / 12 doubles) is inverted on device:
+Device k-nearest (`linkcell_gpu.hpp`) takes device pointers and writes the same packed buffer.
+Link `linkcell_gpu_dep` in Meson, `linkcell::gpu` in CMake, or `linkcell-gpu` with pkg-config.
+A device-packed cell (3 / 9 / 12 doubles) is inverted on device:
 
 ```cpp
 #include "linkcell_gpu.hpp"
@@ -59,16 +58,15 @@ ws.knearest_into(xyz_dev, n, cell, k, out_dev, n * k, nullptr, 5.5);
 ws.knearest_into_many_dcell(xyz_dev, n, 1, cell_dev, 9, k, out_dev,
                             n * k);
 ```
+The device k-nearest workspace writes that same packed buffer and reports `available()` as false when the CUDA driver or NVIDIA Runtime Compilation (NVRTC) fails to load.
+gpulite loads both at runtime.
+The build skips the CUDA SDK.
 
-`linkcell::gpu::available()` is false when a CUDA driver or NVRTC
-cannot be loaded. gpulite loads both at runtime; no CUDA SDK is needed
-to build the target.
+A general parallelepiped cell is `linkcell::Cell::from_vectors(a, b, c, origin)`.
+`Cell::raw()` is the `lc_cell` the ABI consumes.
 
-A general parallelepiped is `linkcell::Cell::from_vectors(a, b, c,
-origin)`. `Cell::raw()` is the `lc_cell` the ABI consumes.
+`mask` is an optional `const int *` of length `n` (nonzero keeps the point).
+`cell_hint <= 0` selects the default bin edge.
 
-`mask` is an optional `const int *` of length `n` (nonzero keeps the
-point). `cell_hint <= 0` selects the default bin edge.
-
-Signatures: [C ABI](../reference/c-api.md). First program:
-[two points](../tutorials/two-points.md).
+Signatures: [C ABI](../reference/c-api.md).
+First program: [two points](../tutorials/two-points.md).

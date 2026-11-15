@@ -65,9 +65,12 @@ linkcell_cargo = custom_target(
     'Cargo.lock',
     'src/lib.rs',
     'src/knearest.rs',
+    'src/bins.rs',
     'src/cell.rs',
     'src/error.rs',
     'src/capi.rs',
+    'src/pairs.rs',
+    'src/partition.rs',
     'scripts/copy-cargo-artifacts.py',
   ),
   output: _cargo_outputs,
@@ -137,7 +140,7 @@ if _gpu_on
   if host_machine.system() == 'windows'
     linkcell_gpu = static_library(
       'linkcell_gpu',
-      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp'],
+      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp', 'src/gpu/partition.cpp'],
       include_directories: include_directories('include'),
       dependencies: [gpulite_dep],
       cpp_args: _gpu_args,
@@ -148,7 +151,7 @@ if _gpu_on
   else
     linkcell_gpu = static_library(
       'linkcell_gpu',
-      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp'],
+      ['src/gpu/knearest.cpp', 'src/gpu/capi.cpp', 'src/gpu/partition.cpp'],
       include_directories: include_directories('include'),
       dependencies: [gpulite_dep],
       cpp_args: _gpu_args,

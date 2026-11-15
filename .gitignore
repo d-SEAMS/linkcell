@@ -104,6 +104,8 @@ Testing/
 !/subprojects/packagefiles/
 
 /target/
+/benchmarks/work/
+/lean/LinkcellPartition/.lake/
 /build/
 /build-meson/
 /build-cmake/

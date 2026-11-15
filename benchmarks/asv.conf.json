@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "project": "linkcell",
+  "project_url": "https://github.com/d-SEAMS/linkcell",
+  "repo": "..",
+  "branches": ["partition-native"],
+  "environment_type": "existing",
+  "build_command": ["python3", "-c", "import linkcell"],
+  "install_command": ["python3", "-c", "import linkcell"],
+  "benchmark_dir": "asv",
+  "results_dir": "work/asv-results",
+  "html_dir": "work/asv-html"
+}

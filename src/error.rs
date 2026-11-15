@@ -31,6 +31,18 @@ pub enum Error {
     Padded,
     /// A coordinate is not finite.
     NonFinite,
+    /// The part count is zero, or the balance bound is below one.
+    BadPartition,
+    /// The cell graph is not a square CSR of that grid.
+    BadGraph,
+    /// A device curve split was requested and no device is loaded.
+    NoDevice,
+    /// The device curve split disagreed with the host weights.
+    DeviceMismatch,
+    /// Scotch support was not compiled in.
+    ScotchDisabled,
+    /// The Scotch library rejected the graph.
+    ScotchFailed,
 }
 
 impl fmt::Display for Error {
@@ -52,6 +64,16 @@ impl fmt::Display for Error {
             Error::Device => write!(f, "this device needs libvesin.so on the loader path"),
             Error::Padded => write!(f, "a point has more neighbours than padded_to"),
             Error::NonFinite => write!(f, "a coordinate is not finite"),
+            Error::BadPartition => {
+                write!(f, "part count must be positive and balance at least 1")
+            }
+            Error::BadGraph => write!(f, "cell graph is not a square CSR"),
+            Error::NoDevice => write!(f, "CUDA curve split is not available"),
+            Error::DeviceMismatch => {
+                write!(f, "device curve split disagreed with the host weights")
+            }
+            Error::ScotchDisabled => write!(f, "Scotch support is compiled out"),
+            Error::ScotchFailed => write!(f, "Scotch returned an error"),
         }
     }
 }

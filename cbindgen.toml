@@ -107,6 +107,11 @@ include = [
     "lc_knearest_d2",
     "lc_knearest_many",
     "lc_pairs_within",
+    "lc_cell_grid",
+    "lc_cell_graph",
+    "lc_partition",
+    "lc_halo_width",
+    "lc_halo",
     "lc_last_error",
     "lc_version",
 ]

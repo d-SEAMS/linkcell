@@ -141,6 +141,7 @@ mod cell;
 mod error;
 mod knearest;
 mod pairs;
+mod partition;
 mod pop;
 mod replica;
 mod simd;
@@ -158,7 +159,17 @@ pub use error::Error;
 pub use knearest::{
     knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many, Neighbors,
 };
-pub use pairs::{pairs_within, pairs_within_columns, Pair, PairColumns};
+pub use pairs::{
+    pairs_within, pairs_within_columns, pairs_within_count, pairs_within_into, Pair, PairColumns,
+};
+pub use partition::{
+    cell_graph, cell_grid, curve_split_device, derived_balance, derived_balance_f64, edge_cut,
+    exclusive_prefix, fused_masks, halo, halo_width, hilbert_key, histogram, mark_reached, mesh_cut,
+    morton_cmp,
+    morton_key, owned_cells, partition, partition_graph, prefix_assign, profile_ns, profile_reset,
+    rank_mask, replicate_graph, score, timer_resolution_ns, CellGraph, CellGrid, MeshCut, Method,
+    PartRequest, PartScore, RankMask, DEFAULT_METHOD,
+};
 pub use pop::{
     efficiencies as pop_efficiencies, engage as pop_engage, prepare as pop_prepare,
     reset as pop_reset, snapshot as pop_snapshot,

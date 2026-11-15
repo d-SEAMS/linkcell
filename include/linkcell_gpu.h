@@ -56,6 +56,16 @@ void lc_gpu_free(void *ptr);
 int lc_gpu_fill_i32(void *ptr, int value, size_t n);
 int lc_gpu_memcpy(void *dst, const void *src, size_t bytes, int kind);
 
+/**
+ * Curve split on the device. Copies both ways are inside the call.
+ * Returns 0 on success, 2 when CUDA is not loaded, 1 on failure.
+ * `method` 0 is Morton. Any other code is the Hilbert key.
+ * `out_weight` receives the histogram of `atom_bin`.
+ */
+int lc_gpu_curve_split(const uint32_t *atom_bin, size_t natom,
+                       const uint32_t *coords, size_t ncell, uint32_t parts,
+                       uint32_t *assign, uint64_t *out_weight, uint8_t method);
+
 #ifdef __cplusplus
 }
 #endif
