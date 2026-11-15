@@ -368,3 +368,17 @@ int lc_gpu_curve_split(const uint32_t *atom_bin, size_t natom,
 }
 
 }
+
+extern "C" void lc_set_gpu_curve_split(int (*f)(const uint32_t *, size_t, const uint32_t *,
+                                                 size_t, uint32_t, uint32_t *, uint64_t *,
+                                                 uint8_t));
+
+namespace {
+
+// Register the device split with the Rust library when this library loads.
+struct RegisterCurveSplit {
+  RegisterCurveSplit() { lc_set_gpu_curve_split(&lc_gpu_curve_split); }
+};
+const RegisterCurveSplit register_curve_split;
+
+}  // namespace

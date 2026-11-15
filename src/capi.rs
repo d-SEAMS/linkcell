@@ -138,6 +138,14 @@ pub extern "C" fn lc_set_continuation(
     });
 }
 
+/// Install the device curve split used by the `device` partition. The
+/// GPU library calls this from a static initializer when it is loaded. A
+/// null `f` removes it, and the device partition then reports no device.
+#[no_mangle]
+pub extern "C" fn lc_set_gpu_curve_split(f: Option<crate::partition::DeviceCurveFn>) {
+    crate::partition::register_device_curve(f);
+}
+
 /// Run `cb(ctx, begin, end)` over disjoint spans of `0..n` on the pool
 /// selected by [`lc_set_threads`]. One thread runs the whole span on the
 /// caller. The spans cover `0..n` exactly once.

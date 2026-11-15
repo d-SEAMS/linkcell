@@ -1,11 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/knn_region.c");
-    println!("cargo:rerun-if-changed=src/gpu_stub.c");
-    cc::Build::new()
-        .file("src/gpu_stub.c")
-        .warnings(true)
-        .compile("linkcell_gpu_stub");
     #[cfg(feature = "scotch")]
     build_scotch();
     #[cfg(feature = "ptscotch")]

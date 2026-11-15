@@ -3431,19 +3431,29 @@ pub fn exclusive_prefix(values: &[u64]) -> Vec<u64> {
     out
 }
 
-unsafe extern "C" {
-    fn lc_gpu_curve_split(
-        atom_bin: *const u32,
-        natom: usize,
-        coords: *const u32,
-        ncell: usize,
-        parts: u32,
-        assign: *mut u32,
-        out_weight: *mut u64,
-        method: u8,
-    ) -> i32;
+/// The device curve split that `src/gpu/partition.cpp` provides. The GPU
+/// library registers it with `lc_set_gpu_curve_split` when it is loaded,
+/// so this crate links without it and a search with no GPU library returns
+/// [`Error::NoDevice`].
+pub type DeviceCurveFn = unsafe extern "C" fn(
+    atom_bin: *const u32,
+    natom: usize,
+    coords: *const u32,
+    ncell: usize,
+    parts: u32,
+    assign: *mut u32,
+    out_weight: *mut u64,
+    method: u8,
+) -> i32;
+
+static DEVICE_CURVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Install the device curve split. `None` removes it.
+pub fn register_device_curve(f: Option<DeviceCurveFn>) {
+    DEVICE_CURVE.store(f.map_or(0, |f| f as usize), AtomicOrdering::Release);
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn call_device_curve(
     atom_bin: *const u32,
     natom: usize,
@@ -3454,11 +3464,14 @@ unsafe fn call_device_curve(
     out_weight: *mut u64,
     method: u8,
 ) -> i32 {
-    unsafe {
-        lc_gpu_curve_split(
-            atom_bin, natom, coords, ncell, parts, assign, out_weight, method,
-        )
+    let raw = DEVICE_CURVE.load(AtomicOrdering::Acquire);
+    if raw == 0 {
+        return 2;
     }
+    // SAFETY: only register_device_curve stores a nonzero value, and it
+    // stores a DeviceCurveFn.
+    let f: DeviceCurveFn = unsafe { std::mem::transmute::<usize, DeviceCurveFn>(raw) };
+    unsafe { f(atom_bin, natom, coords, ncell, parts, assign, out_weight, method) }
 }
 
 /// C ABI method code. Unknown codes are [`Error::BadPartition`].
