@@ -36,9 +36,9 @@ fn compile_knn_region() -> bool {
     let required = target_is("CARGO_CFG_TARGET_ENV", "gnu");
     let mut build = cc::Build::new();
     // Clang as `cc` passes `--target=<rust-triple>` and then does not see
-    // gcc's `omp.h`, and its OpenMP runtime is not the libgomp linked
-    // below. A native build with no compiler chosen keeps gcc. A chosen
-    // compiler or a cross build is left to the `cc` crate.
+    // gcc's `omp.h`. A native build with no compiler chosen keeps gcc. A
+    // chosen compiler or a cross build is left to the `cc` crate, and the
+    // runtime linked below follows whichever compiler that is.
     let target = std::env::var("TARGET").unwrap_or_default();
     let chosen = [
         "CC".to_string(),
