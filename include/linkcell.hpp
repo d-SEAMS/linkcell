@@ -305,8 +305,9 @@ pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
 /// Cartesian half pair list of an open cluster.
 ///
 /// Each row has `i < j`, shift zero, and squared distance strictly
-/// below `cutoff * cutoff`. Bins are the occupied Cartesian cells and
-/// are reused until those bounding bins change.
+/// below `cutoff * cutoff`. Bins are the occupied Cartesian cells. Their
+/// partner stencil depends on the cutoff and `cell_hint` alone, so it is
+/// reused by frames that occupy other bins.
 [[nodiscard]] inline std::vector<ShiftedPair>
 pairs_open(const double *xyz, std::size_t n, double cutoff,
            double cell_hint = 0.0) {

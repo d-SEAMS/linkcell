@@ -69,7 +69,9 @@ A cutoff neighbour list is this call.
 
 An open axis has no image.
 `pairs_open` bins the occupied Cartesian cells and returns the half list (`i < j`, shift zero).
-The partner stencil is rebuilt when the bounding bins change and kept while atoms move inside them.
+With every axis open the partner stencil is, for each row of bins in y and z, the farthest x offset within reach. It depends on the cutoff and the bin edge alone, so a frame in other bins, such as another image of a band, reuses it, and the walk clips each row to the bins the frame spans.
+A reach past 16 bins stores rows only out to the span a frame needs on y and z and widens them when a later frame spans more.
+With a periodic axis the stencil is a link list per occupied bin, rebuilt when the bounding bins change and kept while atoms move inside them.
 `lc_stencil_builds` counts the builds.
 Padding the open axis into a periodic box instead makes that stencil follow the bounding span.
 `pairs_within_pbc` is the same walk with a periodicity mask.

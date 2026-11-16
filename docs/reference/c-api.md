@@ -106,8 +106,10 @@ shift zero, squared distance strictly below `cutoff * cutoff`.
 periodic and is `lc_pairs_within_rows`. An open axis is binned on the
 occupied Cartesian cells. It is not padded into a periodic box.
 `lc_stencil_builds` counts partner stencils that were built. A stencil
-that is reused, because the atoms stayed inside the same bounding bins,
-does not increment it.
+that is reused does not increment it. A fully open stencil is reused
+by every call with the same cutoff and bin edge, wherever the atoms
+sit. With a periodic axis it is reused while the atoms stay inside the
+same bounding bins.
 
 ## Errors and version
 
