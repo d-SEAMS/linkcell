@@ -58,8 +58,10 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     guard.as_ref().unwrap().pool.install(work)
 }
 
-/// Choose the Rayon width for later searches. `n == 0` runs the search
-/// on the calling thread. `n < 0` selects one thread.
+/// Choose the Rayon width for later searches. `n == 0` leaves it unset:
+/// the search starts on the calling thread with Rayon's and OpenMP's own
+/// widths. `n == 1` runs the whole search on the calling thread and
+/// starts no thread. `n < 0` selects one thread.
 #[no_mangle]
 pub extern "C" fn lc_set_threads(n: c_int) {
     let n = if n < 0 { 1 } else { n as usize };

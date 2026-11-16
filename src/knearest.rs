@@ -2306,6 +2306,7 @@ mod fused_agree {
     /// Child process: after `lc_set_threads(1)` a C API search adds no
     /// thread. Asked from outside a pool, rayon would build its global
     /// pool at the cpu count, and the fused region would start its team.
+    #[cfg(feature = "capi")]
     #[test]
     fn one_thread_capi_search_starts_no_thread() {
         if std::env::var_os("LC_ONE_THREAD_PROBE").is_none() {

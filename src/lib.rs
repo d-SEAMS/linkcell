@@ -209,7 +209,7 @@ pub(crate) fn pool_width() -> usize {
 }
 
 /// Runs `work` on this thread as a one-thread search.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "capi"))]
 pub(crate) fn run_on_caller<R>(work: impl FnOnce() -> R) -> R {
     struct Restore(bool);
     impl Drop for Restore {

@@ -646,8 +646,10 @@ void lc_set_gpu_curve_split(int32_t (*f)(const uint32_t *atom_bin,
                                          uint8_t method));
 
 /**
- * Choose the Rayon width for later searches. `n == 0` runs the search
- * on the calling thread. `n < 0` selects one thread.
+ * Choose the Rayon width for later searches. `n == 0` leaves it unset:
+ * the search starts on the calling thread with Rayon's and OpenMP's own
+ * widths. `n == 1` runs the whole search on the calling thread and
+ * starts no thread. `n < 0` selects one thread.
  */
 void lc_set_threads(int n);
 
