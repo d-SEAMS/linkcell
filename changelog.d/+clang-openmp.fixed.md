@@ -1,0 +1,1 @@
+A clang `parallel` build finds libomp when clang answers `-print-file-name=libomp.so` with the bare name, as Ubuntu's clang does for the libomp beside its resource directory (`<llvm>/lib/clang/<v>`), instead of stopping on "finding libomp failed".
