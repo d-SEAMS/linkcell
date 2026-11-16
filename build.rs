@@ -17,65 +17,64 @@ fn main() {
     }
 }
 
-fn linux_target() -> bool {
-    std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("linux")
+fn target_is(key: &str, value: &str) -> bool {
+    std::env::var(key).ok().as_deref() == Some(value)
 }
 
-fn require_linux(step: &str) -> ! {
-    panic!("OpenMP k-nearest region: {step} failed on Linux");
-}
-
+/// Compile `src/knn_region.c` with OpenMP for the target, through the `cc`
+/// crate so `CC`, the target triple and cross compilers are honoured.
+/// On glibc Linux a failure is a build error. musl and other targets keep
+/// the rayon walk when the region does not build.
 fn compile_knn_region() -> bool {
-    if !linux_target() {
+    if !target_is("CARGO_CFG_TARGET_OS", "linux") {
         return false;
     }
-    let out_dir = match std::env::var("OUT_DIR") {
-        Ok(dir) => std::path::PathBuf::from(dir),
-        Err(_) => require_linux("OUT_DIR"),
-    };
-    let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".to_string());
-    let obj = out_dir.join("knn_region.o");
-    let archive = out_dir.join("libknnregion.a");
+    let required = target_is("CARGO_CFG_TARGET_ENV", "gnu");
+    let mut build = cc::Build::new();
+    // Clang, as `cc`, passes `--target=<rust-triple>` and then does not
+    // see gcc's `omp.h`. Honour `CC` when it is set. A native build with
+    // `CC` unset keeps gcc, the compiler this region already used. A
+    // cross build leaves the choice to the `cc` crate.
+    if std::env::var_os("CC").is_none()
+        && std::env::var("HOST").ok() == std::env::var("TARGET").ok()
+    {
+        build.compiler("gcc");
+    }
+    build
+        .file("src/knn_region.c")
+        .flag("-fopenmp")
+        .flag("-pthread")
+        .opt_level(2)
+        .warnings(true)
+        .extra_warnings(true);
     // x86-64 baseline. The host gcc otherwise vectorises this file to
     // AVX2 and BMI2, which the ISA audit rejects. The region only
     // schedules; the wider code is not part of the build.
-    let mut args = vec![
-        "-c", "-O2", "-fPIC", "-fopenmp", "-pthread", "-Wall", "-Wextra",
-    ];
-    if std::env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("x86_64") {
-        args.extend(["-march=x86-64", "-fno-tree-vectorize"]);
+    if target_is("CARGO_CFG_TARGET_ARCH", "x86_64") {
+        build
+            .flag("-march=x86-64")
+            .flag("-mtune=generic")
+            .flag("-fno-tree-vectorize");
     }
-    args.extend(["src/knn_region.c", "-o"]);
-    let compiled = std::process::Command::new(&cc)
-        .args(&args)
-        .arg(&obj)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !compiled {
-        require_linux("compiling src/knn_region.c");
+    if let Err(err) = build.try_compile("knnregion") {
+        if required {
+            panic!("OpenMP k-nearest region: compiling src/knn_region.c failed: {err}");
+        }
+        return false;
     }
-    let archived = std::process::Command::new("ar")
-        .arg("crs")
-        .arg(&archive)
-        .arg(&obj)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !archived {
-        require_linux("archiving libknnregion.a");
+    let compiler = build.get_compiler();
+    match gomp_dir(compiler.path()) {
+        Some(dir) => {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=gomp");
+            true
+        }
+        None if required => panic!("OpenMP k-nearest region: finding libgomp failed"),
+        None => false,
     }
-    let Some(gomp_dir) = gomp_dir(&cc) else {
-        require_linux("finding libgomp");
-    };
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-search=native={}", gomp_dir.display());
-    println!("cargo:rustc-link-lib=static=knnregion");
-    println!("cargo:rustc-link-lib=gomp");
-    true
 }
 
-fn gomp_dir(cc: &str) -> Option<std::path::PathBuf> {
+fn gomp_dir(cc: &std::path::Path) -> Option<std::path::PathBuf> {
     let out = std::process::Command::new(cc)
         .arg("-print-file-name=libgomp.so")
         .output()
