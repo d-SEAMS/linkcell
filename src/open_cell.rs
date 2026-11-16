@@ -4,10 +4,10 @@
 //! open axis has no images. Padding that axis out to a periodic box
 //! makes the partner stencil depend on the bounding span, so moving one
 //! atom rebuilds it. This walk bins the occupied Cartesian cells. With
-//! every axis open the stencil is a set of bin offsets, which depends on
-//! the bin edge and the cutoff alone, so frames that occupy other bins
-//! reuse it. A periodic axis keeps the stencil until the bounding bins
-//! change.
+//! every axis open the stencil is the reach in x of each row of bin
+//! offsets, which depends on the bin edge and the cutoff alone, so
+//! frames that occupy other bins reuse it. A periodic axis keeps the
+//! stencil until the bounding bins change.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -114,8 +114,10 @@ impl<'a> PbcQuery<'a> {
 ///
 /// Every axis is open. Row `(i, j, [0, 0, 0], dist2)` has `i < j` and
 /// `dist2 < cutoff²`. The atoms are binned on the occupied Cartesian
-/// cells. [`stencil_builds`] does not move while later calls stay inside
-/// those bins.
+/// cells. One partner stencil serves every call with the same cutoff and
+/// bin edge, so [`stencil_builds`] does not move when later frames occupy
+/// other bins. A reach past 16 bins can widen it when a frame spans more
+/// bins on y or z than it covers.
 ///
 /// ```
 /// use linkcell::pairs_open;
@@ -696,8 +698,13 @@ fn stencil_for(frame: &Frame, cell: &Cell, query: &PbcQuery<'_>) -> Result<Arc<S
                     return Ok(Arc::clone(stencil));
                 }
                 if let Some(open) = &stencil.open {
-                    need[0] = need[0].max(open.ext[0].saturating_mul(2));
-                    need[1] = need[1].max(open.ext[1].saturating_mul(2));
+                    for axis in 0..2 {
+                        need[axis] = if need[axis] > open.ext[axis] {
+                            need[axis].max(open.ext[axis].saturating_mul(2))
+                        } else {
+                            open.ext[axis]
+                        };
+                    }
                 }
             }
         }

@@ -218,9 +218,9 @@ fn small_molecules_build_the_open_stencil_at_most_once() {
 }
 
 /// A cutoff of many bin edges reaches past the stored rows. Frames that
-/// span more bins widen the table a bounded number of times and still
-/// match brute force, and a reach of a million bins does not walk the
-/// whole reach.
+/// span more bins widen the table a bounded number of times, only on the
+/// axis they outgrow, and still match brute force. A reach of a million
+/// bins does not walk the whole reach.
 #[test]
 fn a_long_reach_widens_the_open_rows_and_matches_brute_force() {
     let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -253,6 +253,28 @@ fn a_long_reach_widens_the_open_rows_and_matches_brute_force() {
         stencil_builds() - before,
         1,
         "the 6 Å frame widens the rows to the whole reach of 26 bins once"
+    );
+
+    let line = |axis: usize| -> Vec<[f64; 3]> {
+        (0..12)
+            .map(|k| {
+                let mut p = [10.0, 10.0, 10.0];
+                p[axis] += 0.9 * k as f64;
+                p
+            })
+            .collect()
+    };
+    pairs_open(&frames[0], cutoff, Some(0.2)).unwrap();
+    let before = stencil_builds();
+    for axis in [1, 2, 1, 2] {
+        let xyz = line(axis);
+        let rows = pairs_open(&xyz, cutoff, Some(0.2)).unwrap();
+        assert_same(&rows, &brute_open(&xyz, cutoff, true));
+    }
+    assert_eq!(
+        stencil_builds() - before,
+        2,
+        "a frame long on y and then one long on z each widen their own axis"
     );
 
     let pair = [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [3.0e5, 0.0, 0.0]];
