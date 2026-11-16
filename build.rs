@@ -10,6 +10,7 @@ fn main() {
     if major > 1 || minor >= 80 {
         println!("cargo:rustc-check-cfg=cfg(linkcell_avx512)");
         println!("cargo:rustc-check-cfg=cfg(linkcell_openmp)");
+        println!("cargo:rustc-check-cfg=cfg(linkcell_libomp)");
     }
     if major > 1 || minor >= 89 {
         println!("cargo:rustc-cfg=linkcell_avx512");
@@ -89,6 +90,9 @@ fn compile_knn_region() -> bool {
         Some(dir) => {
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib={runtime}");
+            if runtime == "omp" {
+                println!("cargo:rustc-cfg=linkcell_libomp");
+            }
             true
         }
         None if required => panic!("OpenMP k-nearest region: finding lib{runtime} failed"),

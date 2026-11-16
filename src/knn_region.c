@@ -288,6 +288,12 @@ static void run_phases(const LcJob *job, int nt) {
     }
 }
 
+/* Every thread carries this name while it runs the region and takes its
+ * own name back when it leaves. libomp keeps its workers in a pool after
+ * the region ends, so the name, not the thread count, tells linkcell's
+ * team apart from threads the runtime keeps. */
+#define LC_TEAM_NAME "linkcell-knn"
+
 static void *team_host(void *arg) {
     int want = (int)(intptr_t)arg;
     if (want < 1) {
@@ -298,6 +304,9 @@ static void *team_host(void *arg) {
     {
         int nt = omp_get_num_threads();
         int seen = 0;
+        char was[16];
+        int named = pthread_getname_np(pthread_self(), was, sizeof was) == 0;
+        pthread_setname_np(pthread_self(), LC_TEAM_NAME);
         pthread_mutex_lock(&g_team.mu);
         g_team.nt = nt;
         g_team.parked++;
@@ -322,6 +331,9 @@ static void *team_host(void *arg) {
             if (g_team.done == nt) {
                 pthread_cond_broadcast(&g_team.cv);
             }
+        }
+        if (named) {
+            pthread_setname_np(pthread_self(), was);
         }
     }
     return NULL;

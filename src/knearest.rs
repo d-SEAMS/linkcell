@@ -2213,6 +2213,57 @@ mod fused_agree {
         last
     }
 
+    /// The name `src/knn_region.c` gives a thread while it runs the region.
+    const TEAM_NAME: &str = "linkcell-knn";
+
+    /// Threads running linkcell's k-nearest region. libomp keeps its
+    /// workers in its own pool after the region ends; those run no
+    /// linkcell code and do not carry the name.
+    fn team_workers() -> usize {
+        let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        dir.flatten()
+            .filter(|entry| {
+                std::fs::read_to_string(entry.path().join("comm"))
+                    .is_ok_and(|comm| comm.trim_end() == TEAM_NAME)
+            })
+            .count()
+    }
+
+    fn wait_team_workers(want: usize) -> usize {
+        let mut last = team_workers();
+        for _ in 0..100 {
+            if last == want {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            last = team_workers();
+        }
+        last
+    }
+
+    /// Under libgomp the host's workers end with it, so the process is
+    /// back to `before` threads. libomp parks them in its own pool.
+    fn assert_threads_back(before: usize, label: &str) {
+        let workers = wait_team_workers(0);
+        assert_eq!(
+            workers,
+            0,
+            "{label} left linkcell workers running\n{}",
+            task_names()
+        );
+        if cfg!(not(linkcell_libomp)) {
+            let after = wait_tasks(before);
+            assert_eq!(
+                after,
+                before,
+                "{label} left threads: before {before} after {after}\n{}",
+                task_names()
+            );
+        }
+    }
+
     fn task_names() -> String {
         let mut names = String::new();
         let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
@@ -2257,6 +2308,7 @@ mod fused_agree {
             fn omp_get_max_threads() -> i32;
         }
         let before = task_count();
+        assert_eq!(team_workers(), 0, "linkcell workers before the first query");
         let saved = unsafe { omp_get_max_threads() }.max(1);
         unsafe { omp_set_num_threads(2) };
         let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
@@ -2268,25 +2320,20 @@ mod fused_agree {
             mid >= before + 2,
             "team not running: before {before} mid {mid}"
         );
+        assert_eq!(team_workers(), 2, "team of two not named\n{}", task_names());
         super::shutdown_knearest_team();
-        let after = wait_tasks(before);
-        assert_eq!(
-            after,
-            before,
-            "shutdown left threads: before {before} after {after}\n{}",
-            task_names()
-        );
+        assert_threads_back(before, "shutdown");
         unsafe { omp_set_num_threads(saved) };
         let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
         assert_eq!(super::knearest_team_threads(), saved as usize);
-        super::shutdown_knearest_team();
-        let after = wait_tasks(before);
         assert_eq!(
-            after,
-            before,
-            "second shutdown left threads: before {before} after {after}\n{}",
+            team_workers(),
+            saved as usize,
+            "team of {saved} not named\n{}",
             task_names()
         );
+        super::shutdown_knearest_team();
+        assert_threads_back(before, "second shutdown");
 
         let so = std::env::current_exe().ok().and_then(|mut exe| {
             for _ in 0..6 {
@@ -2299,7 +2346,7 @@ mod fused_agree {
             None
         });
         if let Some(so) = so {
-            unload_cdylib(&so, before);
+            unload_cdylib(&so, before, saved as usize);
         }
     }
 
@@ -2482,7 +2529,7 @@ mod fused_agree {
         same("cell grid");
     }
 
-    fn unload_cdylib(so: &std::path::Path, before: usize) {
+    fn unload_cdylib(so: &std::path::Path, before: usize, team: usize) {
         use std::os::raw::{c_char, c_int, c_void};
         extern "C" {
             fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
@@ -2529,27 +2576,20 @@ mod fused_agree {
             )
         };
         assert_eq!(rc, 0, "cdylib query");
-        assert!(task_count() > before, "cdylib team did not start");
+        assert_eq!(
+            team_workers(),
+            team,
+            "cdylib team of {team} did not start\n{}",
+            task_names()
+        );
         let stop_name = std::ffi::CString::new("lc_knn_shutdown").unwrap();
         let stop_sym = unsafe { dlsym(handle, stop_name.as_ptr()) };
         assert!(!stop_sym.is_null(), "dlsym lc_knn_shutdown");
         let stop: unsafe extern "C" fn() = unsafe { std::mem::transmute(stop_sym) };
         unsafe { stop() };
-        let stopped = wait_tasks(before);
-        assert_eq!(
-            stopped,
-            before,
-            "cdylib shutdown left threads\n{}",
-            task_names()
-        );
+        assert_threads_back(before, "cdylib shutdown");
         let closed = unsafe { dlclose(handle) };
         assert_eq!(closed, 0, "dlclose");
-        let left = wait_tasks(before);
-        assert_eq!(
-            left,
-            before,
-            "dlclose leaked the team: before {before} after {left}\n{}",
-            task_names()
-        );
+        assert_threads_back(before, "dlclose");
     }
 }
