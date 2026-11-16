@@ -138,7 +138,7 @@ impl Mesh {
         }
 
         #[cfg(feature = "parallel")]
-        let parallel = n_active >= PARALLEL_MESH && rayon::current_num_threads() > 1;
+        let parallel = n_active >= PARALLEL_MESH && crate::pool_width() > 1;
         #[cfg(not(feature = "parallel"))]
         let parallel = false;
         if buf.offsets.len() != ncell + 1 {
@@ -413,7 +413,7 @@ fn prefix_parallel(hist: &[std::sync::atomic::AtomicUsize], offsets: &mut [usize
     use rayon::prelude::*;
     use std::sync::atomic::Ordering;
     let ncell = hist.len();
-    let run = (ncell / (4 * rayon::current_num_threads()).max(1)).max(1 << 12);
+    let run = (ncell / (4 * crate::pool_width()).max(1)).max(1 << 12);
     let sums: Vec<usize> = hist
         .par_chunks(run)
         .map(|c| c.iter().map(|h| h.load(Ordering::Relaxed)).sum())
@@ -564,7 +564,7 @@ fn scatter_parallel(
             }
         });
     // Bins are disjoint runs of slots, so runs of bins sort apart.
-    let run = (ncell / (4 * rayon::current_num_threads()).max(1)).max(1 << 12);
+    let run = (ncell / (4 * crate::pool_width()).max(1)).max(1 << 12);
     let starts: Vec<usize> = (0..ncell).step_by(run).collect();
     starts.par_iter().for_each(|&c0| {
         for c in c0..(c0 + run).min(ncell) {

@@ -9,14 +9,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{Cell, Error};
 
-/// How many Rayon threads the next search should use. Zero or one runs
-/// on the calling thread.
+/// How many Rayon threads the next search should use. Zero is unset: the
+/// search runs from the calling thread with rayon's and OpenMP's own
+/// defaults. One runs on the calling thread alone.
 static WANTED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// One pool for the process. A different width drops the previous pool
 /// before the new one starts, so two widths never run together. The
 /// workers sleep on a condvar between searches (rayon's idle path),
-/// which is the passive wait.
+/// which is the passive wait. A one-thread search starts no pool, builds
+/// no global pool and starts no OpenMP team.
 #[cfg(not(feature = "parallel"))]
 fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     work()
@@ -25,8 +27,11 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
 #[cfg(feature = "parallel")]
 fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     let n = WANTED_THREADS.load(Ordering::Relaxed);
-    if n <= 1 {
+    if n == 0 {
         return work();
+    }
+    if n == 1 {
+        return crate::run_on_caller(work);
     }
     if rayon::current_thread_index().is_some() && rayon::current_num_threads() == n {
         return work();
@@ -860,7 +865,7 @@ fn open_rows(
         .closed(key.closed)
         .exclude_self_images(key.exclude_self);
     query.mask = mask_vec.as_deref();
-    let found = crate::pairs_within_pbc(pts, &cell, &query).map_err(fail)?;
+    let found = with_threads(|| crate::pairs_within_pbc(pts, &cell, &query)).map_err(fail)?;
     let mut rows = Vec::with_capacity(found.len());
     for pair in found {
         if pair.i > c_int::MAX as usize || pair.j > c_int::MAX as usize {
@@ -1140,7 +1145,8 @@ pub unsafe extern "C" fn lc_cell_grid(
         Ok(v) => v,
         Err(rc) => return rc,
     };
-    let grid = match crate::cell_grid(pts, &sim, cutoff, mask_vec.as_deref(), hint) {
+    let grid = match with_threads(|| crate::cell_grid(pts, &sim, cutoff, mask_vec.as_deref(), hint))
+    {
         Ok(grid) => grid,
         Err(err) => return fail(err),
     };
@@ -1200,10 +1206,11 @@ pub unsafe extern "C" fn lc_cell_graph(
         Ok(v) => v,
         Err(rc) => return rc,
     };
-    let graph = match crate::cell_graph(pts, &sim, cutoff, mask_vec.as_deref(), hint) {
-        Ok(graph) => graph,
-        Err(err) => return fail(err),
-    };
+    let graph =
+        match with_threads(|| crate::cell_graph(pts, &sim, cutoff, mask_vec.as_deref(), hint)) {
+            Ok(graph) => graph,
+            Err(err) => return fail(err),
+        };
     let ncell = graph.grid.ncell();
     let arcs = graph.neighbor.len();
     unsafe {
@@ -1288,7 +1295,9 @@ pub unsafe extern "C" fn lc_partition(
         balance,
         device: device != 0,
     };
-    let assign = match crate::partition(pts, &sim, cutoff, mask_vec.as_deref(), hint, request) {
+    let assign = match with_threads(|| {
+        crate::partition(pts, &sim, cutoff, mask_vec.as_deref(), hint, request)
+    }) {
         Ok(assign) => assign,
         Err(err) => return fail(err),
     };
@@ -1391,7 +1400,7 @@ pub unsafe extern "C" fn lc_halo(
         weight: vec![0; ncell],
     };
     let radius = unsafe { [*width, *width.add(1), *width.add(2)] };
-    let ghosts = match crate::halo(&grid, &owned, domain as u32, radius) {
+    let ghosts = match with_threads(|| crate::halo(&grid, &owned, domain as u32, radius)) {
         Ok(ghosts) => ghosts,
         Err(err) => return fail(err),
     };
@@ -1717,14 +1726,16 @@ pub unsafe extern "C" fn lc_owned_mask(
         bin_width: [1.0; 3],
         weight: vec![0; ncell],
     };
-    let view = crate::rank_mask(
-        &grid,
-        &owned_assign,
-        &point_bins,
-        &owned_cells,
-        domain as u32,
-        width,
-    );
+    let view = with_threads(|| {
+        crate::rank_mask(
+            &grid,
+            &owned_assign,
+            &point_bins,
+            &owned_cells,
+            domain as u32,
+            width,
+        )
+    });
     for (i, &painted) in view.mask.iter().enumerate() {
         let flag = if !painted {
             0

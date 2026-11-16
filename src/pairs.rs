@@ -87,7 +87,7 @@ pub fn pairs_within(
             // rows outgrow L2 and their stores can run behind the tile.
             let per = rows_guess / ranges.len().max(1);
             if ranges.len() > 1
-                && ranges.len() <= rayon::current_num_threads()
+                && ranges.len() <= crate::pool_width()
                 && ahead(per, std::mem::size_of::<Pair>())
             {
                 let off = plan.fused_offsets(&words, &ranges);
@@ -273,7 +273,7 @@ pub fn pairs_within_columns(
             let dense = est / xyz.len().max(1) >= 64;
             if dense
                 && ranges.len() > 1
-                && ranges.len() <= rayon::current_num_threads()
+                && ranges.len() <= crate::pool_width()
                 && ahead(per, COLUMN_BYTES)
             {
                 let off = plan.fused_offsets(&words, &ranges);
@@ -636,7 +636,7 @@ pub(crate) fn plan(
 fn walk_threads(hits: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
-        let threads = rayon::current_num_threads().max(1);
+        let threads = crate::pool_width().max(1);
         if threads > 1 && hits >= knobs::split_pairs() {
             return threads;
         }
@@ -1463,7 +1463,7 @@ impl Grid {
         if parallel {
             #[cfg(feature = "parallel")]
             {
-                let p = rayon::current_num_threads().max(1);
+                let p = crate::pool_width().max(1);
                 let block = |k: usize, len: usize| (k * len / p, (k + 1) * len / p);
                 let shift = per.trailing_zeros();
                 // Pass 1: each thread folds a block of atoms, groups it by bin
@@ -2201,7 +2201,7 @@ impl Found {
         if self.chunks.len() > 1 {
             // Chunk `t` was searched on thread `t`; writing it there reads
             // that core's cache.
-            if self.chunks.len() <= rayon::current_num_threads() {
+            if self.chunks.len() <= crate::pool_width() {
                 rayon::broadcast(|ctx| {
                     if let Some(chunk) = self.chunks.get(ctx.index()) {
                         let _timer = crate::pop::JobTimer::new();
@@ -4452,7 +4452,7 @@ impl Walk<'_> {
         #[cfg(feature = "parallel")]
         if threads > 1 && ncell > 1 {
             let ranges = cell_ranges(&self.grid.offsets, threads * knobs::chunks());
-            if ranges.len() > 1 && ranges.len() <= rayon::current_num_threads() {
+            if ranges.len() > 1 && ranges.len() <= crate::pool_width() {
                 let found: Vec<Option<Scratch>> = rayon::broadcast(|ctx| {
                     ranges
                         .get(ctx.index())

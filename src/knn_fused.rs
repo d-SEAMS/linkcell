@@ -33,6 +33,7 @@ extern "C" {
         fill: Phase,
         select: Phase,
         team: *mut i32,
+        width: i32,
     );
 }
 
@@ -379,7 +380,14 @@ pub(super) fn run(
     let n = xyz.len();
     let n_points = i64::try_from(n).map_err(|_| Error::Overflow)?;
     let n_bins = i64::try_from(ncell).map_err(|_| Error::Overflow)?;
-    let threads = unsafe { lc_omp_max_threads() }.max(1) as usize;
+    // A one-thread search runs the region on the caller whatever width
+    // the caller's OpenMP team has.
+    let width = if crate::on_caller() { 1 } else { 0 };
+    let threads = if width == 1 {
+        1
+    } else {
+        unsafe { lc_omp_max_threads() }.max(1) as usize
+    };
     let mut parts = bins::take_recycled();
     if parts.frac.len() != n {
         parts.frac.resize(n, [0.0; 3]);
@@ -512,6 +520,7 @@ pub(super) fn run(
                 phase_fill,
                 phase_select,
                 &mut team,
+                width,
             );
         }
         TEAM.store(team.max(1) as usize, std::sync::atomic::Ordering::Relaxed);

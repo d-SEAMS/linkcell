@@ -1092,7 +1092,7 @@ fn prepare(out: &mut PairColumns, vectors: &mut Vec<[f64; 3]>, total: usize, wan
 fn filter_threads(n: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
-        let pool = rayon::current_num_threads().max(1);
+        let pool = crate::pool_width().max(1);
         if pool > 1 && n >= 32_768 {
             pool
         } else {

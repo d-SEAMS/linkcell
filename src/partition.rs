@@ -1665,7 +1665,7 @@ fn subset_cut(ids: &[u32], cut: usize, graph: &CellGraph, side: &mut [u8]) -> u6
     let left = &ids[..cut];
     #[cfg(feature = "parallel")]
     {
-        if rayon::current_num_threads() > 1 && left.len() > 1 {
+        if crate::pool_width() > 1 && left.len() > 1 {
             use rayon::prelude::*;
             let chunk = work_chunk(left.len());
             return left
@@ -1697,7 +1697,7 @@ fn work_chunk(n: usize) -> usize {
     let threads = {
         #[cfg(feature = "parallel")]
         {
-            rayon::current_num_threads().max(1)
+            crate::pool_width().max(1)
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -1860,7 +1860,7 @@ fn bin_hist(
     };
     #[cfg(feature = "parallel")]
     {
-        if rayon::current_num_threads() > 1 && ids.len() > 1 {
+        if crate::pool_width() > 1 && ids.len() > 1 {
             use rayon::prelude::*;
             let chunk = work_chunk(ids.len());
             let parts: Vec<Option<(Vec<u64>, Vec<usize>)>> =
@@ -1910,7 +1910,7 @@ fn bin_take(
 
 fn arrange_cut(ids: &mut [u32], geom: &RcbGeom, axis: usize, cut_c: i64, take: usize, cut: usize) {
     #[cfg(feature = "parallel")]
-    if rayon::current_num_threads() > 1 && ids.len() >= 4096 {
+    if crate::pool_width() > 1 && ids.len() >= 4096 {
         arrange_cut_parallel(ids, geom, axis, cut_c, take);
         return;
     }
@@ -2003,7 +2003,7 @@ fn slice_span(ids: &[u32], geom: &RcbGeom) -> ([f64; 3], [f64; 3], u64) {
         (min, max, total)
     };
     #[cfg(feature = "parallel")]
-    if rayon::current_num_threads() > 1 && ids.len() >= 4096 {
+    if crate::pool_width() > 1 && ids.len() >= 4096 {
         use rayon::prelude::*;
         let chunk = work_chunk(ids.len());
         let parts: Vec<_> = ids.par_chunks(chunk).map(one).collect();
@@ -2176,11 +2176,10 @@ fn join_measured(a: Phase, b: Phase, wall: u64) -> Phase {
     child
 }
 
-#[cfg_attr(feature = "parallel", allow(dead_code))]
 fn phase_join(a: Phase, b: Phase) -> Phase {
     #[cfg(feature = "parallel")]
     {
-        if rayon::current_num_threads() > 1 {
+        if crate::pool_width() > 1 {
             return if phase_wall(a) >= phase_wall(b) { a } else { b };
         }
     }
@@ -2361,7 +2360,7 @@ fn descend(
     ratio: (u64, u64),
 ) -> Phase {
     #[cfg(feature = "parallel")]
-    {
+    if crate::pool_width() > 1 {
         let left_out = out;
         let right_out = out;
         let t_join = Instant::now();
@@ -2392,10 +2391,8 @@ fn descend(
             },
         );
         let wall = t_join.elapsed().as_nanos() as u64;
-        #[allow(clippy::needless_return)]
         return join_measured(a, b, wall);
     }
-    #[cfg(not(feature = "parallel"))]
     {
         let a = rcb_slice(left, parts_l, part_l, geom, out, graph, refine_cuts, ratio);
         let b = rcb_slice(right, parts_r, part_r, geom, out, graph, refine_cuts, ratio);
@@ -2717,7 +2714,7 @@ fn bisect_gains(
     {
         // The parallel map writes one slot per index, so it matches the
         // serial map at every length. One thread stays on the serial map.
-        if rayon::current_num_threads() > 1 {
+        if crate::pool_width() > 1 {
             use rayon::prelude::*;
             return (0..n).into_par_iter().map(one).collect();
         }
@@ -2775,7 +2772,7 @@ fn kway_proposal(
     {
         // Same rule as the bisection gain scan: every length, and only
         // when the pool has more than one thread.
-        if rayon::current_num_threads() > 1 {
+        if crate::pool_width() > 1 {
             use rayon::prelude::*;
             return (0..n).into_par_iter().map(one).collect();
         }
@@ -3236,7 +3233,7 @@ fn offsets_increase(offsets: &[u32]) -> bool {
     };
     #[cfg(feature = "parallel")]
     {
-        if rayon::current_num_threads() > 1 && offsets.len() > 1 {
+        if crate::pool_width() > 1 && offsets.len() > 1 {
             use rayon::prelude::*;
             let chunk = work_chunk(offsets.len());
             return offsets
@@ -3252,7 +3249,7 @@ fn neighbors_in_range(neighbor: &[u32], n: usize) -> bool {
     let inside = |part: &[u32]| part.iter().all(|&nbr| (nbr as usize) < n);
     #[cfg(feature = "parallel")]
     {
-        if rayon::current_num_threads() > 1 && neighbor.len() > 1 {
+        if crate::pool_width() > 1 && neighbor.len() > 1 {
             use rayon::prelude::*;
             let chunk = work_chunk(neighbor.len());
             return neighbor.par_chunks(chunk).all(inside);

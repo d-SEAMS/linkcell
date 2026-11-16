@@ -409,16 +409,36 @@ void lc_knn_shutdown_impl(void) {
 
 __attribute__((destructor)) static void lc_knn_at_unload(void) { lc_knn_shutdown_impl(); }
 
+static void run_on_caller(void *ctx, int64_t n_points, int64_t n_bins, int64_t n_blocks,
+                          lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
+                          lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team) {
+    bin(ctx, 0, 1, 0, n_points);
+    count(ctx, 0, 1, 0, n_bins);
+    scan_base(ctx, 0, 1, 0, n_bins);
+    scan(ctx, 0, 1, 0, n_bins);
+    fill(ctx, 0, 1, 0, n_points);
+    select(ctx, 0, 1, 0, n_blocks);
+    if (team != NULL) {
+        *team = 1;
+    }
+}
+
 /* `bin`, `count`, `scan`, `fill`, and `select` run inside the standing
  * region. `scan_base` is the single that publishes each slot's prefix.
- * The caller waits on the condition variable, not on an OpenMP join. */
+ * The caller waits on the condition variable, not on an OpenMP join.
+ * `width` above zero is the team size, otherwise the caller's
+ * `omp_get_max_threads()`. A team of one runs every phase on the caller
+ * and starts no thread. */
 void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int64_t n_blocks,
                        lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
-                       lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team) {
-    int want = omp_get_max_threads();
+                       lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team,
+                       int width) {
+    int want = width > 0 ? width : omp_get_max_threads();
     int rebuild = 0;
-    if (want < 1) {
-        want = 1;
+    if (want <= 1) {
+        run_on_caller(ctx, n_points, n_bins, n_blocks, bin, count, scan_base, scan, fill, select,
+                      team);
+        return;
     }
     pthread_mutex_lock(&g_team.mu);
     rebuild = g_team.state == LC_UP && g_team.requested != want;
@@ -431,15 +451,8 @@ void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int
     rebuild = g_team.state != LC_UP;
     pthread_mutex_unlock(&g_team.mu);
     if (rebuild) {
-        bin(ctx, 0, 1, 0, n_points);
-        count(ctx, 0, 1, 0, n_bins);
-        scan_base(ctx, 0, 1, 0, n_bins);
-        scan(ctx, 0, 1, 0, n_bins);
-        fill(ctx, 0, 1, 0, n_points);
-        select(ctx, 0, 1, 0, n_blocks);
-        if (team != NULL) {
-            *team = 1;
-        }
+        run_on_caller(ctx, n_points, n_bins, n_blocks, bin, count, scan_base, scan, fill, select,
+                      team);
         return;
     }
     pthread_mutex_lock(&g_team.mu);

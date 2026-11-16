@@ -185,6 +185,42 @@ pub use simd::simd_path;
 pub use simd::{simd_timing, SimdTiming};
 pub use skin::SkinList;
 
+#[cfg(feature = "parallel")]
+thread_local! {
+    static ON_CALLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True while a search asked to run on one thread is on the calling thread.
+#[cfg(feature = "parallel")]
+pub(crate) fn on_caller() -> bool {
+    rayon::current_thread_index().is_none() && ON_CALLER.with(std::cell::Cell::get)
+}
+
+/// Threads the walk may split over. A one-thread search on the caller is
+/// one: asked from outside a pool, rayon builds its global pool at
+/// `RAYON_NUM_THREADS` or the cpu count, and the walk then splits over it.
+#[cfg(feature = "parallel")]
+pub(crate) fn pool_width() -> usize {
+    if on_caller() {
+        1
+    } else {
+        rayon::current_num_threads()
+    }
+}
+
+/// Runs `work` on this thread as a one-thread search.
+#[cfg(feature = "parallel")]
+pub(crate) fn run_on_caller<R>(work: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ON_CALLER.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(ON_CALLER.with(|flag| flag.replace(true)));
+    work()
+}
+
 #[cfg(feature = "capi")]
 mod capi;
 #[cfg(feature = "tune")]

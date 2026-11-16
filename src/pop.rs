@@ -117,7 +117,7 @@ pub fn prepare() {
             IN_POOL.with(|cell| cell.set(true));
             let _ = slot();
         });
-        NTHREADS.store(rayon::current_num_threads(), Ordering::Relaxed);
+        NTHREADS.store(crate::pool_width(), Ordering::Relaxed);
     }
     #[cfg(not(feature = "parallel"))]
     {

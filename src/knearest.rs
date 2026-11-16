@@ -636,10 +636,7 @@ fn execute(
     }
     #[cfg(feature = "parallel")]
     {
-        TEAM.store(
-            rayon::current_num_threads(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        TEAM.store(crate::pool_width(), std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -2304,6 +2301,63 @@ mod fused_agree {
         if let Some(so) = so {
             unload_cdylib(&so, before);
         }
+    }
+
+    /// Child process: after `lc_set_threads(1)` a C API search adds no
+    /// thread. Asked from outside a pool, rayon would build its global
+    /// pool at the cpu count, and the fused region would start its team.
+    #[test]
+    fn one_thread_capi_search_starts_no_thread() {
+        if std::env::var_os("LC_ONE_THREAD_PROBE").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(&exe)
+                .arg("knearest::fused_agree::one_thread_capi_search_starts_no_thread")
+                .args(["--exact", "--test-threads", "1", "--nocapture"])
+                .env("LC_ONE_THREAD_PROBE", "1")
+                .env_remove("RAYON_NUM_THREADS")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "probe status {:?}\n{}{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let before = task_count();
+        crate::capi::lc_set_threads(1);
+        let n = 8192usize;
+        let xyz: Vec<f64> = (0..n)
+            .flat_map(|i| [(i % 20) as f64, ((i / 20) % 20) as f64, (i / 400) as f64])
+            .collect();
+        let cell = [
+            40.0, 0.0, 0.0, 0.0, 40.0, 0.0, 0.0, 0.0, 40.0, 0.0, 0.0, 0.0,
+        ];
+        let mut out = vec![-1i32; n * 2];
+        let rc = unsafe {
+            crate::capi::lc_knearest(
+                xyz.as_ptr(),
+                n,
+                cell.as_ptr().cast(),
+                2,
+                std::ptr::null(),
+                3.0,
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "one-thread query");
+        assert!(
+            out.iter().all(|&j| j >= 0),
+            "one-thread query left a slot empty"
+        );
+        assert_eq!(
+            task_count(),
+            before,
+            "a one-thread search started threads\n{}",
+            task_names()
+        );
     }
 
     fn unload_cdylib(so: &std::path::Path, before: usize) {
