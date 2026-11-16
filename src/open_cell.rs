@@ -3,8 +3,11 @@
 //! [`crate::pairs_within`](crate::pairs_within) is a periodic list. An
 //! open axis has no images. Padding that axis out to a periodic box
 //! makes the partner stencil depend on the bounding span, so moving one
-//! atom rebuilds it. This walk bins the occupied Cartesian cells and
-//! keeps that stencil until the bounding bins change.
+//! atom rebuilds it. This walk bins the occupied Cartesian cells. With
+//! every axis open the stencil is a set of bin offsets, which depends on
+//! the bin edge and the cutoff alone, so frames that occupy other bins
+//! reuse it. A periodic axis keeps the stencil until the bounding bins
+//! change.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -229,6 +232,9 @@ struct Stencil {
     key: Key,
     off: Vec<u32>,
     links: Vec<Link>,
+    /// Partner offsets of a fully open frame, ascending in flat order.
+    /// Empty when `links` holds the stencil.
+    offsets: Vec<[i32; 3]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -500,13 +506,7 @@ fn build_stencil(
     let repeats = key.repeats;
     let ncell = frame.off.len() - 1;
     let edge = frame.edge;
-    let reach = (query.cutoff / edge).ceil();
-    // `reach as i32 + 2` is the stencil pad. A value past `i32::MAX - 2`
-    // overflows that add in debug and wraps the image window in release.
-    if !reach.is_finite() || reach > (i32::MAX - 2) as f64 {
-        return Err(Error::TooManyImages);
-    }
-    let reach = reach as i32 + 2;
+    let reach = stencil_reach(query.cutoff, edge)?;
     let mut shifts = Vec::new();
     for sa in -repeats[0]..=repeats[0] {
         for sb in -repeats[1]..=repeats[1] {
@@ -579,11 +579,51 @@ fn build_stencil(
         }
         off[src + 1] = links.len() as u32;
     }
-    Ok(Stencil { key, off, links })
+    Ok(Stencil {
+        key,
+        off,
+        links,
+        offsets: Vec::new(),
+    })
+}
+
+fn stencil_reach(cutoff: f64, edge: f64) -> Result<i32, Error> {
+    let reach = (cutoff / edge).ceil();
+    // `reach as i32 + 2` is the stencil pad. A value past `i32::MAX - 2`
+    // overflows that add in debug and wraps the image window in release.
+    if !reach.is_finite() || reach > (i32::MAX - 2) as f64 {
+        return Err(Error::TooManyImages);
+    }
+    Ok(reach as i32 + 2)
+}
+
+/// Bin offsets a fully open frame can pair across. The gap between two
+/// bins depends on their offset and not on where they sit, and the
+/// (z, y, x) order visits partners in the flat order the bin scan did.
+fn build_open_stencil(edge: f64, cutoff: f64, key: Key) -> Result<Stencil, Error> {
+    let reach = stencil_reach(cutoff, edge)?;
+    let mut offsets = Vec::new();
+    for dz in -reach..=reach {
+        for dy in -reach..=reach {
+            for dx in -reach..=reach {
+                let offset = [dx, dy, dz];
+                if !cells_too_far([0; 3], offset, [0; 3], edge, [0.0; 3], cutoff) {
+                    offsets.push(offset);
+                }
+            }
+        }
+    }
+    Ok(Stencil {
+        key,
+        off: Vec::new(),
+        links: Vec::new(),
+        offsets,
+    })
 }
 
 fn stencil_for(frame: &Frame, cell: &Cell, query: &PbcQuery<'_>) -> Result<Arc<Stencil>, Error> {
-    let repeats = if query.periodic == [false, false, false] {
+    let open = query.periodic == [false, false, false];
+    let repeats = if open {
         [0; 3]
     } else {
         repeats_of(cell, query.periodic, query.cutoff)?
@@ -596,8 +636,8 @@ fn stencil_for(frame: &Frame, cell: &Cell, query: &PbcQuery<'_>) -> Result<Arc<S
             u8::from(query.periodic[1]),
             u8::from(query.periodic[2]),
         ],
-        origin: frame.origin,
-        dims: frame.dims,
+        origin: if open { [0; 3] } else { frame.origin },
+        dims: if open { [0; 3] } else { frame.dims },
         repeats,
         box_bits: box_bits(cell, query.periodic),
     };
@@ -609,7 +649,11 @@ fn stencil_for(frame: &Frame, cell: &Cell, query: &PbcQuery<'_>) -> Result<Arc<S
             }
         }
     }
-    let built = Arc::new(build_stencil(frame, cell, query, key)?);
+    let built = Arc::new(if open {
+        build_open_stencil(frame.edge, query.cutoff, key)?
+    } else {
+        build_stencil(frame, cell, query, key)?
+    });
     note_stencil_build();
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     *guard = Some(Arc::clone(&built));
@@ -657,75 +701,109 @@ fn walk(
     let cut2 = query.cutoff * query.cutoff;
     let mut rows = Vec::new();
     let ncell = frame.off.len() - 1;
+    let open = stencil.off.is_empty();
     for src in 0..ncell {
         let src_atoms = &frame.occ[frame.off[src] as usize..frame.off[src + 1] as usize];
         if src_atoms.is_empty() {
             continue;
         }
-        for link in &stencil.links[stencil.off[src] as usize..stencil.off[src + 1] as usize] {
-            let dst_atoms = &frame.occ
-                [frame.off[link.dst as usize] as usize..frame.off[link.dst as usize + 1] as usize];
-            if dst_atoms.is_empty() {
-                continue;
-            }
-            for &ia in src_atoms {
-                let i = ia as usize;
-                let pi = frame.pos[i];
-                for &ja in dst_atoms {
-                    let j = ja as usize;
-                    if i == j && link.shift == [0, 0, 0] {
-                        continue;
-                    }
-                    let reported = reported_shift(frame, i, j, link.shift)?;
-                    if i > j {
-                        continue;
-                    }
-                    if i == j && !keep_half(i, j, reported) {
-                        continue;
-                    }
-                    if query.exclude_self_images && i == j {
-                        continue;
-                    }
-                    let pj = frame.pos[j];
-                    let delta = if reported == [0, 0, 0] {
-                        [0.0; 3]
-                    } else {
-                        cell.lattice_shift(reported[0], reported[1], reported[2])
-                    };
-                    let dx = pj[0] + delta[0] - pi[0];
-                    let dy = pj[1] + delta[1] - pi[1];
-                    let dz = pj[2] + delta[2] - pi[2];
-                    let dist2 = dx * dx + dy * dy + dz * dz;
-                    if !accept(dist2, cut2, query.closed) {
-                        continue;
-                    }
-                    rows.push(Pair {
-                        i,
-                        j,
-                        shift: reported,
-                        dist2,
-                    });
-                    if !query.half {
-                        let flipped = neg_shift(reported).ok_or(Error::Overflow)?;
-                        if i == j {
-                            rows.push(Pair {
-                                i,
-                                j,
-                                shift: flipped,
-                                dist2,
-                            });
-                        } else {
-                            rows.push(Pair {
-                                i: j,
-                                j: i,
-                                shift: flipped,
-                                dist2,
-                            });
-                        }
-                    }
+        if open {
+            let at = local_of(src, frame.dims);
+            for offset in &stencil.offsets {
+                let local = [at[0] + offset[0], at[1] + offset[1], at[2] + offset[2]];
+                if let Some(dst) = flat_of(local, frame.dims) {
+                    pair_bins(frame, cell, query, cut2, src_atoms, dst, [0; 3], &mut rows)?;
                 }
+            }
+        } else {
+            for link in &stencil.links[stencil.off[src] as usize..stencil.off[src + 1] as usize] {
+                pair_bins(
+                    frame,
+                    cell,
+                    query,
+                    cut2,
+                    src_atoms,
+                    link.dst as usize,
+                    link.shift,
+                    &mut rows,
+                )?;
             }
         }
     }
     Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pair_bins(
+    frame: &Frame,
+    cell: &Cell,
+    query: &PbcQuery<'_>,
+    cut2: f64,
+    src_atoms: &[u32],
+    dst: usize,
+    shift: [i32; 3],
+    rows: &mut Vec<Pair>,
+) -> Result<(), Error> {
+    let dst_atoms = &frame.occ[frame.off[dst] as usize..frame.off[dst + 1] as usize];
+    if dst_atoms.is_empty() {
+        return Ok(());
+    }
+    for &ia in src_atoms {
+        let i = ia as usize;
+        let pi = frame.pos[i];
+        for &ja in dst_atoms {
+            let j = ja as usize;
+            if i == j && shift == [0, 0, 0] {
+                continue;
+            }
+            let reported = reported_shift(frame, i, j, shift)?;
+            if i > j {
+                continue;
+            }
+            if i == j && !keep_half(i, j, reported) {
+                continue;
+            }
+            if query.exclude_self_images && i == j {
+                continue;
+            }
+            let pj = frame.pos[j];
+            let delta = if reported == [0, 0, 0] {
+                [0.0; 3]
+            } else {
+                cell.lattice_shift(reported[0], reported[1], reported[2])
+            };
+            let dx = pj[0] + delta[0] - pi[0];
+            let dy = pj[1] + delta[1] - pi[1];
+            let dz = pj[2] + delta[2] - pi[2];
+            let dist2 = dx * dx + dy * dy + dz * dz;
+            if !accept(dist2, cut2, query.closed) {
+                continue;
+            }
+            rows.push(Pair {
+                i,
+                j,
+                shift: reported,
+                dist2,
+            });
+            if !query.half {
+                let flipped = neg_shift(reported).ok_or(Error::Overflow)?;
+                if i == j {
+                    rows.push(Pair {
+                        i,
+                        j,
+                        shift: flipped,
+                        dist2,
+                    });
+                } else {
+                    rows.push(Pair {
+                        i: j,
+                        j: i,
+                        shift: flipped,
+                        dist2,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }

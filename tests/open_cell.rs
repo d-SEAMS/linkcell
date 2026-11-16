@@ -143,16 +143,15 @@ fn open_reach_past_the_image_cast_is_too_many_images() {
 }
 
 #[test]
-fn crossing_a_bin_face_rebuilds_once() {
+fn crossing_a_bin_face_keeps_the_open_stencil() {
     let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let mut xyz = cluster();
     pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
     let before = stencil_builds();
     xyz[26][0] += 20.0;
-    pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
-    assert_eq!(stencil_builds() - before, 1);
-    pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
-    assert_eq!(stencil_builds() - before, 1);
+    let rows = pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
+    assert_same(&rows, &brute_open(&xyz, 2.5, true));
+    assert_eq!(stencil_builds() - before, 0);
 }
 
 /// Band images of one molecule sit in different bins and span different
