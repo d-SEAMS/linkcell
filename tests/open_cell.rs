@@ -155,6 +155,33 @@ fn crossing_a_bin_face_rebuilds_once() {
     assert_eq!(stencil_builds() - before, 1);
 }
 
+/// Band images of one molecule sit in different bins and span different
+/// bin counts. Visiting them in turn is the contact check of a band step.
+#[test]
+fn alternating_open_frames_share_one_stencil() {
+    let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let cutoff = 1.5;
+    let near = cluster();
+    let mut far: Vec<[f64; 3]> = near
+        .iter()
+        .map(|p| [1.3 * p[0] + 7.1, 0.9 * p[1] - 3.4, 1.1 * p[2] + 11.6])
+        .collect();
+    far[5][1] -= 2.2;
+    let frames = [near, far];
+    pairs_open(&frames[0], cutoff, None).unwrap();
+    let before = stencil_builds();
+    for round in 0..20 {
+        let xyz = &frames[round % 2];
+        let rows = pairs_open(xyz, cutoff, None).unwrap();
+        assert_same(&rows, &brute_open(xyz, cutoff, true));
+    }
+    assert_eq!(
+        stencil_builds() - before,
+        0,
+        "an open stencil depends on the bin edge and the cutoff, not on the occupied bins"
+    );
+}
+
 #[test]
 fn randomized_clusters_match_brute_force_and_a_large_box() {
     let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
