@@ -6,7 +6,8 @@
  * file creates and joins, so no OpenMP runtime holds a thread after
  * shutdown. OpenMP is only read: `omp_get_max_threads()` sizes the team,
  * and the bind kind and place list place it. Nothing here reads an
- * environment variable. Affinity changes only when the caller asks to pin.
+ * environment variable. A team of one is the caller itself. Affinity
+ * changes only when the caller asks to pin or the runtime binds threads.
  */
 #define _GNU_SOURCE
 
@@ -215,7 +216,6 @@ static struct {
     pthread_t *workers;
     int started;
     int state;
-    int requested;
     int nt;
     int parked;
     int epoch;
@@ -391,7 +391,6 @@ static int start_team(int want) {
         return 0;
     }
     g_team.state = LC_START;
-    g_team.requested = want;
     g_team.nt = want;
     g_team.parked = 0;
     g_team.quit = 0;
@@ -416,7 +415,6 @@ static int start_team(int want) {
     g_team.workers = NULL;
     g_team.started = 0;
     g_team.quit = 0;
-    g_team.requested = 0;
     g_team.nt = 0;
     g_team.parked = 0;
     g_team.state = LC_EMPTY;
@@ -487,7 +485,6 @@ void lc_knn_shutdown_impl(void) {
     g_team.workers = NULL;
     g_team.started = 0;
     g_team.quit = 0;
-    g_team.requested = 0;
     g_team.nt = 0;
     g_team.parked = 0;
     g_team.epoch = 0;
@@ -501,73 +498,100 @@ void lc_knn_shutdown_impl(void) {
 
 __attribute__((destructor)) static void lc_knn_at_unload(void) { lc_knn_shutdown_impl(); }
 
-static void run_on_caller(void *ctx, int64_t n_points, int64_t n_bins, int64_t n_blocks,
-                          lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
-                          lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team) {
-    bin(ctx, 0, 1, 0, n_points);
-    count(ctx, 0, 1, 0, n_bins);
-    scan_base(ctx, 0, 1, 0, n_bins);
-    scan(ctx, 0, 1, 0, n_bins);
-    fill(ctx, 0, 1, 0, n_points);
-    select(ctx, 0, 1, 0, n_blocks);
-    if (team != NULL) {
-        *team = 1;
+/* A team of one is the caller: no worker and no handoff. For the query
+ * the caller takes the CPU or the place slot 0 would have had, then gets
+ * its own mask back. */
+static void run_on_caller(const LcJob *job) {
+    cpu_set_t mine;
+    cpu_set_t set;
+    int moved = 0;
+    if (job->pin) {
+        pthread_mutex_lock(&g_team.mu);
+        while (g_team.busy) {
+            pthread_cond_wait(&g_team.cv, &g_team.mu);
+        }
+        least_loaded(1);
+        if (g_cpu_n == 1) {
+            CPU_ZERO(&set);
+            CPU_SET((unsigned)g_cpu[0], &set);
+            moved = 1;
+        }
+        pthread_mutex_unlock(&g_team.mu);
+    } else {
+        int bind = (int)omp_get_proc_bind();
+        int np = bind == omp_proc_bind_false ? 0 : omp_get_num_places();
+        moved = np > 0 && place_mask(place_of(bind, 0, 1, np), &set);
+    }
+    moved = moved && sched_getaffinity(0, sizeof mine, &mine) == 0 &&
+            sched_setaffinity(0, sizeof set, &set) == 0;
+    job->bin(job->ctx, 0, 1, 0, job->n_points);
+    job->count(job->ctx, 0, 1, 0, job->n_bins);
+    job->scan_base(job->ctx, 0, 1, 0, job->n_bins);
+    job->scan(job->ctx, 0, 1, 0, job->n_bins);
+    job->fill(job->ctx, 0, 1, 0, job->n_points);
+    job->select(job->ctx, 0, 1, 0, job->n_blocks);
+    if (moved) {
+        sched_setaffinity(0, sizeof mine, &mine);
+    }
+    if (job->team != NULL) {
+        *job->team = 1;
     }
 }
 
 /* `bin`, `count`, `scan`, `fill`, and `select` run on the standing team.
  * `scan_base` is the single that publishes each slot's prefix. The
- * caller waits on the condition variable for every slot to finish.
- * `width` above zero is the team size, otherwise the caller's
- * `omp_get_max_threads()`. A team of one runs every phase on the caller
- * and starts no thread. */
+ * caller waits on the condition variable for every slot to finish. A
+ * change of team size joins the old team first. `width` above zero is
+ * the team size, otherwise the caller's `omp_get_max_threads()`. */
 void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int64_t n_blocks,
                        lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
                        lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team,
                        int width) {
-    int want = width > 0 ? width : omp_get_max_threads();
-    int rebuild = 0;
-    if (want <= 1) {
-        run_on_caller(ctx, n_points, n_bins, n_blocks, bin, count, scan_base, scan, fill, select,
-                      team);
-        return;
+    int nt = width > 0 ? width : omp_get_max_threads();
+    int up;
+    LcJob job = {
+        .ctx = ctx,
+        .pin = pin,
+        .n_points = n_points,
+        .n_bins = n_bins,
+        .n_blocks = n_blocks,
+        .bin = bin,
+        .count = count,
+        .scan_base = scan_base,
+        .scan = scan,
+        .fill = fill,
+        .select = select,
+        .team = team,
+    };
+    if (nt < 1) {
+        nt = 1;
     }
     pthread_mutex_lock(&g_team.mu);
-    rebuild = g_team.state == LC_UP && g_team.requested != want;
+    up = g_team.state == LC_UP && g_team.nt != nt;
     pthread_mutex_unlock(&g_team.mu);
-    if (rebuild) {
+    if (up) {
         lc_knn_shutdown_impl();
     }
-    ensure_team(want);
-    pthread_mutex_lock(&g_team.mu);
-    rebuild = g_team.state != LC_UP;
-    pthread_mutex_unlock(&g_team.mu);
-    if (rebuild) {
-        run_on_caller(ctx, n_points, n_bins, n_blocks, bin, count, scan_base, scan, fill, select,
-                      team);
+    if (nt <= 1) {
+        run_on_caller(&job);
         return;
     }
+    ensure_team(nt);
     pthread_mutex_lock(&g_team.mu);
     while (g_team.busy) {
         pthread_cond_wait(&g_team.cv, &g_team.mu);
+    }
+    if (g_team.state != LC_UP) {
+        pthread_mutex_unlock(&g_team.mu);
+        run_on_caller(&job);
+        return;
     }
     g_team.busy = 1;
     g_team.bar.count = 0;
     g_team.bar.phase = 0;
     g_team.done = 0;
-    g_team.job.ctx = ctx;
-    g_team.job.pin = pin;
-    g_team.job.restore = g_pinned_once;
-    g_team.job.n_points = n_points;
-    g_team.job.n_bins = n_bins;
-    g_team.job.n_blocks = n_blocks;
-    g_team.job.bin = bin;
-    g_team.job.count = count;
-    g_team.job.scan_base = scan_base;
-    g_team.job.scan = scan;
-    g_team.job.fill = fill;
-    g_team.job.select = select;
-    g_team.job.team = team;
+    job.restore = g_pinned_once;
+    g_team.job = job;
     g_team.epoch++;
     pthread_cond_broadcast(&g_team.cv);
     while (g_team.done < g_team.nt) {

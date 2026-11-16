@@ -461,6 +461,7 @@ static PIN_LEAST_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// Off by default. A query does not read CPU counters or change affinity
 /// until this is set, and it does not consult an environment variable.
 /// Turning it off restores each worker to the mask it had before the pin.
+/// A team of one is the calling thread, pinned for the query only.
 /// Builds without the team query store the flag and leave placement alone.
 pub fn pin_knearest_to_least_loaded(enabled: bool) {
     PIN_LEAST_LOADED.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -470,7 +471,8 @@ pub fn pin_knearest_to_least_loaded(enabled: bool) {
 ///
 /// Zero before the first query. This is the k-nearest team when it ran,
 /// and the rayon pool size otherwise. The team is resized to
-/// `omp_get_max_threads()` on the next query when that value changes.
+/// `omp_get_max_threads()` on the next query when that value changes. A
+/// team of one is the calling thread, with no worker.
 pub fn knearest_team_threads() -> usize {
     TEAM.load(std::sync::atomic::Ordering::Relaxed)
 }
