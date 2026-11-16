@@ -35,6 +35,25 @@ fn compile_knn_region() -> bool {
     }
     let required = target_is("CARGO_CFG_TARGET_ENV", "gnu");
     let mut build = cc::Build::new();
+    // Clang as `cc` passes `--target=<rust-triple>` and then does not see
+    // gcc's `omp.h`, and its OpenMP runtime is not the libgomp linked
+    // below. A native build with no compiler chosen keeps gcc. A chosen
+    // compiler or a cross build is left to the `cc` crate.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let chosen = [
+        "CC".to_string(),
+        "TARGET_CC".to_string(),
+        format!("CC_{target}"),
+        format!("CC_{}", target.replace('-', "_")),
+    ];
+    for key in &chosen {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    if chosen.iter().all(|key| std::env::var_os(key).is_none())
+        && std::env::var("HOST").ok().as_deref() == Some(target.as_str())
+    {
+        build.compiler("gcc");
+    }
     build
         .file("src/knn_region.c")
         .flag("-fopenmp")
@@ -46,7 +65,10 @@ fn compile_knn_region() -> bool {
     // vectorising. Pin the x86_64 baseline so no host-specific ISA reaches
     // a path that is not runtime-dispatched.
     if target_is("CARGO_CFG_TARGET_ARCH", "x86_64") {
-        build.flag("-march=x86-64").flag("-mtune=generic");
+        build
+            .flag("-march=x86-64")
+            .flag("-mtune=generic")
+            .flag("-fno-tree-vectorize");
     }
     if let Err(err) = build.try_compile("knnregion") {
         if required {
