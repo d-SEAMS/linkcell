@@ -135,7 +135,8 @@ fn neon_ready() -> bool {
     cfg!(target_feature = "neon")
 }
 
-/// Name of the path [`select`] would use.
+/// Name of the path the next fold or scan takes: `LINKCELL_SIMD` when it
+/// is set, otherwise the widest path this CPU runs.
 pub fn simd_path() -> &'static str {
     select().name()
 }

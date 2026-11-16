@@ -126,7 +126,7 @@ struct Opaque {
     calc: NeighborCalc,
 }
 
-/// Reused buffers for repeated [`vesin_neighbors`] calls.
+/// Reused buffers for repeated `lc_vesin_neighbors` calls through the C ABI.
 #[derive(Default)]
 pub struct NeighborCalc {
     skin_list: Option<SkinList>,
