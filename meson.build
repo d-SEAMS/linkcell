@@ -80,12 +80,18 @@ linkcell_cargo = custom_target(
 
 rust_sys = [dependency('threads')]
 if host_machine.system() == 'linux'
+  # libgomp under GCC, libomp under Clang: the runtime of the compiler
+  # that builds the k-nearest region. It is linked by name, as in
+  # build.rs and CMake, so linkcell.pc names it and a consumer's own
+  # sources are not compiled with -fopenmp.
+  _omp_lib = cc.get_id() == 'clang' ? 'omp' : 'gomp'
+  if not cc.has_header('omp.h', args: ['-fopenmp'])
+    error('the k-nearest region needs omp.h from ' + cc.get_id() + ' -fopenmp')
+  endif
   rust_sys += [
     cc.find_library('dl', required: true),
     cc.find_library('m', required: true),
-    # libgomp under GCC, libomp under Clang: the runtime of the compiler
-    # that built the k-nearest region.
-    dependency('openmp', language: 'c', required: true),
+    cc.find_library(_omp_lib, required: true),
   ]
 elif host_machine.system() == 'darwin'
   rust_sys += [cc.find_library('m', required: true)]
