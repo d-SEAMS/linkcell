@@ -204,8 +204,9 @@ jobs:
           pkg-config --cflags --libs linkcell
           pkg-config --exists --print-errors linkcell-gpu
           pkg-config --modversion linkcell-gpu
+          read -ra gpu_flags <<<"$(pkg-config --cflags --libs linkcell-gpu)"
           c++ -std=c++17 tests/cmake-consumer/gpu.cpp \
-            $(pkg-config --cflags --libs linkcell-gpu) \
+            "${gpu_flags[@]}" \
             -o build/installed-gpu-consumer
 
   cmake:
