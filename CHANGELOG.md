@@ -11,6 +11,17 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 <!-- towncrier release notes start -->
 #skip_lint_end
 
+## [0.4.1] - 2026-11-16
+
+### Fixed
+
+- A Clang build links libomp instead of libgomp. The Meson and CMake builds hand their C compiler to the cc crate, and `build.rs`, the link line and `linkcell.pc` name the OpenMP runtime of that compiler, so one process no longer loads both runtimes.
+- A fully open frame reuses one stencil for every frame with the same bin edge and cutoff, so band images that occupy other bins no longer rebuild it. The stencil is the farthest x offset within reach on each row of bins, and the walk clips the rows to the bins the frame spans, so a small molecule in a few bins is no slower than with the per-bin link list, and a reach of many bins builds rows only out to the span the frames need.
+- A native Linux build with no C compiler chosen compiles the OpenMP k-nearest region with gcc, so the `parallel` build no longer stops on a missing `omp.h` when `cc` is clang.
+  `CC`, `TARGET_CC` and `CC_<target>` still choose the compiler.
+- A search asked to run on one thread (`lc_set_threads(1)`) stays on the calling thread. The grid, pair, partition and skin walks read that width instead of rayon's global pool, the fused k-nearest region runs every phase on the caller, and the cell grid and cell graph entry points use the same width. An unset width (zero) keeps rayon's and OpenMP's defaults.
+- Meson and CMake rebuild the library when any crate source changes. Meson reads the sources from the Cargo dep-info, and CMake also tracks `build.rs` and the C sources.
+
 ## [0.4.0] - 2026-11-15
 
 ### Added

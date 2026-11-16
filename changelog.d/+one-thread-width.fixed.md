@@ -1,1 +1,0 @@
-A search asked to run on one thread (`lc_set_threads(1)`) stays on the calling thread. The grid, pair, partition and skin walks read that width instead of rayon's global pool, the fused k-nearest region runs every phase on the caller, and the cell grid and cell graph entry points use the same width. An unset width (zero) keeps rayon's and OpenMP's defaults.
