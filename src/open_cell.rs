@@ -698,11 +698,11 @@ fn stencil_for(frame: &Frame, cell: &Cell, query: &PbcQuery<'_>) -> Result<Arc<S
                     return Ok(Arc::clone(stencil));
                 }
                 if let Some(open) = &stencil.open {
-                    for axis in 0..2 {
-                        need[axis] = if need[axis] > open.ext[axis] {
-                            need[axis].max(open.ext[axis].saturating_mul(2))
+                    for (want, &ext) in need.iter_mut().zip(open.ext.iter()) {
+                        *want = if *want > ext {
+                            (*want).max(ext.saturating_mul(2))
                         } else {
-                            open.ext[axis]
+                            ext
                         };
                     }
                 }
