@@ -605,9 +605,27 @@ struct Prepared {
     point_cell: Vec<u32>,
 }
 
+/// Threads the point binning splits over. A one-thread search on the
+/// caller bins there, as its walks do, and a build without `parallel`
+/// keeps the whole search serial.
+#[cfg(feature = "parallel")]
+fn bin_threads() -> usize {
+    if crate::on_caller() {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+#[cfg(not(feature = "parallel"))]
+fn bin_threads() -> usize {
+    1
+}
+
 /// Point counts on the link-cell grid. Threads own disjoint point ranges
 /// and private histograms, then the histograms add. The active-bin list
-/// stays in point order.
+/// stays in point order. One range is binned on the calling thread.
 fn bin_points(
     xyz: &[[f64; 3]],
     sim: &Cell,
@@ -616,41 +634,44 @@ fn bin_points(
     ncell: usize,
 ) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
     let n = xyz.len();
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let threads = if n >= 8192 { threads.max(1) } else { 1 };
+    let threads = if n >= 8192 { bin_threads() } else { 1 };
     let chunk = (n + threads - 1) / threads;
     let mut bin_of = vec![0u32; n];
     let mut weight = vec![0u64; ncell];
-    let mut hits: Vec<(usize, Vec<(usize, u32)>, Vec<u64>)> = Vec::new();
-    std::thread::scope(|scope| {
-        let mut joins = Vec::new();
-        for t in 0..threads {
-            let lo = t * chunk;
-            let hi = ((t + 1) * chunk).min(n);
-            if lo >= hi {
+    let bin_range = |t: usize, lo: usize, hi: usize| {
+        let mut local = vec![0u64; ncell];
+        let mut active = Vec::new();
+        for i in lo..hi {
+            if mask.is_some_and(|m| !m[i]) {
                 continue;
             }
-            joins.push(scope.spawn(move || {
-                let mut local = vec![0u64; ncell];
-                let mut active = Vec::new();
-                for i in lo..hi {
-                    if mask.is_some_and(|m| !m[i]) {
-                        continue;
-                    }
-                    let (_, b) = bins::fold_point(sim, xyz[i], dims);
-                    let c = flat_cell(b, dims) as u32;
-                    local[c as usize] += 1;
-                    active.push((i, c));
+            let (_, b) = bins::fold_point(sim, xyz[i], dims);
+            let c = flat_cell(b, dims) as u32;
+            local[c as usize] += 1;
+            active.push((i, c));
+        }
+        (t, active, local)
+    };
+    let mut hits: Vec<(usize, Vec<(usize, u32)>, Vec<u64>)> = if threads == 1 {
+        vec![bin_range(0, 0, n)]
+    } else {
+        std::thread::scope(|scope| {
+            let bin_range = &bin_range;
+            let mut joins = Vec::new();
+            for t in 0..threads {
+                let lo = t * chunk;
+                let hi = ((t + 1) * chunk).min(n);
+                if lo >= hi {
+                    continue;
                 }
-                (t, active, local)
-            }));
-        }
-        for join in joins {
-            hits.push(join.join().expect("bin"));
-        }
-    });
+                joins.push(scope.spawn(move || bin_range(t, lo, hi)));
+            }
+            joins
+                .into_iter()
+                .map(|join| join.join().expect("bin"))
+                .collect()
+        })
+    };
     hits.sort_by_key(|(t, _, _)| *t);
     let mut active_bins = Vec::new();
     for (_, active, local) in hits {

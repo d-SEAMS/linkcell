@@ -46,6 +46,10 @@ cc = "1.2"
 name = "abi"
 required-features = ["capi"]
 
+[[test]]
+name = "one_thread"
+required-features = ["capi"]
+
 [[example]]
 name = "simd_bench"
 required-features = ["timing"]
