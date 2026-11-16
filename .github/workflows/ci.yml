@@ -211,6 +211,82 @@ jobs:
           grep -qw -- -lomp <<<"$libs"
           if grep -w -- -lgomp <<<"$libs"; then exit 1; fi
 
+  # Clang's -print-file-name does not search LIBRARY_PATH. A libomp the
+  # compiler reaches only through LIBRARY_PATH and CPATH, as a sanitizer
+  # build of the runtime is, must still be found and linked alone. The
+  # packages are unpacked, not installed, so the runner's Clang has no
+  # libomp of its own.
+  clang-library-path:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: pip install meson ninja
+      - name: Unpack libomp 21 into a private prefix
+        run: |
+          . /etc/os-release
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update
+          cd "$RUNNER_TEMP"
+          apt-get download libomp-21-dev libomp5
+          for deb in libomp*.deb; do dpkg -x "$deb" omp; done
+          lib="$RUNNER_TEMP/omp/usr/lib/x86_64-linux-gnu"
+          inc="$RUNNER_TEMP/omp/usr/lib/llvm-21/lib/clang/21/include"
+          test -f "$lib/libomp.so" && test -f "$inc/omp.h"
+          if [ -f "$(clang -print-file-name=libomp.so)" ]; then
+            echo "::error::clang finds a libomp of its own; LIBRARY_PATH would not be exercised"
+            exit 1
+          fi
+          {
+            echo "LIBRARY_PATH=$lib"
+            echo "CPATH=$inc"
+            echo "LD_LIBRARY_PATH=$lib"
+            echo "LINKCELL_OMP_LIB=$lib"
+          } >> "$GITHUB_ENV"
+      - name: Runtime check
+        run: |
+          cat > "$RUNNER_TEMP/private-libomp.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Fail unless every argument loads the private libomp and no other runtime.
+          set -euo pipefail
+          for lib in "$@"; do
+            needed=$(readelf -d "$lib" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+            printf '%s needs:\n%s\n' "$lib" "$needed"
+            grep -q '^libomp\.so' <<<"$needed" || { echo "::error::$lib does not need libomp"; exit 1; }
+            if grep -E 'gomp|iomp' <<<"$needed"; then
+              echo "::error::$lib needs another OpenMP runtime"
+              exit 1
+            fi
+            loaded=$(ldd "$lib")
+            echo "$loaded"
+            grep -q "libomp\.so.* => $LINKCELL_OMP_LIB/" <<<"$loaded" \
+              || { echo "::error::$lib does not load libomp from $LINKCELL_OMP_LIB"; exit 1; }
+            if grep -E 'libgomp|libiomp' <<<"$loaded"; then
+              echo "::error::$lib loads another OpenMP runtime"
+              exit 1
+            fi
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/private-libomp.sh"
+      - run: cargo build --locked
+      - name: liblinkcell.so needs the private libomp alone
+        run: '"$RUNNER_TEMP/private-libomp.sh" target/debug/liblinkcell.so'
+      - run: cargo test --locked
+      - run: meson setup build
+      - run: meson compile -C build
+      - run: meson test -C build --print-errorlogs
+      - name: Meson's liblinkcell.so needs the private libomp alone
+        run: '"$RUNNER_TEMP/private-libomp.sh" build/liblinkcell.so'
+
   meson:
     strategy:
       fail-fast: false
