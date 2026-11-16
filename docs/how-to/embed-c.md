@@ -34,6 +34,10 @@ executable('app', 'app.c', dependencies: linkcell_dep)
 
 `linkcell_dep` already carries the Rust sysroot (pthread, dl, m on Linux).
 
+Meson takes `linkcell.wrap` from the top-level project before the one in a subproject.
+A project that builds a linkcell consumer as a subproject, such as a binding over seams-core, therefore builds the revision its own wrap names.
+Keep that wrap at or above the version the subproject requires, or remove it so the subproject's wrap applies.
+
 For the device API, request `linkcell-gpu` with fallback `['linkcell', 'linkcell_gpu_dep']`.
 The dependency is `LINKCELL_HAS_GPULITE`.
 It links the C++ implementation.
