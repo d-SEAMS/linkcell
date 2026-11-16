@@ -45,6 +45,7 @@ _cargo_command = [
   '--static', cargo_static,
   '--out-shared', '@OUTPUT0@',
   '--out-static', '@OUTPUT1@',
+  '--depfile', '@DEPFILE@',
 ]
 if host_machine.system() == 'windows'
   _cargo_outputs += [cargo_implib]
@@ -58,23 +59,16 @@ endif
 
 # cargo rustc emits both crate types; the target lists both so Meson
 # does not pretend the static archive is the only artifact.
+# The crate sources come from Cargo's dep-info through the depfile.
 linkcell_cargo = custom_target(
   'linkcell-cargo',
   input: files(
     'Cargo.toml',
     'Cargo.lock',
-    'src/lib.rs',
-    'src/knearest.rs',
-    'src/bins.rs',
-    'src/open_cell.rs',
-    'src/cell.rs',
-    'src/error.rs',
-    'src/capi.rs',
-    'src/pairs.rs',
-    'src/partition.rs',
     'scripts/copy-cargo-artifacts.py',
   ),
   output: _cargo_outputs,
+  depfile: 'linkcell-cargo.d',
   command: _cargo_command,
   build_by_default: true,
   install: _install,
