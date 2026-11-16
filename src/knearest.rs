@@ -2595,26 +2595,16 @@ mod fused_agree {
         assert_threads_back(before, "dlclose");
     }
 
-    /// Read-write mappings of exactly `bytes`, as a thread stack of that
-    /// size leaves beside its guard page.
-    fn mappings_of(bytes: u64) -> usize {
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
-        maps.lines()
-            .filter(|line| {
-                let mut fields = line.split_whitespace();
-                let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
-                    return false;
-                };
-                let Some((lo, hi)) = range.split_once('-') else {
-                    return false;
-                };
-                let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16))
-                else {
-                    return false;
-                };
-                perms.starts_with("rw") && hi - lo == bytes
-            })
-            .count()
+    /// The stack size of each worker of the standing team, in slot order,
+    /// as the C library reports it for that thread.
+    fn team_stacks() -> Vec<usize> {
+        extern "C" {
+            fn lc_knn_team_stack(slot: i32) -> usize;
+        }
+        (0..)
+            .map(|slot| unsafe { lc_knn_team_stack(slot) })
+            .take_while(|&size| size != 0)
+            .collect()
     }
 
     /// Child processes: `OMP_THREAD_LIMIT` caps the team below what
@@ -2670,9 +2660,18 @@ mod fused_agree {
                 (procs - busy) as usize
             }
         };
-        let stack = 12u64 << 20;
+        let stack = 12usize << 20;
         let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
         let xyz = periodic(&cell, 64, 9);
+        // Another thread holds a 12 MiB stack through the query. No thread
+        // exits before it, so no cached stack can stand in for a worker's.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || {
+                let _ = held.recv();
+            })
+            .unwrap();
         // A team of one warms everything else up and leaves no worker
         // stack in glibc's cache of joined threads.
         unsafe { omp_set_num_threads(1) };
@@ -2680,7 +2679,6 @@ mod fused_agree {
         assert_eq!(super::knearest_team_threads(), 1);
         unsafe { omp_set_num_threads(4) };
         let before = task_count();
-        let stacks = mappings_of(stack);
         let expect = match mode.to_str() {
             Some("2") => vec![2],
             Some("1") => vec![1],
@@ -2710,12 +2708,15 @@ mod fused_agree {
             task_names()
         );
         assert_eq!(
-            mappings_of(stack) - stacks,
-            workers,
+            team_stacks(),
+            vec![stack; workers],
             "OMP_STACKSIZE=12m stacks for a team of {team}"
         );
         super::shutdown_knearest_team();
         let after = wait_tasks(before);
         assert_eq!(after, before, "shutdown left threads\n{}", task_names());
+        assert_eq!(team_stacks(), Vec::<usize>::new(), "stacks after shutdown");
+        drop(release);
+        holder.join().unwrap();
     }
 }

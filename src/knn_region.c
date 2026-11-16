@@ -585,6 +585,26 @@ void lc_knn_shutdown_impl(void) {
 
 __attribute__((destructor)) static void lc_knn_at_unload(void) { lc_knn_shutdown_impl(); }
 
+/* The stack size of worker `slot` as the C library reports it, or 0 when
+ * the standing team has no such worker. This is the stack the thread was
+ * given, whatever the memory map looks like: a recent glibc on a recent
+ * kernel keeps the guard inside the stack mapping, and a reused stack
+ * makes no new mapping at all. */
+size_t lc_knn_team_stack(int slot) {
+    pthread_attr_t attr;
+    size_t size = 0;
+    pthread_mutex_lock(&g_team.mu);
+    if (g_team.state == LC_UP && slot >= 0 && slot < g_team.started &&
+        pthread_getattr_np(g_team.workers[slot], &attr) == 0) {
+        if (pthread_attr_getstacksize(&attr, &size) != 0) {
+            size = 0;
+        }
+        pthread_attr_destroy(&attr);
+    }
+    pthread_mutex_unlock(&g_team.mu);
+    return size;
+}
+
 /* libgomp's size for a parallel region the caller opens with no
  * num_threads clause. With dyn-var set the team is the processors
  * available, at most nthreads-var, less the 15-minute load average
