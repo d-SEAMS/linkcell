@@ -80,7 +80,11 @@ fn compile_knn_region() -> bool {
     // calls into libgomp. Link the runtime of the compiler that built the
     // region, so a Clang build does not load both.
     let compiler = build.get_compiler();
-    let runtime = if compiler.is_like_clang() { "omp" } else { "gomp" };
+    let runtime = if compiler.is_like_clang() {
+        "omp"
+    } else {
+        "gomp"
+    };
     match runtime_dir(compiler.path(), runtime) {
         Some(dir) => {
             println!("cargo:rustc-link-search=native={}", dir.display());
