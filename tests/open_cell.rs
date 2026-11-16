@@ -143,16 +143,170 @@ fn open_reach_past_the_image_cast_is_too_many_images() {
 }
 
 #[test]
-fn crossing_a_bin_face_rebuilds_once() {
+fn crossing_a_bin_face_keeps_the_open_stencil() {
     let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let mut xyz = cluster();
     pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
     let before = stencil_builds();
     xyz[26][0] += 20.0;
+    let rows = pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
+    assert_same(&rows, &brute_open(&xyz, 2.5, true));
+    assert_eq!(stencil_builds() - before, 0);
     pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
+    assert_eq!(stencil_builds() - before, 0);
+}
+
+/// A periodic axis keeps the per-bin link list, so the bounding bins are
+/// still part of its key.
+#[test]
+fn crossing_an_open_face_of_a_slab_rebuilds_once() {
+    let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let (cell, mut xyz) = slab();
+    let query = PbcQuery::new([true, true, false], 2.2).half(true);
+    pairs_within_pbc(&xyz, &cell, &query).unwrap();
+    let before = stencil_builds();
+    xyz[3][2] += 9.0;
+    let rows = pairs_within_pbc(&xyz, &cell, &query).unwrap();
+    assert_same(&rows, &brute_slab(&xyz, &cell, 2.2));
     assert_eq!(stencil_builds() - before, 1);
-    pairs_open(&xyz, 2.5, Some(8.0)).unwrap();
+    pairs_within_pbc(&xyz, &cell, &query).unwrap();
     assert_eq!(stencil_builds() - before, 1);
+}
+
+fn water_at(origin: [f64; 3]) -> Vec<[f64; 3]> {
+    [[0.0, 0.0, 0.0], [0.757, 0.586, 0.0], [-0.757, 0.586, 0.0]]
+        .iter()
+        .map(|p| [p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]])
+        .collect()
+}
+
+/// A small molecule that moves, also across bin faces, keeps the stencil
+/// it first built, on the half and the full list.
+#[test]
+fn small_molecules_build_the_open_stencil_at_most_once() {
+    let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let cutoff = 2.0;
+    pairs_open(&cluster(), 1.7, None).unwrap();
+    let before = stencil_builds();
+    let mut state = 99u64;
+    for step in 0..300 {
+        let drift = |state: &mut u64| (xorshift(state) % 10_001) as f64 / 10_000.0 - 0.5;
+        let origin = [
+            5.0 + 0.01 * step as f64 + drift(&mut state),
+            5.0 - 0.02 * step as f64 + drift(&mut state),
+            5.0 + drift(&mut state),
+        ];
+        let mut xyz = water_at(origin);
+        if step % 3 == 0 {
+            xyz.extend(water_at([origin[0] + 2.8, origin[1], origin[2] + 0.4]));
+        }
+        let rows = pairs_open(&xyz, cutoff, None).unwrap();
+        assert_same(&rows, &brute_open(&xyz, cutoff, true));
+        let full = pairs_within_pbc(
+            &xyz,
+            &Cell::ortho(1.0, 1.0, 1.0).unwrap(),
+            &PbcQuery::open(cutoff),
+        )
+        .unwrap();
+        assert_same(&full, &brute_open(&xyz, cutoff, false));
+    }
+    let builds = stencil_builds() - before;
+    assert!(
+        builds <= 1,
+        "a small molecule built the open stencil {builds} times"
+    );
+}
+
+/// A cutoff of many bin edges reaches past the stored rows. Frames that
+/// span more bins widen the table a bounded number of times, only on the
+/// axis they outgrow, and still match brute force. A reach of a million
+/// bins does not walk the whole reach.
+#[test]
+fn a_long_reach_widens_the_open_rows_and_matches_brute_force() {
+    let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let cutoff = 6.0;
+    let hint = Some(0.25);
+    let mut state = 0x5eed_u64;
+    let mut frames = Vec::new();
+    for size in [2.0, 6.0, 12.0, 3.0, 12.0] {
+        let xyz: Vec<[f64; 3]> = (0..40)
+            .map(|_| {
+                [
+                    10.0 + size * (xorshift(&mut state) % 1000) as f64 / 1000.0,
+                    10.0 + size * (xorshift(&mut state) % 1000) as f64 / 1000.0,
+                    10.0 + size * (xorshift(&mut state) % 1000) as f64 / 1000.0,
+                ]
+            })
+            .collect();
+        frames.push(xyz);
+    }
+    pairs_open(&frames[0], cutoff, hint).unwrap();
+    let before = stencil_builds();
+    for xyz in &frames {
+        for half in [true, false] {
+            let query = PbcQuery::open(cutoff).half(half).cell_hint(hint);
+            let rows = pairs_within_pbc(xyz, &Cell::ortho(1.0, 1.0, 1.0).unwrap(), &query).unwrap();
+            assert_same(&rows, &brute_open(xyz, cutoff, half));
+        }
+    }
+    assert_eq!(
+        stencil_builds() - before,
+        1,
+        "the 6 Å frame widens the rows to the whole reach of 26 bins once"
+    );
+
+    let line = |axis: usize| -> Vec<[f64; 3]> {
+        (0..12)
+            .map(|k| {
+                let mut p = [10.0, 10.0, 10.0];
+                p[axis] += 0.9 * k as f64;
+                p
+            })
+            .collect()
+    };
+    pairs_open(&frames[0], cutoff, Some(0.2)).unwrap();
+    let before = stencil_builds();
+    for axis in [1, 2, 1, 2] {
+        let xyz = line(axis);
+        let rows = pairs_open(&xyz, cutoff, Some(0.2)).unwrap();
+        assert_same(&rows, &brute_open(&xyz, cutoff, true));
+    }
+    assert_eq!(
+        stencil_builds() - before,
+        2,
+        "a frame long on y and then one long on z each widen their own axis"
+    );
+
+    let pair = [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [3.0e5, 0.0, 0.0]];
+    let rows = pairs_open(&pair, 1.0e6, Some(1.0)).unwrap();
+    assert_same(&rows, &brute_open(&pair, 1.0e6, true));
+}
+
+/// Band images of one molecule sit in different bins and span different
+/// bin counts. Visiting them in turn is the contact check of a band step.
+#[test]
+fn alternating_open_frames_share_one_stencil() {
+    let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let cutoff = 1.5;
+    let near = cluster();
+    let mut far: Vec<[f64; 3]> = near
+        .iter()
+        .map(|p| [1.3 * p[0] + 7.1, 0.9 * p[1] - 3.4, 1.1 * p[2] + 11.6])
+        .collect();
+    far[5][1] -= 2.2;
+    let frames = [near, far];
+    pairs_open(&frames[0], cutoff, None).unwrap();
+    let before = stencil_builds();
+    for round in 0..20 {
+        let xyz = &frames[round % 2];
+        let rows = pairs_open(xyz, cutoff, None).unwrap();
+        assert_same(&rows, &brute_open(xyz, cutoff, true));
+    }
+    assert_eq!(
+        stencil_builds() - before,
+        0,
+        "an open stencil depends on the bin edge and the cutoff, not on the occupied bins"
+    );
 }
 
 #[test]
@@ -191,11 +345,10 @@ fn randomized_clusters_match_brute_force_and_a_large_box() {
     }
 }
 
-#[test]
-fn mixed_slab_matches_an_image_scan() {
-    let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+/// Ten points in a 5 x 6 x 8 cell, inside the cell on the periodic x
+/// and y.
+fn slab() -> (Cell, Vec<[f64; 3]>) {
     let cell = Cell::ortho(5.0, 6.0, 8.0).unwrap();
-    let periodic = [true, true, false];
     let mut state = 7u64;
     let mut xyz = Vec::new();
     for _ in 0..10 {
@@ -205,9 +358,11 @@ fn mixed_slab_matches_an_image_scan() {
             1.0 + (xorshift(&mut state) % 4000) as f64 / 1000.0,
         ]);
     }
-    let cutoff = 2.2;
-    let query = PbcQuery::new(periodic, cutoff).half(true);
-    let rows = pairs_within_pbc(&xyz, &cell, &query).unwrap();
+    (cell, xyz)
+}
+
+/// Half list of a slab periodic on x and y, by scanning one image on each.
+fn brute_slab(xyz: &[[f64; 3]], cell: &Cell, cutoff: f64) -> BTreeMap<Key, f64> {
     let mut want = BTreeMap::new();
     let limit = cutoff * cutoff;
     let span = [1i32, 1, 0];
@@ -240,6 +395,18 @@ fn mixed_slab_matches_an_image_scan() {
             }
         }
     }
+    want
+}
+
+#[test]
+fn mixed_slab_matches_an_image_scan() {
+    let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let (cell, xyz) = slab();
+    let periodic = [true, true, false];
+    let cutoff = 2.2;
+    let query = PbcQuery::new(periodic, cutoff).half(true);
+    let rows = pairs_within_pbc(&xyz, &cell, &query).unwrap();
+    let want = brute_slab(&xyz, &cell, cutoff);
     assert_same(&rows, &want);
     assert!(!want.is_empty());
 }
