@@ -2,7 +2,7 @@
 //!
 //! Bin, count, scan, fill, and select are phases of one standing team in
 //! `src/knn_region.c`.
-//! Each slot keeps a private histogram, a private cursor row, and a private
+//! Each slot keeps a private histogram, a private next-slot row, and a private
 //! candidate list. Slots meet only at the barriers between phases.
 
 use std::cell::RefCell;
@@ -237,12 +237,12 @@ extern "C" fn phase_scan(raw: *mut c_void, slot: i32, nt: i32, begin: i64, end: 
         let mut acc = unsafe { *ctx.chunk_base.add(slot as usize) };
         for (bin, &count) in counts.iter().enumerate().skip(begin).take(end - begin) {
             unsafe { *ctx.offsets.add(bin) = acc };
-            let mut cursor = acc;
+            let mut next_slot = acc;
             for other in 0..nt as usize {
-                // Safety: this slot owns every thread's cursor at `bin`,
+                // Safety: this slot owns every thread's next slot at `bin`,
                 // and other slots own other bins.
-                unsafe { *ctx.base.add(other * ncell + bin) = cursor };
-                cursor += unsafe { *ctx.hist.add(other * ncell + bin) };
+                unsafe { *ctx.base.add(other * ncell + bin) = next_slot };
+                next_slot += unsafe { *ctx.hist.add(other * ncell + bin) };
             }
             acc += count;
         }
@@ -258,18 +258,18 @@ extern "C" fn phase_fill(raw: *mut c_void, slot: i32, nt: i32, begin: i64, end: 
     timed(ctx, slot, || {
         let ncell = ctx.ncell;
         // Safety: key, frac, and folded are read-only after the scan barrier.
-        // This slot's cursor row is private. Each cursor value was the
+        // This slot's next-slot row is private. Each next slot was the
         // exclusive start of this slot's points in that bin, so the
         // destinations do not alias another slot.
         let key = unsafe { std::slice::from_raw_parts(ctx.key, ctx.n) };
         let frac = unsafe { std::slice::from_raw_parts(ctx.frac, ctx.n) };
         let folded = unsafe { std::slice::from_raw_parts(ctx.folded, ctx.n) };
-        let cursors =
+        let next_slots =
             unsafe { std::slice::from_raw_parts_mut(ctx.base.add(slot as usize * ncell), ncell) };
         for i in begin..end {
             let bin = key[i] as usize;
-            let dest = cursors[bin];
-            cursors[bin] = dest + 1;
+            let dest = next_slots[bin];
+            next_slots[bin] = dest + 1;
             unsafe {
                 ctx.occupants.add(dest).write(i);
                 ctx.slot_frac.add(dest).write(frac[i]);
@@ -344,7 +344,7 @@ fn assemble(parts: Recycled, nbin: [i32; 3], widths: [f64; 3]) -> Mesh {
         offsets: parts.offsets,
         occupants: parts.occupants,
         counts: parts.counts,
-        cursor: parts.cursor,
+        next_slot: parts.next_slot,
         hist: parts.hist,
     }
 }

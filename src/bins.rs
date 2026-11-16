@@ -33,7 +33,7 @@ pub(crate) struct Recycled {
     pub(crate) offsets: Vec<usize>,
     pub(crate) occupants: Vec<usize>,
     pub(crate) counts: Vec<usize>,
-    pub(crate) cursor: Vec<usize>,
+    pub(crate) next_slot: Vec<usize>,
     pub(crate) hist: Vec<std::sync::atomic::AtomicUsize>,
 }
 
@@ -77,7 +77,7 @@ pub(crate) struct Mesh {
     pub(crate) offsets: Vec<usize>,
     pub(crate) occupants: Vec<usize>,
     pub(crate) counts: Vec<usize>,
-    pub(crate) cursor: Vec<usize>,
+    pub(crate) next_slot: Vec<usize>,
     pub(crate) hist: Vec<std::sync::atomic::AtomicUsize>,
 }
 
@@ -92,7 +92,7 @@ impl Drop for Mesh {
             offsets: std::mem::take(&mut self.offsets),
             occupants: std::mem::take(&mut self.occupants),
             counts: std::mem::take(&mut self.counts),
-            cursor: std::mem::take(&mut self.cursor),
+            next_slot: std::mem::take(&mut self.next_slot),
             hist: std::mem::take(&mut self.hist),
         });
     }
@@ -150,7 +150,7 @@ impl Mesh {
         if parallel {
             #[cfg(feature = "parallel")]
             {
-                // Counts, offsets, and cursors in parallel over the bins:
+                // Counts, offsets, and next slots in parallel over the bins:
                 // there can be more bins than points.
                 if buf.hist.len() != ncell {
                     buf.hist.clear();
@@ -211,14 +211,14 @@ impl Mesh {
             for c in 0..ncell {
                 buf.offsets[c + 1] = buf.offsets[c] + buf.counts[c];
             }
-            buf.cursor.clear();
-            buf.cursor.extend_from_slice(&buf.offsets[..ncell]);
+            buf.next_slot.clear();
+            buf.next_slot.extend_from_slice(&buf.offsets[..ncell]);
             for slot in 0..n_active {
                 let i = ids.get(slot);
                 let c = buf.key[i] as usize;
-                let dest = buf.cursor[c];
+                let dest = buf.next_slot[c];
                 buf.occupants[dest] = i;
-                buf.cursor[c] = dest + 1;
+                buf.next_slot[c] = dest + 1;
             }
         }
 
@@ -257,7 +257,7 @@ impl Mesh {
             offsets: buf.offsets,
             occupants: buf.occupants,
             counts: buf.counts,
-            cursor: buf.cursor,
+            next_slot: buf.next_slot,
             hist: buf.hist,
         })
     }
@@ -527,22 +527,22 @@ fn bin_parallel(
     }
 }
 
-/// Scatter the points into their bins with `cursor` (the counts) as
-/// atomic cursors, then sort each bin of several points, so the order is
+/// Scatter the points into their bins with `next_slot` (the counts) as
+/// atomic counters, then sort each bin of several points, so the order is
 /// the serial scatter's, which walks the points in order.
 #[cfg(feature = "parallel")]
 fn scatter_parallel(
     ids: Active<'_>,
     key: &[u32],
     offsets: &[usize],
-    cursor: &[std::sync::atomic::AtomicUsize],
+    next_slot: &[std::sync::atomic::AtomicUsize],
     occupants: &mut [usize],
 ) {
     use rayon::prelude::*;
     use std::sync::atomic::Ordering;
 
     let ncell = offsets.len() - 1;
-    cursor
+    next_slot
         .par_chunks(1 << 14)
         .zip(offsets[..ncell].par_chunks(1 << 14))
         .for_each(|(c, o)| {
@@ -556,7 +556,7 @@ fn scatter_parallel(
         .into_par_iter()
         .for_each_init(crate::pop::JobTimer::new, |_timer, slot| {
             let i = ids.get(slot);
-            let dest = cursor[key[i] as usize].fetch_add(1, Ordering::Relaxed);
+            let dest = next_slot[key[i] as usize].fetch_add(1, Ordering::Relaxed);
             // SAFETY: each `fetch_add` returns a distinct slot, and the
             // cell ranges partition `occupants`.
             unsafe {
