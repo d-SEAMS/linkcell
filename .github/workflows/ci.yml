@@ -81,7 +81,7 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
-          pip install maturin pytest numpy
+          pip install maturin pytest numpy vesin minimage
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: maturin develop
         run: |
