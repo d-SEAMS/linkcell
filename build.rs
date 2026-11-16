@@ -100,19 +100,31 @@ fn compile_knn_region() -> bool {
     }
 }
 
+/// The directory holding `lib<runtime>.so`: the compiler's own search
+/// path first, then `LIBRARY_PATH`. Both drivers link `-l<runtime>` from
+/// `LIBRARY_PATH`, but Clang's `-print-file-name` does not look there, so
+/// a libomp reached only through it (a sanitizer build of the runtime, a
+/// conda prefix) is otherwise reported missing.
 fn runtime_dir(cc: &std::path::Path, runtime: &str) -> Option<std::path::PathBuf> {
-    let out = std::process::Command::new(cc)
-        .arg(format!("-print-file-name=lib{runtime}.so"))
+    let file = format!("lib{runtime}.so");
+    println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
+    let reported = std::process::Command::new(cc)
+        .arg(format!("-print-file-name={file}"))
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| std::path::PathBuf::from(text.trim()));
+    if let Some(dir) = reported
+        .filter(|path| path.is_file())
+        .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
+    {
+        return Some(dir);
     }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let path = std::path::PathBuf::from(text.trim());
-    path.parent()
-        .filter(|_| path.is_file())
-        .map(|dir| dir.to_path_buf())
+    let dirs = std::env::var_os("LIBRARY_PATH")?;
+    std::env::split_paths(&dirs)
+        .filter(|dir| dir.is_absolute())
+        .find(|dir| dir.join(&file).is_file())
 }
 
 #[cfg(feature = "scotch")]
