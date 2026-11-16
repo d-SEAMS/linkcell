@@ -1,6 +1,7 @@
-//! One OpenMP region for an unmasked k-nearest query.
+//! One thread team for an unmasked k-nearest query.
 //!
-//! Bin, count, scan, fill, and select are phases of a single `omp parallel`.
+//! Bin, count, scan, fill, and select are phases of one standing team in
+//! `src/knn_region.c`.
 //! Each slot keeps a private histogram, a private cursor row, and a private
 //! candidate list. Slots meet only at the barriers between phases.
 
@@ -136,7 +137,8 @@ struct OmpCtx {
     d2: *mut f64,
 }
 
-/// OpenMP static share. The same division is in `src/knn_region.c`.
+/// Static share, as `schedule(static)` divides. The same division is in
+/// `src/knn_region.c`.
 fn share(n: usize, slot: i32, nt: i32) -> (usize, usize) {
     let n = n as i64;
     let begin = (n * i64::from(slot)) / i64::from(nt);
@@ -162,8 +164,8 @@ extern "C" fn phase_bin(raw: *mut c_void, slot: i32, nt: i32, begin: i64, end: i
     timed(ctx, slot, || {
         let ncell = ctx.ncell;
         // Safety: slot `slot` owns histogram row `slot`, and `begin..end`
-        // is that slot's disjoint slice of the point arrays. The OpenMP
-        // static schedule gives this iteration to one thread.
+        // is that slot's disjoint slice of the point arrays. One team
+        // thread runs each slot.
         let hist =
             unsafe { std::slice::from_raw_parts_mut(ctx.hist.add(slot as usize * ncell), ncell) };
         hist.fill(0);
@@ -207,7 +209,7 @@ extern "C" fn phase_count(raw: *mut c_void, slot: i32, nt: i32, begin: i64, end:
 extern "C" fn phase_scan_base(raw: *mut c_void, slot: i32, nt: i32, _begin: i64, _end: i64) {
     let ctx = unsafe { &*raw.cast::<OmpCtx>() };
     timed(ctx, slot, || {
-        // Safety: `omp single` runs this on one thread. `counts` is complete.
+        // Safety: slot 0 alone runs this. `counts` is complete.
         let counts = unsafe { std::slice::from_raw_parts(ctx.counts, ctx.ncell) };
         let chunk = unsafe { std::slice::from_raw_parts_mut(ctx.chunk_base, nt as usize) };
         let mut acc = 0usize;

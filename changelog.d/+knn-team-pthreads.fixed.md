@@ -1,0 +1,3 @@
+The k-nearest team is now linkcell's own pthreads rather than an OpenMP parallel region, so `shutdown_knearest_team`, `lc_knn_shutdown` and the unload destructor join every worker under any OpenMP runtime, including LLVM libomp and a `libgomp.so.1` that resolves to it, and no thread is left behind. Each worker is named `linkcell-knn` for as long as it lives.
+OpenMP is only read: the team still has `omp_get_max_threads()` workers and binds them to `OMP_PLACES` under `OMP_PROC_BIND` as libgomp placed the region's threads, and neighbour rows are unchanged.
+Settings that act on OpenMP threads, such as `OMP_STACKSIZE`, `OMP_DYNAMIC` and `OMP_THREAD_LIMIT`, no longer reach these workers.
