@@ -36,9 +36,9 @@ fn compile_knn_region() -> bool {
     let required = target_is("CARGO_CFG_TARGET_ENV", "gnu");
     let mut build = cc::Build::new();
     // Clang as `cc` passes `--target=<rust-triple>` and then does not see
-    // gcc's `omp.h`, and its OpenMP runtime is not the libgomp linked
-    // below. A native build with no compiler chosen keeps gcc. A chosen
-    // compiler or a cross build is left to the `cc` crate.
+    // gcc's `omp.h`. A native build with no compiler chosen keeps gcc. A
+    // chosen compiler or a cross build is left to the `cc` crate, and the
+    // runtime below follows it.
     let target = std::env::var("TARGET").unwrap_or_default();
     let chosen = [
         "CC".to_string(),
@@ -76,31 +76,47 @@ fn compile_knn_region() -> bool {
         }
         return false;
     }
+    // Clang compiles against libomp's `omp.h`, so it links libomp.
     let compiler = build.get_compiler();
-    match gomp_dir(compiler.path()) {
+    let runtime = if compiler.is_like_clang() {
+        "omp"
+    } else {
+        "gomp"
+    };
+    match runtime_dir(compiler.path(), runtime) {
         Some(dir) => {
             println!("cargo:rustc-link-search=native={}", dir.display());
-            println!("cargo:rustc-link-lib=gomp");
+            println!("cargo:rustc-link-lib={runtime}");
             true
         }
-        None if required => panic!("OpenMP k-nearest region: finding libgomp failed"),
+        None if required => panic!("OpenMP k-nearest region: finding lib{runtime} failed"),
         None => false,
     }
 }
 
-fn gomp_dir(cc: &std::path::Path) -> Option<std::path::PathBuf> {
-    let out = std::process::Command::new(cc)
-        .arg("-print-file-name=libgomp.so")
-        .output()
-        .ok()?;
+fn compiler_says(cc: &std::path::Path, arg: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new(cc).arg(arg).output().ok()?;
     if !out.status.success() {
         return None;
     }
     let text = String::from_utf8(out.stdout).ok()?;
-    let path = std::path::PathBuf::from(text.trim());
-    path.parent()
-        .filter(|_| path.is_file())
-        .map(|dir| dir.to_path_buf())
+    Some(std::path::PathBuf::from(text.trim()))
+}
+
+/// The directory holding `lib<runtime>.so`. Clang answers
+/// `-print-file-name` with the bare name when the library sits next to
+/// its resource directory (`<llvm>/lib/clang/<v>`) rather than on its
+/// search path.
+fn runtime_dir(cc: &std::path::Path, runtime: &str) -> Option<std::path::PathBuf> {
+    let file = format!("lib{runtime}.so");
+    let found = compiler_says(cc, &format!("-print-file-name={file}"))
+        .filter(|path| path.is_absolute() && path.is_file())
+        .or_else(|| {
+            let resource = compiler_says(cc, "-print-resource-dir")?;
+            let path = resource.parent()?.parent()?.join(&file);
+            path.is_file().then_some(path)
+        })?;
+    found.parent().map(|dir| dir.to_path_buf())
 }
 
 #[cfg(feature = "scotch")]
