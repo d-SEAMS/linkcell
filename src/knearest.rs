@@ -470,9 +470,12 @@ pub fn pin_knearest_to_least_loaded(enabled: bool) {
 /// Threads that ran the last k-nearest query.
 ///
 /// Zero before the first query. This is the k-nearest team when it ran,
-/// and the rayon pool size otherwise. The team is resized to
-/// `omp_get_max_threads()` on the next query when that value changes. A
-/// team of one is the calling thread, with no worker.
+/// and the rayon pool size otherwise. The team is sized as libgomp sizes
+/// a parallel region the caller opens: `omp_get_max_threads()`, trimmed
+/// by the load average under `OMP_DYNAMIC` and capped by
+/// `OMP_THREAD_LIMIT`. Its stacks follow `OMP_STACKSIZE`. It is resized
+/// on the next query when that size changes. A team of one is the calling
+/// thread, with no worker.
 pub fn knearest_team_threads() -> usize {
     TEAM.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2377,5 +2380,129 @@ mod fused_agree {
             "dlclose leaked the team: before {before} after {left}\n{}",
             task_names()
         );
+    }
+
+    /// Read-write mappings of exactly `bytes`, as a thread stack of that
+    /// size leaves beside its guard page.
+    fn mappings_of(bytes: u64) -> usize {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        maps.lines()
+            .filter(|line| {
+                let mut fields = line.split_whitespace();
+                let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+                    return false;
+                };
+                let Some((lo, hi)) = range.split_once('-') else {
+                    return false;
+                };
+                let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16))
+                else {
+                    return false;
+                };
+                perms.starts_with("rw") && hi - lo == bytes
+            })
+            .count()
+    }
+
+    /// Child processes: `OMP_THREAD_LIMIT` caps the team below what
+    /// `omp_set_num_threads` asks for, `OMP_STACKSIZE` sizes the worker
+    /// stacks, a team of one is the caller with no worker, and
+    /// `OMP_DYNAMIC` trims the team by the load average as libgomp does.
+    #[test]
+    fn team_honours_thread_limit_stacksize_and_dynamic() {
+        let Some(mode) = std::env::var_os("LC_LIMIT_PROBE") else {
+            let exe = std::env::current_exe().unwrap();
+            for (mode, var, value) in [
+                ("2", "OMP_THREAD_LIMIT", "2"),
+                ("1", "OMP_THREAD_LIMIT", "1"),
+                ("dyn", "OMP_DYNAMIC", "true"),
+            ] {
+                let out = std::process::Command::new(&exe)
+                    .arg("knearest::fused_agree::team_honours_thread_limit_stacksize_and_dynamic")
+                    .args(["--exact", "--test-threads", "1", "--nocapture"])
+                    .env_remove("OMP_THREAD_LIMIT")
+                    .env_remove("OMP_DYNAMIC")
+                    .env("OMP_STACKSIZE", " 12m ")
+                    .env(var, value)
+                    .env("LC_LIMIT_PROBE", mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "probe {mode} status {:?}\n{}{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        };
+        extern "C" {
+            fn omp_set_num_threads(n: i32);
+            fn omp_get_thread_limit() -> i32;
+            fn omp_get_num_procs() -> i32;
+            fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+        }
+        let dynamic = || {
+            let mut load = [0.0f64; 3];
+            let busy = if unsafe { getloadavg(load.as_mut_ptr(), 3) } == 3 {
+                (load[2] + 0.1) as i32
+            } else {
+                0
+            };
+            let procs = unsafe { omp_get_num_procs() }.min(4);
+            if busy >= procs {
+                1
+            } else {
+                (procs - busy) as usize
+            }
+        };
+        let stack = 12u64 << 20;
+        let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
+        let xyz = periodic(&cell, 64, 9);
+        // A team of one warms everything else up and leaves no worker
+        // stack in glibc's cache of joined threads.
+        unsafe { omp_set_num_threads(1) };
+        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_eq!(super::knearest_team_threads(), 1);
+        unsafe { omp_set_num_threads(4) };
+        let before = task_count();
+        let stacks = mappings_of(stack);
+        let expect = match mode.to_str() {
+            Some("2") => vec![2],
+            Some("1") => vec![1],
+            _ => vec![dynamic()],
+        };
+        assert!(
+            mode != "dyn" || expect[0] <= 4,
+            "dynamic size above nthreads-var"
+        );
+        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        let team = super::knearest_team_threads();
+        if mode == "dyn" {
+            assert!(
+                team == expect[0] || team == dynamic(),
+                "OMP_DYNAMIC team {team}, load-average size {expect:?}"
+            );
+        } else {
+            assert_eq!(unsafe { omp_get_thread_limit() }, expect[0] as i32);
+            assert_eq!(team, expect[0], "OMP_THREAD_LIMIT={}", expect[0]);
+        }
+        let workers = if team > 1 { team } else { 0 };
+        let mid = task_count();
+        assert_eq!(
+            mid,
+            before + workers,
+            "team {team}: before {before} mid {mid}\n{}",
+            task_names()
+        );
+        assert_eq!(
+            mappings_of(stack) - stacks,
+            workers,
+            "OMP_STACKSIZE=12m stacks for a team of {team}"
+        );
+        super::shutdown_knearest_team();
+        let after = wait_tasks(before);
+        assert_eq!(after, before, "shutdown left threads\n{}", task_names());
     }
 }

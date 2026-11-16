@@ -4,13 +4,17 @@
  * This file only schedules: static shares, in thread order, so slot t is
  * the same thread for every phase. The workers are pthreads that this
  * file creates and joins, so no OpenMP runtime holds a thread after
- * shutdown. OpenMP is only read: `omp_get_max_threads()` sizes the team,
- * and the bind kind and place list place it. Nothing here reads an
- * environment variable. A team of one is the caller itself. Affinity
- * changes only when the caller asks to pin or the runtime binds threads.
+ * shutdown. OpenMP is only read: the team is sized as libgomp sizes a
+ * parallel region the caller opens (`omp_get_max_threads()`, then
+ * `omp_get_dynamic()` and `omp_get_thread_limit()`), the bind kind and
+ * place list place it, and `OMP_STACKSIZE` sizes its stacks. A team of
+ * one is the caller itself. Affinity changes only when the caller asks to
+ * pin or the runtime binds threads.
  */
 #define _GNU_SOURCE
 
+#include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <linux/futex.h>
 #include <omp.h>
@@ -204,7 +208,8 @@ typedef struct {
 /* One standing team between queries. Workers sleep on `cv`. Phase edges
  * use LcBar. The team is joined from `lc_knn_shutdown`, including the
  * image destructor, so a dlclose does not leave threads in unmapped code.
- * Team size is the caller's `omp_get_max_threads()` for that query. */
+ * Team size comes from `team_size`, kept for as long as the caller's
+ * nthreads-var and dyn-var stay the same and the team is not joined. */
 #define LC_EMPTY 0
 #define LC_START 1
 #define LC_UP 2
@@ -222,6 +227,9 @@ static struct {
     int done;
     int busy;
     int quit;
+    int sized_want;
+    int sized_dyn;
+    int sized_nt;
     LcJob job;
     LcBar bar;
 } g_team = {
@@ -354,23 +362,101 @@ static int place_mask(int place, cpu_set_t *set) {
     return CPU_COUNT(set) > 0;
 }
 
+/* libgomp's reading of OMP_STACKSIZE: a decimal size with an optional
+ * B, K, M, or G suffix (K when absent), spaces allowed around both. The
+ * OpenMP API has no getter for stacksize-var, so the variable is read
+ * here, once. An invalid value leaves the default, as libgomp does after
+ * it has reported the value itself. */
+static int parse_stacksize(const char *name, size_t *out) {
+    const char *env = getenv(name);
+    char *end;
+    unsigned long value;
+    unsigned shift = 10;
+    if (env == NULL) {
+        return 0;
+    }
+    while (isspace((unsigned char)*env)) {
+        env++;
+    }
+    if (*env == '\0') {
+        return 0;
+    }
+    errno = 0;
+    value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env) {
+        return 0;
+    }
+    while (isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end != '\0') {
+        switch (tolower((unsigned char)*end)) {
+        case 'b':
+            shift = 0;
+            break;
+        case 'k':
+            break;
+        case 'm':
+            shift = 20;
+            break;
+        case 'g':
+            shift = 30;
+            break;
+        default:
+            return 0;
+        }
+        end++;
+        while (isspace((unsigned char)*end)) {
+            end++;
+        }
+        if (*end != '\0') {
+            return 0;
+        }
+    }
+    if (((value << shift) >> shift) != value) {
+        return 0;
+    }
+    *out = (size_t)(value << shift);
+    return 1;
+}
+
+static pthread_once_t g_stack_once = PTHREAD_ONCE_INIT;
+static size_t g_stacksize;
+
+static void read_stacksize(void) {
+    if (!parse_stacksize("OMP_STACKSIZE", &g_stacksize) &&
+        !parse_stacksize("GOMP_STACKSIZE", &g_stacksize)) {
+        g_stacksize = 0;
+    }
+}
+
 /* A bound slot starts on its place, as an OpenMP worker does. Without a
  * bind kind, or when the place cannot be applied, it inherits the
- * caller's mask. */
+ * caller's mask. A stack size the system refuses leaves the default. */
+static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
+    pthread_attr_t attr;
+    int made;
+    if (pthread_attr_init(&attr) != 0) {
+        return 0;
+    }
+    if (g_stacksize != 0) {
+        pthread_attr_setstacksize(&attr, g_stacksize);
+    }
+    made = (place == NULL || pthread_attr_setaffinity_np(&attr, sizeof *place, place) == 0) &&
+           pthread_create(th, &attr, team_worker, arg) == 0;
+    pthread_attr_destroy(&attr);
+    return made;
+}
+
 static int start_worker(int slot, int nt, int bind, int np) {
     pthread_t *th = &g_team.workers[slot];
     void *arg = (void *)(intptr_t)slot;
     cpu_set_t set;
-    pthread_attr_t attr;
-    if (np > 0 && place_mask(place_of(bind, slot, nt, np), &set) && pthread_attr_init(&attr) == 0) {
-        int made = pthread_attr_setaffinity_np(&attr, sizeof set, &set) == 0 &&
-                   pthread_create(th, &attr, team_worker, arg) == 0;
-        pthread_attr_destroy(&attr);
-        if (made) {
-            return 1;
-        }
+    pthread_once(&g_stack_once, read_stacksize);
+    if (np > 0 && place_mask(place_of(bind, slot, nt, np), &set) && create_worker(th, arg, &set)) {
+        return 1;
     }
-    return pthread_create(th, NULL, team_worker, arg) == 0;
+    return create_worker(th, arg, NULL) || pthread_create(th, NULL, team_worker, arg) == 0;
 }
 
 /* Called with `mu` held and the team empty. Returns with `mu` held. A
@@ -446,6 +532,7 @@ void lc_knn_shutdown_impl(void) {
     int started;
     int slot;
     pthread_mutex_lock(&g_team.mu);
+    g_team.sized_want = 0;
     if (g_team.state == LC_EMPTY) {
         pthread_mutex_unlock(&g_team.mu);
         return;
@@ -491,6 +578,45 @@ void lc_knn_shutdown_impl(void) {
 }
 
 __attribute__((destructor)) static void lc_knn_at_unload(void) { lc_knn_shutdown_impl(); }
+
+/* libgomp's size for a parallel region the caller opens with no
+ * num_threads clause. With dyn-var set the team is the processors
+ * available, at most nthreads-var, less the 15-minute load average
+ * rounded as libgomp rounds it, and at least one. thread-limit-var caps
+ * the result. Called with `mu` held. */
+static int team_size(int want, int dyn) {
+    int nt = want;
+    int limit;
+    if (g_team.sized_want == want && g_team.sized_dyn == dyn) {
+        return g_team.sized_nt;
+    }
+    if (dyn) {
+        int procs = omp_get_num_procs();
+        double load[3];
+        int busy = 0;
+        if (procs > want) {
+            procs = want;
+        }
+        if (getloadavg(load, 3) == 3) {
+            busy = (int)(load[2] + 0.1);
+        }
+        procs = busy >= procs ? 1 : procs - busy;
+        if (procs < nt) {
+            nt = procs;
+        }
+    }
+    limit = omp_get_thread_limit();
+    if (limit > 0 && limit < nt) {
+        nt = limit;
+    }
+    if (nt < 1) {
+        nt = 1;
+    }
+    g_team.sized_want = want;
+    g_team.sized_dyn = dyn;
+    g_team.sized_nt = nt;
+    return nt;
+}
 
 /* A team of one is the caller: no worker and no handoff. For the query
  * the caller takes the CPU or the place slot 0 would have had, then gets
@@ -539,7 +665,9 @@ static void run_on_caller(const LcJob *job) {
 void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int64_t n_blocks,
                        lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
                        lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team) {
-    int nt = omp_get_max_threads();
+    int want = omp_get_max_threads();
+    int dyn = omp_get_dynamic() != 0;
+    int nt;
     int up;
     LcJob job = {
         .ctx = ctx,
@@ -555,14 +683,18 @@ void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int
         .select = select,
         .team = team,
     };
-    if (nt < 1) {
-        nt = 1;
+    if (want < 1) {
+        want = 1;
     }
     pthread_mutex_lock(&g_team.mu);
+    nt = team_size(want, dyn);
     up = g_team.state == LC_UP && g_team.nt != nt;
     pthread_mutex_unlock(&g_team.mu);
     if (up) {
         lc_knn_shutdown_impl();
+        pthread_mutex_lock(&g_team.mu);
+        nt = team_size(want, dyn);
+        pthread_mutex_unlock(&g_team.mu);
     }
     if (nt <= 1) {
         run_on_caller(&job);

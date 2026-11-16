@@ -1,4 +1,4 @@
 The k-nearest team is now linkcell's own pthreads rather than an OpenMP parallel region, so `shutdown_knearest_team`, `lc_knn_shutdown` and the unload destructor join every worker under any OpenMP runtime, including LLVM libomp and a `libgomp.so.1` that resolves to it.
-OpenMP is only read: the team still has `omp_get_max_threads()` workers and binds them to `OMP_PLACES` under `OMP_PROC_BIND` as libgomp placed the region's threads, and neighbour rows are unchanged.
-Settings that act on OpenMP threads, such as `OMP_STACKSIZE`, `OMP_DYNAMIC` and `OMP_THREAD_LIMIT`, no longer reach these workers.
+OpenMP is only read: the team is sized as libgomp sizes a parallel region the caller opens, from `omp_get_max_threads()` trimmed by the load average under `OMP_DYNAMIC` and capped by `OMP_THREAD_LIMIT`; worker stacks follow `OMP_STACKSIZE` (or `GOMP_STACKSIZE`) as libgomp parses it; and workers bind to `OMP_PLACES` under `OMP_PROC_BIND` as libgomp placed the region's threads. Neighbour rows are unchanged.
 A team of one is the calling thread, so a single-threaded query hands nothing to a worker.
+Under libomp, in a clang build or with `libgomp.so.1` resolving to libomp, the bind kind and place list are libomp's own: with `OMP_PLACES` set and `OMP_PROC_BIND` unset libomp reports `spread` where libgomp reports `true`, and the workers are placed accordingly.
