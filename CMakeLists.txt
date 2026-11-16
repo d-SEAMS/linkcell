@@ -86,9 +86,13 @@ if(WIN32)
             "${LINKCELL_IMPLIB}")
 endif()
 
+# The cc crate compiles the OpenMP region with the C compiler CMake uses,
+# so its runtime matches LINKCELL_OMP_LIB below.
+set(LINKCELL_CARGO_CC "${CMAKE_COMMAND}" -E env "CC=${CMAKE_C_COMPILER}")
+
 add_custom_command(
   OUTPUT ${LINKCELL_CARGO_OUTPUTS}
-  COMMAND "${CARGO_EXECUTABLE}" rustc --lib ${LINKCELL_CARGO_ARGS}
+  COMMAND ${LINKCELL_CARGO_CC} "${CARGO_EXECUTABLE}" rustc --lib ${LINKCELL_CARGO_ARGS}
           --features capi
           --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
           --target-dir "${LINKCELL_CARGO_DIR}"
@@ -117,9 +121,16 @@ if(WIN32)
   set_target_properties(linkcell PROPERTIES IMPORTED_IMPLIB "${LINKCELL_IMPLIB}")
 endif()
 
+# Clang's -fopenmp calls libomp, GCC's calls libgomp.
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+  set(LINKCELL_OMP_LIB omp)
+else()
+  set(LINKCELL_OMP_LIB gomp)
+endif()
+
 set(_linkcell_sys Threads::Threads)
 if(UNIX AND NOT APPLE)
-  list(APPEND _linkcell_sys ${CMAKE_DL_LIBS} m gomp)
+  list(APPEND _linkcell_sys ${CMAKE_DL_LIBS} m ${LINKCELL_OMP_LIB})
 elseif(APPLE)
   list(APPEND _linkcell_sys m)
 elseif(WIN32)
@@ -188,7 +199,7 @@ endif()
 
 if(LINKCELL_INSTALL)
   if(UNIX AND NOT APPLE)
-    set(LINKCELL_PKG_LIBS_PRIVATE "-ldl -lpthread -lm -lgomp")
+    set(LINKCELL_PKG_LIBS_PRIVATE "-ldl -lpthread -lm -l${LINKCELL_OMP_LIB}")
     set(LINKCELL_GPU_PKG_LIBS "-ldl -lpthread")
   elseif(APPLE)
     set(LINKCELL_PKG_LIBS_PRIVATE "-lpthread -lm")

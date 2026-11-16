@@ -1,0 +1,1 @@
+A Clang build links libomp instead of libgomp. The Meson and CMake builds hand their C compiler to the cc crate, and `build.rs`, the link line and `linkcell.pc` name the OpenMP runtime of that compiler, so one process no longer loads both runtimes.

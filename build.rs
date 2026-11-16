@@ -76,21 +76,25 @@ fn compile_knn_region() -> bool {
         }
         return false;
     }
+    // Clang's -fopenmp emits __kmpc_* calls into libomp, GCC's emits GOMP_*
+    // calls into libgomp. Link the runtime of the compiler that built the
+    // region, so a Clang build does not load both.
     let compiler = build.get_compiler();
-    match gomp_dir(compiler.path()) {
+    let runtime = if compiler.is_like_clang() { "omp" } else { "gomp" };
+    match runtime_dir(compiler.path(), runtime) {
         Some(dir) => {
             println!("cargo:rustc-link-search=native={}", dir.display());
-            println!("cargo:rustc-link-lib=gomp");
+            println!("cargo:rustc-link-lib={runtime}");
             true
         }
-        None if required => panic!("OpenMP k-nearest region: finding libgomp failed"),
+        None if required => panic!("OpenMP k-nearest region: finding lib{runtime} failed"),
         None => false,
     }
 }
 
-fn gomp_dir(cc: &std::path::Path) -> Option<std::path::PathBuf> {
+fn runtime_dir(cc: &std::path::Path, runtime: &str) -> Option<std::path::PathBuf> {
     let out = std::process::Command::new(cc)
-        .arg("-print-file-name=libgomp.so")
+        .arg(format!("-print-file-name=lib{runtime}.so"))
         .output()
         .ok()?;
     if !out.status.success() {

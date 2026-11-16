@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static", required=True)
     parser.add_argument("--out-shared", type=Path, required=True)
     parser.add_argument("--out-static", type=Path, required=True)
+    parser.add_argument("--cc", help="C compiler for the cc crate, unless CC is set")
     parser.add_argument("--implib")
     parser.add_argument("--out-implib", type=Path)
     parser.add_argument("--depfile", type=Path)
@@ -65,6 +66,8 @@ def main() -> None:
         rustc.append(f"-Clink-arg=-Wl,-install_name,@rpath/{args.shared}")
     command.extend(["--", *rustc])
     env = os.environ.copy()
+    if args.cc and not env.get("CC"):
+        env["CC"] = args.cc
     if tsan:
         nightly_cargo = subprocess.check_output(
             ["rustup", "which", "--toolchain", "nightly", "cargo"], text=True

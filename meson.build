@@ -46,6 +46,9 @@ _cargo_command = [
   '--out-shared', '@OUTPUT0@',
   '--out-static', '@OUTPUT1@',
   '--depfile', '@DEPFILE@',
+  # The cc crate compiles the OpenMP region with this compiler, so its
+  # runtime matches the one the openmp dependency below links.
+  '--cc', ' '.join(cc.cmd_array()),
 ]
 if host_machine.system() == 'windows'
   _cargo_outputs += [cargo_implib]
@@ -80,7 +83,9 @@ if host_machine.system() == 'linux'
   rust_sys += [
     cc.find_library('dl', required: true),
     cc.find_library('m', required: true),
-    cc.find_library('gomp', required: true),
+    # libgomp under GCC, libomp under Clang: the runtime of the compiler
+    # that built the k-nearest region.
+    dependency('openmp', language: 'c', required: true),
   ]
 elif host_machine.system() == 'darwin'
   rust_sys += [cc.find_library('m', required: true)]
