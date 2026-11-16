@@ -536,11 +536,14 @@ pub unsafe extern "C" fn lc_pairs_within(
         _ => return fail(Error::Overflow),
     }
     // Safety: the caller gave `cap >= rows` slots in each buffer and
-    // three times that in `out_shift`.
+    // three times that in `out_shift`. The fill runs on the same pool as
+    // the search, as in `lc_pairs_within_rows`.
     let cols = ColumnOut(out_i, out_j, out_shift, out_d2);
-    crate::pairs::in_pool(found.rows(), move || {
-        let (i, j, s, d) = cols.get();
-        unsafe { found.write_columns(i, j, s, d) }
+    with_threads(move || {
+        crate::pairs::in_pool(found.rows(), move || {
+            let (i, j, s, d) = cols.get();
+            unsafe { found.write_columns(i, j, s, d) }
+        })
     });
     clear_error();
     0

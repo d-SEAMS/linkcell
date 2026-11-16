@@ -2353,12 +2353,133 @@ mod fused_agree {
             out.iter().all(|&j| j >= 0),
             "one-thread query left a slot empty"
         );
-        assert_eq!(
-            task_count(),
-            before,
-            "a one-thread search started threads\n{}",
-            task_names()
-        );
+        let same = |label: &str| {
+            assert_eq!(
+                task_count(),
+                before,
+                "a one-thread {label} started threads\n{}",
+                task_names()
+            );
+        };
+        same("k-nearest search");
+
+        let simbox: *const crate::capi::lc_cell = cell.as_ptr().cast();
+        let mut rows = 0usize;
+        let rc = unsafe {
+            crate::capi::lc_pairs_within(
+                xyz.as_ptr(),
+                n,
+                simbox,
+                1.5,
+                std::ptr::null(),
+                0.0,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut rows,
+            )
+        };
+        assert_eq!(rc, 0, "one-thread pair count");
+        assert!(rows > 0, "one-thread pair count found no pair");
+        same("pair count");
+        let mut pi = vec![0i32; rows];
+        let mut pj = vec![0i32; rows];
+        let mut shift = vec![0i32; rows * 3];
+        let mut d2 = vec![0.0f64; rows];
+        let rc = unsafe {
+            crate::capi::lc_pairs_within(
+                xyz.as_ptr(),
+                n,
+                simbox,
+                1.5,
+                std::ptr::null(),
+                0.0,
+                1,
+                pi.as_mut_ptr(),
+                pj.as_mut_ptr(),
+                shift.as_mut_ptr(),
+                d2.as_mut_ptr(),
+                rows,
+                &mut rows,
+            )
+        };
+        assert_eq!(rc, 0, "one-thread pair fill");
+        same("pair fill");
+
+        let mut found = vec![crate::capi::lc_pair::default(); rows];
+        let rc = unsafe {
+            crate::capi::lc_pairs_within_rows(
+                xyz.as_ptr(),
+                n,
+                simbox,
+                1.5,
+                std::ptr::null(),
+                0.0,
+                1,
+                found.as_mut_ptr(),
+                rows,
+                &mut rows,
+            )
+        };
+        assert_eq!(rc, 0, "one-thread pair rows");
+        same("pair row fill");
+
+        let pbc = [1, 1, 0];
+        let mut count = 0usize;
+        let rc = unsafe {
+            crate::capi::lc_pairs_within_pbc(
+                xyz.as_ptr(),
+                n,
+                simbox,
+                pbc.as_ptr(),
+                1.5,
+                std::ptr::null(),
+                0.0,
+                1,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        assert_eq!(rc, 0, "one-thread mixed pair count");
+        same("mixed-boundary pair count");
+        let rc = unsafe {
+            crate::capi::lc_pairs_open(
+                xyz.as_ptr(),
+                n,
+                1.5,
+                0.0,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        assert_eq!(rc, 0, "one-thread open pair count");
+        same("open pair count");
+
+        let mut ncell = 0usize;
+        let rc = unsafe {
+            crate::capi::lc_cell_grid(
+                xyz.as_ptr(),
+                n,
+                simbox,
+                1.5,
+                std::ptr::null(),
+                0.0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut ncell,
+            )
+        };
+        assert_eq!(rc, 0, "one-thread cell grid");
+        same("cell grid");
     }
 
     fn unload_cdylib(so: &std::path::Path, before: usize) {
