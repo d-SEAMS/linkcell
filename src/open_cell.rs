@@ -232,10 +232,25 @@ struct Stencil {
     key: Key,
     off: Vec<u32>,
     links: Vec<Link>,
-    /// Partner offsets of a fully open frame, ascending in flat order.
-    /// Empty when `links` holds the stencil.
-    offsets: Vec<[i32; 3]>,
+    /// The partner rows of a fully open frame. `None` when `links` holds
+    /// the stencil.
+    open: Option<OpenRows>,
 }
+
+/// Partner bins of a fully open frame, one row of `dx` per `(dy, dz)`.
+///
+/// `width[(dz + ext[1]) * (2 * ext[0] + 1) + dy + ext[0]]` is the largest
+/// `|dx|` within reach on that row, or -1 when no bin of the row is. Rows
+/// past `ext` are not stored. A frame that spans more bins on y or z
+/// needs a wider table, unless `ext` already covers `reach` on that axis.
+struct OpenRows {
+    reach: i32,
+    ext: [i32; 2],
+    width: Vec<i32>,
+}
+
+/// Rows stored on y and z before a frame asks for more.
+const OPEN_EXTENT: i32 = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Key {
@@ -583,7 +598,7 @@ fn build_stencil(
         key,
         off,
         links,
-        offsets: Vec::new(),
+        open: None,
     })
 }
 
@@ -598,27 +613,58 @@ fn stencil_reach(cutoff: f64, edge: f64) -> Result<i32, Error> {
 }
 
 /// Bin offsets a fully open frame can pair across. The gap between two
-/// bins depends on their offset and not on where they sit, and the
-/// (z, y, x) order visits partners in the flat order the bin scan did.
-fn build_open_stencil(edge: f64, cutoff: f64, key: Key) -> Result<Stencil, Error> {
+/// bins depends on their offset and not on where they sit, so one table
+/// serves every frame with this bin edge and cutoff that spans at most
+/// `need[0] + 1` bins on y and `need[1] + 1` on z.
+fn build_open_stencil(edge: f64, cutoff: f64, key: Key, need: [i32; 2]) -> Result<Stencil, Error> {
     let reach = stencil_reach(cutoff, edge)?;
-    let mut offsets = Vec::new();
-    for dz in -reach..=reach {
-        for dy in -reach..=reach {
-            for dx in -reach..=reach {
-                let offset = [dx, dy, dz];
-                if !cells_too_far([0; 3], offset, [0; 3], edge, [0.0; 3], cutoff) {
-                    offsets.push(offset);
-                }
-            }
+    let ext = [
+        need[0].max(OPEN_EXTENT).min(reach),
+        need[1].max(OPEN_EXTENT).min(reach),
+    ];
+    let mut width = Vec::with_capacity((2 * ext[0] + 1) as usize * (2 * ext[1] + 1) as usize);
+    for dz in -ext[1]..=ext[1] {
+        for dy in -ext[0]..=ext[0] {
+            width.push(row_width(dy, dz, reach, edge, cutoff));
         }
     }
     Ok(Stencil {
         key,
         off: Vec::new(),
         links: Vec::new(),
-        offsets,
+        open: Some(OpenRows { reach, ext, width }),
     })
+}
+
+/// Largest `|dx|` up to `reach` whose bin is within reach of the origin
+/// bin on row `(dy, dz)`, or -1. The true gap grows with `|dx|`, so once
+/// the certified gap passes the cutoff no farther bin on the row holds a
+/// pair.
+fn row_width(dy: i32, dz: i32, reach: i32, edge: f64, cutoff: f64) -> i32 {
+    let near = |dx: i32| !cells_too_far([0; 3], [dx, dy, dz], [0; 3], edge, [0.0; 3], cutoff);
+    if !near(0) {
+        return -1;
+    }
+    let (mut lo, mut hi) = (0, reach);
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if near(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+impl Stencil {
+    fn covers(&self, frame: &Frame) -> bool {
+        let Some(open) = &self.open else {
+            return true;
+        };
+        (0..2)
+            .all(|axis| frame.dims[axis + 1] - 1 <= open.ext[axis] || open.ext[axis] == open.reach)
+    }
 }
 
 fn stencil_for(frame: &Frame, cell: &Cell, query: &PbcQuery<'_>) -> Result<Arc<Stencil>, Error> {
@@ -641,16 +687,23 @@ fn stencil_for(frame: &Frame, cell: &Cell, query: &PbcQuery<'_>) -> Result<Arc<S
         repeats,
         box_bits: box_bits(cell, query.periodic),
     };
+    let mut need = [frame.dims[1] - 1, frame.dims[2] - 1];
     {
         let guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
         if let Some(stencil) = guard.as_ref() {
             if stencil.key == key {
-                return Ok(Arc::clone(stencil));
+                if stencil.covers(frame) {
+                    return Ok(Arc::clone(stencil));
+                }
+                if let Some(open) = &stencil.open {
+                    need[0] = need[0].max(open.ext[0].saturating_mul(2));
+                    need[1] = need[1].max(open.ext[1].saturating_mul(2));
+                }
             }
         }
     }
     let built = Arc::new(if open {
-        build_open_stencil(frame.edge, query.cutoff, key)?
+        build_open_stencil(frame.edge, query.cutoff, key, need)?
     } else {
         build_stencil(frame, cell, query, key)?
     });
@@ -700,40 +753,131 @@ fn walk(
 ) -> Result<Vec<Pair>, Error> {
     let cut2 = query.cutoff * query.cutoff;
     let mut rows = Vec::new();
+    if let Some(open) = &stencil.open {
+        walk_open(frame, open, query, cut2, &mut rows);
+        return Ok(rows);
+    }
     let ncell = frame.off.len() - 1;
-    let open = stencil.off.is_empty();
     for src in 0..ncell {
         let src_atoms = &frame.occ[frame.off[src] as usize..frame.off[src + 1] as usize];
         if src_atoms.is_empty() {
             continue;
         }
-        if open {
-            let at = local_of(src, frame.dims);
-            for offset in &stencil.offsets {
-                let local = [at[0] + offset[0], at[1] + offset[1], at[2] + offset[2]];
-                if let Some(dst) = flat_of(local, frame.dims) {
-                    pair_bins(frame, cell, query, cut2, src_atoms, dst, [0; 3], &mut rows)?;
-                }
-            }
-        } else {
-            for link in &stencil.links[stencil.off[src] as usize..stencil.off[src + 1] as usize] {
-                pair_bins(
-                    frame,
-                    cell,
-                    query,
-                    cut2,
-                    src_atoms,
-                    link.dst as usize,
-                    link.shift,
-                    &mut rows,
-                )?;
-            }
+        for link in &stencil.links[stencil.off[src] as usize..stencil.off[src + 1] as usize] {
+            pair_bins(
+                frame,
+                cell,
+                query,
+                cut2,
+                src_atoms,
+                link.dst as usize,
+                link.shift,
+                &mut rows,
+            )?;
         }
     }
     Ok(rows)
 }
 
+/// Each source bin visits its partner rows clipped to the frame, in
+/// ascending flat order, which is the order of a per-bin link list.
+fn walk_open(
+    frame: &Frame,
+    open: &OpenRows,
+    query: &PbcQuery<'_>,
+    cut2: f64,
+    rows: &mut Vec<Pair>,
+) {
+    let dims = frame.dims;
+    let [ey, ez] = open.ext;
+    let stride = (2 * ey + 1) as usize;
+    let mut src = 0usize;
+    for z in 0..dims[2] {
+        let dz_lo = (-z).max(-ez);
+        let dz_hi = (dims[2] - 1 - z).min(ez);
+        for y in 0..dims[1] {
+            let dy_lo = (-y).max(-ey);
+            let dy_hi = (dims[1] - 1 - y).min(ey);
+            for x in 0..dims[0] {
+                let src_atoms = &frame.occ[frame.off[src] as usize..frame.off[src + 1] as usize];
+                src += 1;
+                if src_atoms.is_empty() {
+                    continue;
+                }
+                for dz in dz_lo..=dz_hi {
+                    let plane = (dz + ez) as usize * stride;
+                    let row_z = (z + dz) as usize * dims[1] as usize;
+                    for dy in dy_lo..=dy_hi {
+                        let width = open.width[plane + (dy + ey) as usize];
+                        if width < 0 {
+                            continue;
+                        }
+                        let row = (row_z + (y + dy) as usize) * dims[0] as usize;
+                        let first = row + (x - width.min(x)) as usize;
+                        let last = row + (x + width.min(dims[0] - 1 - x)) as usize;
+                        for dst in first..=last {
+                            let dst_atoms =
+                                &frame.occ[frame.off[dst] as usize..frame.off[dst + 1] as usize];
+                            pair_open_bins(frame, query, cut2, src_atoms, dst_atoms, rows);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`pair_bins`] with no shift and no images. A bin lists its atoms in
+/// ascending index, so the partners `j > i` are a suffix of `dst_atoms`.
+#[inline(always)]
+fn pair_open_bins(
+    frame: &Frame,
+    query: &PbcQuery<'_>,
+    cut2: f64,
+    src_atoms: &[u32],
+    dst_atoms: &[u32],
+    rows: &mut Vec<Pair>,
+) {
+    for &ia in src_atoms {
+        let i = ia as usize;
+        let start = match (dst_atoms.first(), dst_atoms.last()) {
+            (Some(&first), _) if first > ia => 0,
+            (_, Some(&last)) if last > ia => dst_atoms.partition_point(|&ja| ja <= ia),
+            _ => continue,
+        };
+        let pi = frame.pos[i];
+        for &ja in &dst_atoms[start..] {
+            let j = ja as usize;
+            let pj = frame.pos[j];
+            // The zero shift [`pair_bins`] adds can only flip the sign of
+            // a zero difference, which squares to the same `dist2` bits.
+            let dx = pj[0] - pi[0];
+            let dy = pj[1] - pi[1];
+            let dz = pj[2] - pi[2];
+            let dist2 = dx * dx + dy * dy + dz * dz;
+            if !accept(dist2, cut2, query.closed) {
+                continue;
+            }
+            rows.push(Pair {
+                i,
+                j,
+                shift: [0; 3],
+                dist2,
+            });
+            if !query.half {
+                rows.push(Pair {
+                    i: j,
+                    j: i,
+                    shift: [0; 3],
+                    dist2,
+                });
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn pair_bins(
     frame: &Frame,
     cell: &Cell,
