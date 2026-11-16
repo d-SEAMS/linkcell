@@ -1,1 +1,0 @@
-The `lc_set_threads` documentation in `linkcell.h` says that a width of one runs the whole search on the calling thread and starts no thread, and that zero leaves the width unset. A build with `parallel` and without `capi` compiles its tests again.

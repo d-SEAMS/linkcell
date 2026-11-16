@@ -1,1 +1,0 @@
-The column fill of `lc_pairs_within` runs on the width chosen with `lc_set_threads`, like its search and the row fill of `lc_pairs_within_rows`. At width one it no longer builds Rayon's global pool at the CPU count.

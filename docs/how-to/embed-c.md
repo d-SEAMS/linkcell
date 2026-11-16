@@ -19,7 +19,7 @@ On failure, read `lc_last_error()` on the same thread and keep the pointer.
 ```
 [wrap-git]
 url = https://github.com/d-SEAMS/linkcell.git
-revision = v0.4.1
+revision = v0.4.2
 depth = 1
 
 [provide]

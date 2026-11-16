@@ -1,1 +1,0 @@
-`build.rs` finds the OpenMP runtime in `LIBRARY_PATH` when the compiler does not report it. Clang's `-print-file-name` does not search `LIBRARY_PATH`, so a Clang build against a libomp reached only through it, such as an Archer runtime for ThreadSanitizer, stopped on "finding libomp failed" although the region compiled and `-lomp` would link.

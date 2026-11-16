@@ -11,6 +11,20 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 <!-- towncrier release notes start -->
 #skip_lint_end
 
+## [0.4.2] - 2026-11-16
+
+### Changed
+
+- The threads of the k-nearest OpenMP team are named `linkcell-knn` while they run linkcell's region, and take their own names back when it ends, so `top -H` and `/proc/<pid>/task/*/comm` tell them apart from threads the OpenMP runtime keeps.
+
+### Fixed
+
+- After `lc_set_threads(1)`, `lc_cell_grid`, `lc_cell_graph` and `lc_partition` bin the points on the calling thread, and a build without `parallel` bins them on one thread. Binning a frame of 8192 points or more started a thread per CPU for the length of the call, and a smaller frame started one thread.
+- Meson links the OpenMP runtime by name, `omp` under Clang and `gomp` otherwise, as `build.rs` and CMake do, so its `linkcell.pc` says `-lomp` or `-lgomp` instead of `-fopenmp` and a wrap consumer's own sources are no longer compiled with `-fopenmp`. Configure stops when the C compiler has no `omp.h`.
+- The `lc_set_threads` documentation in `linkcell.h` says that a width of one runs the whole search on the calling thread and starts no thread, and that zero leaves the width unset. A build with `parallel` and without `capi` compiles its tests again.
+- The column fill of `lc_pairs_within` runs on the width chosen with `lc_set_threads`, like its search and the row fill of `lc_pairs_within_rows`. At width one it no longer builds Rayon's global pool at the CPU count.
+- `build.rs` finds the OpenMP runtime in `LIBRARY_PATH` when the compiler does not report it. Clang's `-print-file-name` does not search `LIBRARY_PATH`, so a Clang build against a libomp reached only through it, such as an Archer runtime for ThreadSanitizer, stopped on "finding libomp failed" although the region compiled and `-lomp` would link.
+
 ## [0.4.1] - 2026-11-16
 
 ### Fixed

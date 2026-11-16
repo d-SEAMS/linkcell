@@ -1,1 +1,0 @@
-The threads of the k-nearest OpenMP team are named `linkcell-knn` while they run linkcell's region, and take their own names back when it ends, so `top -H` and `/proc/<pid>/task/*/comm` tell them apart from threads the OpenMP runtime keeps.

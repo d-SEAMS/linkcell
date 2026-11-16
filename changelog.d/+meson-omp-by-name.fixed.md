@@ -1,1 +1,0 @@
-Meson links the OpenMP runtime by name, `omp` under Clang and `gomp` otherwise, as `build.rs` and CMake do, so its `linkcell.pc` says `-lomp` or `-lgomp` instead of `-fopenmp` and a wrap consumer's own sources are no longer compiled with `-fopenmp`. Configure stops when the C compiler has no `omp.h`.

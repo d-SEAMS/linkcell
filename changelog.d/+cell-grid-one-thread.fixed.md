@@ -1,1 +1,0 @@
-After `lc_set_threads(1)`, `lc_cell_grid`, `lc_cell_graph` and `lc_partition` bin the points on the calling thread, and a build without `parallel` bins them on one thread. Binning a frame of 8192 points or more started a thread per CPU for the length of the call, and a smaller frame started one thread.
