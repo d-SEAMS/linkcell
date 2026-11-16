@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-static", type=Path, required=True)
     parser.add_argument("--implib")
     parser.add_argument("--out-implib", type=Path)
+    parser.add_argument("--depfile", type=Path)
     args = parser.parse_args()
     if (args.implib is None) != (args.out_implib is None):
         parser.error("--implib and --out-implib must be supplied together")
@@ -87,6 +89,26 @@ def main() -> None:
     shutil.copy2(built / args.static, args.out_static)
     if args.implib is not None:
         shutil.copy2(built / args.implib, args.out_implib)
+    if args.depfile is not None:
+        write_depfile(built / (Path(args.static).stem + ".d"), args.out_shared, args.depfile)
+
+
+def write_depfile(cargo_dep: Path, target: Path, depfile: Path) -> None:
+    """Restate Cargo's dep-info for the first Meson output.
+
+    Cargo names its own artifacts as the rule targets. Ninja wants the
+    custom target's output, so only the prerequisites are kept. Cargo has
+    already escaped spaces in them.
+    """
+    deps: list[str] = []
+    for line in cargo_dep.read_text(encoding="utf-8").splitlines():
+        _, sep, rest = line.partition(": ")
+        if sep and rest.strip():
+            for dep in re.split(r"(?<!\\) +", rest.strip()):
+                if dep not in deps:
+                    deps.append(dep)
+    escaped = str(target).replace(" ", "\\ ")
+    depfile.write_text(f"{escaped}: {' '.join(deps)}\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
