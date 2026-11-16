@@ -61,7 +61,7 @@
 //! # Features
 //!
 //! `parallel` is on by default. An unmasked k-nearest query of at least
-//! 8192 points runs in one OpenMP region when this build has it: bin,
+//! 8192 points runs on one linkcell thread team when this build has it: bin,
 //! count, scan, fill, and select, with a private histogram and scratch
 //! on each thread. Masked and smaller queries use rayon.
 //! `--no-default-features` drops rayon and serializes the walk (re-enable

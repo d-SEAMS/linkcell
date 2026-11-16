@@ -14,7 +14,7 @@ use crate::Error;
 
 /// Below this many active points the mesh stays serial. The cubic hot
 /// path is 4096 points, and a parallel histogram there costs more than
-/// the fold. The fused OpenMP query starts at the same count.
+/// the fold. The fused team query starts at the same count.
 #[cfg(feature = "parallel")]
 pub(crate) const PARALLEL_MESH: usize = 8_192;
 

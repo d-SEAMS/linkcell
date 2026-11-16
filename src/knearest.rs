@@ -14,8 +14,8 @@
 //! writes packed `n * k` indices (`-1` unused). [`knearest_into_d2`]
 //! also writes the matching squared distances (`NaN` unused). With the
 //! `parallel` feature (the default) an unmasked query of at least 8192
-//! points runs in one OpenMP region on Linux: bin, count, scan, fill, and
-//! select, each thread with its own histogram and scratch. Masked queries,
+//! points runs on one linkcell thread team on Linux: bin, count, scan, fill,
+//! and select, each thread with its own histogram and scratch. Masked queries,
 //! smaller queries, and builds without that region still walk under rayon.
 //! `--no-default-features` serializes the walk. The per-source `KHeap` stays
 //! on the stack for `k <= 16`.
@@ -453,23 +453,23 @@ struct Geom {
 /// Threads in the last k-nearest team. Zero before the first query.
 static TEAM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Opt-in placement of the OpenMP team. Off unless a caller asks.
+/// Opt-in placement of the k-nearest team. Off unless a caller asks.
 static PIN_LEAST_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Place the k-nearest OpenMP workers on the least-loaded CPUs.
+/// Place the k-nearest team workers on the least-loaded CPUs.
 ///
 /// Off by default. A query does not read CPU counters or change affinity
 /// until this is set, and it does not consult an environment variable.
 /// Turning it off restores each worker to the mask it had before the pin.
-/// Builds without the OpenMP query store the flag and leave placement alone.
+/// Builds without the team query store the flag and leave placement alone.
 pub fn pin_knearest_to_least_loaded(enabled: bool) {
     PIN_LEAST_LOADED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Threads that ran the last k-nearest query.
 ///
-/// Zero before the first query. This is the OpenMP team when that region
-/// ran, and the rayon pool size otherwise. The OpenMP team is resized to
+/// Zero before the first query. This is the k-nearest team when it ran,
+/// and the rayon pool size otherwise. The team is resized to
 /// `omp_get_max_threads()` on the next query when that value changes.
 pub fn knearest_team_threads() -> usize {
     TEAM.load(std::sync::atomic::Ordering::Relaxed)
