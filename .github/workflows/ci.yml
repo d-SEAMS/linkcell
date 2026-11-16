@@ -287,6 +287,75 @@ jobs:
       - name: Meson's liblinkcell.so needs the private libomp alone
         run: '"$RUNNER_TEMP/private-libomp.sh" build/liblinkcell.so'
 
+  # A gcc build whose libgomp.so.1 resolves to LLVM libomp at run time, as
+  # in a conda-forge environment with the llvm OpenMP mutex.
+  libomp-alias:
+    name: cargo (gcc build, libgomp.so.1 -> libomp)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install LLVM libomp
+        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+      - name: Alias libgomp.so.1 to libomp
+        run: |
+          libomp=$(ls /usr/lib/llvm-*/lib/libomp.so.5 | sort -V | tail -n 1)
+          mkdir -p "$RUNNER_TEMP/gomp-alias"
+          ln -s "$libomp" "$RUNNER_TEMP/gomp-alias/libgomp.so.1"
+          echo "GOMP_ALIAS=$RUNNER_TEMP/gomp-alias" >> "$GITHUB_ENV"
+      - name: The test binary loads libomp as libgomp.so.1
+        run: |
+          exe=$(cargo test --locked --lib --no-run --message-format=json | jq -r 'select(.executable != null) | .executable')
+          readelf -d "$exe" | grep -F 'libgomp.so.1'
+          LD_LIBRARY_PATH="$GOMP_ALIAS" ldd "$exe" | grep -F "libgomp.so.1 => $GOMP_ALIAS/libgomp.so.1"
+      - run: LD_LIBRARY_PATH="$GOMP_ALIAS" cargo test --locked
+
+  # The distribution's clang and libomp-dev: clang answers
+  # -print-file-name=libomp.so with the bare name, and build.rs finds the
+  # library beside clang's resource directory.
+  clang-distro-libomp:
+    name: cargo (distribution clang, libomp-dev)
+    # 24.04's clang names libomp.so by bare name; 26.04's libomp-dev puts
+    # it on clang's own search path.
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-clang-distro-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-clang-distro-cargo-
+      - name: Install clang and libomp-dev
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang libomp-dev
+          clang --version
+          if [ -f "$(clang -print-file-name=libomp.so)" ]; then
+            echo "::error::clang finds libomp on its own search path; the resource-directory lookup would not be exercised"
+            exit 1
+          fi
+      - name: The test binary links libomp alone
+        run: |
+          exe=$(env -u LIBRARY_PATH cargo test --locked --lib --no-run --message-format=json | jq -r 'select(.executable != null) | .executable')
+          needed=$(readelf -d "$exe" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+          echo "$needed"
+          grep -q '^libomp\.so' <<<"$needed"
+          if grep -E 'gomp|iomp' <<<"$needed"; then exit 1; fi
+      - run: env -u LIBRARY_PATH cargo test --locked
+
   meson:
     strategy:
       fail-fast: false
