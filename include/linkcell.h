@@ -430,8 +430,9 @@ int lc_owned_mask(const int *nxyz,
  * Every axis is open. Each row has `i < j`, shift `(0, 0, 0)`, and
  * `dist2` strictly below `cutoff` squared. Null `out` queries
  * `*out_count`. A short buffer sets `*out_count` and returns nonzero
- * without writing. The bins are the occupied Cartesian cells and are
- * reused until those bounding bins change.
+ * without writing. The bins are the occupied Cartesian cells. Their
+ * partner stencil depends on the cutoff and `cell_hint` alone, so it is
+ * reused by frames that occupy other bins.
  *
  * # Safety
  *
