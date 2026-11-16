@@ -16,6 +16,9 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v6
+      - name: The tag names the version
+        if: github.ref_type == 'tag'
+        run: python3 scripts/check-versions.py --tag "$GITHUB_REF_NAME"
       - uses: dtolnay/rust-toolchain@stable
       - uses: rust-lang/crates-io-auth-action@v1.0.5
         id: auth

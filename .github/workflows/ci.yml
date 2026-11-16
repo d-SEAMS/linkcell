@@ -26,6 +26,10 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
       - run: python3 scripts/check-llms-txt.py
+      - run: python3 scripts/check-versions.py
+      - name: The tag names the version
+        if: github.ref_type == 'tag'
+        run: python3 scripts/check-versions.py --tag "$GITHUB_REF_NAME"
 
   header-check:
     runs-on: ubuntu-latest
