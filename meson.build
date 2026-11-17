@@ -88,10 +88,34 @@ if host_machine.system() == 'linux'
   if not cc.has_header('omp.h', args: ['-fopenmp'])
     error('the k-nearest region needs omp.h from ' + cc.get_id() + ' -fopenmp')
   endif
+  # The linker searches its default path and LIBRARY_PATH. Ubuntu's clang
+  # answers -print-file-name=libomp.so with the bare name and keeps the
+  # library in <llvm>/lib, two levels above -print-resource-dir, which is
+  # not on that path. build.rs looks there; do the same, and pass -L/-l so
+  # linkcell.pc still names the runtime rather than an absolute path.
+  _omp_dep = cc.find_library(_omp_lib, required: false)
+  if not _omp_dep.found()
+    _res = run_command(cc.cmd_array()[0], '-print-resource-dir', check: false)
+    if _res.returncode() == 0
+      _fs = import('fs')
+      _beside = _fs.parent(_fs.parent(_res.stdout().strip()))
+      _link = ['-L' + _beside, '-l' + _omp_lib]
+      if _fs.is_file(_beside / ('lib' + _omp_lib + '.so')) and cc.links(
+        'int main(void) { return 0; }',
+        args: _link,
+        name: 'lib' + _omp_lib + ' beside the resource directory',
+      )
+        _omp_dep = declare_dependency(link_args: _link)
+      endif
+    endif
+  endif
+  if not _omp_dep.found()
+    error('finding lib' + _omp_lib + ' failed')
+  endif
   rust_sys += [
     cc.find_library('dl', required: true),
     cc.find_library('m', required: true),
-    cc.find_library(_omp_lib, required: true),
+    _omp_dep,
   ]
 elif host_machine.system() == 'darwin'
   rust_sys += [cc.find_library('m', required: true)]
