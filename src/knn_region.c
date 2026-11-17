@@ -428,52 +428,139 @@ static int parse_stacksize(const char *name, size_t *out) {
 
 static pthread_once_t g_stack_once = PTHREAD_ONCE_INIT;
 static size_t g_stacksize;
+/* `pthread_attr_setstacksize` returned EINVAL. Later queries do not try
+ * that size again. Read and written only with `mu` held. */
+static int g_stack_refused;
+/* `pthread_create` failed for an explicit size. The warning is once.
+ * The next query tries again. Read and written only with `mu` held. */
+static int g_stack_create_warned;
+/* Times `start_team` got as far as creating workers. */
+static unsigned g_stack_starts;
+
+/* `pthread_attr_setstacksize` rejects a size below `PTHREAD_STACK_MIN`.
+ * The wide fold frame does not fit in that minimum: on this toolchain
+ * `fold8_regs` asks for about 8 KiB after its callers have already used
+ * most of a 16 KiB stack, and the worker dies on the guard. 32 KiB
+ * completes the query. The floor is 64 KiB, or `PTHREAD_STACK_MIN` when
+ * that is larger. Any request below the floor is raised to it, so a size
+ * that pthread accepts but the frame does not fit is raised too. */
+static size_t stack_floor(void) {
+    size_t floor = (size_t)PTHREAD_STACK_MIN;
+    if (floor < (size_t)64 * 1024) {
+        floor = (size_t)64 * 1024;
+    }
+    return floor;
+}
+
+/* Runs once, from read_stacksize under g_stack_once. */
+static void note_stack_raised(void) {
+    static int noted;
+    if (noted) {
+        return;
+    }
+    noted = 1;
+    fprintf(stderr, "linkcell: OMP_STACKSIZE is below the worker stack floor; using %zu bytes\n",
+            g_stacksize);
+}
+
+static void note_stack_refused(void) {
+    if (g_stack_refused) {
+        return;
+    }
+    g_stack_refused = 1;
+    fprintf(stderr,
+            "linkcell: OMP_STACKSIZE was refused; k-nearest queries stay on the calling thread\n");
+}
+
+static void note_stack_create_failed(void) {
+    if (g_stack_create_warned) {
+        return;
+    }
+    g_stack_create_warned = 1;
+    fprintf(stderr, "linkcell: OMP_STACKSIZE could not start a worker; this query stays on the "
+                    "calling thread\n");
+}
 
 static void read_stacksize(void) {
     if (!parse_stacksize("OMP_STACKSIZE", &g_stacksize) &&
         !parse_stacksize("GOMP_STACKSIZE", &g_stacksize)) {
         g_stacksize = 0;
+        return;
     }
+    if (g_stacksize < stack_floor()) {
+        g_stacksize = stack_floor();
+        note_stack_raised();
+    }
+}
+
+/* 1 started, 0 the place could not be applied, -1
+ * `pthread_attr_setstacksize` returned EINVAL, -2 some other start
+ * failure. A `pthread_create` failure is -2, including EAGAIN. */
+static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
+    pthread_attr_t attr;
+    int set;
+    if (pthread_attr_init(&attr) != 0) {
+        return -2;
+    }
+    if (g_stacksize != 0) {
+        set = pthread_attr_setstacksize(&attr, g_stacksize);
+        if (set != 0) {
+            pthread_attr_destroy(&attr);
+            return set == EINVAL ? -1 : -2;
+        }
+    }
+    if (place != NULL && pthread_attr_setaffinity_np(&attr, sizeof *place, place) != 0) {
+        pthread_attr_destroy(&attr);
+        return 0;
+    }
+    if (pthread_create(th, &attr, team_worker, arg) != 0) {
+        pthread_attr_destroy(&attr);
+        return -2;
+    }
+    pthread_attr_destroy(&attr);
+    return 1;
 }
 
 /* A bound slot starts on its place, as an OpenMP worker does. When that
  * place cannot be applied, a second start keeps the stack size and
- * inherits the caller's mask. If that start fails too, this returns 0.
- * A null attribute would drop the stack size and the placement, so no
- * such thread is created. An OMP_STACKSIZE that does not parse leaves
- * the default. A parsed size that pthread_attr_setstacksize refuses,
- * such as one below PTHREAD_STACK_MIN, fails the start. */
-static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
-    pthread_attr_t attr;
-    int made;
-    if (pthread_attr_init(&attr) != 0) {
-        return 0;
-    }
-    if (g_stacksize != 0 && pthread_attr_setstacksize(&attr, g_stacksize) != 0) {
-        pthread_attr_destroy(&attr);
-        return 0;
-    }
-    made = (place == NULL || pthread_attr_setaffinity_np(&attr, sizeof *place, place) == 0) &&
-           pthread_create(th, &attr, team_worker, arg) == 0;
-    pthread_attr_destroy(&attr);
-    return made;
-}
-
+ * inherits the caller's mask. A size below the stack floor was already
+ * raised to it. EINVAL from `pthread_attr_setstacksize` is remembered,
+ * and a later query does not try the size. A `pthread_create` failure
+ * warns once and leaves the size to be tried on the next query. */
 static int start_worker(int slot, int nt, int bind, int np) {
     pthread_t *th = &g_team.workers[slot];
     void *arg = (void *)(intptr_t)slot;
     cpu_set_t set;
     int want_place;
+    int rc;
     pthread_once(&g_stack_once, read_stacksize);
+    if (g_stack_refused) {
+        return 0;
+    }
     want_place = np > 0 && place_mask(place_of(bind, slot, nt, np), &set);
-    if (want_place && create_worker(th, arg, &set)) {
+    if (want_place) {
+        rc = create_worker(th, arg, &set);
+        if (rc == 1) {
+            return 1;
+        }
+        if (rc == -1) {
+            note_stack_refused();
+            return 0;
+        }
+    }
+    rc = create_worker(th, arg, NULL);
+    if (rc == 1) {
         return 1;
     }
-    if (create_worker(th, arg, NULL)) {
-        return 1;
+    if (rc == -1) {
+        note_stack_refused();
+        return 0;
     }
-    fprintf(stderr, "linkcell: k-nearest worker %d failed to start with its stack size%s\n", slot,
-            want_place ? " and CPU placement" : "");
+    if (g_stacksize != 0) {
+        note_stack_create_failed();
+        return 0;
+    }
+    fprintf(stderr, "linkcell: k-nearest worker %d failed to start\n", slot);
     return 0;
 }
 
@@ -484,6 +571,11 @@ static int start_team(int want) {
     int bind = (int)omp_get_proc_bind();
     int np = bind == omp_proc_bind_false ? 0 : omp_get_num_places();
     int slot;
+    pthread_once(&g_stack_once, read_stacksize);
+    if (g_stack_refused) {
+        return 0;
+    }
+    g_stack_starts++;
     g_team.workers = malloc(sizeof *g_team.workers * (size_t)want);
     if (g_team.workers == NULL) {
         return 0;
@@ -622,6 +714,18 @@ size_t lc_knn_team_stack(int slot) {
     }
     pthread_mutex_unlock(&g_team.mu);
     return size;
+}
+
+size_t lc_knn_pthread_stack_min(void) { return (size_t)PTHREAD_STACK_MIN; }
+
+size_t lc_knn_stack_floor(void) { return stack_floor(); }
+
+size_t lc_knn_stack_starts(void) {
+    size_t n;
+    pthread_mutex_lock(&g_team.mu);
+    n = g_stack_starts;
+    pthread_mutex_unlock(&g_team.mu);
+    return n;
 }
 
 /* The guard size beside that stack, or 0 when the standing team has no

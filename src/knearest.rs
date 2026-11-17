@@ -3233,6 +3233,113 @@ mod fused_agree {
         drop(release);
         holder.join().unwrap();
     }
+
+    /// `OMP_STACKSIZE=1k` is below `PTHREAD_STACK_MIN`, and the mid size is
+    /// one page above it, still below the stack floor. Both run the workers
+    /// on the floor and warn once. `2^63` bytes is larger than the user
+    /// address space. `pthread_attr_setstacksize` accepts it and
+    /// `pthread_create` fails, so the query stays on the caller, the
+    /// process warns once, and the next query tries again.
+    #[test]
+    fn small_stack_is_raised_and_a_refused_stack_stays_on_the_caller() {
+        extern "C" {
+            fn omp_set_num_threads(n: i32);
+            fn omp_set_dynamic(dynamic_threads: i32);
+            fn lc_knn_pthread_stack_min() -> usize;
+            fn lc_knn_stack_floor() -> usize;
+            fn lc_knn_stack_starts() -> usize;
+        }
+        let Some(mode) = std::env::var_os("LC_STACK_PROBE") else {
+            let exe = std::env::current_exe().unwrap();
+            let min = unsafe { lc_knn_pthread_stack_min() };
+            let floor = unsafe { lc_knn_stack_floor() };
+            let mut probes = vec![("small", "1k".to_string())];
+            // One page above the minimum: pthread accepts it, and it sits in
+            // the range where the fold frame can reach the guard.
+            let mid = min + 4096;
+            if mid < floor {
+                probes.push(("mid", format!("{mid}b")));
+            }
+            // 2^63 bytes. Larger than a 57-bit virtual address space, so
+            // the mapping cannot succeed under any overcommit setting.
+            // glibc's pthread_attr_setstacksize accepts it.
+            probes.push(("huge", "9223372036854775808b".to_string()));
+            for (mode, stack) in probes {
+                let out = std::process::Command::new(&exe)
+                    .arg(
+                        "knearest::fused_agree::small_stack_is_raised_and_a_refused_stack_stays_on_the_caller",
+                    )
+                    .args(["--exact", "--test-threads", "1", "--nocapture"])
+                    .env_remove("OMP_THREAD_LIMIT")
+                    .env_remove("OMP_DYNAMIC")
+                    .env_remove("GOMP_STACKSIZE")
+                    .env("OMP_DYNAMIC", "false")
+                    .env("OMP_STACKSIZE", &stack)
+                    .env("LC_STACK_PROBE", mode)
+                    .output()
+                    .unwrap();
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success(),
+                    "probe {mode} status {:?}\n{}{err}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout)
+                );
+                let raised = err.matches("below the worker stack floor").count();
+                let refused = err.matches("was refused").count();
+                let create_failed = err.matches("could not start a worker").count();
+                if mode != "huge" {
+                    assert_eq!(raised, 1, "{err}");
+                    assert_eq!(refused, 0, "{err}");
+                    assert_eq!(create_failed, 0, "{err}");
+                } else {
+                    assert_eq!(create_failed, 1, "{err}");
+                    assert_eq!(refused, 0, "{err}");
+                    assert_eq!(raised, 0, "{err}");
+                }
+            }
+            return;
+        };
+        let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
+        let xyz = periodic(&cell, 64, 9);
+        unsafe {
+            omp_set_dynamic(0);
+            omp_set_num_threads(1);
+        }
+        let reference = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_eq!(super::knearest_team_threads(), 1);
+        unsafe { omp_set_num_threads(4) };
+        let first = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        let second = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_same("first query", &first, &reference);
+        assert_same("second query", &second, &reference);
+        let team = super::knearest_team_threads();
+        let starts = unsafe { lc_knn_stack_starts() };
+        if mode != "huge" {
+            assert!(team > 1, "raised stack started no team");
+            let min = unsafe { lc_knn_pthread_stack_min() };
+            let floor = unsafe { lc_knn_stack_floor() };
+            assert!(
+                floor >= min,
+                "floor {floor} is below PTHREAD_STACK_MIN {min}"
+            );
+            let stacks = team_stacks();
+            assert_eq!(stacks.len(), team, "raised stack workers");
+            for (slot, size) in stacks.iter().copied().enumerate() {
+                assert!(
+                    size >= min,
+                    "worker {slot} stack {size} is below PTHREAD_STACK_MIN {min}"
+                );
+                assert_eq!(size, floor, "worker {slot} stack {size}");
+            }
+            assert_eq!(starts, 1, "raised stack was started twice");
+        } else {
+            assert_eq!(team, 1, "huge stack started a team");
+            assert!(team_stacks().is_empty(), "huge stack left workers");
+            assert_eq!(starts, 2, "pthread_create failure was remembered");
+        }
+        super::shutdown_knearest_team();
+    }
 }
 
 #[cfg(test)]
