@@ -120,6 +120,10 @@ def enhance(root: Path) -> None:
     for page in pages:
         ET.SubElement(ET.SubElement(sitemap, "url"), "loc").text = canonical(root, page)
     ET.ElementTree(sitemap).write(root / "sitemap.xml", encoding="utf-8", xml_declaration=True)
+    (root / "robots.txt").write_text(
+        f"User-agent: *\nAllow: /\nSitemap: {urljoin(URL, 'sitemap.xml')}\n",
+        encoding="utf-8",
+    )
 
 
 def validate(root: Path) -> None:
@@ -152,6 +156,15 @@ def validate(root: Path) -> None:
         missing = expected_meta - meta.keys()
         if missing:
             raise RuntimeError(f"{page}: missing metadata {sorted(missing)}")
+        og_images = re.findall(
+            r'<meta\b[^>]*property=["\']og:image["\'][^>]*content=["\']([^"\']*)["\'][^>]*>',
+            text,
+            re.I,
+        )
+        if og_images != [IMAGE]:
+            raise RuntimeError(f"{page}: expected exactly one non-empty og:image")
+        if meta[("name", "twitter:image")] != IMAGE:
+            raise RuntimeError(f"{page}: twitter:image must be {IMAGE}")
         links = re.findall(
             r'<link\b[^>]*rel=["\']canonical["\'][^>]*href=["\']([^"\']+)["\'][^>]*>',
             text, re.I
@@ -177,6 +190,9 @@ def validate(root: Path) -> None:
     locations = {node.text for node in ET.parse(root / "sitemap.xml").findall(".//{*}loc")}
     if locations != canonicals:
         raise RuntimeError("sitemap URLs do not match generated HTML canonicals")
+    robots = (root / "robots.txt").read_text(encoding="utf-8").splitlines()
+    if robots != ["User-agent: *", "Allow: /", f"Sitemap: {urljoin(URL, 'sitemap.xml')}"]:
+        raise RuntimeError("robots.txt must allow crawling and name the custom-domain sitemap")
     print(f"SEO validated for {len(pages)} HTML pages")
 
 
