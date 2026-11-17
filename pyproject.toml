@@ -21,6 +21,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+numpy = ["numpy>=1.26"]
 test = ["pytest>=8.0", "numpy>=1.26"]
 
 [project.urls]

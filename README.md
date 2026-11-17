@@ -44,6 +44,11 @@ Wheels: one CPython 3.12 limited-ABI (`abi3`) artifact per platform (GIL, 3.12+)
 pip install linkcell
 ```
 
+NumPy is optional.
+Install `linkcell[numpy]`, or `numpy>=1.26`, for ndarray output and the example below.
+Without NumPy, results come back as DLPack arrays.
+Building from source needs only maturin.
+
 ```python
 import numpy as np
 import linkcell
