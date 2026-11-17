@@ -61,7 +61,7 @@
 //! # Features
 //!
 //! `parallel` is on by default. An unmasked k-nearest query of at least
-//! 8192 points runs in one OpenMP region when this build has it: bin,
+//! 8192 points runs on one linkcell thread team when this build has it: bin,
 //! count, scan, fill, and select, with a private histogram and scratch
 //! on each thread. Masked and smaller queries use rayon.
 //! `--no-default-features` drops rayon and serializes the walk (re-enable
@@ -146,11 +146,13 @@ mod knearest;
 mod open_cell;
 mod pairs;
 mod partition;
+mod place;
 mod pop;
 mod replica;
 mod simd;
 mod skin;
 mod skin_simd;
+mod team;
 #[cfg(feature = "capi")]
 mod vesin_abi;
 #[cfg(feature = "capi")]
@@ -161,7 +163,7 @@ pub use cell::{
 };
 pub use error::Error;
 pub use knearest::{
-    knearest, knearest_brute, knearest_into, knearest_into_d2, knearest_into_many,
+    knearest, knearest_brute, knearest_csr, knearest_into, knearest_into_d2, knearest_into_many,
     knearest_team_threads, pin_knearest_to_least_loaded, shutdown_knearest_team, Neighbors,
 };
 pub use open_cell::{cell_for_pbc, pairs_open, pairs_within_pbc, stencil_builds, PbcQuery};

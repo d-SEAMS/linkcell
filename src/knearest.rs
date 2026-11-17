@@ -14,15 +14,18 @@
 //! writes packed `n * k` indices (`-1` unused). [`knearest_into_d2`]
 //! also writes the matching squared distances (`NaN` unused). With the
 //! `parallel` feature (the default) an unmasked query of at least 8192
-//! points runs in one OpenMP region on Linux: bin, count, scan, fill, and
-//! select, each thread with its own histogram and scratch. Masked queries,
+//! points runs on one linkcell thread team on Linux: bin, count, scan, fill,
+//! and select, each thread with its own histogram and scratch. Masked queries,
 //! smaller queries, and builds without that region still walk under rayon.
 //! `--no-default-features` serializes the walk. The per-source `KHeap` stays
 //! on the stack for `k <= 16`.
 
 use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
 use crate::cell::Cell;
+use crate::team::Stage;
 use crate::Error;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::Mutex;
 
 fn pair_dist2(simbox: &Cell, p: [f64; 3], q: [f64; 3]) -> f64 {
     simbox.dist2_euclidean(p, q)
@@ -374,18 +377,346 @@ fn write_one(
             return Err(Error::BufferSize);
         }
     }
-    out_nn.fill(-1);
-    if let Some(d2) = out_d2.as_mut() {
-        d2.fill(f64::NAN);
-    }
+    #[cfg(feature = "timing")]
+    let started = std::time::Instant::now();
+    let found = execute(
+        xyz,
+        simbox,
+        k,
+        mask,
+        cell_hint,
+        out_nn,
+        out_d2.as_deref_mut(),
+        None,
+        &[],
+    );
     #[cfg(feature = "timing")]
     if crate::simd::coarse_timing_enabled() {
-        let started = std::time::Instant::now();
-        let result = execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2);
         crate::simd::add_knn_ns(started.elapsed().as_nanos());
-        return result;
     }
-    execute(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
+    if found.is_err() {
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
+    }
+    found
+}
+
+/// A pointer the chunks of one region share; each chunk writes slots no
+/// other chunk of its stage writes.
+#[derive(Clone, Copy)]
+struct Shared<T>(*mut T);
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+
+impl<T> Shared<T> {
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
+/// Rows of the graph stages per chunk.
+const GRAPH_ROWS: usize = 2048;
+
+/// Buffers of [`knearest_graph`], kept for the next call.
+#[derive(Default)]
+struct GraphBufs {
+    nom: Vec<i32>,
+    accepted: Vec<u8>,
+    lo: Vec<AtomicU32>,
+    hi: Vec<AtomicU32>,
+    left: Vec<AtomicU32>,
+    start: Vec<u32>,
+}
+
+static GRAPH_POOL: Mutex<Option<GraphBufs>> = Mutex::new(None);
+
+/// `true` when row `j` of the packed nominations lists `i`.
+#[inline(always)]
+fn lists(nom: &[i32], k: usize, j: usize, i: i32) -> bool {
+    nom[j * k..(j + 1) * k].contains(&i)
+}
+
+/// The k-nearest graph as CSR, built in the search's region.
+///
+/// Row `i` of the nominations is its `k` nearest, nearest first. With
+/// `mutual`, row `i` holds every `j` that row `i` lists and that lists
+/// `i`: the lower indices ascending, then the higher ones nearest first.
+/// Otherwise an edge comes from the nomination slot `s = i * k + t` of
+/// the lower index when both rows list each other, and from the only
+/// slot that names it when one does; row `i` holds its edges in slot
+/// order: the edges from lower rows ascending, then its own nearest
+/// first, then the edges from higher rows ascending.
+///
+/// `offsets` has `n + 1` entries. `alloc(total)` is called once, from
+/// any worker, and returns `total` writable ints for the columns, or
+/// null ([`Error::BufferSize`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn knearest_graph(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    mutual: bool,
+    offsets: &mut [i32],
+    alloc: &(dyn Fn(usize) -> *mut i32 + Sync),
+) -> Result<(), Error> {
+    let n = xyz.len();
+    if offsets.len() != n + 1 {
+        return Err(Error::BufferSize);
+    }
+    let Some(nk) = n.checked_mul(k) else {
+        return Err(Error::Overflow);
+    };
+    if n > i32::MAX as usize {
+        return Err(Error::Overflow);
+    }
+    let mut bufs = GRAPH_POOL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()
+        .unwrap_or_default();
+    bufs.nom.resize(nk, -1);
+    bufs.accepted.resize(nk, 0);
+    bufs.start.resize(n, 0);
+    for v in [&mut bufs.lo, &mut bufs.hi, &mut bufs.left] {
+        v.truncate(n);
+        v.resize_with(n, || AtomicU32::new(0));
+    }
+    let failed = AtomicBool::new(false);
+    let overflow = AtomicBool::new(false);
+    let cols = AtomicPtr::new(std::ptr::null_mut::<i32>());
+    let result = {
+        let GraphBufs {
+            nom,
+            accepted,
+            lo,
+            hi,
+            left,
+            start,
+        } = &mut bufs;
+        let nom_p = Shared(nom.as_mut_ptr());
+        let acc_p = Shared(accepted.as_mut_ptr());
+        let start_p = Shared(start.as_mut_ptr());
+        let off_p = Shared(offsets.as_mut_ptr());
+        let (lo, hi, left) = (&lo[..], &hi[..], &left[..]);
+        // SAFETY (every stage below): the scan has written every row of
+        // `nom` before the first graph stage starts, and chunk `c` owns
+        // rows `c * GRAPH_ROWS ..` of `accepted`, `start`, and `offsets`.
+        let nom_ro = move || unsafe { std::slice::from_raw_parts(nom_p.get(), nk) };
+        let rows = |c: usize| c * GRAPH_ROWS..((c + 1) * GRAPH_ROWS).min(n);
+        let chunks = (n + GRAPH_ROWS - 1) / GRAPH_ROWS;
+        let prep = |r: std::ops::Range<usize>| {
+            for i in r {
+                lo[i].store(0, Ordering::Relaxed);
+                hi[i].store(0, Ordering::Relaxed);
+            }
+        };
+        let degree = |_: &mut Scratch, c: usize| {
+            let nom = nom_ro();
+            for i in rows(c) {
+                let row = &nom[i * k..(i + 1) * k];
+                let mut own = 0u32;
+                for (t, &j) in row.iter().enumerate() {
+                    let take = j >= 0
+                        && (j as usize) < n
+                        && j as usize != i
+                        && if mutual {
+                            lists(nom, k, j as usize, i as i32)
+                        } else {
+                            (i as i32) < j || !lists(nom, k, j as usize, i as i32)
+                        };
+                    if !mutual {
+                        unsafe { acc_p.get().add(i * k + t).write(u8::from(take)) };
+                    }
+                    if !take {
+                        continue;
+                    }
+                    own += 1;
+                    if !mutual {
+                        if (i as i32) < j {
+                            lo[j as usize].fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            hi[j as usize].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                unsafe { start_p.get().add(i).write(own) };
+            }
+        };
+        let prefix = |_: &mut Scratch, _: usize| {
+            // SAFETY: one chunk; the degree stage has finished.
+            let (off, start) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(off_p.get(), n + 1),
+                    std::slice::from_raw_parts_mut(start_p.get(), n),
+                )
+            };
+            let mut acc = 0u64;
+            for i in 0..n {
+                off[i] = acc as i32;
+                let own = u64::from(start[i]);
+                if mutual {
+                    acc += own;
+                } else {
+                    let l = lo[i].load(Ordering::Relaxed);
+                    let h = hi[i].load(Ordering::Relaxed);
+                    start[i] = (acc + u64::from(l)) as u32;
+                    left[i].store(l + h, Ordering::Relaxed);
+                    acc += u64::from(l) + own + u64::from(h);
+                }
+                if acc > i32::MAX as u64 {
+                    overflow.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+            off[n] = acc as i32;
+            let p = alloc(acc as usize);
+            if p.is_null() && acc > 0 {
+                failed.store(true, Ordering::Relaxed);
+                return;
+            }
+            cols.store(p, Ordering::Relaxed);
+        };
+        let fill = |s: &mut Scratch, c: usize| {
+            let out = cols.load(Ordering::Relaxed);
+            if out.is_null() {
+                return;
+            }
+            let nom = nom_ro();
+            // SAFETY: the prefix stage has finished; `out` holds
+            // `offsets[n]` ints and each write below lands in a slot of
+            // one row that no other write fills.
+            let off = unsafe { std::slice::from_raw_parts(off_p.get(), n + 1) };
+            let start = unsafe { std::slice::from_raw_parts(start_p.get(), n) };
+            let keep = |i: usize, j: i32| {
+                j >= 0 && (j as usize) < n && j as usize != i && lists(nom, k, j as usize, i as i32)
+            };
+            if mutual {
+                for i in rows(c) {
+                    let row = &nom[i * k..(i + 1) * k];
+                    let low = &mut s.rows;
+                    low.clear();
+                    low.extend(
+                        row.iter()
+                            .copied()
+                            .filter(|&j| (j as usize) < i && keep(i, j)),
+                    );
+                    low.sort_unstable();
+                    let mut put = off[i] as usize;
+                    for &j in low.iter() {
+                        unsafe { out.add(put).write(j) };
+                        put += 1;
+                    }
+                    for &j in row {
+                        if j as usize > i && keep(i, j) {
+                            unsafe { out.add(put).write(j) };
+                            put += 1;
+                        }
+                    }
+                }
+                return;
+            }
+            // SAFETY: the degree stage has finished.
+            let acc = unsafe { std::slice::from_raw_parts(acc_p.get(), nk) };
+            let finish = |j: usize| {
+                let own = acc[j * k..(j + 1) * k].iter().filter(|&&a| a != 0).count();
+                let (b, m, e) = (off[j] as usize, start[j] as usize, off[j + 1] as usize);
+                // SAFETY: every edge from another row into row `j` is
+                // written (`left` reached zero), and row `j`'s own edges
+                // lie between these two runs.
+                unsafe {
+                    std::slice::from_raw_parts_mut(out.add(b), m - b).sort_unstable();
+                    std::slice::from_raw_parts_mut(out.add(m + own), e - m - own).sort_unstable();
+                }
+            };
+            for i in rows(c) {
+                let mut put = start[i] as usize;
+                for t in 0..k {
+                    if acc[i * k + t] == 0 {
+                        continue;
+                    }
+                    let j = nom[i * k + t] as usize;
+                    unsafe { out.add(put).write(j as i32) };
+                    put += 1;
+                    let at = if i < j {
+                        off[j] as usize + lo[j].fetch_sub(1, Ordering::Relaxed) as usize - 1
+                    } else {
+                        off[j + 1] as usize - hi[j].fetch_sub(1, Ordering::Relaxed) as usize
+                    };
+                    unsafe { out.add(at).write(i as i32) };
+                    if left[j].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        finish(j);
+                    }
+                }
+            }
+        };
+        let tail = [
+            Stage {
+                chunks,
+                run: &degree,
+            },
+            Stage {
+                chunks: 1,
+                run: &prefix,
+            },
+            Stage { chunks, run: &fill },
+        ];
+        let nn = unsafe { std::slice::from_raw_parts_mut(nom_p.get(), nk) };
+        execute(
+            xyz,
+            simbox,
+            k,
+            mask,
+            cell_hint,
+            nn,
+            None,
+            Some(&prep),
+            &tail,
+        )
+    };
+    *GRAPH_POOL.lock().unwrap_or_else(|err| err.into_inner()) = Some(bufs);
+    result?;
+    if overflow.load(Ordering::Relaxed) {
+        return Err(Error::Overflow);
+    }
+    if failed.load(Ordering::Relaxed) {
+        return Err(Error::BufferSize);
+    }
+    Ok(())
+}
+
+/// The k-nearest graph as CSR `(offsets, columns)`; see the C entry
+/// `lc_knearest_csr` for the row order.
+pub fn knearest_csr(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    mutual: bool,
+) -> Result<(Vec<i32>, Vec<i32>), Error> {
+    let mut offsets = vec![0i32; xyz.len() + 1];
+    let cols = Mutex::new(Vec::<i32>::new());
+    let alloc = |total: usize| {
+        let mut guard = cols.lock().unwrap_or_else(|err| err.into_inner());
+        guard.resize(total, 0);
+        guard.as_mut_ptr()
+    };
+    knearest_graph(
+        xyz,
+        simbox,
+        k,
+        mask,
+        cell_hint,
+        mutual,
+        &mut offsets,
+        &alloc,
+    )?;
+    let cols = cols.into_inner().unwrap_or_else(|err| err.into_inner());
+    Ok((offsets, cols))
 }
 
 /// k-nearest neighbours of every point (or of the masked subset).
@@ -453,24 +784,29 @@ struct Geom {
 /// Threads in the last k-nearest team. Zero before the first query.
 static TEAM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Opt-in placement of the OpenMP team. Off unless a caller asks.
+/// Opt-in placement of the k-nearest team. Off unless a caller asks.
 static PIN_LEAST_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Place the k-nearest OpenMP workers on the least-loaded CPUs.
+/// Place the k-nearest team workers on the least-loaded CPUs.
 ///
 /// Off by default. A query does not read CPU counters or change affinity
 /// until this is set, and it does not consult an environment variable.
 /// Turning it off restores each worker to the mask it had before the pin.
-/// Builds without the OpenMP query store the flag and leave placement alone.
+/// A team of one is the calling thread, pinned for the query only.
+/// Builds without the team query store the flag and leave placement alone.
 pub fn pin_knearest_to_least_loaded(enabled: bool) {
     PIN_LEAST_LOADED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Threads that ran the last k-nearest query.
 ///
-/// Zero before the first query. This is the OpenMP team when that region
-/// ran, and the rayon pool size otherwise. The OpenMP team is resized to
-/// `omp_get_max_threads()` on the next query when that value changes.
+/// Zero before the first query. This is the k-nearest team when it ran,
+/// and the rayon pool size otherwise. The team is sized as libgomp sizes
+/// a parallel region the caller opens: `omp_get_max_threads()`, trimmed
+/// by the load average under `OMP_DYNAMIC` and capped by
+/// `OMP_THREAD_LIMIT`. Its stacks follow `OMP_STACKSIZE`. It is resized
+/// on the next query when that size changes. A team of one is the calling
+/// thread, with no worker.
 pub fn knearest_team_threads() -> usize {
     TEAM.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -530,6 +866,22 @@ fn force_legacy() -> bool {
     }
 }
 
+/// Per-worker buffers of one search region.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    cand: Candidates,
+    heap: Option<KHeap>,
+    /// Row scratch for stages appended to the search.
+    pub(crate) rows: Vec<i32>,
+}
+
+/// Units of the scan (blocks or bins) per chunk: about sixteen chunks a
+/// worker, so a worker the scheduler parks holds a small share.
+fn scan_chunk(units: usize, width: usize) -> usize {
+    (units / (16 * width.max(1))).max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -537,7 +889,9 @@ fn execute(
     mask: Option<&[bool]>,
     cell_hint: Option<f64>,
     out_nn: &mut [i32],
-    out_d2: Option<&mut [f64]>,
+    mut out_d2: Option<&mut [f64]>,
+    prep: Option<&(dyn Fn(std::ops::Range<usize>) + Sync)>,
+    tail: &[Stage<'_, Scratch>],
 ) -> Result<(), Error> {
     if k == 0 {
         return Err(Error::ZeroK);
@@ -556,6 +910,14 @@ fn execute(
         None => n,
     };
     if n_active <= 1 {
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
+        if let Some(prep) = prep {
+            prep(0..n);
+        }
+        crate::team::run(1, None, tail);
         return Ok(());
     }
     crate::pop::prepare();
@@ -577,75 +939,190 @@ fn execute(
     let active_owned = mask.map(|m| (0..n).filter(|&i| m[i]).collect::<Vec<_>>());
     #[cfg(all(feature = "parallel", linkcell_openmp))]
     if active_owned.is_none()
+        && prep.is_none()
+        && tail.is_empty()
+        && !crate::team::installed()
+        && !crate::on_caller()
         && !force_legacy()
         && (xyz.len() >= bins::PARALLEL_MESH || force_fused())
     {
+        // The region writes only the slots it finds.
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
         return fused::run(xyz, &walk, k, edge, out_nn, out_d2);
     }
-    let mesh = {
-        #[cfg(feature = "timing")]
-        {
-            if crate::simd::coarse_timing_enabled() {
-                let started = std::time::Instant::now();
-                let mesh = Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?;
-                crate::simd::add_mesh_ns(started.elapsed().as_nanos());
-                mesh
-            } else {
-                Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
+    let nn = RowsOut(out_nn.as_mut_ptr());
+    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
+    let mode = match (walk.is_ortho(), walk.is_restricted()) {
+        (true, _) => 0u8,
+        (false, true) => 1,
+        (false, false) => 2,
+    };
+    crate::team::with_current(|width, spawn| {
+        if width <= 1 || spawn.is_none() {
+            if let Some(m) = mask {
+                for (i, &on) in m.iter().enumerate() {
+                    if !on {
+                        // SAFETY: row `i` of an `n * k` output.
+                        unsafe {
+                            nn.row(i, k).fill(-1);
+                            if let Some(d) = dd {
+                                d.row(i, k).fill(f64::NAN);
+                            }
+                        }
+                    }
+                }
             }
+            if let Some(prep) = prep {
+                prep(0..n);
+            }
+            let mesh = timed_mesh(|| Mesh::build(xyz, &walk, active_owned.as_deref(), edge))?;
+            let nbin = [mesh.nx, mesh.ny, mesh.nz];
+            let geom = geom_of(&walk, nbin, mesh.widths);
+            let max_reach = reach_of(&walk, &geom, mesh.image_reach());
+            let side = block_side(mesh.occupants.len(), nbin);
+            let (units, _) = scan_units(nbin, side);
+            let mut scratch = Scratch::default();
+            match mode {
+                0 => serial_scan::<0>(
+                    &mesh,
+                    &geom,
+                    k,
+                    max_reach,
+                    side,
+                    nn,
+                    dd,
+                    units,
+                    &mut scratch,
+                ),
+                1 => serial_scan::<1>(
+                    &mesh,
+                    &geom,
+                    k,
+                    max_reach,
+                    side,
+                    nn,
+                    dd,
+                    units,
+                    &mut scratch,
+                ),
+                _ => serial_scan::<2>(
+                    &mesh,
+                    &geom,
+                    k,
+                    max_reach,
+                    side,
+                    nn,
+                    dd,
+                    units,
+                    &mut scratch,
+                ),
+            }
+            drop(mesh);
+            crate::team::run(1, None, tail);
+            return Ok(());
         }
-        #[cfg(not(feature = "timing"))]
-        {
-            Mesh::build(xyz, &walk, active_owned.as_deref(), edge)?
-        }
-    };
-    let nbin = [mesh.nx, mesh.ny, mesh.nz];
-    let widths = mesh.widths;
-    let cell_min = (widths[0] / f64::from(mesh.nx))
-        .min(widths[1] / f64::from(mesh.ny))
-        .min(widths[2] / f64::from(mesh.nz));
-    let need = (box_diameter(&walk) / cell_min).ceil();
-    let max_reach = if need.is_finite() && need < 1.0e7 {
-        (need as i32).saturating_add(3).max(mesh.image_reach())
-    } else {
-        mesh.image_reach()
-    };
-    let geom = Geom {
+        let stages = bins::MeshStages::new(xyz, &walk, active_owned.as_deref(), edge, width)?;
+        let nbin = stages.nbin();
+        let geom = geom_of(&walk, nbin, stages.widths());
+        let max_reach = reach_of(
+            &walk,
+            &geom,
+            nbin.iter().copied().max().unwrap_or(1) / 2 + 2,
+        );
+        let side = block_side(stages.n_active(), nbin);
+        let (units, _) = scan_units(nbin, side);
+        let per = scan_chunk(units, width);
+        let fold_chunks = stages.fold_chunks();
+        let fold = |_: &mut Scratch, c: usize| {
+            let _timer = crate::pop::JobTimer::new();
+            stages.fold(c);
+            let lo = n * c / fold_chunks;
+            let hi = n * (c + 1) / fold_chunks;
+            if let Some(prep) = prep {
+                prep(lo..hi);
+            }
+            if let Some(m) = mask {
+                for i in (lo..hi).filter(|&i| !m[i]) {
+                    // SAFETY: chunk `c` alone fills masked rows `lo..hi`.
+                    unsafe {
+                        nn.row(i, k).fill(-1);
+                        if let Some(d) = dd {
+                            d.row(i, k).fill(f64::NAN);
+                        }
+                    }
+                }
+            }
+        };
+        let prefix = |_: &mut Scratch, _: usize| stages.prefix();
+        let scatter = |_: &mut Scratch, t: usize| {
+            let _timer = crate::pop::JobTimer::new();
+            stages.scatter(t);
+        };
+        let mesh = stages.mesh();
+        let geom = &geom;
+        let path = crate::simd::select();
+        let scan = move |s: &mut Scratch, c: usize| {
+            let _timer = crate::pop::JobTimer::new();
+            let lo = c * per;
+            let hi = (lo + per).min(units);
+            match mode {
+                0 => scan_range::<0>(mesh, geom, k, max_reach, side, nn, dd, lo..hi, path, s),
+                1 => scan_range::<1>(mesh, geom, k, max_reach, side, nn, dd, lo..hi, path, s),
+                _ => scan_range::<2>(mesh, geom, k, max_reach, side, nn, dd, lo..hi, path, s),
+            }
+        };
+        let mut list: Vec<Stage<'_, Scratch>> = vec![
+            Stage {
+                chunks: fold_chunks,
+                run: &fold,
+            },
+            Stage {
+                chunks: 1,
+                run: &prefix,
+            },
+            Stage {
+                chunks: stages.scatter_chunks(),
+                run: &scatter,
+            },
+            Stage {
+                chunks: (units + per - 1) / per,
+                run: &scan,
+            },
+        ];
+        list.extend(tail.iter().map(|t| Stage {
+            chunks: t.chunks,
+            run: t.run,
+        }));
+        crate::team::run(width, spawn, &list);
+        Ok(())
+    })
+}
+
+fn timed_mesh(build: impl FnOnce() -> Result<Mesh, Error>) -> Result<Mesh, Error> {
+    #[cfg(feature = "timing")]
+    if crate::simd::coarse_timing_enabled() {
+        let started = std::time::Instant::now();
+        let mesh = build()?;
+        crate::simd::add_mesh_ns(started.elapsed().as_nanos());
+        return Ok(mesh);
+    }
+    build()
+}
+
+fn geom_of(walk: &Cell, nbin: [i32; 3], widths: [f64; 3]) -> Geom {
+    Geom {
         cols: [walk.a(), walk.b(), walk.c()],
         lengths: walk.widths(),
         nbin,
         widths,
-    };
-    match (
-        block_side(&mesh, nbin),
-        walk.is_ortho(),
-        walk.is_restricted(),
-    ) {
-        (Some(side), true, _) => {
-            dispatch_blocks::<0>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
-        }
-        (Some(side), false, true) => {
-            dispatch_blocks::<1>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
-        }
-        (Some(side), false, false) => {
-            dispatch_blocks::<2>(&mesh, &geom, k, max_reach, side, out_nn, out_d2)
-        }
-        (None, true, _) => dispatch::<0>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
-        (None, false, true) => dispatch::<1>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
-        (None, false, false) => dispatch::<2>(&mesh, &geom, k, max_reach, mask, out_nn, out_d2),
     }
-    #[cfg(feature = "parallel")]
-    {
-        TEAM.store(crate::pool_width(), std::sync::atomic::Ordering::Relaxed);
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        TEAM.store(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(())
 }
 
 /// Shell walk of every source in bin `c`.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
 fn walk_cell<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
@@ -684,49 +1161,128 @@ fn walk_cells<const MODE: u8>(
     }
 }
 
-fn dispatch<const MODE: u8>(
+fn reach_of(walk: &Cell, geom: &Geom, image_reach: i32) -> i32 {
+    let [nx, ny, nz] = geom.nbin;
+    let widths = geom.widths;
+    let cell_min = (widths[0] / f64::from(nx))
+        .min(widths[1] / f64::from(ny))
+        .min(widths[2] / f64::from(nz));
+    let need = (box_diameter(walk) / cell_min).ceil();
+    if need.is_finite() && need < 1.0e7 {
+        (need as i32).saturating_add(3).max(image_reach)
+    } else {
+        image_reach
+    }
+}
+
+/// Scan units, blocks of `side` bins or single bins, and the blocks per
+/// axis.
+fn scan_units(nbin: [i32; 3], side: Option<i32>) -> (usize, [i32; 3]) {
+    let [nx, ny, nz] = nbin;
+    match side {
+        Some(side) => {
+            let blocks = [
+                (nx + side - 1) / side,
+                (ny + side - 1) / side,
+                (nz + side - 1) / side,
+            ];
+            ((blocks[0] * blocks[1] * blocks[2]) as usize, blocks)
+        }
+        None => ((nx as usize) * (ny as usize) * (nz as usize), nbin),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serial_scan<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
     k: usize,
     max_reach: i32,
-    mask: Option<&[bool]>,
-    out_nn: &mut [i32],
-    out_d2: Option<&mut [f64]>,
+    side: Option<i32>,
+    nn: RowsOut<i32>,
+    dd: Option<RowsOut<f64>>,
+    units: usize,
+    scratch: &mut Scratch,
 ) {
-    // Masked points are not in the mesh, so every slot is an active source.
-    let _ = mask;
-    // Sources go in bin order: consecutive sources are neighbours, so their
-    // shells share cache lines whatever order the caller's points came in.
-    // Source `i` writes its own row, `out[i * k ..]`.
-    let nn = RowsOut(out_nn.as_mut_ptr());
-    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
-    let [nx, ny, _] = geom.nbin;
-    let cell = |c: usize| {
-        let c = c as i32;
-        [c % nx, (c / nx) % ny, c / (nx * ny)]
-    };
-    let job = |c: usize| {
-        walk_cell::<MODE>(mesh, geom, k, max_reach, cell(c), c, (nn, dd));
-    };
-    let ncell = mesh.offsets.len() - 1;
-    let span = (nx as usize).saturating_mul(ny as usize);
-    run_z_slabs(ncell, span, 64, job);
+    let _timer = crate::pop::JobTimer::new();
+    let path = crate::simd::select();
+    scan_range::<MODE>(
+        mesh,
+        geom,
+        k,
+        max_reach,
+        side,
+        nn,
+        dd,
+        0..units,
+        path,
+        scratch,
+    );
 }
 
-/// Bins a side of the source blocks of [`dispatch_blocks`] for this mesh:
+/// Scan units `range`: blocks through [`scan_block`] when `side` is set,
+/// bins through the shell walk otherwise.
+#[allow(clippy::too_many_arguments)]
+fn scan_range<const MODE: u8>(
+    mesh: &Mesh,
+    geom: &Geom,
+    k: usize,
+    max_reach: i32,
+    side: Option<i32>,
+    nn: RowsOut<i32>,
+    dd: Option<RowsOut<f64>>,
+    range: std::ops::Range<usize>,
+    path: crate::simd::Path,
+    scratch: &mut Scratch,
+) {
+    match side {
+        Some(side) => {
+            let (_, blocks) = scan_units(geom.nbin, Some(side));
+            let Scratch { cand, heap, .. } = scratch;
+            let heap = heap.get_or_insert_with(|| KHeap::new(k));
+            for blk in range {
+                scan_block::<MODE>(
+                    mesh, geom, k, max_reach, side, blocks, path, nn, dd, cand, heap, blk,
+                );
+            }
+        }
+        None => {
+            let [nx, ny, _] = geom.nbin;
+            for c in range {
+                let ci = c as i32;
+                let bin = [ci % nx, (ci / nx) % ny, ci / (nx * ny)];
+                for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+                    let i = mesh.occupants[slot];
+                    // Safety: each source owns row `i` of both outputs, and the
+                    // caller sized them to `n * k`.
+                    let (row, mut row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+                    clear_row(row, row_d2.as_deref_mut());
+                    walk_source::<MODE>(mesh, geom, k, max_reach, bin, slot, row, row_d2, None);
+                }
+            }
+        }
+    }
+}
+
+/// Every slot of a row unused: the search writes the found prefix.
+#[inline(always)]
+fn clear_row(row: &mut [i32], d2: Option<&mut [f64]>) {
+    row.fill(-1);
+    if let Some(d2) = d2 {
+        d2.fill(f64::NAN);
+    }
+}
+
+/// Bins a side of the source blocks of [`scan_block`] for this mesh:
 /// two when bins hold few points, so eight bins share one gather, and one
 /// otherwise. `None` when a candidate box would wrap onto itself.
-fn block_side(mesh: &Mesh, nbin: [i32; 3]) -> Option<i32> {
+fn block_side(n_active: usize, nbin: [i32; 3]) -> Option<i32> {
     #[cfg(test)]
     if NO_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let ncell = nbin.iter().map(|&n| n as usize).product::<usize>().max(1);
-    let side = if mesh.occupants.len() < 4 * ncell {
-        2
-    } else {
-        1
-    };
+    let side = if n_active < 4 * ncell { 2 } else { 1 };
     nbin.iter().all(|&n| n >= side + 2).then_some(side)
 }
 
@@ -752,6 +1308,7 @@ struct Candidates {
 
 /// Shared inputs for one block scan. The candidate list and heap stay
 /// per thread.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
 struct BlockScan<'a> {
     mesh: &'a Mesh,
     geom: &'a Geom,
@@ -766,6 +1323,7 @@ struct BlockScan<'a> {
 }
 
 /// One block of the shared-candidate scan. `blk` is the block index.
+#[cfg(all(feature = "parallel", linkcell_openmp))]
 fn select_one_block<const MODE: u8>(
     scan: &BlockScan<'_>,
     cand: &mut Candidates,
@@ -872,8 +1430,8 @@ fn select_one_block<const MODE: u8>(
     }
 }
 
-/// [`dispatch`] by blocks of `side` bins a side: a block's sources share
-/// one candidate list, the occupants of the `side + 2` bins a side around
+/// One block of `side` bins a side: a block's sources share one
+/// candidate list, the occupants of the `side + 2` bins a side around
 /// the block with their images, gathered once. When a source's k-th
 /// neighbour is closer than the plane bound of the gathered bins, the answer
 /// is among the candidates: every other point lies strictly past one of
@@ -882,160 +1440,108 @@ fn select_one_block<const MODE: u8>(
 /// the bound does not settle resumes the shell walk from its heap, which
 /// holds its 3 x 3 x 3 bins already.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_blocks<const MODE: u8>(
+#[inline(always)]
+fn scan_block<const MODE: u8>(
     mesh: &Mesh,
     geom: &Geom,
     k: usize,
     max_reach: i32,
     side: i32,
-    out_nn: &mut [i32],
-    out_d2: Option<&mut [f64]>,
+    blocks: [i32; 3],
+    path: crate::simd::Path,
+    nn: RowsOut<i32>,
+    dd: Option<RowsOut<f64>>,
+    cand: &mut Candidates,
+    heap: &mut KHeap,
+    blk: usize,
 ) {
-    let nn = RowsOut(out_nn.as_mut_ptr());
-    let dd = out_d2.map(|d| RowsOut(d.as_mut_ptr()));
     let [nx, ny, nz] = geom.nbin;
-    let blocks = [
-        (nx + side - 1) / side,
-        (ny + side - 1) / side,
-        (nz + side - 1) / side,
-    ];
-    let nblock = (blocks[0] * blocks[1] * blocks[2]) as usize;
-    let path = crate::simd::select();
     #[cfg(feature = "timing")]
     let time_scan = crate::simd::scan_timing_enabled();
-    #[cfg(not(feature = "timing"))]
-    let time_scan = false;
-    let scan = BlockScan {
-        mesh,
-        geom,
-        k,
-        max_reach,
-        side,
-        blocks,
-        path,
-        time_scan,
-        nn,
-        dd,
-    };
-    let job = move |cand: &mut Candidates, heap: &mut KHeap, blk: usize| {
-        select_one_block::<MODE>(&scan, cand, heap, blk);
-    };
-    let span = (blocks[0] as usize).saturating_mul(blocks[1] as usize);
-    run_block_slabs(nblock, span, k, job);
-}
-
-/// One candidate list and one heap per worker, then the blocks of that
-/// worker's z-slab. See [`run_z_slabs`].
-fn run_block_slabs<F>(nblock: usize, z_span: usize, k: usize, job: F)
-where
-    F: Fn(&mut Candidates, &mut KHeap, usize) + Sync,
-{
-    #[cfg(not(feature = "parallel"))]
-    let _ = z_span;
-    #[cfg(feature = "parallel")]
-    {
-        let width = requested_threads();
-        if width != 1 {
-            if width > 1 {
-                let span = z_span.max(1);
-                rayon::broadcast(|ctx| {
-                    let _timer = crate::pop::JobTimer::new();
-                    let mut cand = Candidates::default();
-                    let mut heap = KHeap::new(k);
-                    let workers = ctx.num_threads().max(1);
-                    let t = ctx.index();
-                    let layers = nblock.saturating_add(span - 1) / span;
-                    let z0 = layers * t / workers;
-                    let z1 = layers * (t + 1) / workers;
-                    let begin = z0.saturating_mul(span);
-                    let end = z1.saturating_mul(span).min(nblock);
-                    for blk in begin..end {
-                        job(&mut cand, &mut heap, blk);
-                    }
-                });
-                return;
+    let blk = blk as i32;
+    let x0 = side * (blk % blocks[0]);
+    let y0 = side * ((blk / blocks[0]) % blocks[1]);
+    let z0 = side * (blk / (blocks[0] * blocks[1]));
+    cand.x.clear();
+    cand.y.clear();
+    cand.z.clear();
+    cand.id.clear();
+    let interior =
+        x0 >= 1 && y0 >= 1 && z0 >= 1 && x0 + side < nx && y0 + side < ny && z0 + side < nz;
+    for dz in -1..=side {
+        for dy in -1..=side {
+            // Inside the box a row of bins is one run of slots with no
+            // shift: `p + 0` is `p`.
+            if interior {
+                let row = ((z0 + dz) * ny + (y0 + dy)) * nx + x0;
+                let (lo, hi) = (
+                    mesh.offsets[(row - 1) as usize],
+                    mesh.offsets[(row + side + 1) as usize],
+                );
+                for slot in lo..hi {
+                    let p = mesh.slot_folded[slot];
+                    cand.x.push(p[0]);
+                    cand.y.push(p[1]);
+                    cand.z.push(p[2]);
+                    cand.id.push(mesh.occupants[slot] as u64);
+                }
+                continue;
             }
-            use rayon::prelude::*;
-            (0..nblock).into_par_iter().with_min_len(8).for_each_init(
-                || {
-                    (
-                        crate::pop::JobTimer::new(),
-                        Candidates::default(),
-                        KHeap::new(k),
-                    )
-                },
-                |(_timer, cand, heap), blk| job(cand, heap, blk),
-            );
-            return;
+            for dx in -1..=side {
+                let (cell, na, nb, nc) = mesh.locate(x0 + dx, y0 + dy, z0 + dz);
+                let shift = image_shift::<MODE>(geom, na, nb, nc);
+                for slot in mesh.offsets[cell]..mesh.offsets[cell + 1] {
+                    let p = mesh.slot_folded[slot];
+                    cand.x.push(p[0] + shift[0]);
+                    cand.y.push(p[1] + shift[1]);
+                    cand.z.push(p[2] + shift[2]);
+                    cand.id.push(mesh.occupants[slot] as u64);
+                }
+            }
         }
     }
-    let _timer = crate::pop::JobTimer::new();
-    let mut cand = Candidates::default();
-    let mut heap = KHeap::new(k);
-    for blk in 0..nblock {
-        job(&mut cand, &mut heap, blk);
-    }
-}
-
-/// How many workers `lc_set_threads` asked for. Zero means the caller
-/// left the default iterator in place.
-#[cfg(feature = "parallel")]
-fn requested_threads() -> usize {
-    #[cfg(feature = "capi")]
-    {
-        crate::capi::search_width()
-    }
-    #[cfg(not(feature = "capi"))]
-    {
-        0
-    }
-}
-
-/// Visit `0..count` in spatial slabs.
-///
-/// The index is x-fastest, so `z_span` indices are one z layer. A width
-/// of one runs the layers on the calling thread. A wider pool gives each
-/// worker one contiguous run of layers and the AVX scan stays inside
-/// that worker. Width zero keeps the default Rayon iterator, chunked by
-/// `min_len`, which is what the Rust callers use.
-fn run_z_slabs<F>(count: usize, z_span: usize, min_len: usize, job: F)
-where
-    F: Fn(usize) + Sync,
-{
-    #[cfg(not(feature = "parallel"))]
-    let _ = (z_span, min_len);
-    #[cfg(feature = "parallel")]
-    {
-        let width = requested_threads();
-        if width != 1 {
-            if width > 1 {
-                let span = z_span.max(1);
-                rayon::broadcast(|ctx| {
-                    let _timer = crate::pop::JobTimer::new();
-                    let workers = ctx.num_threads().max(1);
-                    let t = ctx.index();
-                    let layers = count.saturating_add(span - 1) / span;
-                    let z0 = layers * t / workers;
-                    let z1 = layers * (t + 1) / workers;
-                    let begin = z0.saturating_mul(span);
-                    let end = z1.saturating_mul(span).min(count);
-                    for index in begin..end {
-                        job(index);
+    let planes = box_planes([x0, y0, z0], side, geom);
+    for iz in z0..(z0 + side).min(nz) {
+        for iy in y0..(y0 + side).min(ny) {
+            for ix in x0..(x0 + side).min(nx) {
+                let c = ((iz * ny + iy) * nx + ix) as usize;
+                for slot in mesh.offsets[c]..mesh.offsets[c + 1] {
+                    let i = mesh.occupants[slot];
+                    // Safety: each source owns row `i` of both outputs,
+                    // and the caller sized them to `n * k`.
+                    let (row, mut row_d2) = unsafe { (nn.row(i, k), dd.map(|d| d.row(i, k))) };
+                    clear_row(row, row_d2.as_deref_mut());
+                    heap.clear();
+                    let pi = mesh.slot_folded[slot];
+                    #[cfg(feature = "timing")]
+                    if time_scan {
+                        let started = std::time::Instant::now();
+                        scan_at(path, cand, pi, i, heap);
+                        crate::simd::add_scan_ns(started.elapsed().as_nanos());
+                    } else {
+                        scan_at(path, cand, pi, i, heap);
                     }
-                });
-                return;
+                    #[cfg(not(feature = "timing"))]
+                    scan_at(path, cand, pi, i, heap);
+                    let bound = box_bound(mesh.slot_frac[slot], &planes, geom);
+                    if heap.full() && heap.worst() < bound {
+                        heap.write_sorted(row, row_d2);
+                    } else {
+                        walk_source::<MODE>(
+                            mesh,
+                            geom,
+                            k,
+                            max_reach,
+                            [ix, iy, iz],
+                            slot,
+                            row,
+                            row_d2,
+                            Some(heap.clone()),
+                        );
+                    }
+                }
             }
-            use rayon::prelude::*;
-            (0..count)
-                .into_par_iter()
-                .with_min_len(min_len)
-                .for_each_init(crate::pop::JobTimer::new, |_timer, index| job(index));
-            return;
         }
-    }
-    let _timer = crate::pop::JobTimer::new();
-    for index in 0..count {
-        job(index);
     }
 }
 
@@ -2213,12 +2719,11 @@ mod fused_agree {
         last
     }
 
-    /// The name `src/knn_region.c` gives a thread while it runs the region.
+    /// The name `src/knn_region.c` gives every worker of the team.
     const TEAM_NAME: &str = "linkcell-knn";
 
-    /// Threads running linkcell's k-nearest region. libomp keeps its
-    /// workers in its own pool after the region ends; those run no
-    /// linkcell code and do not carry the name.
+    /// Workers of linkcell's k-nearest team. The caller, rayon's pool and
+    /// any thread an OpenMP runtime keeps do not carry the name.
     fn team_workers() -> usize {
         let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
             return 0;
@@ -2243,8 +2748,8 @@ mod fused_agree {
         last
     }
 
-    /// Under libgomp the host's workers end with it, so the process is
-    /// back to `before` threads. libomp parks them in its own pool.
+    /// The team is joined, so no worker is left and the process is back to
+    /// `before` threads under libgomp and libomp alike.
     fn assert_threads_back(before: usize, label: &str) {
         let workers = wait_team_workers(0);
         assert_eq!(
@@ -2253,15 +2758,13 @@ mod fused_agree {
             "{label} left linkcell workers running\n{}",
             task_names()
         );
-        if cfg!(not(linkcell_libomp)) {
-            let after = wait_tasks(before);
-            assert_eq!(
-                after,
-                before,
-                "{label} left threads: before {before} after {after}\n{}",
-                task_names()
-            );
-        }
+        let after = wait_tasks(before);
+        assert_eq!(
+            after,
+            before,
+            "{label} left threads: before {before} after {after}\n{}",
+            task_names()
+        );
     }
 
     fn task_names() -> String {
@@ -2591,5 +3094,395 @@ mod fused_agree {
         let closed = unsafe { dlclose(handle) };
         assert_eq!(closed, 0, "dlclose");
         assert_threads_back(before, "dlclose");
+    }
+
+    /// Guard size of worker `slot`, or 0 when that worker is not up.
+    fn team_guard(slot: i32) -> usize {
+        extern "C" {
+            fn lc_knn_team_guard(slot: i32) -> usize;
+        }
+        unsafe { lc_knn_team_guard(slot) }
+    }
+
+    /// The stack size of each worker of the standing team, in slot order,
+    /// as the C library reports it for that thread.
+    fn team_stacks() -> Vec<usize> {
+        extern "C" {
+            fn lc_knn_team_stack(slot: i32) -> usize;
+        }
+        (0..)
+            .map(|slot| unsafe { lc_knn_team_stack(slot) })
+            .take_while(|&size| size != 0)
+            .collect()
+    }
+
+    /// Child processes: `OMP_THREAD_LIMIT` caps the team below what
+    /// `omp_set_num_threads` asks for, `OMP_STACKSIZE` sizes the worker
+    /// stacks, a team of one is the caller with no worker, and
+    /// `OMP_DYNAMIC` trims the team by the load average as libgomp does.
+    #[test]
+    fn team_honours_thread_limit_stacksize_and_dynamic() {
+        let Some(mode) = std::env::var_os("LC_LIMIT_PROBE") else {
+            let exe = std::env::current_exe().unwrap();
+            for (mode, var, value) in [
+                ("2", "OMP_THREAD_LIMIT", "2"),
+                ("1", "OMP_THREAD_LIMIT", "1"),
+                ("dyn", "OMP_DYNAMIC", "true"),
+            ] {
+                let out = std::process::Command::new(&exe)
+                    .arg("knearest::fused_agree::team_honours_thread_limit_stacksize_and_dynamic")
+                    .args(["--exact", "--test-threads", "1", "--nocapture"])
+                    .env_remove("OMP_THREAD_LIMIT")
+                    .env_remove("OMP_DYNAMIC")
+                    .env("OMP_STACKSIZE", " 12m ")
+                    .env(var, value)
+                    .env("LC_LIMIT_PROBE", mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "probe {mode} status {:?}\n{}{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        };
+        extern "C" {
+            fn omp_set_num_threads(n: i32);
+            fn omp_get_thread_limit() -> i32;
+            fn omp_get_num_procs() -> i32;
+            fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+        }
+        let dynamic = || {
+            let mut load = [0.0f64; 3];
+            let busy = if unsafe { getloadavg(load.as_mut_ptr(), 3) } == 3 {
+                (load[2] + 0.1) as i32
+            } else {
+                0
+            };
+            let procs = unsafe { omp_get_num_procs() }.min(4);
+            if busy >= procs {
+                1
+            } else {
+                (procs - busy) as usize
+            }
+        };
+        let stack = 12usize << 20;
+        let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
+        let xyz = periodic(&cell, 64, 9);
+        // Another thread holds a 12 MiB stack through the query. No thread
+        // exits before it, so no cached stack can stand in for a worker's.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || {
+                let _ = held.recv();
+            })
+            .unwrap();
+        // A team of one warms everything else up and leaves no worker
+        // stack in glibc's cache of joined threads.
+        unsafe { omp_set_num_threads(1) };
+        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_eq!(super::knearest_team_threads(), 1);
+        unsafe { omp_set_num_threads(4) };
+        let before = task_count();
+        let expect = match mode.to_str() {
+            Some("2") => vec![2],
+            Some("1") => vec![1],
+            _ => vec![dynamic()],
+        };
+        assert!(
+            mode != "dyn" || expect[0] <= 4,
+            "dynamic size above nthreads-var"
+        );
+        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        let team = super::knearest_team_threads();
+        if mode == "dyn" {
+            assert!(
+                team == expect[0] || team == dynamic(),
+                "OMP_DYNAMIC team {team}, load-average size {expect:?}"
+            );
+        } else {
+            assert_eq!(unsafe { omp_get_thread_limit() }, expect[0] as i32);
+            assert_eq!(team, expect[0], "OMP_THREAD_LIMIT={}", expect[0]);
+        }
+        let workers = if team > 1 { team } else { 0 };
+        let mid = task_count();
+        assert_eq!(
+            mid,
+            before + workers,
+            "team {team}: before {before} mid {mid}\n{}",
+            task_names()
+        );
+        assert_eq!(
+            team_stacks(),
+            vec![stack; workers],
+            "OMP_STACKSIZE=12m stacks for a team of {team}"
+        );
+        for slot in 0..workers {
+            let guard = team_guard(slot as i32);
+            assert!(guard > 0, "worker {slot} guard size {guard}");
+        }
+        super::shutdown_knearest_team();
+        let after = wait_tasks(before);
+        assert_eq!(after, before, "shutdown left threads\n{}", task_names());
+        assert_eq!(team_stacks(), Vec::<usize>::new(), "stacks after shutdown");
+        assert_eq!(team_guard(0), 0, "guard after shutdown");
+        drop(release);
+        holder.join().unwrap();
+    }
+
+    /// `OMP_STACKSIZE=1k` is below `PTHREAD_STACK_MIN`, and the mid size is
+    /// one page above it, still below the stack floor. Both run the workers
+    /// on the floor and warn once. `2^63` bytes is larger than the user
+    /// address space. `pthread_attr_setstacksize` accepts it and
+    /// `pthread_create` fails, so the query stays on the caller, the
+    /// process warns once, and the next query tries again.
+    #[test]
+    fn small_stack_is_raised_and_a_refused_stack_stays_on_the_caller() {
+        extern "C" {
+            fn omp_set_num_threads(n: i32);
+            fn omp_set_dynamic(dynamic_threads: i32);
+            fn lc_knn_pthread_stack_min() -> usize;
+            fn lc_knn_stack_floor() -> usize;
+            fn lc_knn_stack_starts() -> usize;
+        }
+        let Some(mode) = std::env::var_os("LC_STACK_PROBE") else {
+            let exe = std::env::current_exe().unwrap();
+            let min = unsafe { lc_knn_pthread_stack_min() };
+            let floor = unsafe { lc_knn_stack_floor() };
+            let mut probes = vec![("small", "1k".to_string())];
+            // One page above the minimum: pthread accepts it, and it sits in
+            // the range where the fold frame can reach the guard.
+            let mid = min + 4096;
+            if mid < floor {
+                probes.push(("mid", format!("{mid}b")));
+            }
+            // 2^63 bytes. Larger than a 57-bit virtual address space, so
+            // the mapping cannot succeed under any overcommit setting.
+            // glibc's pthread_attr_setstacksize accepts it.
+            probes.push(("huge", "9223372036854775808b".to_string()));
+            for (mode, stack) in probes {
+                let out = std::process::Command::new(&exe)
+                    .arg(
+                        "knearest::fused_agree::small_stack_is_raised_and_a_refused_stack_stays_on_the_caller",
+                    )
+                    .args(["--exact", "--test-threads", "1", "--nocapture"])
+                    .env_remove("OMP_THREAD_LIMIT")
+                    .env_remove("OMP_DYNAMIC")
+                    .env_remove("GOMP_STACKSIZE")
+                    .env("OMP_DYNAMIC", "false")
+                    .env("OMP_STACKSIZE", &stack)
+                    .env("LC_STACK_PROBE", mode)
+                    .output()
+                    .unwrap();
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success(),
+                    "probe {mode} status {:?}\n{}{err}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout)
+                );
+                let raised = err.matches("below the worker stack floor").count();
+                let refused = err.matches("was refused").count();
+                let create_failed = err.matches("could not start a worker").count();
+                if mode != "huge" {
+                    assert_eq!(raised, 1, "{err}");
+                    assert_eq!(refused, 0, "{err}");
+                    assert_eq!(create_failed, 0, "{err}");
+                } else {
+                    assert_eq!(create_failed, 1, "{err}");
+                    assert_eq!(refused, 0, "{err}");
+                    assert_eq!(raised, 0, "{err}");
+                }
+            }
+            return;
+        };
+        let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
+        let xyz = periodic(&cell, 64, 9);
+        unsafe {
+            omp_set_dynamic(0);
+            omp_set_num_threads(1);
+        }
+        let reference = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_eq!(super::knearest_team_threads(), 1);
+        unsafe { omp_set_num_threads(4) };
+        let first = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        let second = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        assert_same("first query", &first, &reference);
+        assert_same("second query", &second, &reference);
+        let team = super::knearest_team_threads();
+        let starts = unsafe { lc_knn_stack_starts() };
+        if mode != "huge" {
+            assert!(team > 1, "raised stack started no team");
+            let min = unsafe { lc_knn_pthread_stack_min() };
+            let floor = unsafe { lc_knn_stack_floor() };
+            assert!(
+                floor >= min,
+                "floor {floor} is below PTHREAD_STACK_MIN {min}"
+            );
+            let stacks = team_stacks();
+            assert_eq!(stacks.len(), team, "raised stack workers");
+            for (slot, size) in stacks.iter().copied().enumerate() {
+                assert!(
+                    size >= min,
+                    "worker {slot} stack {size} is below PTHREAD_STACK_MIN {min}"
+                );
+                assert_eq!(size, floor, "worker {slot} stack {size}");
+            }
+            assert_eq!(starts, 1, "raised stack was started twice");
+        } else {
+            assert_eq!(team, 1, "huge stack started a team");
+            assert!(team_stacks().is_empty(), "huge stack left workers");
+            assert_eq!(starts, 2, "pthread_create failure was remembered");
+        }
+        super::shutdown_knearest_team();
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    /// The graph from the nominations one slot at a time: an accepted slot
+    /// `(i, t) -> j` appends `j` to row `i` and `i` to row `j`. Mutual rows
+    /// are the lower partners ascending, then the higher ones in row order.
+    #[cfg(feature = "parallel")]
+    fn reference(nom: &[i32], n: usize, k: usize, mutual: bool) -> (Vec<i32>, Vec<i32>) {
+        let listed = |j: usize, i: usize| nom[j * k..(j + 1) * k].contains(&(i as i32));
+        let mut rows = vec![Vec::new(); n];
+        if mutual {
+            for (i, row) in rows.iter_mut().enumerate() {
+                let keep: Vec<i32> = nom[i * k..(i + 1) * k]
+                    .iter()
+                    .copied()
+                    .filter(|&j| j >= 0 && (j as usize) != i && listed(j as usize, i))
+                    .collect();
+                let mut low: Vec<i32> =
+                    keep.iter().copied().filter(|&j| (j as usize) < i).collect();
+                low.sort_unstable();
+                row.extend(low);
+                row.extend(keep.iter().copied().filter(|&j| (j as usize) > i));
+            }
+        } else {
+            for i in 0..n {
+                for t in 0..k {
+                    let j = nom[i * k + t];
+                    if j < 0 || j as usize == i {
+                        continue;
+                    }
+                    let j = j as usize;
+                    if i < j || !listed(j, i) {
+                        rows[i].push(j as i32);
+                        rows[j].push(i as i32);
+                    }
+                }
+            }
+        }
+        let mut offsets = vec![0i32];
+        let mut cols = Vec::new();
+        for row in rows {
+            cols.extend(row);
+            offsets.push(cols.len() as i32);
+        }
+        (offsets, cols)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn points(n: usize, cell: &Cell, state: &mut u64) -> Vec<[f64; 3]> {
+        let mut next = || {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            (*state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let s = [next(), next(), next()];
+                let (a, b, c) = (cell.a(), cell.b(), cell.c());
+                std::array::from_fn(|x| s[0] * a[x] + s[1] * b[x] + s[2] * c[x])
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "parallel")]
+    fn in_pool<R: Send>(width: usize, f: impl FnOnce() -> R + Send) -> R {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .build()
+            .unwrap()
+            .install(f)
+    }
+
+    /// Every width, cell shape, mask, and k gives the graph the
+    /// nominations define, row for row.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn csr_rows_follow_the_nominations_at_every_width() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let cells = [
+            Cell::ortho(41.0, 37.0, 45.0).unwrap(),
+            Cell::from_vectors(
+                [40.0, 0.0, 0.0],
+                [6.0, 38.0, 0.0],
+                [-5.0, 4.0, 42.0],
+                [0.0; 3],
+            )
+            .unwrap(),
+            Cell::from_vectors(
+                [30.0, 9.0, 2.0],
+                [-4.0, 33.0, 7.0],
+                [3.0, -6.0, 36.0],
+                [1.0, 2.0, 3.0],
+            )
+            .unwrap(),
+        ];
+        for cell in &cells {
+            let xyz = points(9_000, cell, &mut state);
+            let mask: Vec<bool> = (0..xyz.len()).map(|i| i % 7 != 3).collect();
+            for k in [1usize, 4, 12] {
+                for masked in [false, true] {
+                    let m = masked.then_some(&mask[..]);
+                    let mut nom = vec![0i32; xyz.len() * k];
+                    knearest_into(&xyz, cell, k, m, Some(3.0), &mut nom).unwrap();
+                    for mutual in [false, true] {
+                        let want = reference(&nom, xyz.len(), k, mutual);
+                        for width in [1usize, 2, 3, 8] {
+                            let got = in_pool(width, || {
+                                knearest_csr(&xyz, cell, k, m, Some(3.0), mutual).unwrap()
+                            });
+                            assert!(
+                                got == want,
+                                "k={k} masked={masked} mutual={mutual} width={width}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One or no active point, and a box of two, leave every row empty
+    /// or give the single pair.
+    #[test]
+    fn csr_of_tiny_inputs() {
+        let cell = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let one = [[1.0, 1.0, 1.0]];
+        assert_eq!(
+            knearest_csr(&one, &cell, 3, None, None, false).unwrap(),
+            (vec![0, 0], vec![])
+        );
+        let two = [[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]];
+        let off = [false, true];
+        assert_eq!(
+            knearest_csr(&two, &cell, 3, Some(&off), None, true).unwrap(),
+            (vec![0, 0, 0], vec![])
+        );
+        assert_eq!(
+            knearest_csr(&two, &cell, 3, None, None, false).unwrap(),
+            (vec![0, 1, 2], vec![1, 0])
+        );
     }
 }

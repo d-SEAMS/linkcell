@@ -25,6 +25,15 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
 }
 
 #[cfg(feature = "parallel")]
+struct Slot {
+    n: usize,
+    pool: rayon::ThreadPool,
+}
+
+#[cfg(feature = "parallel")]
+static CACHE: std::sync::Mutex<Option<Slot>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "parallel")]
 fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     let n = WANTED_THREADS.load(Ordering::Relaxed);
     if n == 0 {
@@ -36,26 +45,41 @@ fn with_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     if rayon::current_thread_index().is_some() && rayon::current_num_threads() == n {
         return work();
     }
-    struct Slot {
-        n: usize,
-        pool: rayon::ThreadPool,
-    }
-    static CACHE: std::sync::Mutex<Option<Slot>> = std::sync::Mutex::new(None);
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     if guard.as_ref().map(|slot| slot.n) != Some(n) {
         *guard = None;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .unwrap_or_else(|_| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .build()
-                    .unwrap()
-            });
+        let pool = crate::place::build_pool(n);
         *guard = Some(Slot { n, pool });
     }
     guard.as_ref().unwrap().pool.install(work)
+}
+
+/// Run a k-nearest search on the calling thread, with the workers of the
+/// pool [`lc_set_threads`] chose joining it (see `team`). The caller does
+/// not hand the search to a pool thread and sleep: it is one of the
+/// workers, and the call returns when the last stage closes.
+#[cfg(not(feature = "parallel"))]
+fn with_team<R>(work: impl FnOnce() -> R) -> R {
+    work()
+}
+
+#[cfg(feature = "parallel")]
+fn with_team<R>(work: impl FnOnce() -> R) -> R {
+    let n = WANTED_THREADS.load(Ordering::Relaxed);
+    if n == 0 || (rayon::current_thread_index().is_some() && rayon::current_num_threads() == n) {
+        return work();
+    }
+    if n == 1 {
+        return crate::run_on_caller(|| crate::team::install(1, &|job| job(), work));
+    }
+    let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if guard.as_ref().map(|slot| slot.n) != Some(n) {
+        *guard = None;
+        let pool = crate::place::build_pool(n);
+        *guard = Some(Slot { n, pool });
+    }
+    let pool = &guard.as_ref().unwrap().pool;
+    crate::team::install(n, &|job| pool.spawn(job), work)
 }
 
 /// Choose the Rayon width for later searches. `n == 0` leaves it unset:
@@ -89,13 +113,6 @@ fn default_width() -> usize {
     {
         1
     }
-}
-
-/// Width stored by [`lc_set_threads`]. Zero means the caller did not
-/// choose, and the search keeps its default iterator.
-#[cfg(feature = "parallel")]
-pub(crate) fn search_width() -> usize {
-    WANTED_THREADS.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy)]
@@ -205,6 +222,66 @@ pub extern "C" fn lc_for_slabs(
             });
         }
     });
+}
+
+/// Workers an [`lc_team_run`] started now may use: the `worker` index it
+/// passes is below this.
+#[no_mangle]
+pub extern "C" fn lc_team_width() -> usize {
+    with_team(|| {
+        crate::team::with_current(|width, spawn| if spawn.is_some() { width.max(1) } else { 1 })
+    })
+}
+
+/// Run `nstages` stages in one parallel region on the pool selected by
+/// [`lc_set_threads`], the caller one of the workers (see `team`). Stage
+/// `s` is `chunks[s]` calls of `fn_(ctx, s, chunk, worker)`, in any order
+/// and on any worker; every chunk of a stage returns before any chunk of
+/// the next starts. `worker` is fixed for one worker thread during the
+/// call and below [`lc_team_width`], so it can index per-worker scratch.
+/// No worker that has not started holds up a stage or the return.
+///
+/// # Safety
+///
+/// `chunks` is readable for `nstages` sizes. `fn_` does not unwind and
+/// may be called from any thread of the pool until the call returns.
+#[no_mangle]
+pub unsafe extern "C" fn lc_team_run(
+    nstages: usize,
+    chunks: *const usize,
+    fn_: Option<extern "C" fn(*mut std::ffi::c_void, usize, usize, usize)>,
+    ctx: *mut std::ffi::c_void,
+) -> c_int {
+    let Some(fn_) = fn_ else {
+        return fail_msg("null pointer");
+    };
+    if nstages == 0 {
+        clear_error();
+        return 0;
+    }
+    if chunks.is_null() {
+        return fail_msg("null pointer");
+    }
+    let sizes = unsafe { std::slice::from_raw_parts(chunks, nstages) }.to_vec();
+    let ctx_bits = ctx as usize;
+    let workers = AtomicUsize::new(0);
+    let runs: Vec<_> = (0..nstages)
+        .map(|stage| {
+            let workers = &workers;
+            move |worker: &mut Option<usize>, chunk: usize| {
+                let w = *worker.get_or_insert_with(|| workers.fetch_add(1, Ordering::Relaxed));
+                fn_(ctx_bits as *mut std::ffi::c_void, stage, chunk, w);
+            }
+        })
+        .collect();
+    let stages: Vec<crate::team::Stage<'_, Option<usize>>> = sizes
+        .iter()
+        .zip(&runs)
+        .map(|(&chunks, run)| crate::team::Stage { chunks, run })
+        .collect();
+    with_team(|| crate::team::with_current(|width, spawn| crate::team::run(width, spawn, &stages)));
+    clear_error();
+    0
 }
 
 /// Periodic parallelepiped. Lattice vectors are a, b, c (same as vesin rows).
@@ -445,7 +522,7 @@ pub unsafe extern "C" fn lc_knearest_many(
         Some(&mut d2_store[..])
     };
     let cont = take_continuation();
-    let err = with_threads(|| {
+    let err = with_team(|| {
         let found = if n_frames == 1 {
             crate::knearest_into_d2(pts, &sim, k, mask_vec.as_deref(), hint, nn, d2)
         } else {
@@ -459,6 +536,104 @@ pub unsafe extern "C" fn lc_knearest_many(
     if let Err(e) = err {
         set_error(&e.to_string());
         return 1;
+    }
+    clear_error();
+    0
+}
+
+/// The k-nearest graph of `n` points as CSR.
+///
+/// Inputs are those of [`lc_knearest`]. Row `i` of the nominations is
+/// its `k` nearest, nearest first. With `mutual` nonzero, row `i` holds
+/// every `j` that row `i` lists and that lists `i`: the lower indices
+/// ascending, then the higher ones nearest first. Otherwise each edge
+/// comes from one nomination slot `s = i * k + t`: the lower index's
+/// when both rows list each other, the only one that names it when one
+/// does. A row holds its edges in slot order: edges from lower rows
+/// ascending, then its own nearest first, then edges from higher rows
+/// ascending.
+///
+/// `out_offsets` is caller-owned, `n + 1` ints. `alloc(ctx, total)` is
+/// called once, from any thread of the search, and returns `total`
+/// writable ints for the columns; null fails the call. The search, the
+/// degrees, and the fill run in one parallel region.
+///
+/// # Safety
+///
+/// Same pointer contract as [`lc_knearest`]. `out_offsets` is writable
+/// for `n + 1` ints. `alloc` returns null or `total` writable ints and
+/// does not unwind.
+#[no_mangle]
+pub unsafe extern "C" fn lc_knearest_csr(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    k: usize,
+    mask: *const c_int,
+    cell_hint: f64,
+    mutual: c_int,
+    out_offsets: *mut c_int,
+    alloc: Option<extern "C" fn(*mut std::ffi::c_void, usize) -> *mut c_int>,
+    ctx: *mut std::ffi::c_void,
+) -> c_int {
+    if n == 0 {
+        return fail(Error::Empty);
+    }
+    if k == 0 {
+        return fail(Error::ZeroK);
+    }
+    let Some(alloc) = alloc else {
+        return fail_msg("null pointer");
+    };
+    if xyz.is_null() || simbox.is_null() || out_offsets.is_null() {
+        return fail_msg("null pointer");
+    }
+    let Some(need) = n.checked_mul(k) else {
+        return fail(Error::Overflow);
+    };
+    if n > (isize::MAX as usize) / 3 || need > (isize::MAX as usize) / std::mem::size_of::<c_int>()
+    {
+        return fail(Error::Overflow);
+    }
+    let box_c = unsafe { *simbox };
+    let sim = match Cell::from_vectors(
+        [box_c.ax, box_c.ay, box_c.az],
+        [box_c.bx, box_c.by, box_c.bz],
+        [box_c.cx, box_c.cy, box_c.cz],
+        [box_c.ox, box_c.oy, box_c.oz],
+    ) {
+        Ok(b) => b,
+        Err(e) => return fail_msg(&e.to_string()),
+    };
+    let pts: &[[f64; 3]] = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_vec: Option<Vec<bool>> = if mask.is_null() {
+        None
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(mask, n) };
+        Some(raw.iter().map(|&v| v != 0).collect())
+    };
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
+    let offsets = unsafe { std::slice::from_raw_parts_mut(out_offsets, n + 1) };
+    let ctx_bits = ctx as usize;
+    let get = move |total: usize| alloc(ctx_bits as *mut std::ffi::c_void, total);
+    let found = with_team(|| {
+        crate::knearest::knearest_graph(
+            pts,
+            &sim,
+            k,
+            mask_vec.as_deref(),
+            hint,
+            mutual != 0,
+            offsets,
+            &get,
+        )
+    });
+    if let Err(e) = found {
+        return fail(e);
     }
     clear_error();
     0
@@ -1753,4 +1928,71 @@ pub unsafe extern "C" fn lc_owned_mask(
     }
     clear_error();
     0
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod tests {
+    use super::*;
+
+    struct Tally {
+        sizes: [usize; 3],
+        hits: Vec<Vec<AtomicUsize>>,
+        closed: [AtomicUsize; 3],
+        early: AtomicUsize,
+        widest: AtomicUsize,
+    }
+
+    extern "C" fn tally(ctx: *mut std::ffi::c_void, stage: usize, chunk: usize, worker: usize) {
+        let t = unsafe { &*ctx.cast::<Tally>() };
+        if stage > 0 && t.closed[stage - 1].load(Ordering::SeqCst) != t.sizes[stage - 1] {
+            t.early.fetch_add(1, Ordering::SeqCst);
+        }
+        t.widest.fetch_max(worker + 1, Ordering::SeqCst);
+        t.hits[stage][chunk].fetch_add(1, Ordering::SeqCst);
+        t.closed[stage].fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_team_runs_every_chunk_once_and_the_stages_in_order() {
+        for threads in [1, 4] {
+            lc_set_threads(threads);
+            let sizes = [97, 0, 13];
+            let t = Tally {
+                sizes,
+                hits: sizes
+                    .iter()
+                    .map(|&n| (0..n).map(|_| AtomicUsize::new(0)).collect())
+                    .collect(),
+                closed: Default::default(),
+                early: AtomicUsize::new(0),
+                widest: AtomicUsize::new(0),
+            };
+            let code = unsafe {
+                lc_team_run(
+                    3,
+                    sizes.as_ptr(),
+                    Some(tally),
+                    (&t as *const Tally).cast_mut().cast(),
+                )
+            };
+            lc_set_threads(0);
+            assert_eq!(code, 0);
+            assert_eq!(t.early.load(Ordering::SeqCst), 0);
+            assert!(t
+                .hits
+                .iter()
+                .flatten()
+                .all(|h| h.load(Ordering::SeqCst) == 1));
+            let bound = (threads as usize).max(rayon::current_num_threads());
+            assert!(t.widest.load(Ordering::SeqCst) <= bound);
+        }
+        assert_ne!(
+            unsafe { lc_team_run(1, ptr::null(), Some(tally), ptr::null_mut()) },
+            0
+        );
+        assert_ne!(
+            unsafe { lc_team_run(1, [1].as_ptr(), None, ptr::null_mut()) },
+            0
+        );
+    }
 }

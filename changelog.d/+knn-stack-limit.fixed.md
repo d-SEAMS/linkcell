@@ -1,0 +1,3 @@
+An `OMP_STACKSIZE` below the worker stack floor is raised to the floor. linkcell warns once per process. The workers use that explicit size. The floor is 64 KiB, or `PTHREAD_STACK_MIN` when that is larger. The wide fold frame does not fit in 16 KiB, so a size that pthread accepts is raised too when it is below the floor.
+`pthread_attr_setstacksize` returns `EINVAL` for a size. linkcell warns once per process and remembers the refusal. Later queries stay on the calling thread.
+`pthread_create` may fail for an `OMP_STACKSIZE`, including with `EAGAIN`. linkcell warns once per process. That query stays on the calling thread. The next query tries the size again.

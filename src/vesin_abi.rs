@@ -372,15 +372,7 @@ fn with_threads<R: Send>(n: usize, f: impl FnOnce() -> R + Send) -> R {
         let n = n.max(1);
         let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         if slots.iter().all(|s| s.n != n) {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build()
-                .unwrap_or_else(|_| {
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(1)
-                        .build()
-                        .expect("rayon")
-                });
+            let pool = crate::place::build_pool(n);
             slots.push(Slot { n, pool });
         }
         let slot = slots.iter().find(|s| s.n == n).unwrap();

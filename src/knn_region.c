@@ -1,12 +1,20 @@
-/* One OpenMP team for a whole k-nearest query.
+/* One linkcell-owned thread team for a whole k-nearest query.
  *
  * The Rust side owns the points, the bins, and each thread's scratch.
  * This file only schedules: static shares, in thread order, so slot t is
- * the same thread for every phase. Nothing here reads an environment
- * variable. Affinity changes only when the caller asks to pin.
+ * the same thread for every phase. The workers are pthreads that this
+ * file creates and joins, so no OpenMP runtime holds a thread after
+ * shutdown. OpenMP is only read: the team is sized as libgomp sizes a
+ * parallel region the caller opens (`omp_get_max_threads()`, then
+ * `omp_get_dynamic()` and `omp_get_thread_limit()`), the bind kind and
+ * place list place it, and `OMP_STACKSIZE` sizes its stacks. A team of
+ * one is the caller itself. Affinity changes only when the caller asks to
+ * pin or the runtime binds threads.
  */
 #define _GNU_SOURCE
 
+#include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <linux/futex.h>
 #include <omp.h>
@@ -197,10 +205,11 @@ typedef struct {
     int *team;
 } LcJob;
 
-/* One OpenMP region between queries. Workers sleep on `cv`. Phase edges
- * use LcBar. The region is joined from `lc_knn_shutdown`, including the
+/* One standing team between queries. Workers sleep on `cv`. Phase edges
+ * use LcBar. The team is joined from `lc_knn_shutdown`, including the
  * image destructor, so a dlclose does not leave threads in unmapped code.
- * Team size is the caller's `omp_get_max_threads()` for that query. */
+ * Team size comes from `team_size`, kept for as long as the caller's
+ * nthreads-var and dyn-var stay the same and the team is not joined. */
 #define LC_EMPTY 0
 #define LC_START 1
 #define LC_UP 2
@@ -209,15 +218,18 @@ typedef struct {
 static struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    pthread_t host;
+    pthread_t *workers;
+    int started;
     int state;
-    int requested;
     int nt;
     int parked;
     int epoch;
     int done;
     int busy;
     int quit;
+    int sized_want;
+    int sized_dyn;
+    int sized_nt;
     LcJob job;
     LcBar bar;
 } g_team = {
@@ -225,118 +237,379 @@ static struct {
     .cv = PTHREAD_COND_INITIALIZER,
 };
 
-static void run_phases(const LcJob *job, int nt) {
+/* Slot t takes share t of every phase, as `schedule(static)` over nt
+ * iterations on nt threads does. Slot 0 runs the singles. */
+static void run_phases(const LcJob *job, int slot, int nt) {
     void *ctx = job->ctx;
     int pin = job->pin;
     int restore = job->restore;
     LcBar *bar = &g_team.bar;
+    int64_t begin, end;
 
     if (pin || restore) {
-#pragma omp single nowait
-        {
-            if (pin) {
-                least_loaded(nt);
-            }
+        if (slot == 0 && pin) {
+            least_loaded(nt);
         }
         passive_barrier(bar, nt);
-        apply_affinity(pin, omp_get_thread_num());
+        apply_affinity(pin, slot);
     }
 
-#pragma omp for schedule(static) nowait
-    for (int slot = 0; slot < nt; ++slot) {
-        int64_t begin, end;
-        share(job->n_points, slot, nt, &begin, &end);
-        job->bin(ctx, slot, nt, begin, end);
+    share(job->n_points, slot, nt, &begin, &end);
+    job->bin(ctx, slot, nt, begin, end);
+    passive_barrier(bar, nt);
+    share(job->n_bins, slot, nt, &begin, &end);
+    job->count(ctx, slot, nt, begin, end);
+    passive_barrier(bar, nt);
+    if (slot == 0) {
+        job->scan_base(ctx, 0, nt, 0, job->n_bins);
     }
     passive_barrier(bar, nt);
-#pragma omp for schedule(static) nowait
-    for (int slot = 0; slot < nt; ++slot) {
-        int64_t begin, end;
-        share(job->n_bins, slot, nt, &begin, &end);
-        job->count(ctx, slot, nt, begin, end);
-    }
+    share(job->n_bins, slot, nt, &begin, &end);
+    job->scan(ctx, slot, nt, begin, end);
     passive_barrier(bar, nt);
-#pragma omp single nowait
-    job->scan_base(ctx, 0, nt, 0, job->n_bins);
+    share(job->n_points, slot, nt, &begin, &end);
+    job->fill(ctx, slot, nt, begin, end);
     passive_barrier(bar, nt);
-#pragma omp for schedule(static) nowait
-    for (int slot = 0; slot < nt; ++slot) {
-        int64_t begin, end;
-        share(job->n_bins, slot, nt, &begin, &end);
-        job->scan(ctx, slot, nt, begin, end);
-    }
+    share(job->n_blocks, slot, nt, &begin, &end);
+    job->select(ctx, slot, nt, begin, end);
     passive_barrier(bar, nt);
-#pragma omp for schedule(static) nowait
-    for (int slot = 0; slot < nt; ++slot) {
-        int64_t begin, end;
-        share(job->n_points, slot, nt, &begin, &end);
-        job->fill(ctx, slot, nt, begin, end);
-    }
-    passive_barrier(bar, nt);
-#pragma omp for schedule(static) nowait
-    for (int slot = 0; slot < nt; ++slot) {
-        int64_t begin, end;
-        share(job->n_blocks, slot, nt, &begin, &end);
-        job->select(ctx, slot, nt, begin, end);
-    }
-    passive_barrier(bar, nt);
-#pragma omp single nowait
-    {
-        if (job->team != NULL) {
-            *job->team = nt;
-        }
+    if (slot == 0 && job->team != NULL) {
+        *job->team = nt;
     }
 }
 
-/* Every thread carries this name while it runs the region and takes its
- * own name back when it leaves. libomp keeps its workers in a pool after
- * the region ends, so the name, not the thread count, tells linkcell's
- * team apart from threads the runtime keeps. */
+/* Every worker carries this name, so `top -H` and
+ * `/proc/<pid>/task/<tid>/comm` tell linkcell's team apart from the
+ * caller's threads and from any the OpenMP runtime keeps. */
 #define LC_TEAM_NAME "linkcell-knn"
 
-static void *team_host(void *arg) {
-    int want = (int)(intptr_t)arg;
-    if (want < 1) {
-        want = 1;
+static void *team_worker(void *arg) {
+    int slot = (int)(intptr_t)arg;
+    int seen = 0;
+    int nt;
+    pthread_setname_np(pthread_self(), LC_TEAM_NAME);
+    pthread_mutex_lock(&g_team.mu);
+    nt = g_team.nt;
+    g_team.parked++;
+    if (g_team.parked == nt) {
+        g_team.state = LC_UP;
+        pthread_cond_broadcast(&g_team.cv);
     }
-    /* Size this region only. The caller's nthreads-var is left alone. */
-#pragma omp parallel num_threads(want)
-    {
-        int nt = omp_get_num_threads();
-        int seen = 0;
-        char was[16];
-        int named = pthread_getname_np(pthread_self(), was, sizeof was) == 0;
-        pthread_setname_np(pthread_self(), LC_TEAM_NAME);
-        pthread_mutex_lock(&g_team.mu);
-        g_team.nt = nt;
-        g_team.parked++;
-        if (g_team.parked == nt) {
-            g_team.state = LC_UP;
-            pthread_cond_broadcast(&g_team.cv);
+    for (;;) {
+        while (g_team.epoch == seen && !g_team.quit) {
+            pthread_cond_wait(&g_team.cv, &g_team.mu);
         }
-        for (;;) {
-            while (g_team.epoch == seen && !g_team.quit) {
-                pthread_cond_wait(&g_team.cv, &g_team.mu);
-            }
-            if (g_team.quit) {
-                pthread_mutex_unlock(&g_team.mu);
-                break;
-            }
-            seen = g_team.epoch;
-            LcJob job = g_team.job;
+        if (g_team.quit) {
             pthread_mutex_unlock(&g_team.mu);
-            run_phases(&job, nt);
-            pthread_mutex_lock(&g_team.mu);
-            g_team.done++;
-            if (g_team.done == nt) {
-                pthread_cond_broadcast(&g_team.cv);
-            }
+            break;
         }
-        if (named) {
-            pthread_setname_np(pthread_self(), was);
+        seen = g_team.epoch;
+        LcJob job = g_team.job;
+        pthread_mutex_unlock(&g_team.mu);
+        run_phases(&job, slot, nt);
+        pthread_mutex_lock(&g_team.mu);
+        g_team.done++;
+        if (g_team.done == nt) {
+            pthread_cond_broadcast(&g_team.cv);
         }
     }
     return NULL;
+}
+
+/* The place of slot `slot` in a team of `nt` over `np` places, as libgomp
+ * binds a team that a new thread starts: from place 0 of the whole list.
+ * `close` and `true` put consecutive slots on consecutive places. `spread`
+ * starts each slot on its own subpartition, the first `np % nt` one place
+ * longer. With more slots than places both give each place a run of
+ * `nt / np` consecutive slots, and the `nt % np` left over wrap round from
+ * place 0. `primary` keeps every slot on place 0. */
+static int place_of(int bind, int slot, int nt, int np) {
+    int each, rest;
+    if (bind != omp_proc_bind_true && bind != omp_proc_bind_close && bind != omp_proc_bind_spread) {
+        return 0;
+    }
+    if (nt > np) {
+        each = nt / np;
+        if (slot < each * np) {
+            return slot / each;
+        }
+        return slot - each * np;
+    }
+    if (bind == omp_proc_bind_spread) {
+        each = np / nt;
+        rest = np % nt;
+        if (slot < rest) {
+            return slot * (each + 1);
+        }
+        return rest * (each + 1) + (slot - rest) * each;
+    }
+    return slot;
+}
+
+static int place_mask(int place, cpu_set_t *set) {
+    int n = omp_get_place_num_procs(place);
+    int *ids;
+    int i;
+    CPU_ZERO(set);
+    if (n <= 0) {
+        return 0;
+    }
+    ids = malloc(sizeof *ids * (size_t)n);
+    if (ids == NULL) {
+        return 0;
+    }
+    omp_get_place_proc_ids(place, ids);
+    for (i = 0; i < n; i++) {
+        if (ids[i] >= 0 && ids[i] < CPU_SETSIZE) {
+            CPU_SET((unsigned)ids[i], set);
+        }
+    }
+    free(ids);
+    return CPU_COUNT(set) > 0;
+}
+
+/* libgomp's reading of OMP_STACKSIZE: a decimal size with an optional
+ * B, K, M, or G suffix (K when absent), spaces allowed around both. The
+ * OpenMP API has no getter for stacksize-var, so the variable is read
+ * here, once. An invalid value leaves the default, as libgomp does after
+ * it has reported the value itself. */
+static int parse_stacksize(const char *name, size_t *out) {
+    const char *env = getenv(name);
+    char *end;
+    unsigned long value;
+    unsigned shift = 10;
+    if (env == NULL) {
+        return 0;
+    }
+    while (isspace((unsigned char)*env)) {
+        env++;
+    }
+    if (*env == '\0') {
+        return 0;
+    }
+    errno = 0;
+    value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env) {
+        return 0;
+    }
+    while (isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end != '\0') {
+        switch (tolower((unsigned char)*end)) {
+        case 'b':
+            shift = 0;
+            break;
+        case 'k':
+            break;
+        case 'm':
+            shift = 20;
+            break;
+        case 'g':
+            shift = 30;
+            break;
+        default:
+            return 0;
+        }
+        end++;
+        while (isspace((unsigned char)*end)) {
+            end++;
+        }
+        if (*end != '\0') {
+            return 0;
+        }
+    }
+    if (((value << shift) >> shift) != value) {
+        return 0;
+    }
+    *out = (size_t)(value << shift);
+    return 1;
+}
+
+static pthread_once_t g_stack_once = PTHREAD_ONCE_INIT;
+static size_t g_stacksize;
+/* `pthread_attr_setstacksize` returned EINVAL. Later queries do not try
+ * that size again. Read and written only with `mu` held. */
+static int g_stack_refused;
+/* `pthread_create` failed for an explicit size. The warning is once.
+ * The next query tries again. Read and written only with `mu` held. */
+static int g_stack_create_warned;
+/* Times `start_team` got as far as creating workers. */
+static unsigned g_stack_starts;
+
+/* `pthread_attr_setstacksize` rejects a size below `PTHREAD_STACK_MIN`.
+ * The wide fold frame does not fit in that minimum: on this toolchain
+ * `fold8_regs` asks for about 8 KiB after its callers have already used
+ * most of a 16 KiB stack, and the worker dies on the guard. 32 KiB
+ * completes the query. The floor is 64 KiB, or `PTHREAD_STACK_MIN` when
+ * that is larger. Any request below the floor is raised to it, so a size
+ * that pthread accepts but the frame does not fit is raised too. */
+static size_t stack_floor(void) {
+    size_t floor = (size_t)PTHREAD_STACK_MIN;
+    if (floor < (size_t)64 * 1024) {
+        floor = (size_t)64 * 1024;
+    }
+    return floor;
+}
+
+/* Runs once, from read_stacksize under g_stack_once. */
+static void note_stack_raised(void) {
+    static int noted;
+    if (noted) {
+        return;
+    }
+    noted = 1;
+    fprintf(stderr, "linkcell: OMP_STACKSIZE is below the worker stack floor; using %zu bytes\n",
+            g_stacksize);
+}
+
+static void note_stack_refused(void) {
+    if (g_stack_refused) {
+        return;
+    }
+    g_stack_refused = 1;
+    fprintf(stderr,
+            "linkcell: OMP_STACKSIZE was refused; k-nearest queries stay on the calling thread\n");
+}
+
+static void note_stack_create_failed(void) {
+    if (g_stack_create_warned) {
+        return;
+    }
+    g_stack_create_warned = 1;
+    fprintf(stderr, "linkcell: OMP_STACKSIZE could not start a worker; this query stays on the "
+                    "calling thread\n");
+}
+
+static void read_stacksize(void) {
+    if (!parse_stacksize("OMP_STACKSIZE", &g_stacksize) &&
+        !parse_stacksize("GOMP_STACKSIZE", &g_stacksize)) {
+        g_stacksize = 0;
+        return;
+    }
+    if (g_stacksize < stack_floor()) {
+        g_stacksize = stack_floor();
+        note_stack_raised();
+    }
+}
+
+/* 1 started, 0 the place could not be applied, -1
+ * `pthread_attr_setstacksize` returned EINVAL, -2 some other start
+ * failure. A `pthread_create` failure is -2, including EAGAIN. */
+static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
+    pthread_attr_t attr;
+    int set;
+    if (pthread_attr_init(&attr) != 0) {
+        return -2;
+    }
+    if (g_stacksize != 0) {
+        set = pthread_attr_setstacksize(&attr, g_stacksize);
+        if (set != 0) {
+            pthread_attr_destroy(&attr);
+            return set == EINVAL ? -1 : -2;
+        }
+    }
+    if (place != NULL && pthread_attr_setaffinity_np(&attr, sizeof *place, place) != 0) {
+        pthread_attr_destroy(&attr);
+        return 0;
+    }
+    if (pthread_create(th, &attr, team_worker, arg) != 0) {
+        pthread_attr_destroy(&attr);
+        return -2;
+    }
+    pthread_attr_destroy(&attr);
+    return 1;
+}
+
+/* A bound slot starts on its place, as an OpenMP worker does. When that
+ * place cannot be applied, a second start keeps the stack size and
+ * inherits the caller's mask. A size below the stack floor was already
+ * raised to it. EINVAL from `pthread_attr_setstacksize` is remembered,
+ * and a later query does not try the size. A `pthread_create` failure
+ * warns once and leaves the size to be tried on the next query. */
+static int start_worker(int slot, int nt, int bind, int np) {
+    pthread_t *th = &g_team.workers[slot];
+    void *arg = (void *)(intptr_t)slot;
+    cpu_set_t set;
+    int want_place;
+    int rc;
+    pthread_once(&g_stack_once, read_stacksize);
+    if (g_stack_refused) {
+        return 0;
+    }
+    want_place = np > 0 && place_mask(place_of(bind, slot, nt, np), &set);
+    if (want_place) {
+        rc = create_worker(th, arg, &set);
+        if (rc == 1) {
+            return 1;
+        }
+        if (rc == -1) {
+            note_stack_refused();
+            return 0;
+        }
+    }
+    rc = create_worker(th, arg, NULL);
+    if (rc == 1) {
+        return 1;
+    }
+    if (rc == -1) {
+        note_stack_refused();
+        return 0;
+    }
+    if (g_stacksize != 0) {
+        note_stack_create_failed();
+        return 0;
+    }
+    fprintf(stderr, "linkcell: k-nearest worker %d failed to start\n", slot);
+    return 0;
+}
+
+/* Called with `mu` held and the team empty. Returns with `mu` held. A
+ * short team cannot run the static shares, so a failed start joins the
+ * workers it made and leaves the team empty. */
+static int start_team(int want) {
+    int bind = (int)omp_get_proc_bind();
+    int np = bind == omp_proc_bind_false ? 0 : omp_get_num_places();
+    int slot;
+    pthread_once(&g_stack_once, read_stacksize);
+    if (g_stack_refused) {
+        return 0;
+    }
+    g_stack_starts++;
+    g_team.workers = malloc(sizeof *g_team.workers * (size_t)want);
+    if (g_team.workers == NULL) {
+        return 0;
+    }
+    g_team.state = LC_START;
+    g_team.nt = want;
+    g_team.parked = 0;
+    g_team.quit = 0;
+    g_team.started = 0;
+    for (slot = 0; slot < want; slot++) {
+        if (!start_worker(slot, want, bind, np)) {
+            break;
+        }
+        g_team.started++;
+    }
+    if (g_team.started == want) {
+        return 1;
+    }
+    g_team.quit = 1;
+    pthread_cond_broadcast(&g_team.cv);
+    pthread_mutex_unlock(&g_team.mu);
+    for (slot = 0; slot < g_team.started; slot++) {
+        pthread_join(g_team.workers[slot], NULL);
+    }
+    pthread_mutex_lock(&g_team.mu);
+    free(g_team.workers);
+    g_team.workers = NULL;
+    g_team.started = 0;
+    g_team.quit = 0;
+    g_team.nt = 0;
+    g_team.parked = 0;
+    g_team.state = LC_EMPTY;
+    pthread_cond_broadcast(&g_team.cv);
+    return 0;
 }
 
 static void ensure_team(int want) {
@@ -352,31 +625,24 @@ static void ensure_team(int want) {
         if (g_team.state == LC_UP && g_team.parked == g_team.nt && g_team.nt > 0) {
             break;
         }
-        if (g_team.state == LC_EMPTY) {
-            g_team.state = LC_START;
-            g_team.requested = want;
-            g_team.parked = 0;
-            g_team.nt = 0;
-            g_team.quit = 0;
-            if (pthread_create(&g_team.host, NULL, team_host, (void *)(intptr_t)want) != 0) {
-                g_team.state = LC_EMPTY;
-                pthread_cond_broadcast(&g_team.cv);
-                pthread_mutex_unlock(&g_team.mu);
-                return;
-            }
+        if (g_team.state == LC_EMPTY && !start_team(want)) {
+            pthread_mutex_unlock(&g_team.mu);
+            return;
         }
         pthread_cond_wait(&g_team.cv, &g_team.mu);
     }
     pthread_mutex_unlock(&g_team.mu);
 }
 
-/* Join the standing region. Safe to call twice, from a query, and from
- * the image destructor (process exit, or dlclose after the workers have
- * been asked to leave). */
+/* Join every worker. Safe to call twice, from a query, and from the
+ * image destructor (process exit, or dlclose after the workers have been
+ * asked to leave). */
 void lc_knn_shutdown_impl(void) {
-    pthread_t host;
-    int join = 0;
+    pthread_t *workers;
+    int started;
+    int slot;
     pthread_mutex_lock(&g_team.mu);
+    g_team.sized_want = 0;
     if (g_team.state == LC_EMPTY) {
         pthread_mutex_unlock(&g_team.mu);
         return;
@@ -398,16 +664,18 @@ void lc_knn_shutdown_impl(void) {
     g_team.state = LC_STOP;
     g_team.quit = 1;
     g_team.epoch++;
-    host = g_team.host;
-    join = 1;
+    workers = g_team.workers;
+    started = g_team.started;
     pthread_cond_broadcast(&g_team.cv);
     pthread_mutex_unlock(&g_team.mu);
-    if (join) {
-        pthread_join(host, NULL);
+    for (slot = 0; slot < started; slot++) {
+        pthread_join(workers[slot], NULL);
     }
     pthread_mutex_lock(&g_team.mu);
+    free(workers);
+    g_team.workers = NULL;
+    g_team.started = 0;
     g_team.quit = 0;
-    g_team.requested = 0;
     g_team.nt = 0;
     g_team.parked = 0;
     g_team.epoch = 0;
@@ -421,73 +689,202 @@ void lc_knn_shutdown_impl(void) {
 
 __attribute__((destructor)) static void lc_knn_at_unload(void) { lc_knn_shutdown_impl(); }
 
-static void run_on_caller(void *ctx, int64_t n_points, int64_t n_bins, int64_t n_blocks,
-                          lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
-                          lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team) {
-    bin(ctx, 0, 1, 0, n_points);
-    count(ctx, 0, 1, 0, n_bins);
-    scan_base(ctx, 0, 1, 0, n_bins);
-    scan(ctx, 0, 1, 0, n_bins);
-    fill(ctx, 0, 1, 0, n_points);
-    select(ctx, 0, 1, 0, n_blocks);
-    if (team != NULL) {
-        *team = 1;
+/* Called with `mu` held. */
+static int team_attr(int slot, pthread_attr_t *attr) {
+    if (g_team.state != LC_UP || slot < 0 || slot >= g_team.started) {
+        return 0;
+    }
+    return pthread_getattr_np(g_team.workers[slot], attr) == 0;
+}
+
+/* The stack size of worker `slot` as the C library reports it, or 0 when
+ * the standing team has no such worker. This is the stack the thread was
+ * given, whatever the memory map looks like: a recent glibc on a recent
+ * kernel keeps the guard inside the stack mapping, and a reused stack
+ * makes no new mapping at all. */
+size_t lc_knn_team_stack(int slot) {
+    pthread_attr_t attr;
+    size_t size = 0;
+    pthread_mutex_lock(&g_team.mu);
+    if (team_attr(slot, &attr)) {
+        if (pthread_attr_getstacksize(&attr, &size) != 0) {
+            size = 0;
+        }
+        pthread_attr_destroy(&attr);
+    }
+    pthread_mutex_unlock(&g_team.mu);
+    return size;
+}
+
+size_t lc_knn_pthread_stack_min(void) { return (size_t)PTHREAD_STACK_MIN; }
+
+size_t lc_knn_stack_floor(void) { return stack_floor(); }
+
+size_t lc_knn_stack_starts(void) {
+    size_t n;
+    pthread_mutex_lock(&g_team.mu);
+    n = g_stack_starts;
+    pthread_mutex_unlock(&g_team.mu);
+    return n;
+}
+
+/* The guard size beside that stack, or 0 when the standing team has no
+ * such worker. `pthread_attr_setstacksize` keeps a guard, so a live
+ * worker reports a size above zero. */
+size_t lc_knn_team_guard(int slot) {
+    pthread_attr_t attr;
+    size_t size = 0;
+    pthread_mutex_lock(&g_team.mu);
+    if (team_attr(slot, &attr)) {
+        if (pthread_attr_getguardsize(&attr, &size) != 0) {
+            size = 0;
+        }
+        pthread_attr_destroy(&attr);
+    }
+    pthread_mutex_unlock(&g_team.mu);
+    return size;
+}
+
+/* libgomp's size for a parallel region the caller opens with no
+ * num_threads clause. With dyn-var set the team is the processors
+ * available, at most nthreads-var, less the 15-minute load average
+ * rounded as libgomp rounds it, and at least one. thread-limit-var caps
+ * the result. Called with `mu` held. */
+static int team_size(int want, int dyn) {
+    int nt = want;
+    int limit;
+    if (g_team.sized_want == want && g_team.sized_dyn == dyn) {
+        return g_team.sized_nt;
+    }
+    if (dyn) {
+        int procs = omp_get_num_procs();
+        double load[3];
+        int busy = 0;
+        if (procs > want) {
+            procs = want;
+        }
+        if (getloadavg(load, 3) == 3) {
+            busy = (int)(load[2] + 0.1);
+        }
+        procs = busy >= procs ? 1 : procs - busy;
+        if (procs < nt) {
+            nt = procs;
+        }
+    }
+    limit = omp_get_thread_limit();
+    if (limit > 0 && limit < nt) {
+        nt = limit;
+    }
+    if (nt < 1) {
+        nt = 1;
+    }
+    g_team.sized_want = want;
+    g_team.sized_dyn = dyn;
+    g_team.sized_nt = nt;
+    return nt;
+}
+
+/* A team of one is the caller: no worker and no handoff. For the query
+ * the caller takes the CPU or the place slot 0 would have had, then gets
+ * its own mask back. */
+static void run_on_caller(const LcJob *job) {
+    cpu_set_t mine;
+    cpu_set_t set;
+    int moved = 0;
+    if (job->pin) {
+        pthread_mutex_lock(&g_team.mu);
+        while (g_team.busy) {
+            pthread_cond_wait(&g_team.cv, &g_team.mu);
+        }
+        least_loaded(1);
+        if (g_cpu_n == 1) {
+            CPU_ZERO(&set);
+            CPU_SET((unsigned)g_cpu[0], &set);
+            moved = 1;
+        }
+        pthread_mutex_unlock(&g_team.mu);
+    } else {
+        int bind = (int)omp_get_proc_bind();
+        int np = bind == omp_proc_bind_false ? 0 : omp_get_num_places();
+        moved = np > 0 && place_mask(place_of(bind, 0, 1, np), &set);
+    }
+    moved = moved && sched_getaffinity(0, sizeof mine, &mine) == 0 &&
+            sched_setaffinity(0, sizeof set, &set) == 0;
+    job->bin(job->ctx, 0, 1, 0, job->n_points);
+    job->count(job->ctx, 0, 1, 0, job->n_bins);
+    job->scan_base(job->ctx, 0, 1, 0, job->n_bins);
+    job->scan(job->ctx, 0, 1, 0, job->n_bins);
+    job->fill(job->ctx, 0, 1, 0, job->n_points);
+    job->select(job->ctx, 0, 1, 0, job->n_blocks);
+    if (moved) {
+        sched_setaffinity(0, sizeof mine, &mine);
+    }
+    if (job->team != NULL) {
+        *job->team = 1;
     }
 }
 
-/* `bin`, `count`, `scan`, `fill`, and `select` run inside the standing
- * region. `scan_base` is the single that publishes each slot's prefix.
- * The caller waits on the condition variable, not on an OpenMP join.
- * `width` above zero is the team size, otherwise the caller's
- * `omp_get_max_threads()`. A team of one runs every phase on the caller
- * and starts no thread. */
+/* `bin`, `count`, `scan`, `fill`, and `select` run on the standing team.
+ * `scan_base` is the single that publishes each slot's prefix. The
+ * caller waits on the condition variable for every slot to finish. A
+ * change of team size joins the old team first. `width` above zero
+ * stands in for `omp_get_max_threads()`, as a num_threads clause does,
+ * and is trimmed and capped the same way. */
 void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int64_t n_blocks,
                        lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
                        lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team,
                        int width) {
     int want = width > 0 ? width : omp_get_max_threads();
-    int rebuild = 0;
-    if (want <= 1) {
-        run_on_caller(ctx, n_points, n_bins, n_blocks, bin, count, scan_base, scan, fill, select,
-                      team);
-        return;
+    int dyn = omp_get_dynamic() != 0;
+    int nt;
+    int up;
+    LcJob job = {
+        .ctx = ctx,
+        .pin = pin,
+        .n_points = n_points,
+        .n_bins = n_bins,
+        .n_blocks = n_blocks,
+        .bin = bin,
+        .count = count,
+        .scan_base = scan_base,
+        .scan = scan,
+        .fill = fill,
+        .select = select,
+        .team = team,
+    };
+    if (want < 1) {
+        want = 1;
     }
     pthread_mutex_lock(&g_team.mu);
-    rebuild = g_team.state == LC_UP && g_team.requested != want;
+    nt = team_size(want, dyn);
+    up = g_team.state == LC_UP && g_team.nt != nt;
     pthread_mutex_unlock(&g_team.mu);
-    if (rebuild) {
+    if (up) {
         lc_knn_shutdown_impl();
+        pthread_mutex_lock(&g_team.mu);
+        nt = team_size(want, dyn);
+        pthread_mutex_unlock(&g_team.mu);
     }
-    ensure_team(want);
-    pthread_mutex_lock(&g_team.mu);
-    rebuild = g_team.state != LC_UP;
-    pthread_mutex_unlock(&g_team.mu);
-    if (rebuild) {
-        run_on_caller(ctx, n_points, n_bins, n_blocks, bin, count, scan_base, scan, fill, select,
-                      team);
+    if (nt <= 1) {
+        run_on_caller(&job);
         return;
     }
+    ensure_team(nt);
     pthread_mutex_lock(&g_team.mu);
     while (g_team.busy) {
         pthread_cond_wait(&g_team.cv, &g_team.mu);
+    }
+    if (g_team.state != LC_UP) {
+        pthread_mutex_unlock(&g_team.mu);
+        run_on_caller(&job);
+        return;
     }
     g_team.busy = 1;
     g_team.bar.count = 0;
     g_team.bar.phase = 0;
     g_team.done = 0;
-    g_team.job.ctx = ctx;
-    g_team.job.pin = pin;
-    g_team.job.restore = g_pinned_once;
-    g_team.job.n_points = n_points;
-    g_team.job.n_bins = n_bins;
-    g_team.job.n_blocks = n_blocks;
-    g_team.job.bin = bin;
-    g_team.job.count = count;
-    g_team.job.scan_base = scan_base;
-    g_team.job.scan = scan;
-    g_team.job.fill = fill;
-    g_team.job.select = select;
-    g_team.job.team = team;
+    job.restore = g_pinned_once;
+    g_team.job = job;
     g_team.epoch++;
     pthread_cond_broadcast(&g_team.cv);
     while (g_team.done < g_team.nt) {

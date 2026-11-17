@@ -314,6 +314,41 @@ int lc_knearest(const double *xyz,
                 int *out_nn);
 
 /**
+ * The k-nearest graph of `n` points as CSR.
+ *
+ * Inputs are those of [`lc_knearest`]. Row `i` of the nominations is
+ * its `k` nearest, nearest first. With `mutual` nonzero, row `i` holds
+ * every `j` that row `i` lists and that lists `i`: the lower indices
+ * ascending, then the higher ones nearest first. Otherwise each edge
+ * comes from one nomination slot `s = i * k + t`: the lower index's
+ * when both rows list each other, the only one that names it when one
+ * does. A row holds its edges in slot order: edges from lower rows
+ * ascending, then its own nearest first, then edges from higher rows
+ * ascending.
+ *
+ * `out_offsets` is caller-owned, `n + 1` ints. `alloc(ctx, total)` is
+ * called once, from any thread of the search, and returns `total`
+ * writable ints for the columns; null fails the call. The search, the
+ * degrees, and the fill run in one parallel region.
+ *
+ * # Safety
+ *
+ * Same pointer contract as [`lc_knearest`]. `out_offsets` is writable
+ * for `n + 1` ints. `alloc` returns null or `total` writable ints and
+ * does not unwind.
+ */
+int lc_knearest_csr(const double *xyz,
+                    size_t n,
+                    const struct lc_cell *simbox,
+                    size_t k,
+                    const int *mask,
+                    double cell_hint,
+                    int mutual,
+                    int *out_offsets,
+                    int *(*alloc)(void*, size_t),
+                    void *ctx);
+
+/**
  * Like [`lc_knearest`], and write squared distances into `out_d2`.
  *
  * `out_d2` is caller-owned, length `n * k`. Unused slots are `NaN`.
@@ -646,6 +681,13 @@ void lc_set_gpu_curve_split(int32_t (*f)(const uint32_t *atom_bin,
                                          uint8_t method));
 
 /**
+ * CPUs Rayon workers may use. Every worker may run on any of them.
+ * Replaces any list recorded earlier. A pool that has already started
+ * keeps the cpus it was built with. `n <= 0` is ignored.
+ */
+void lc_set_places(const int *cpus, int n);
+
+/**
  * Choose the Rayon width for later searches. `n == 0` leaves it unset:
  * the search starts on the calling thread with Rayon's and OpenMP's own
  * widths. `n == 1` runs the whole search on the calling thread and
@@ -660,6 +702,31 @@ void lc_set_threads(int n);
  * the open-cell list share the counter.
  */
 uint64_t lc_stencil_builds(void);
+
+/**
+ * Run `nstages` stages in one parallel region on the pool selected by
+ * [`lc_set_threads`], the caller one of the workers (see `team`). Stage
+ * `s` is `chunks[s]` calls of `fn_(ctx, s, chunk, worker)`, in any order
+ * and on any worker; every chunk of a stage returns before any chunk of
+ * the next starts. `worker` is fixed for one worker thread during the
+ * call and below [`lc_team_width`], so it can index per-worker scratch.
+ * No worker that has not started holds up a stage or the return.
+ *
+ * # Safety
+ *
+ * `chunks` is readable for `nstages` sizes. `fn_` does not unwind and
+ * may be called from any thread of the pool until the call returns.
+ */
+int lc_team_run(size_t nstages,
+                const size_t *chunks,
+                void (*fn_)(void*, size_t, size_t, size_t),
+                void *ctx);
+
+/**
+ * Workers an [`lc_team_run`] started now may use: the `worker` index it
+ * passes is below this.
+ */
+size_t lc_team_width(void);
 
 /**
  * Library version string. Process-static, NUL-terminated. Do not free.

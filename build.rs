@@ -10,7 +10,6 @@ fn main() {
     if major > 1 || minor >= 80 {
         println!("cargo:rustc-check-cfg=cfg(linkcell_avx512)");
         println!("cargo:rustc-check-cfg=cfg(linkcell_openmp)");
-        println!("cargo:rustc-check-cfg=cfg(linkcell_libomp)");
     }
     if major > 1 || minor >= 89 {
         println!("cargo:rustc-cfg=linkcell_avx512");
@@ -90,9 +89,6 @@ fn compile_knn_region() -> bool {
         Some(dir) => {
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib={runtime}");
-            if runtime == "omp" {
-                println!("cargo:rustc-cfg=linkcell_libomp");
-            }
             true
         }
         None if required => panic!("OpenMP k-nearest region: finding lib{runtime} failed"),
@@ -101,30 +97,42 @@ fn compile_knn_region() -> bool {
 }
 
 /// The directory holding `lib<runtime>.so`: the compiler's own search
-/// path first, then `LIBRARY_PATH`. Both drivers link `-l<runtime>` from
+/// path first, then `LIBRARY_PATH`, then the library directory beside
+/// Clang's resource directory. Both drivers link `-l<runtime>` from
 /// `LIBRARY_PATH`, but Clang's `-print-file-name` does not look there, so
 /// a libomp reached only through it (a sanitizer build of the runtime, a
-/// conda prefix) is otherwise reported missing.
+/// conda prefix) is otherwise reported missing. Clang also answers with
+/// the bare name for the libomp a distribution installs in `<llvm>/lib`,
+/// next to its resource directory `<llvm>/lib/clang/<v>`.
 fn runtime_dir(cc: &std::path::Path, runtime: &str) -> Option<std::path::PathBuf> {
     let file = format!("lib{runtime}.so");
     println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
-    let reported = std::process::Command::new(cc)
-        .arg(format!("-print-file-name={file}"))
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|text| std::path::PathBuf::from(text.trim()));
-    if let Some(dir) = reported
-        .filter(|path| path.is_file())
+    if let Some(dir) = compiler_says(cc, &format!("-print-file-name={file}"))
+        .filter(|path| path.is_absolute() && path.is_file())
         .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
     {
         return Some(dir);
     }
-    let dirs = std::env::var_os("LIBRARY_PATH")?;
-    std::env::split_paths(&dirs)
-        .filter(|dir| dir.is_absolute())
-        .find(|dir| dir.join(&file).is_file())
+    if let Some(dir) = std::env::var_os("LIBRARY_PATH").and_then(|dirs| {
+        std::env::split_paths(&dirs)
+            .filter(|dir| dir.is_absolute())
+            .find(|dir| dir.join(&file).is_file())
+    }) {
+        return Some(dir);
+    }
+    let resource = compiler_says(cc, "-print-resource-dir")?;
+    let dir = resource.parent()?.parent()?;
+    dir.join(&file).is_file().then(|| dir.to_path_buf())
+}
+
+fn compiler_says(cc: &std::path::Path, arg: &str) -> Option<std::path::PathBuf> {
+    std::process::Command::new(cc)
+        .arg(arg)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| std::path::PathBuf::from(text.trim()))
 }
 
 #[cfg(feature = "scotch")]
