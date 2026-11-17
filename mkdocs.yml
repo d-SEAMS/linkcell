@@ -1,10 +1,12 @@
-site_name: linkcell
-site_description: Periodic linked-cell neighbour lists for molecular simulations
+site_name: LinkCell
+site_description: High-performance periodic linked-cell neighbour lists and k-nearest neighbour search for Rust, C, C++, and Python
 site_url: https://linkcell.dseams.info/
 repo_url: https://github.com/d-SEAMS/linkcell
 edit_uri: edit/main/docs/
 docs_dir: docs
 strict: true
+hooks:
+  - scripts/seo.py
 exclude_docs: |
   assets/branding/README.md
 

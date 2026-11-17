@@ -3,6 +3,8 @@ name: Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -36,6 +38,10 @@ jobs:
           cargo doc --no-deps --locked --lib
           cp -a target/doc _site/api
           cp assets/rustdoc-index.html _site/api/index.html
+      - name: Add and validate SEO metadata
+        run: |
+          python3 scripts/seo.py _site
+          python3 scripts/seo.py --check _site
       - name: llms.txt
         run: |
           python3 scripts/check-llms-txt.py
@@ -45,6 +51,7 @@ jobs:
           path: _site
   deploy:
     needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
