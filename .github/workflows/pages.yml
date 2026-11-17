@@ -29,10 +29,13 @@ jobs:
         run: |
           python -m pip install "mkdocs==1.6.1" "mkdocs-material==9.5.49"
           mkdocs build --site-dir _site
+      # rustdoc's help and settings pages link api/index.html, which a
+      # single-crate build does not write.
       - name: Rust API reference
         run: |
           cargo doc --no-deps --locked --lib
           cp -a target/doc _site/api
+          cp assets/rustdoc-index.html _site/api/index.html
       - name: llms.txt
         run: |
           python3 scripts/check-llms-txt.py
@@ -49,3 +52,37 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # The published site, as readers get it: every page of the deployed
+  # artifact is a lychee input at its live address, so relative links
+  # resolve against the page they are on. A live 404 fails the run.
+  live-links:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: github-pages
+          path: artifact
+      - name: Page list
+        run: |
+          mkdir site && tar -xf artifact/artifact.tar -C site
+          (cd site && find . -name '*.html' -not -name 404.html \
+            | sed 's#^\./#https://linkcell.dseams.info/#') > pages.txt
+          wc -l pages.txt
+      - name: Lychee
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          fail: true
+          args: >-
+            --no-progress
+            --max-retries 3
+            --retry-wait-time 5
+            --timeout 30
+            --max-concurrency 8
+            --accept 200,202,206,429
+            --remap "https://github.com/d-SEAMS/linkcell/(blob|tree)/main file://${{ github.workspace }}"
+            --exclude '^https://doi\.org/'
+            --files-from pages.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
