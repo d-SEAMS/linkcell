@@ -3096,6 +3096,14 @@ mod fused_agree {
         assert_threads_back(before, "dlclose");
     }
 
+    /// Guard size of worker `slot`, or 0 when that worker is not up.
+    fn team_guard(slot: i32) -> usize {
+        extern "C" {
+            fn lc_knn_team_guard(slot: i32) -> usize;
+        }
+        unsafe { lc_knn_team_guard(slot) }
+    }
+
     /// The stack size of each worker of the standing team, in slot order,
     /// as the C library reports it for that thread.
     fn team_stacks() -> Vec<usize> {
@@ -3213,10 +3221,15 @@ mod fused_agree {
             vec![stack; workers],
             "OMP_STACKSIZE=12m stacks for a team of {team}"
         );
+        for slot in 0..workers {
+            let guard = team_guard(slot as i32);
+            assert!(guard > 0, "worker {slot} guard size {guard}");
+        }
         super::shutdown_knearest_team();
         let after = wait_tasks(before);
         assert_eq!(after, before, "shutdown left threads\n{}", task_names());
         assert_eq!(team_stacks(), Vec::<usize>::new(), "stacks after shutdown");
+        assert_eq!(team_guard(0), 0, "guard after shutdown");
         drop(release);
         holder.join().unwrap();
     }

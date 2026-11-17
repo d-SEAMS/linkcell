@@ -1,0 +1,1 @@
+A k-nearest worker that cannot take its CPU place is started again with the same stack size and the caller's mask. If that start fails, linkcell creates no worker on the default stack. The query runs on the calling thread.

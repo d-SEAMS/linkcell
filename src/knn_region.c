@@ -436,17 +436,22 @@ static void read_stacksize(void) {
     }
 }
 
-/* A bound slot starts on its place, as an OpenMP worker does. Without a
- * bind kind, or when the place cannot be applied, it inherits the
- * caller's mask. A stack size the system refuses leaves the default. */
+/* A bound slot starts on its place, as an OpenMP worker does. When that
+ * place cannot be applied, a second start keeps the stack size and
+ * inherits the caller's mask. If that start fails too, this returns 0.
+ * A null attribute would drop the stack size and the placement, so no
+ * such thread is created. An OMP_STACKSIZE that does not parse leaves
+ * the default. A parsed size that pthread_attr_setstacksize refuses,
+ * such as one below PTHREAD_STACK_MIN, fails the start. */
 static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
     pthread_attr_t attr;
     int made;
     if (pthread_attr_init(&attr) != 0) {
         return 0;
     }
-    if (g_stacksize != 0) {
-        pthread_attr_setstacksize(&attr, g_stacksize);
+    if (g_stacksize != 0 && pthread_attr_setstacksize(&attr, g_stacksize) != 0) {
+        pthread_attr_destroy(&attr);
+        return 0;
     }
     made = (place == NULL || pthread_attr_setaffinity_np(&attr, sizeof *place, place) == 0) &&
            pthread_create(th, &attr, team_worker, arg) == 0;
@@ -458,11 +463,18 @@ static int start_worker(int slot, int nt, int bind, int np) {
     pthread_t *th = &g_team.workers[slot];
     void *arg = (void *)(intptr_t)slot;
     cpu_set_t set;
+    int want_place;
     pthread_once(&g_stack_once, read_stacksize);
-    if (np > 0 && place_mask(place_of(bind, slot, nt, np), &set) && create_worker(th, arg, &set)) {
+    want_place = np > 0 && place_mask(place_of(bind, slot, nt, np), &set);
+    if (want_place && create_worker(th, arg, &set)) {
         return 1;
     }
-    return create_worker(th, arg, NULL) || pthread_create(th, NULL, team_worker, arg) == 0;
+    if (create_worker(th, arg, NULL)) {
+        return 1;
+    }
+    fprintf(stderr, "linkcell: k-nearest worker %d failed to start with its stack size%s\n", slot,
+            want_place ? " and CPU placement" : "");
+    return 0;
 }
 
 /* Called with `mu` held and the team empty. Returns with `mu` held. A
@@ -585,6 +597,14 @@ void lc_knn_shutdown_impl(void) {
 
 __attribute__((destructor)) static void lc_knn_at_unload(void) { lc_knn_shutdown_impl(); }
 
+/* Called with `mu` held. */
+static int team_attr(int slot, pthread_attr_t *attr) {
+    if (g_team.state != LC_UP || slot < 0 || slot >= g_team.started) {
+        return 0;
+    }
+    return pthread_getattr_np(g_team.workers[slot], attr) == 0;
+}
+
 /* The stack size of worker `slot` as the C library reports it, or 0 when
  * the standing team has no such worker. This is the stack the thread was
  * given, whatever the memory map looks like: a recent glibc on a recent
@@ -594,9 +614,25 @@ size_t lc_knn_team_stack(int slot) {
     pthread_attr_t attr;
     size_t size = 0;
     pthread_mutex_lock(&g_team.mu);
-    if (g_team.state == LC_UP && slot >= 0 && slot < g_team.started &&
-        pthread_getattr_np(g_team.workers[slot], &attr) == 0) {
+    if (team_attr(slot, &attr)) {
         if (pthread_attr_getstacksize(&attr, &size) != 0) {
+            size = 0;
+        }
+        pthread_attr_destroy(&attr);
+    }
+    pthread_mutex_unlock(&g_team.mu);
+    return size;
+}
+
+/* The guard size beside that stack, or 0 when the standing team has no
+ * such worker. `pthread_attr_setstacksize` keeps a guard, so a live
+ * worker reports a size above zero. */
+size_t lc_knn_team_guard(int slot) {
+    pthread_attr_t attr;
+    size_t size = 0;
+    pthread_mutex_lock(&g_team.mu);
+    if (team_attr(slot, &attr)) {
+        if (pthread_attr_getguardsize(&attr, &size) != 0) {
             size = 0;
         }
         pthread_attr_destroy(&attr);
