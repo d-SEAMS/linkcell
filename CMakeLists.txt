@@ -128,6 +128,46 @@ else()
   set(LINKCELL_OMP_LIB gomp)
 endif()
 
+# Directory of lib<runtime>.so when it is not on the default linker path.
+# Ubuntu's libomp-dev keeps the linker name beside the Clang resource dir.
+set(LINKCELL_OMP_DIR "")
+if(UNIX AND NOT APPLE)
+  set(_linkcell_omp_file "lib${LINKCELL_OMP_LIB}.so")
+  execute_process(
+    COMMAND "${CMAKE_C_COMPILER}" "-print-file-name=${_linkcell_omp_file}"
+    OUTPUT_VARIABLE _linkcell_omp_printed
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(EXISTS "${_linkcell_omp_printed}")
+    get_filename_component(LINKCELL_OMP_DIR "${_linkcell_omp_printed}" DIRECTORY)
+  endif()
+  if(NOT LINKCELL_OMP_DIR AND DEFINED ENV{LIBRARY_PATH})
+    string(REPLACE ":" ";" _linkcell_lp "$ENV{LIBRARY_PATH}")
+    foreach(_dir IN LISTS _linkcell_lp)
+      if(EXISTS "${_dir}/${_linkcell_omp_file}")
+        set(LINKCELL_OMP_DIR "${_dir}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(NOT LINKCELL_OMP_DIR)
+    execute_process(
+      COMMAND "${CMAKE_C_COMPILER}" -print-resource-dir
+      OUTPUT_VARIABLE _linkcell_resdir
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if(_linkcell_resdir)
+      get_filename_component(_linkcell_res_parent "${_linkcell_resdir}" DIRECTORY)
+      get_filename_component(_linkcell_res_lib "${_linkcell_res_parent}" DIRECTORY)
+      if(EXISTS "${_linkcell_res_lib}/${_linkcell_omp_file}")
+        set(LINKCELL_OMP_DIR "${_linkcell_res_lib}")
+      endif()
+    endif()
+  endif()
+endif()
+
 set(_linkcell_sys Threads::Threads)
 if(UNIX AND NOT APPLE)
   list(APPEND _linkcell_sys ${CMAKE_DL_LIBS} m ${LINKCELL_OMP_LIB})
@@ -145,6 +185,10 @@ set_target_properties(linkcell_static PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/include"
   INTERFACE_LINK_LIBRARIES "${_linkcell_sys}"
 )
+if(LINKCELL_OMP_DIR)
+  set_property(TARGET linkcell_static APPEND PROPERTY
+    INTERFACE_LINK_DIRECTORIES "${LINKCELL_OMP_DIR}")
+endif()
 
 add_library(linkcell_cpp INTERFACE)
 add_library(linkcell::cpp ALIAS linkcell_cpp)
@@ -199,7 +243,12 @@ endif()
 
 if(LINKCELL_INSTALL)
   if(UNIX AND NOT APPLE)
-    set(LINKCELL_PKG_LIBS_PRIVATE "-ldl -lpthread -lm -l${LINKCELL_OMP_LIB}")
+    if(LINKCELL_OMP_DIR)
+      set(LINKCELL_PKG_LIBS_PRIVATE
+        "-ldl -lpthread -lm -L${LINKCELL_OMP_DIR} -l${LINKCELL_OMP_LIB}")
+    else()
+      set(LINKCELL_PKG_LIBS_PRIVATE "-ldl -lpthread -lm -l${LINKCELL_OMP_LIB}")
+    endif()
     set(LINKCELL_GPU_PKG_LIBS "-ldl -lpthread")
   elseif(APPLE)
     set(LINKCELL_PKG_LIBS_PRIVATE "-lpthread -lm")
