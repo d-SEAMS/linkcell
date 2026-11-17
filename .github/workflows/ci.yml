@@ -432,6 +432,37 @@ jobs:
           pkg-config --exists --print-errors linkcell
           pkg-config --modversion linkcell
 
+  # Published crates.io, PyPI, the staged-recipes conda recipe, and the
+  # release tag (Meson, CMake, and a Meson wrap), each in a clean prefix.
+  # The tag is built with gcc. Clang then installs this tree: Ubuntu's
+  # libomp-dev keeps the linker name beside the resource directory, off
+  # the default search path.
+  published-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Compilers and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            clang libomp-dev python3-venv
+          python -m pip install meson ninja
+      - name: Published artifacts
+        env:
+          CC: gcc
+          CXX: g++
+        run: scripts/prove-published-install.sh all
+      - name: This tree with Clang
+        env:
+          CC: clang
+          CXX: clang++
+        run: scripts/prove-published-install.sh checkout
+
   static-minimage:
     runs-on: ubuntu-latest
     steps:
