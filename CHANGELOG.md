@@ -11,6 +11,26 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 <!-- towncrier release notes start -->
 #skip_lint_end
 
+## [0.4.3] - 2026-11-17
+
+### Added
+
+- `knearest_csr` and `lc_knearest_csr` build the k-nearest graph as CSR in the same parallel region as the search. The degrees, one prefix, and the fill share that region with the search. With `mutual` unset, a row holds edges from lower rows ascending, its own nominations nearest first, then edges from higher rows ascending. With `mutual` set, a row holds the partners that list it back: lower ones ascending, then higher ones nearest first. The rows match a serial merge at every width.
+- `lc_team_run` runs a caller's stages on the pool selected with `lc_set_threads`, the caller one of the workers. `lc_team_width` is the bound on the worker index passed to each chunk.
+
+### Changed
+
+- The k-nearest mesh is scattered by bin owner. Each worker counts and places the points of its own run of bins, and the build has no atomic counters. Each bin still lists its points in input order. One thread builds the mesh serially. The mesh buffers are kept for the process, and a large output is filled by the pool before the search.
+- A k-nearest search on the team region runs the mesh count, the prefix, the scatter, the masked-row fill and the scan as stages of one region. The caller is one of the workers. A stage finishes before the next one starts.
+- `lc_set_places` records the cpus Rayon workers may use. Each worker may run on any cpu of that list, and a later call replaces the list until a pool has been built. Workers stay on the list.
+- On an 8-cpu host the release probe `knn_scale` (cubic, 262144 points, k = 4, six repetitions, `OMP_DYNAMIC=false`) took 34.99 ms per repetition at `OMP_NUM_THREADS=1`, 21.72 ms at six threads and 16.20 ms at eight. With `RAYON_NUM_THREADS` set to 1, 2, 4 and 8 and `OMP_NUM_THREADS` left at the host width, the same probe kept eight workers and took 16.76, 16.99, 16.70 and 14.98 ms per repetition.
+
+### Fixed
+
+- The k-nearest team is linkcell's own pthreads. `shutdown_knearest_team`, `lc_knn_shutdown` and the unload destructor join every worker, under libgomp and under LLVM libomp, including when `libgomp.so.1` resolves to libomp. Each worker is named `linkcell-knn` for as long as it lives. The team is sized as libgomp sizes a parallel region the caller opens: `omp_get_max_threads()`, the load average when `OMP_DYNAMIC` is set, and `OMP_THREAD_LIMIT`. Worker stacks follow `OMP_STACKSIZE`, then `GOMP_STACKSIZE`. With `OMP_PROC_BIND` set, each worker starts on the `OMP_PLACES` entry libgomp gave that slot. Neighbour rows are unchanged.
+- A team of one runs on the calling thread. For that query the caller takes the CPU from `pin_knearest_to_least_loaded`, or the place slot 0 would have had under `OMP_PLACES` and `OMP_PROC_BIND`, and its previous mask is restored afterwards. A standing team of another size is joined first.
+- A clang build finds libomp when `-print-file-name=libomp.so` answers with the bare name, in the directory two levels above `-print-resource-dir`. Meson finds that library the same way, and `linkcell.pc` names `-lomp` together with the directory.
+
 ## [0.4.2] - 2026-11-16
 
 ### Changed
