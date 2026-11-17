@@ -34,6 +34,8 @@ jobs:
       # rustdoc's help and settings pages link api/index.html, which a
       # single-crate build does not write.
       - name: Rust API reference
+        env:
+          RUSTDOCFLAGS: --extend-css assets/rustdoc/dseams-rustdoc.css --html-before-content assets/rustdoc/dseams-rustdoc-before.html --html-in-header assets/rustdoc/dseams-rustdoc-head.html
         run: |
           cargo doc --no-deps --locked --lib
           cp -a target/doc _site/api

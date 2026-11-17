@@ -1,0 +1,678 @@
+/*
+ * d-SEAMS documentation design tokens, shared by every *.dseams.info site.
+ * Palette, type scale, radii and header come from the live dseams.info page
+ * (d-SEAMS/landing css/site.css); the dark scheme is derived from the same hues.
+ * The blue and cyan trace back to the d-SEAMS logo (#0000ff, #00aaff).
+ */
+
+:root {
+  --ds-logo-blue: #0000ff;
+  --ds-logo-cyan: #00aaff;
+
+  --ds-font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --ds-font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+  --ds-leading: 1.6;
+  --ds-measure: 44rem;
+  --ds-radius: 10px;
+  --ds-radius-md: 6px;
+  --ds-radius-sm: 4px;
+  --ds-family-h: 52px;
+
+  --ds-h1: clamp(2rem, 3.6vw, 2.95rem);
+  --ds-h1-weight: 750;
+  --ds-h2: clamp(1.5rem, 2.5vw, 2rem);
+  --ds-h3: 1.12rem;
+  --ds-h-weight: 700;
+  --ds-h-leading: 1.15;
+  --ds-h-tracking: -0.02em;
+
+  /* landing: paper, surface, frost, abyss, line */
+  --ds-bg: #f5f9fe;
+  --ds-bg-subtle: #ffffff;
+  --ds-bg-raised: #ffffff;
+  --ds-bg-hover: #e8f2fc;
+  --ds-border: #d0e1f0;
+  --ds-border-strong: #adc6dc;
+
+  --ds-ink: #0a1a2b;
+  --ds-text: #0a1a2b;
+  --ds-muted: #3e566e;
+  --ds-faint: #6b8399;
+
+  --ds-primary: #0e4da4;
+  --ds-primary-hover: #0a3b82;
+  --ds-link: #0e4da4;
+  --ds-link-hover: #006fa8;
+  --ds-accent: #0086c9;
+  --ds-accent-text: #006fa8;
+  --ds-accent-bright: #00a8e8;
+  --ds-accent-wash: rgba(0, 134, 201, 0.12);
+  --ds-primary-wash: rgba(14, 77, 164, 0.08);
+  --ds-focus: #9a650b;
+  --ds-on-primary: #ffffff;
+
+  /* The family header is the landing topbar: translucent surface, 1px line */
+  --ds-bar-bg: rgba(255, 255, 255, 0.94);
+  --ds-bar-text: #3e566e;
+  --ds-bar-text-hover: #0e4da4;
+  --ds-bar-border: #d0e1f0;
+  --ds-bar-menu-bg: #ffffff;
+  --ds-bar-shadow: 0 12px 28px rgba(8, 24, 41, 0.12);
+
+  --ds-inline-code-bg: #e8f2fc;
+  --ds-inline-code-text: #093772;
+
+  /* Code blocks are abyss in both modes, so the palette is fixed */
+  --ds-code-bg: #081829;
+  --ds-code-border: #16314a;
+  --ds-code-text: #e6f0fa;
+  --ds-code-faint: #6f889f;
+  --ds-syn-comment: #7f9ab5;
+  --ds-syn-keyword: #82b6ff;
+  --ds-syn-function: #4db8ff;
+  --ds-syn-type: #7fd8ff;
+  --ds-syn-string: #86e3d2;
+  --ds-syn-number: #f0b96b;
+  --ds-syn-operator: #a9bed3;
+  --ds-syn-error: #ff8d93;
+
+  --ds-note: #0e4da4;
+  --ds-note-bg: rgba(14, 77, 164, 0.06);
+  --ds-tip: #0077b3;
+  --ds-tip-bg: rgba(0, 149, 217, 0.1);
+  --ds-warn: #8f5a00;
+  --ds-warn-bg: rgba(199, 138, 27, 0.12);
+  --ds-danger: #b3202a;
+  --ds-danger-bg: rgba(220, 38, 38, 0.07);
+
+  --ds-shadow: 0 1px 2px rgba(11, 28, 44, 0.06), 0 4px 14px rgba(11, 28, 44, 0.05);
+  color-scheme: light;
+}
+
+/* Every generator names its dark mode differently. */
+:root[data-theme="dark"],
+:root[data-theme="ayu"],
+:root[data-bs-theme="dark"],
+html.dark,
+html.dark-mode,
+html.theme--documenter-dark,
+html.coal,
+html.navy,
+html.ayu,
+body[data-md-color-scheme="slate"] {
+  --ds-bg: #09131e;
+  --ds-bg-subtle: #0d1b2a;
+  --ds-bg-raised: #112336;
+  --ds-bg-hover: #15293f;
+  --ds-border: #1d344b;
+  --ds-border-strong: #2b4a68;
+
+  --ds-ink: #f0f7ff;
+  --ds-text: #e6f0fa;
+  --ds-muted: #9db5cc;
+  --ds-faint: #6f889f;
+
+  --ds-primary: #1f6fd0;
+  --ds-primary-hover: #7fd0ff;
+  --ds-link: #4db8ff;
+  --ds-link-hover: #7fd0ff;
+  --ds-accent: #0095d9;
+  --ds-accent-text: #4db8ff;
+  --ds-accent-wash: rgba(0, 149, 217, 0.18);
+  --ds-primary-wash: rgba(77, 184, 255, 0.12);
+
+  --ds-bar-bg: rgba(9, 19, 30, 0.94);
+  --ds-bar-text: #9db5cc;
+  --ds-bar-text-hover: #7fd0ff;
+  --ds-bar-border: #1d344b;
+  --ds-bar-menu-bg: #112336;
+  --ds-bar-shadow: 0 12px 28px rgba(0, 0, 0, 0.5);
+  --ds-focus: #e8b04a;
+
+  --ds-inline-code-bg: #11253a;
+  --ds-inline-code-text: #bfe3ff;
+  --ds-code-bg: #0c1c2e;
+  --ds-code-border: #1d344b;
+
+  --ds-note: #7db4ff;
+  --ds-note-bg: rgba(77, 140, 255, 0.12);
+  --ds-tip: #4db8ff;
+  --ds-tip-bg: rgba(0, 149, 217, 0.14);
+  --ds-warn: #e8b04a;
+  --ds-warn-bg: rgba(232, 176, 74, 0.12);
+  --ds-danger: #ff8d93;
+  --ds-danger-bg: rgba(248, 81, 90, 0.13);
+
+  --ds-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 6px 18px rgba(0, 0, 0, 0.35);
+  color-scheme: dark;
+}
+
+:focus-visible {
+  outline: 3px solid var(--ds-focus);
+  outline-offset: 2px;
+}
+/*
+ * The d-SEAMS family header: the dseams.info topbar, same type, colours and
+ * brand mark, as one fixed bar above every generator's own header.
+ */
+
+.dseams-family {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2000;
+  box-sizing: border-box;
+  height: var(--ds-family-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1em;
+  padding: 0 clamp(16px, 2vw, 24px);
+  background: var(--ds-bar-bg);
+  border-bottom: 1px solid var(--ds-bar-border);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  font-family: var(--ds-font-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.dseams-family *,
+.dseams-family *::before,
+.dseams-family *::after {
+  box-sizing: border-box;
+}
+
+.dseams-family__brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55em;
+  flex: none;
+  color: var(--ds-ink);
+  font-size: 1.08em;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.dseams-family__brand::before {
+  content: "";
+  width: 28px;
+  height: 29px;
+  flex: none;
+  background: url("data:image/webp;base64,UklGRhILAABXRUJQVlA4WAoAAAAQAAAAPwAAQgAAQUxQSFsEAAAB8HZtm2nbtm1P6H7fN1d0Y9i2bdu2bdu2bdu2bdu2WWstEfE+H2opEaWWEhETwAr6FBGTs642GXPD1sOCE97upe9+wz1Pg9tauN3jb0qldp6yja2B8UK1UmopTR86FFu54B6aNe3PPb0QXzXjRH9S0/xseQF8pSy2uJ2KFhc9gwA8IsIOzifDeJNqR9Pn2DAP5oaNmEf4Ip8M/MLP/rlSXb84DmYc79I3udEFDsO9yyb2ewA+OfjZn/DNplR/6nf3O/xkL/urUvmrRxxNdLhz6LmvcZXTOD45cLoHf2kmtdIGlKlf/F7Zam2pH50NX+Ac9qhfZWr2qctinPQuH9uVslQtsVVlbZKyzfTb0+NznNN8Qy1bU+qJ13rvv5UqNbXk1rRwpo8w1zjq25q1lLI2Sao1tZJV1ySA4Bna08LWampVi166zzjen5WLVrrpawDB1VS1Jr+aMCbuoLIu3waYuOO6VL0Bh+BKageQeQBFtyDAOPqXasuqVa1ltpLLqPruYRgQPEJ7y8haUvrPjvYvo2r3EjiAsf1JlaEsKZXP3PtkV/7m7t4nXlPHUv+6GsFc49j3qY20zK8/9CwA02lOOXFjtYGqj5+KYKE5j1ftSv3nCeeewCcPg+CMNbOv6N5s0rnB1QeKPob55ADmbsRXVEYewtQTXK8vpSuzQa9z+aoceNjINbtS/78tTr9zpT8r+x4xcu2uolewyejEO1X7Hj9ynYGXMw05bxt5EtF3zQMLXq/S9/SRax+Y82bVvueOXHfglavwnJFrHljwcpW+F41ce+DVS3n1yEtHrjfwKjaW8IqRV4xcu6vqXcTQBi8eeeXIDbrU9Hofce65o+x7/chN+1R1f7a8J7iRUt1Vb8R7NrnBQNN3J/DJAYvJzb6sOvJWNjqCS/9Q2aXMz9/n1IBPYWAc74/KkY/hviC4dSo1mKmdD9/mBBjHueI1T8Wt24hSnzw1Mce54G5WDdea0t/ffq1b/kX6+1dT46k/nhPfZ3xERcvMWiQ1tSq1HNNM3z8WA+c8TbkUSVlra1I2LXWmJxIwcUcVrWXqd8fFCB6zLmq6HMHEfdem6k4EwZXU1ub+TBjH/FZtUeZq3ZSA4GGaLcimWnNVUrOz4WBM79OsZGYr2v2vlKWtRtVHMADjyLcpJaX+c5OT3vuLRWql5ZJayQWt6nLEPsztWh/882znR888JYad41HfldRKLiGrlKVlZitVj8CZbw5HnvYUm1j4ZLBxoWf9XKlackh/fvVflJJS5X44neGATQ4Qk8GhV3rdH5XqT/332Sfl9M/8+Z72fvuKsxP0m7ux0GIyOOaG7/yvsqfqvkxhbJ3p/Gc+DAsbGLYIguuo9d2CDTzYH8GSbQFgG5zgr8oO1XPiGHi4AdhSBoOXqSyq+gQr75zubyrzWtMViVUjuMpMpdRaS9MDCFY/uNiPlVLq73fEWcfg0Ju++ctf+8CDT0CwnmGAAcG6WoRZTM6SAQBWUDggkAYAAJAeAJ0BKkAAQwA+XSKPRSOiIRjMXqg4BcS2AGHUoKsvIr5x+Mn5R/K9Tv699+/3O5K0pXYP/B+yj4AeoD8x+wB+nf6q9arzC/zL+zftv2K/QA/qf+G9GD2Gv3A9hXyxf3A+DH9qv23+Ab9d//nel35XpLw155kc9bFZN4l9LRjr/1XLf+nvYB/kX9j/4fYQ/ar2Sf1zVbzBb9DByJPBzDKfxDkbijuyhSrqjKr6WPvLoSKQDi88mhWdt+/BEQ54mtGulxusAy1F7wBSrSH1OhfZY0cbKHNO0JBzRdVgtgvNVWn98E1yocCfo6DIVOHhjGlAW786qm3tn6D98AAA/v+dHn5XtOKQIQL9TK+33akHFe6WotkAX6sg3hPmC5oNyFjItEw/tt/f37L/oR2thUn9X3HcaUKbmuAmr91vgmFStot+ui4WUGkfWwQirgqpqt/5nKu04bCwbyP82muQudyPooCm5ys+p5/xauZ7AwRQM3OeC92EcqMz1wC3nfeg/+h/v/+1/Bftb/Hq6YkoeFPjyRnsV8maKg8adZtD95MFN/rv90eFL1TVvj8mByM1/6I2v6rQkS2TIA6tFwXK4U3NjtTtBvaqn2TEO270BMJV+dLqMvpeiW5eL4+L4GRZjDV4beMGWxAVH6/vVZPTXJMJqxv/4ra2cKRy7TWOjqdklPqF1w2wFaeYUfBqxE1dbkUv9zjnvO9jPrybbez4SrTh404QW31bwHVVLLNXU7e3FcfY9K3C+/6VL5qdGtTFh4nfiDk3yDP4dfJVxw7pbS5aERGbYCoMCWtSd3+N+QUs0M448NlkS0xNEO2NRg8hcGA7N9t5ckGKplqOChq6dRg9qxHRrfZwN8TFIFwJl8AO3zdHFmS23Us2JV3gly/ok+W0bdNB096WEmUyo1A/9hwG0FvAwVMfEfoZ3Q/2AWcUgGcagP+SreEEaj5/IiyyaSy6uC7Gc/dkDIHTBJB0XBBcxgSfMmK3OMJifu+3FNZzcn2MuM2Cnjz+3AiaqTGC+aQ5vU3d4LFlkZEbCBIl5KDTXuH6Ie0ZtNWOK5WVSu5CQn2EfGch73wsJKy5plsDAFbU78EBNFVyeNRo3g1QzXjfQm3nXDu3x8rNRpmLsXb/pv6DamDdZ65rPhxHnYBlp7X0bLDF9WyhMrb3Z/XvkYv6TChJGL7qyeNUgPG51l99wrNrna20FPN1ldK3H4b3p/qT0nKAoDsgjzEn/kPL93eQde67+LT4jzX2JgQ0zbJPGqMcx3t+H2he8/e+Gc/r1hFfvM15ZwySzK+FrGVE2VDDm7MNsKs6RiVEeVbLccTZUtb6o79OfoljzBjnHMp5QIF12nBc7uv0c2FjOcEwxiH3rAr/hwr8/f7z55At7BvmMM7rbiKF7iId0oj85IKXlmZu65nWGB/4nr/4Ub89DHoWAOV3h0aDKOzGrhmvof1TnE7mDZTzaZ9/UTDcSSFP4He2oSbnYpAaxnOUUul3nHqmyBFT2LtZnFreuGNp/+hS4aSEdeWLU/za7arYBbGdKNLsN6CJ1ESiYdhoHlqaskFR/7+ypMvzieP1SOmTXd46xOC8moEjKA0dDvy7dLIr+bfw1C+87kNb+8HttzIkxZX2D8aFRZ7yNSiT9PS1i1i9KSgokNjMn6hcpTynioIBOfBW2wJPbeSFpO37w+eDPW62i54aQX1jZIPnE5FO+uY78sj1wONipH2B3SYzmy2uiwlj/4NesNZ+Bvh4WizLqd5en2t3xEtOz4uncBs5gNGHGBp5q+IulsL0GZnt/4Hx7gjI51DRriPpVupyhssNKL78zwxjG4g48waPfEOl79eEDm+AEgZ1SR53dag3qz/xounxw1M8fQJvtSnAux15m3MYM0J55z6/jcEtkAA5YTy+hr9PITm1ndAtKyk2HgODNcsBQ/hmt+g5hzTeTfiLkguHO347/vxgzAhi0chO0fqZY2ounboE8tMODbIZ1M/t9+bqjYHXqt03kWimahDqZi/vSLsXFDFUiYKn83tRknFTq0ZaxzKrJg+gDikVcfX4LNwqpj8sXETh/Qybcz5OS3LFJrp/Mi3ChTIlAj/yMvJ8YPGtaQ9b5f/Ub2xmX2zYkupk0LC/83bEcmA0wAPXOBlq6Oa9+djfnJlHZIcf2aGPz+N90t7qMeG9g+Peu37JBepIZc2vzRevD+aUyVyaWv2j8UOP0LfzwXtKMy8f8q7nxAqCqWPnQv6JGAO1D0AAAA==") center / contain no-repeat;
+}
+
+.dseams-family__nav {
+  display: flex;
+  align-items: center;
+  gap: 1.25em;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dseams-family__nav > li {
+  display: flex;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dseams-family__nav a,
+.dseams-family summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  margin: 0;
+  color: var(--ds-bar-text);
+  font-size: 0.94em;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  list-style: none;
+  white-space: nowrap;
+}
+
+.dseams-family summary::-webkit-details-marker {
+  display: none;
+}
+
+.dseams-family summary::marker {
+  content: "";
+}
+
+.dseams-family summary::after {
+  content: " \25BE";
+  font-size: 0.78em;
+}
+
+.dseams-family__docs details {
+  position: relative;
+  margin: 0;
+}
+
+.dseams-family__menu {
+  position: absolute;
+  top: calc(100% + 0.35em);
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 11.5em;
+  padding: 0.4em;
+  background: var(--ds-bar-menu-bg);
+  border: 1px solid var(--ds-bar-border);
+  border-radius: 8px;
+  box-shadow: var(--ds-bar-shadow);
+}
+
+.dseams-family__menu a {
+  min-height: 0;
+  padding: 0.42em 0.65em;
+  border-radius: 5px;
+  color: var(--ds-text);
+  font-size: 0.9em;
+  font-weight: 500;
+}
+
+.dseams-family__menu a[aria-current="page"] {
+  color: var(--ds-accent-text);
+  font-weight: 700;
+  background: var(--ds-accent-wash);
+}
+
+.dseams-family__menu a:hover {
+  background: var(--ds-bg-hover);
+}
+
+.dseams-family a:focus-visible,
+.dseams-family summary:focus-visible {
+  outline: 3px solid var(--ds-focus);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .dseams-family {
+    gap: 0.5em;
+  }
+  .dseams-family__nav {
+    gap: 0.85em;
+  }
+  .dseams-family__nav a,
+  .dseams-family summary {
+    font-size: 0.8em;
+  }
+  .dseams-family__anchor {
+    display: none !important;
+  }
+  .dseams-family__docs details {
+    position: static;
+  }
+  .dseams-family__menu {
+    right: 0.75em;
+  }
+}
+
+/* Themes colour every link; the header keeps its own colours. */
+.dseams-family.dseams-family a {
+  color: var(--ds-bar-text);
+  text-decoration: none;
+}
+
+.dseams-family.dseams-family .dseams-family__brand {
+  color: var(--ds-ink);
+}
+
+.dseams-family.dseams-family .dseams-family__menu a {
+  color: var(--ds-text);
+}
+
+.dseams-family.dseams-family .dseams-family__menu a[aria-current="page"] {
+  color: var(--ds-accent-text);
+}
+
+.dseams-family.dseams-family a:hover,
+.dseams-family.dseams-family a:focus-visible,
+.dseams-family.dseams-family summary:hover {
+  color: var(--ds-bar-text-hover);
+}
+
+.dseams-family.dseams-family .dseams-family__menu a:hover {
+  color: var(--ds-bar-text-hover);
+}
+
+@media print {
+  .dseams-family {
+    display: none;
+  }
+}
+/* d-SEAMS family look for rustdoc. Loaded with --extend-css after the tokens and the header. */
+
+html:root[data-theme] {
+  --font-family: var(--ds-font-sans);
+  --font-family-code: var(--ds-font-mono);
+
+  --main-background-color: var(--ds-bg);
+  --main-color: var(--ds-text);
+  --settings-input-color: var(--ds-accent);
+  --settings-input-border-color: var(--ds-border-strong);
+  --settings-button-color: var(--ds-text);
+  --settings-button-border-focus: var(--ds-focus);
+  --sidebar-background-color: var(--ds-bg-subtle);
+  --sidebar-background-color-hover: var(--ds-bg-hover);
+  --sidebar-border-color: var(--ds-border);
+  --code-block-background-color: var(--ds-code-bg);
+  --scrollbar-track-background-color: transparent;
+  --scrollbar-thumb-background-color: var(--ds-border-strong);
+  --scrollbar-color: var(--ds-border-strong) transparent;
+  --headings-border-bottom-color: var(--ds-border);
+  --border-color: var(--ds-border);
+  --button-background-color: var(--ds-bg-subtle);
+  --right-side-color: var(--ds-faint);
+  --code-attribute-color: var(--ds-faint);
+  --toggles-color: var(--ds-faint);
+  --search-input-focused-border-color: var(--ds-accent);
+  --copy-path-button-color: var(--ds-faint);
+  --code-example-button-color: var(--ds-code-faint);
+  --code-example-button-hover-color: var(--ds-code-text);
+  --warning-border-color: var(--ds-warn);
+
+  --type-link-color: var(--ds-accent-text);
+  --trait-link-color: var(--ds-primary);
+  --assoc-item-link-color: var(--ds-link);
+  --function-link-color: var(--ds-link);
+  --macro-link-color: var(--ds-accent-text);
+  --keyword-link-color: var(--ds-link);
+  --attribute-link-color: var(--ds-link);
+  --mod-link-color: var(--ds-link);
+  --link-color: var(--ds-link);
+  --sidebar-link-color: var(--ds-muted);
+  --sidebar-current-link-background-color: var(--ds-primary-wash);
+
+  --search-result-link-focus-background-color: var(--ds-bg-hover);
+  --search-result-border-color: var(--ds-border);
+  --search-color: var(--ds-text);
+  --search-error-code-background-color: var(--ds-inline-code-bg);
+  --search-results-alias-color: var(--ds-muted);
+  --search-results-grey-color: var(--ds-muted);
+  --search-tab-title-count-color: var(--ds-faint);
+  --search-tab-button-not-selected-border-top-color: var(--ds-border);
+  --search-tab-button-not-selected-background: var(--ds-bg-subtle);
+  --search-tab-button-selected-border-top-color: var(--ds-accent);
+  --search-tab-button-selected-background: var(--ds-bg);
+
+  --stab-background-color: var(--ds-tip-bg);
+  --stab-code-color: var(--ds-text);
+
+  --code-highlight-kw-color: var(--ds-syn-keyword);
+  --code-highlight-kw-2-color: var(--ds-syn-keyword);
+  --code-highlight-lifetime-color: var(--ds-syn-number);
+  --code-highlight-prelude-color: var(--ds-syn-type);
+  --code-highlight-prelude-val-color: var(--ds-syn-type);
+  --code-highlight-number-color: var(--ds-syn-number);
+  --code-highlight-string-color: var(--ds-syn-string);
+  --code-highlight-literal-color: var(--ds-syn-number);
+  --code-highlight-attribute-color: var(--ds-syn-type);
+  --code-highlight-self-color: var(--ds-syn-keyword);
+  --code-highlight-macro-color: var(--ds-syn-function);
+  --code-highlight-question-mark-color: var(--ds-syn-number);
+  --code-highlight-comment-color: var(--ds-syn-comment);
+  --code-highlight-doc-comment-color: var(--ds-syn-comment);
+  --src-line-numbers-span-color: var(--ds-accent-text);
+  --src-line-number-highlighted-background-color: var(--ds-accent-wash);
+  --target-background-color: var(--ds-accent-wash);
+  --target-border-color: var(--ds-accent);
+
+  --crate-search-hover-border: var(--ds-accent);
+  --src-sidebar-background-selected: var(--ds-bg-hover);
+  --src-sidebar-background-hover: var(--ds-bg-hover);
+  --table-alt-row-background-color: var(--ds-bg-subtle);
+  --codeblock-link-background: var(--ds-code-border);
+  --scrape-example-code-wrapper-background-start: transparent;
+  --scrape-example-code-wrapper-background-end: transparent;
+  --sidebar-resizer-hover: var(--ds-accent);
+  --sidebar-resizer-active: var(--ds-primary);
+
+  --code-block-border-radius: var(--ds-radius-md);
+  --toolbar-button-border-radius: var(--ds-radius-md);
+  --button-border-radius: var(--ds-radius-sm);
+}
+
+html:root[data-theme="dark"],
+html:root[data-theme="ayu"] {
+  --rust-logo-filter: none;
+}
+
+body.rustdoc {
+  padding-top: var(--ds-family-h);
+  font-size: 16px;
+  line-height: var(--ds-leading);
+  -webkit-font-smoothing: antialiased;
+}
+
+body.rustdoc :is(h1, h2, h3, h4, h5, h6, .sidebar, rustdoc-topbar, .search-input,
+  .search-results .result-name, .item-table dt > a, .out-of-band, .sub-heading, span.sin) {
+  font-family: var(--ds-font-sans);
+}
+
+/* The family header is fixed; rustdoc's own sticky pieces sit below it. */
+body.rustdoc .sidebar {
+  top: var(--ds-family-h);
+  height: calc(100vh - var(--ds-family-h));
+}
+
+body.rustdoc .sidebar-resizer {
+  top: var(--ds-family-h);
+  height: calc(100% - var(--ds-family-h));
+}
+
+body.rustdoc *[id] {
+  scroll-margin-top: calc(var(--ds-family-h) + 12px);
+}
+
+body.rustdoc.src {
+  padding-top: var(--ds-family-h);
+}
+
+body.rustdoc.src #sidebar-button {
+  top: calc(var(--ds-family-h) + 8px);
+}
+
+body.rustdoc.src .src-sidebar-title {
+  top: var(--ds-family-h);
+}
+
+@media (max-width: 700px) {
+  body.rustdoc rustdoc-topbar {
+    top: var(--ds-family-h);
+  }
+  body.rustdoc .sidebar {
+    top: calc(var(--ds-family-h) + 45px);
+    height: calc(100vh - var(--ds-family-h) - 45px);
+  }
+  body.rustdoc.src .sidebar,
+  body.rustdoc .src .sidebar {
+    top: var(--ds-family-h);
+    height: calc(100vh - var(--ds-family-h));
+  }
+}
+
+/* Headings and prose follow the family type scale */
+body.rustdoc .main-heading h1,
+body.rustdoc h1.fqn {
+  font-size: var(--ds-h2);
+  font-weight: var(--ds-h1-weight);
+  letter-spacing: var(--ds-h-tracking);
+  line-height: var(--ds-h-leading);
+  color: var(--ds-ink);
+}
+
+body.rustdoc :is(h2, h3, h4, h5):not(.sidebar *) {
+  color: var(--ds-ink);
+  letter-spacing: var(--ds-h-tracking);
+  font-weight: var(--ds-h-weight);
+}
+
+body.rustdoc .docblock h2 {
+  font-size: 1.4rem;
+  line-height: var(--ds-h-leading);
+}
+
+body.rustdoc .docblock h3 {
+  font-size: var(--ds-h3);
+}
+
+body.rustdoc .sidebar h2,
+body.rustdoc .sidebar h3 {
+  color: var(--ds-ink);
+  letter-spacing: 0;
+}
+
+body.rustdoc .docblock,
+body.rustdoc .docblock-short,
+body.rustdoc .item-table dd {
+  font-family: var(--ds-font-sans);
+}
+
+body.rustdoc .docblock p,
+body.rustdoc .docblock li {
+  max-width: var(--ds-measure);
+}
+
+body.rustdoc a {
+  text-underline-offset: 2px;
+}
+
+body.rustdoc .dseams-family summary {
+  font-family: inherit;
+  line-height: inherit;
+  margin: 0;
+  padding: 0;
+}
+
+body.rustdoc .dseams-family summary::before {
+  content: none;
+}
+
+body.rustdoc .dseams-family a {
+  font-family: inherit;
+  text-decoration: none;
+}
+
+body.rustdoc .docblock a:not(.test-arrow),
+body.rustdoc .docblock-short a:not(.test-arrow) {
+  color: var(--ds-link);
+}
+
+body.rustdoc .docblock a:not(.test-arrow):hover,
+body.rustdoc .docblock-short a:not(.test-arrow):hover {
+  color: var(--ds-link-hover);
+}
+
+body.rustdoc .sidebar a:hover,
+body.rustdoc .sidebar .current,
+body.rustdoc .sidebar a.current {
+  color: var(--ds-link);
+}
+
+/* Inline code is frost; blocks are abyss */
+body.rustdoc :not(pre) > code,
+body.rustdoc .docblock :not(pre) > code,
+body.rustdoc .docblock-short :not(pre) > code {
+  background: var(--ds-inline-code-bg);
+  color: var(--ds-inline-code-text);
+  border-radius: var(--ds-radius-sm);
+  font-size: 0.88em;
+}
+
+body.rustdoc pre,
+body.rustdoc .example-wrap pre,
+body.rustdoc .rustdoc-toolbar-pre {
+  background: var(--ds-code-bg);
+  color: var(--ds-code-text);
+  border: 1px solid var(--ds-code-border);
+  border-radius: var(--ds-radius);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+body.rustdoc pre code {
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+}
+
+body.rustdoc .item-decl pre,
+body.rustdoc pre.item-decl {
+  background: var(--ds-bg-subtle);
+  color: var(--ds-text);
+  border: 1px solid var(--ds-border);
+}
+
+body.rustdoc .item-decl,
+body.rustdoc .item-decl code {
+  --code-highlight-kw-color: var(--ds-primary);
+  --code-highlight-kw-2-color: var(--ds-primary);
+}
+
+body.rustdoc .example-wrap .rust,
+body.rustdoc .example-wrap .language-text {
+  color: var(--ds-code-text);
+}
+
+body.rustdoc .example-wrap {
+  border: 0;
+}
+
+body.rustdoc .example-wrap pre.rust a {
+  color: var(--ds-syn-type);
+}
+
+/* Tables, toolbar, search */
+body.rustdoc .item-table dt > a,
+body.rustdoc .item-table dt .stab {
+  font-weight: 600;
+}
+
+body.rustdoc .search-input {
+  background: var(--ds-bg-subtle);
+  color: var(--ds-text);
+  border: 1px solid var(--ds-border-strong);
+  border-radius: var(--ds-radius-md);
+}
+
+body.rustdoc .search-input:focus {
+  border-color: var(--ds-accent);
+}
+
+body.rustdoc rustdoc-toolbar > *,
+body.rustdoc #settings-menu > a,
+body.rustdoc #help-button > a {
+  color: var(--ds-muted);
+}
+
+body.rustdoc .main-heading .src,
+body.rustdoc .main-heading a.src {
+  color: var(--ds-link);
+}
+
+body.rustdoc .stab {
+  border-radius: var(--ds-radius-sm);
+  color: var(--ds-text);
+}
+
+body.rustdoc .sidebar-crate .logo-container img {
+  max-height: 32px;
+}
+
+@media print {
+  body.rustdoc {
+    padding-top: 0;
+  }
+}
