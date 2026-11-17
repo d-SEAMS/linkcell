@@ -49,7 +49,33 @@ jobs:
       - name: Rust API reference
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --locked --lib
+        run: |
+          cargo doc --no-deps --locked --lib
+          cp -a target/doc _site/api
+          cp assets/rustdoc-index.html _site/api/index.html
+          cp llms.txt _site/llms.txt
+      # The built site as pages.yml assembles it. --root-dir resolves the
+      # site-absolute links in 404.html. The site's own URL is skipped:
+      # _site is that site. doi.org redirects to publishers that answer CI
+      # runners with 403. static.files holds the rustdoc font licenses.
+      - name: Link check
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          fail: true
+          args: >-
+            --no-progress
+            --max-retries 3
+            --retry-wait-time 5
+            --timeout 30
+            --max-concurrency 4
+            --accept 200,206,429
+            --extensions md,html
+            --root-dir ${{ github.workspace }}/_site
+            --exclude '^https://linkcell\.dseams\.info/'
+            --exclude '^https://doi\.org/'
+            --exclude-path '_site/api/static\.files'
+            README.md _site
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   header-check:
     runs-on: ubuntu-latest
