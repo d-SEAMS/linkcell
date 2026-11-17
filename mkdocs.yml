@@ -1,6 +1,6 @@
 site_name: linkcell
 site_description: Periodic linked-cell neighbour lists for molecular simulations
-site_url: https://d-seams.github.io/linkcell/
+site_url: https://linkcell.dseams.info/
 repo_url: https://github.com/d-SEAMS/linkcell
 edit_uri: edit/main/docs/
 docs_dir: docs
@@ -47,7 +47,7 @@ nav:
       - C API: reference/c-api.md
       - Algorithm: reference/algorithm.md
       - Cell partition: reference/partition.md
-      - Rust API: https://d-seams.github.io/linkcell/api/linkcell/
+      - Rust API: https://linkcell.dseams.info/api/linkcell/
   - Explanation:
       - Minimum image and linked cells: explanation/mic-and-cells.md
       - SIMD paths and dispatch: explanation/simd-paths.md

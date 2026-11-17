@@ -25,9 +25,9 @@ numpy = ["numpy>=1.26"]
 test = ["pytest>=8.0", "numpy>=1.26"]
 
 [project.urls]
-Homepage = "https://d-seams.github.io/linkcell/"
+Homepage = "https://linkcell.dseams.info/"
 Repository = "https://github.com/d-SEAMS/linkcell"
-Documentation = "https://d-seams.github.io/linkcell/"
+Documentation = "https://linkcell.dseams.info/"
 
 [tool.maturin]
 manifest-path = "python/Cargo.toml"
