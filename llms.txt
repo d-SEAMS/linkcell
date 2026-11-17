@@ -7,28 +7,28 @@ The Rust crate `linkcell` is the implementation. The C ABI (`lc_*`, `include/lin
 ## Start
 
 - [README](https://github.com/d-SEAMS/linkcell/blob/main/README.md): what the library computes, install lines for Rust, C, C++, Python, Meson and CMake
-- [Documentation site](https://d-seams.github.io/linkcell/): the pages below, rendered
-- [Tutorial: two points](https://d-seams.github.io/linkcell/tutorials/two-points/): nearest neighbour of two atoms in a 10-unit cubic box, in each language
+- [Documentation site](https://linkcell.dseams.info/): the pages below, rendered
+- [Tutorial: two points](https://linkcell.dseams.info/tutorials/two-points/): nearest neighbour of two atoms in a 10-unit cubic box, in each language
 
 ## How-to guides
 
-- [Embed linkcell from C](https://d-seams.github.io/linkcell/how-to/embed-c/): link the installed CPU library and include linkcell.h
-- [Embed linkcell from C++](https://d-seams.github.io/linkcell/how-to/embed-cpp/): the C++17 RAII header over the C ABI, with CMake
-- [Embed linkcell from Python](https://d-seams.github.io/linkcell/how-to/embed-python/): the DLPack module, accepting any object with `__dlpack__()`
-- [Use pkg-config](https://d-seams.github.io/linkcell/how-to/pkg-config/): linkcell.pc and linkcell-gpu.pc from Meson and CMake installs
+- [Embed linkcell from C](https://linkcell.dseams.info/how-to/embed-c/): link the installed CPU library and include linkcell.h
+- [Embed linkcell from C++](https://linkcell.dseams.info/how-to/embed-cpp/): the C++17 RAII header over the C ABI, with CMake
+- [Embed linkcell from Python](https://linkcell.dseams.info/how-to/embed-python/): the DLPack module, accepting any object with `__dlpack__()`
+- [Use pkg-config](https://linkcell.dseams.info/how-to/pkg-config/): linkcell.pc and linkcell-gpu.pc from Meson and CMake installs
 
 ## Reference
 
-- [C ABI](https://d-seams.github.io/linkcell/reference/c-api/): every `lc_*` entry point, ownership and error contract
-- [Rust API](https://d-seams.github.io/linkcell/api/linkcell/): rustdoc for the crate
-- [Algorithm](https://d-seams.github.io/linkcell/reference/algorithm/): the linked-cell walk, the k-heap per source, basis reduction, threading and bit identity
-- [Cell partition](https://d-seams.github.io/linkcell/reference/partition/): domain ids per cell, halos, and the balance bound
+- [C ABI](https://linkcell.dseams.info/reference/c-api/): every `lc_*` entry point, ownership and error contract
+- [Rust API](https://linkcell.dseams.info/api/linkcell/): rustdoc for the crate
+- [Algorithm](https://linkcell.dseams.info/reference/algorithm/): the linked-cell walk, the k-heap per source, basis reduction, threading and bit identity
+- [Cell partition](https://linkcell.dseams.info/reference/partition/): domain ids per cell, halos, and the balance bound
 - [Changelog](https://github.com/d-SEAMS/linkcell/blob/main/CHANGELOG.md): release notes per version
 
 ## Explanation
 
-- [Minimum image and linked cells](https://d-seams.github.io/linkcell/explanation/mic-and-cells/): why the walk applies lattice shifts per cell instead of a minimum image per pair
-- [SIMD paths and dispatch](https://d-seams.github.io/linkcell/explanation/simd-paths/): scalar, AVX2, AVX-512 and NEON paths, and the bit identity they keep
+- [Minimum image and linked cells](https://linkcell.dseams.info/explanation/mic-and-cells/): why the walk applies lattice shifts per cell instead of a minimum image per pair
+- [SIMD paths and dispatch](https://linkcell.dseams.info/explanation/simd-paths/): scalar, AVX2, AVX-512 and NEON paths, and the bit identity they keep
 
 ## Related
 

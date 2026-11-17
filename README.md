@@ -173,7 +173,7 @@ d-SEAMS writes the same keys from `SEAMS_CONFIG` / `seams --tpp`.
 
 ## Docs
 
-The documentation is published at [d-seams.github.io/linkcell](https://d-seams.github.io/linkcell/), with the Rust API under [/api](https://d-seams.github.io/linkcell/api/linkcell/) and an [llms.txt](https://d-seams.github.io/linkcell/llms.txt) map. The sources are under `docs/`.
+The documentation is published at [linkcell.dseams.info](https://linkcell.dseams.info/), with the Rust API under [/api](https://linkcell.dseams.info/api/linkcell/) and an [llms.txt](https://linkcell.dseams.info/llms.txt) map. The sources are under `docs/`.
 
 | Quadrant | Page |
 | --- | --- |

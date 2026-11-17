@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BLOB = "https://github.com/d-SEAMS/linkcell/blob/main/"
-SITE = "https://d-seams.github.io/linkcell/"
+SITE = "https://linkcell.dseams.info/"
 
 
 def main():
