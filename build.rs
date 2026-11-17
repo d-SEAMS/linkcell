@@ -100,31 +100,62 @@ fn compile_knn_region() -> bool {
     }
 }
 
-/// The directory holding `lib<runtime>.so`: the compiler's own search
-/// path first, then `LIBRARY_PATH`. Both drivers link `-l<runtime>` from
-/// `LIBRARY_PATH`, but Clang's `-print-file-name` does not look there, so
-/// a libomp reached only through it (a sanitizer build of the runtime, a
-/// conda prefix) is otherwise reported missing.
+/// The directory holding `lib<runtime>.so`.
+///
+/// Order: the compiler's `-print-file-name` result, then `LIBRARY_PATH`,
+/// then the directory beside a Clang resource dir
+/// (`<prefix>/lib/clang/<ver>` → `<prefix>/lib`). Both drivers link
+/// `-l<runtime>` from `LIBRARY_PATH`, but Clang's `-print-file-name` does
+/// not look there, so a libomp reached only through it (a sanitizer build
+/// of the runtime, a conda prefix) is otherwise reported missing. Ubuntu's
+/// `libomp-dev` has the same gap the other way: `-print-file-name=libomp.so`
+/// prints the bare name, and the linker name lives in the compiler's lib
+/// directory while only `libomp.so.5` is on the default path.
 fn runtime_dir(cc: &std::path::Path, runtime: &str) -> Option<std::path::PathBuf> {
     let file = format!("lib{runtime}.so");
     println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
+    if let Some(dir) = print_file_name_dir(cc, &file) {
+        return Some(dir);
+    }
+    if let Some(dir) = library_path_dir(&file) {
+        return Some(dir);
+    }
+    resource_lib_dir(cc, &file)
+}
+
+fn print_file_name_dir(cc: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
     let reported = std::process::Command::new(cc)
         .arg(format!("-print-file-name={file}"))
         .output()
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|text| std::path::PathBuf::from(text.trim()));
-    if let Some(dir) = reported
-        .filter(|path| path.is_file())
-        .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
-    {
-        return Some(dir);
-    }
+        .map(|text| std::path::PathBuf::from(text.trim()))?;
+    reported
+        .is_file()
+        .then(|| reported.parent().map(|dir| dir.to_path_buf()))
+        .flatten()
+}
+
+fn library_path_dir(file: &str) -> Option<std::path::PathBuf> {
     let dirs = std::env::var_os("LIBRARY_PATH")?;
     std::env::split_paths(&dirs)
         .filter(|dir| dir.is_absolute())
-        .find(|dir| dir.join(&file).is_file())
+        .find(|dir| dir.join(file).is_file())
+}
+
+fn resource_lib_dir(cc: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new(cc)
+        .arg("-print-resource-dir")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let resource = std::path::PathBuf::from(text.trim());
+    let lib = resource.parent()?.parent()?;
+    lib.join(file).is_file().then(|| lib.to_path_buf())
 }
 
 #[cfg(feature = "scotch")]

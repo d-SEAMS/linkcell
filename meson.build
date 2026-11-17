@@ -88,10 +88,37 @@ if host_machine.system() == 'linux'
   if not cc.has_header('omp.h', args: ['-fopenmp'])
     error('the k-nearest region needs omp.h from ' + cc.get_id() + ' -fopenmp')
   endif
+  # Clang on Debian/Ubuntu reports `-print-file-name=libomp.so` as the bare
+  # name. The linker name is next to the resource dir; only the SONAME is
+  # on the default path. LIBRARY_PATH stays ahead of that fallback.
+  _fs = import('fs')
+  _omp_dirs = []
+  _omp_file = 'lib' + _omp_lib + '.so'
+  _cc0 = cc.cmd_array()[0]
+  _printed = run_command(_cc0, '-print-file-name=' + _omp_file, check: false)
+  if _printed.returncode() == 0 and _fs.is_file(_printed.stdout().strip())
+    _omp_dirs += _fs.parent(_printed.stdout().strip())
+  endif
+  _lp = run_command(
+    py, '-c', 'import os; print(os.environ.get("LIBRARY_PATH", ""))',
+    check: false,
+  ).stdout().strip()
+  foreach _dir : _lp.split(':')
+    if _dir != '' and _fs.is_file(_dir / _omp_file)
+      _omp_dirs += _dir
+    endif
+  endforeach
+  _res = run_command(_cc0, '-print-resource-dir', check: false)
+  if _res.returncode() == 0 and _res.stdout().strip() != ''
+    _reslib = _fs.parent(_fs.parent(_res.stdout().strip()))
+    if _fs.is_file(_reslib / _omp_file)
+      _omp_dirs += _reslib
+    endif
+  endif
   rust_sys += [
     cc.find_library('dl', required: true),
     cc.find_library('m', required: true),
-    cc.find_library(_omp_lib, required: true),
+    cc.find_library(_omp_lib, dirs: _omp_dirs, required: true),
   ]
 elif host_machine.system() == 'darwin'
   rust_sys += [cc.find_library('m', required: true)]
