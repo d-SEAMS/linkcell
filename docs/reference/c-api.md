@@ -111,6 +111,35 @@ by every call with the same cutoff and bin edge, wherever the atoms
 sit. With a periodic axis it is reused while the atoms stay inside the
 same bounding bins.
 
+## Vesin compatibility
+
+`include/linkcell_vesin.h` declares `lc_vesin_neighbors` and
+`lc_vesin_free`. Their device, options, and output structures have the
+same layout as vesin's C API. `lc_vesin_neighbors` computes fully
+periodic CPU lists in linkcell. It forwards a non-periodic list or a
+CUDA list to the platform vesin library when that library is visible to
+the loader.
+
+```c
+int32_t lc_vesin_neighbors(
+    const double (*points)[3], size_t n_points,
+    const double box[3][3], const bool periodic[3],
+    struct lc_vesin_device device, struct lc_vesin_options options,
+    struct lc_vesin_list *neighbors, const char **error_message);
+void lc_vesin_free(struct lc_vesin_list *neighbors);
+```
+
+The caller zero-initializes the output list before its first call and
+may pass it back to reuse its buffers. A zero return is success. On
+failure, `error_message` receives a borrowed string. The output pointers
+remain owned by the list and are valid until its next call or
+`lc_vesin_free`. `lc_vesin_free` accepts a null pointer, releases a list
+filled by linkcell, and zeros it. It must not receive a list allocated
+by another vesin build.
+
+`include/vesin_alias.c` supplies the unprefixed `vesin_neighbors` and
+`vesin_free` names for drop-in use.
+
 ## Errors and version
 
 ```c
@@ -119,8 +148,10 @@ const char *lc_version(void);
 ```
 
 Both return pointers the caller leaves alone.
-`lc_last_error` is thread-local and `NULL` after a successful `lc_knearest` on that thread, or if none has failed yet.
-Its pointer is valid until the next `lc_knearest` on that thread.
+`lc_last_error` is the one thread-local error slot shared by the
+status-returning `lc_*` calls in `linkcell.h`. It is `NULL` after a
+successful call on that thread, or if none has failed yet.
+Its pointer is valid until the next such `lc_*` call on that thread.
 `lc_version` returns the process-static version string and does not read or write the error slot.
 Distinct searches may run concurrently; each thread reads its own error slot.
 
@@ -265,6 +296,11 @@ A null `cb` clears the hook.
 The hook belongs to the calling thread, and a search runs the hook set on the thread that started it.
 The search leaves the hook in place. The caller clears it.
 
+`void lc_knn_shutdown(void)` joins the standing k-nearest worker team before
+library unload. It is safe to call repeatedly, and a later query starts
+a new team. The symbol is present when the `parallel` build uses the
+OpenMP-compatible pthread team.
+
 ## Device hook
 
 `lc_set_gpu_curve_split` installs the device curve split used when `lc_partition` is called with `device` nonzero.
@@ -283,7 +319,8 @@ A null function removes the hook, and the device partition then reports that no 
 | `BufferSize` | `knearest_into` / `out` length is not `n * k` |
 | `MaskLen` | `mask` is `Some` and `mask.len() != n` |
 | `TooManyCells` | linked-cell mesh overflows the bin cap |
-| `Overflow` | `n * k` overflows a slice |
+| `BadCutoff` | `cutoff` is not finite and strictly positive |
+| `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation |
 | `BadPartition` | The part count is zero, or the balance bound is below 1 |
 | `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |
 | `NoDevice` | A device curve split was requested and no device is loaded |
@@ -298,7 +335,10 @@ A null function removes the hook, and the device partition then reports that no 
 
 `Error::Empty` is not a wrong-length buffer.
 `knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, and `TooManyCells`.
-`pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow` (more than `u32::MAX` points), `TooManyImages`, and `TooManyCells`.
+`pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
+`TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
+point count above `u32::MAX` and a relative periodic image offset that
+does not fit the stored shift.
 Positions and cell vectors share one length unit.
 `dist2` is that unit squared.
 `cutoff` and `cell_hint` are lengths in that unit.

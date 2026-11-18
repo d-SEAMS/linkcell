@@ -339,9 +339,10 @@ where
 /// is inverted on device; the host only reads the four launch ints.
 ///
 /// `k == 0`, a cell of the wrong shape, and a singular cell raise
-/// `ValueError`. An empty frame, a mask whose length is not `n`, and a
-/// mesh past the bin cap raise `RuntimeError` with the crate's error
-/// text. Lengths are the cell's unit. `dist2` is that unit squared.
+/// `ValueError`. An empty frame and a mask whose length is not `n` also
+/// raise `ValueError`. A mesh past the bin cap raises `RuntimeError`
+/// with the crate's error text. Lengths are the cell's unit. `dist2` is
+/// that unit squared.
 /// `cell_hint` defaults to `None`, which selects a bin edge of 3 in
 /// that unit.
 #[pyfunction]
@@ -435,10 +436,10 @@ fn knearest<'py>(
 /// false. `cell_hint` defaults to `None`, which selects `cutoff / k`
 /// with `k` in `1..=6` (`k` is the rounded fourth root of the estimated
 /// atoms per cutoff-sized cell after that estimate is divided by 16).
-/// A singular cell or a cell of the wrong shape
-/// raises `ValueError`. A non-positive cutoff, an empty frame, a mask
-/// of the wrong length, an image count above 2**24, and a mesh past
-/// the bin cap raise `RuntimeError`.
+/// A singular cell, a cell of the wrong shape, an empty frame, and a
+/// mask of the wrong length raise `ValueError`. A non-positive cutoff,
+/// an image count above 2**24, and a mesh past the bin cap raise
+/// `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "pairs_within", signature = (xyz, cell, cutoff, mask=None, cell_hint=None, half=false))]
 fn pairs_within_py<'py>(
@@ -771,8 +772,9 @@ fn columns_of(rows: Vec<linkcell::Pair>) -> PyResult<PairColumns> {
 /// `xyz` is float64 `(n, 3)`. Each row has `i < j`, shift zero, and
 /// squared distance strictly below `cutoff` squared. `cutoff` is a
 /// length. `cell_hint` defaults to `None`. Returns `(i, j, S, dist2)`
-/// in the same layout as [`pairs_within`]. A non-positive cutoff, an
-/// empty frame, or a non-finite coordinate raises `RuntimeError`.
+/// in the same layout as [`pairs_within`]. An empty frame raises
+/// `ValueError`. A non-positive cutoff or a non-finite coordinate raises
+/// `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "pairs_open", signature = (xyz, cutoff, cell_hint=None))]
 fn pairs_open_py<'py>(
@@ -805,8 +807,11 @@ fn pairs_open_py<'py>(
 /// `periodic` is a bool or three bools. False is an open axis. A fully
 /// periodic mask is [`pairs_within`]. Returns `(i, j, S, dist2)`.
 /// `cutoff` is a length in the cell's unit. `half` defaults to false.
-/// A non-positive cutoff, an empty frame, or a non-finite coordinate
-/// raises `RuntimeError`. A singular cell raises `ValueError`.
+/// An empty frame or a mask of the wrong length raises `ValueError`. A
+/// non-positive cutoff or a non-finite coordinate raises `RuntimeError`.
+/// A singular cell raises `ValueError` when any axis is periodic. For a
+/// fully non-periodic search, the cell is ignored and replaced by a unit
+/// orthorhombic cell.
 #[pyfunction]
 #[pyo3(
     name = "pairs_within_pbc",

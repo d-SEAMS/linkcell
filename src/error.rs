@@ -13,7 +13,8 @@ pub enum Error {
     Empty,
     /// Caller `out` length is not `n * k`.
     BufferSize,
-    /// `n * k` does not fit a slice (`usize` or `isize`).
+    /// A size, index, weight, coordinate, or image offset does not fit
+    /// its representation.
     Overflow,
     /// `mask` is `Some` and its length is not `n`.
     MaskLen,

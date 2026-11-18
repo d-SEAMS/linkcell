@@ -239,16 +239,20 @@ The comparison with vesin's ordered 27-cell stencil, for a bin edge equal to the
 
 `knearest` takes no cutoff.
 `cell_hint` of `None`, or a value that is not finite and strictly positive, selects a bin edge of 3 in the box length unit, then clamps it to the shortest box width.
-Each source keeps a max-heap of `k` pairs `(dist2, index)`.
-For `k <= 16` the heap stays on the stack.
-Each accepted candidate is a logarithmic update in `k`.
+Each source keeps up to `k` pairs `(dist2, index)` and tracks the worst
+entry. For `k <= 16` the storage stays on the stack.
+`KHeap` scans its entries to reject duplicate indices and scans them
+again after replacing the worst entry, so an accepted candidate is
+linear in `k`.
 The first visit is the 3 by 3 by 3 around the home bin.
 An axis then grows only while the squared gap to its unvisited plane is smaller than the worst heap entry, and only while the radius is below `max_reach`.
 `max_reach` is the longest corner vector of the walk cell, `|±a ±b ±c|`, divided by the shortest bin edge, rounded up, plus 3.
 It is also at least half the longest bin count, plus 2.
 A source that stops on the frontier has read every bin that can hold a closer neighbour.
 A source that reaches `max_reach` on every axis has covered a space diagonal.
-On a filled lattice with about one point per bin the frontier stops in the first shells, and the work per source stays proportional to a small multiple of `k` heap updates.
+On a filled lattice with about one point per bin the frontier stops in
+the first shells. A source then visits a small multiple of `k`
+candidates, with each accepted update taking `O(k)`.
 If the points collapse into a few bins, or `k` is `n - 1`, a source reads every other point and the search is quadratic.
 The output is `n` rows of length at most `k`.
 Reduction changes which integer offsets are short.
