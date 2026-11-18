@@ -811,6 +811,15 @@ size_t lc_knn_team_stack(int slot) {
 #else
     if (g_team.state == LC_UP && slot >= 0 && slot < g_team.started) {
         size = pthread_get_stacksize_np(g_team.workers[slot]);
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+        /* Darwin places pthread_t 12 KiB into the top 16 KiB stack page
+         * and includes that PTHREAD_T_OFFSET in pthread_get_stacksize_np.
+         * pthread_attr_setstacksize does not include it, so remove the
+         * implementation offset to report the requested usable stack. */
+        if (size >= (size_t)12 * 1024) {
+            size -= (size_t)12 * 1024;
+        }
+#endif
     }
 #endif
     pthread_mutex_unlock(&g_team.mu);
