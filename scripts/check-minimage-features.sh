@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Default linkcell must not enable minimage/capi (mi_* collides with mimalloc).
+# Default linkcell must not enable minimage/capi, so static consumers can
+# link minimage's C ABI (minimage_*) themselves without duplicate symbols.
 # Optional minimage-capi forwards that feature when a caller needs it.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
