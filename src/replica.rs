@@ -39,6 +39,11 @@ impl ReplicaList {
     /// Build the shared list and filter every bead.
     ///
     /// `xyz` is bead-major, `beads * atoms` points, `atoms = xyz.len() / beads`.
+    /// `cutoff` and `skin` use the cell's length unit. `cutoff` must be
+    /// finite and strictly positive. `skin` must be finite and at least
+    /// zero. Otherwise the result is [`Error::BadCutoff`]. `beads == 0`,
+    /// an empty `xyz`, or a length that is not a multiple of `beads`
+    /// returns [`Error::Empty`].
     pub fn build(
         xyz: &[[f64; 3]],
         beads: usize,
