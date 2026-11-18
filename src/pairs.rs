@@ -5462,13 +5462,14 @@ mod tests {
             .unwrap(),
             Cell::ortho(40.0, 39.0, 41.0).unwrap(),
         ];
-        // The fill needs the pool and AVX-512; elsewhere the rows still
-        // match through the buffered writers.
+        // The split fill needs the pool and active AVX-512; with another
+        // selected path the rows still match through the buffered writers.
         let split = cfg!(all(
             feature = "parallel",
             target_arch = "x86_64",
             linkcell_avx512
-        )) && Path::Avx512.usable();
+        )) && Path::Avx512.usable()
+            && crate::simd::select() == Path::Avx512;
         for (c, sim) in cells.iter().enumerate() {
             let n = if c == 2 { 3000 } else { 4000 };
             let xyz: Vec<[f64; 3]> = (0..n)

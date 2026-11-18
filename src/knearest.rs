@@ -2923,18 +2923,21 @@ mod fused_agree {
         super::shutdown_knearest_team();
         assert_threads_back(before, "second shutdown");
 
-        let so = std::env::current_exe().ok().and_then(|mut exe| {
-            for _ in 0..6 {
-                exe.pop();
-                let candidate = exe.join("liblinkcell.so");
-                if candidate.is_file() {
-                    return Some(candidate);
+        #[cfg(feature = "capi")]
+        {
+            let so = std::env::current_exe().ok().and_then(|mut exe| {
+                for _ in 0..6 {
+                    exe.pop();
+                    let candidate = exe.join("liblinkcell.so");
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
                 }
+                None
+            });
+            if let Some(so) = so {
+                unload_cdylib(&so, before, saved as usize);
             }
-            None
-        });
-        if let Some(so) = so {
-            unload_cdylib(&so, before, saved as usize);
         }
     }
 
@@ -3117,6 +3120,7 @@ mod fused_agree {
         same("cell grid");
     }
 
+    #[cfg(feature = "capi")]
     fn unload_cdylib(so: &std::path::Path, before: usize, team: usize) {
         use std::os::raw::{c_char, c_int, c_void};
         extern "C" {
