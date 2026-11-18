@@ -23,6 +23,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-shared", type=Path, required=True)
     parser.add_argument("--out-static", type=Path, required=True)
     parser.add_argument("--cc", help="C compiler for the cc crate (overrides CC)")
+    parser.add_argument(
+        "--library-path",
+        action="append",
+        default=[],
+        help="library directory made visible to the cc crate",
+    )
     parser.add_argument("--implib")
     parser.add_argument("--out-implib", type=Path)
     parser.add_argument("--depfile", type=Path)
@@ -42,6 +48,8 @@ def main() -> None:
     # of rustup on PATH. rustup run nightly still leaves that rustc first,
     # so the nightly compiler has to be named by its own path.
     command = [args.cargo]
+    if os.environ.get("LINKCELL_CARGO_VERBOSE") == "1":
+        command.append("-vv")
     command += [
         "rustc",
         "--lib",
@@ -70,6 +78,12 @@ def main() -> None:
     # activated environment may export a different CC, so this wins.
     if args.cc:
         env["CC"] = args.cc
+    if args.library_path:
+        inherited = env.get("LIBRARY_PATH")
+        paths = [*args.library_path]
+        if inherited:
+            paths.append(inherited)
+        env["LIBRARY_PATH"] = os.pathsep.join(paths)
     if tsan:
         nightly_cargo = subprocess.check_output(
             ["rustup", "which", "--toolchain", "nightly", "cargo"], text=True

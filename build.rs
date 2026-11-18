@@ -14,8 +14,8 @@ fn main() {
     if major > 1 || minor >= 89 {
         println!("cargo:rustc-cfg=linkcell_avx512");
     }
-    // Linux with `parallel` links the fused region. A failed probe is a
-    // build error there. Other targets keep the rayon walk.
+    // Linux and macOS with `parallel` link the fused OpenMP region. A failed
+    // probe is a build error on glibc Linux and macOS.
     if std::env::var_os("CARGO_FEATURE_PARALLEL").is_some() && compile_knn_region() {
         println!("cargo:rustc-cfg=linkcell_openmp");
     }
@@ -27,13 +27,19 @@ fn target_is(key: &str, value: &str) -> bool {
 
 /// Compile `src/knn_region.c` with OpenMP for the target, through the `cc`
 /// crate so `CC`, the target triple and cross compilers are honoured.
-/// On glibc Linux a failure is a build error. musl and other targets keep
-/// the rayon walk when the region does not build.
+/// On glibc Linux and macOS a failure is a build error. musl and other
+/// targets keep the rayon walk when the region does not build.
 fn compile_knn_region() -> bool {
-    if !target_is("CARGO_CFG_TARGET_OS", "linux") {
+    let linux = target_is("CARGO_CFG_TARGET_OS", "linux");
+    let macos = target_is("CARGO_CFG_TARGET_OS", "macos");
+    if !linux && !macos {
         return false;
     }
-    let required = target_is("CARGO_CFG_TARGET_ENV", "gnu");
+    let required = macos || target_is("CARGO_CFG_TARGET_ENV", "gnu");
+    let macos_libomp = macos.then(|| {
+        homebrew_libomp_prefix()
+            .unwrap_or_else(|| panic!("OpenMP k-nearest region: finding Homebrew libomp failed"))
+    });
     let mut build = cc::Build::new();
     // Clang as `cc` passes `--target=<rust-triple>` and then does not see
     // gcc's `omp.h`. A native build with no compiler chosen keeps gcc. A
@@ -49,18 +55,26 @@ fn compile_knn_region() -> bool {
     for key in &chosen {
         println!("cargo:rerun-if-env-changed={key}");
     }
-    if chosen.iter().all(|key| std::env::var_os(key).is_none())
+    if linux
+        && chosen.iter().all(|key| std::env::var_os(key).is_none())
         && std::env::var("HOST").ok().as_deref() == Some(target.as_str())
     {
         build.compiler("gcc");
     }
     build
         .file("src/knn_region.c")
-        .flag("-fopenmp")
         .flag("-pthread")
         .opt_level(2)
         .warnings(true)
         .extra_warnings(true);
+    if let Some(prefix) = &macos_libomp {
+        build
+            .flag("-Xpreprocessor")
+            .flag("-fopenmp")
+            .include(prefix.join("include"));
+    } else {
+        build.flag("-fopenmp");
+    }
     // The region coordinates threads and does no arithmetic worth
     // vectorising. Pin the x86_64 baseline so no host-specific ISA reaches
     // a path that is not runtime-dispatched.
@@ -80,12 +94,15 @@ fn compile_knn_region() -> bool {
     // calls into libgomp. Link the runtime of the compiler that built the
     // region, so a Clang build does not load both.
     let compiler = build.get_compiler();
-    let runtime = if compiler.is_like_clang() {
+    let runtime = if macos || compiler.is_like_clang() {
         "omp"
     } else {
         "gomp"
     };
-    match runtime_dir(compiler.path(), runtime) {
+    let directory = macos_libomp
+        .map(|prefix| prefix.join("lib"))
+        .or_else(|| runtime_dir(compiler.path(), runtime));
+    match directory {
         Some(dir) => {
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib={runtime}");
@@ -94,6 +111,30 @@ fn compile_knn_region() -> bool {
         None if required => panic!("OpenMP k-nearest region: finding lib{runtime} failed"),
         None => false,
     }
+}
+
+/// Homebrew's keg-only libomp prefix. Query brew when it is available, then
+/// try the standard Apple Silicon and Intel prefixes.
+fn homebrew_libomp_prefix() -> Option<std::path::PathBuf> {
+    println!("cargo:rerun-if-env-changed=PATH");
+    let mut prefixes = Vec::new();
+    if let Ok(output) = std::process::Command::new("brew")
+        .args(["--prefix", "libomp"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                prefixes.push(std::path::PathBuf::from(text.trim()));
+            }
+        }
+    }
+    prefixes.extend([
+        std::path::PathBuf::from("/opt/homebrew/opt/libomp"),
+        std::path::PathBuf::from("/usr/local/opt/libomp"),
+    ]);
+    prefixes.into_iter().find(|prefix| {
+        prefix.join("include/omp.h").is_file() && prefix.join("lib/libomp.dylib").is_file()
+    })
 }
 
 /// The directory holding `lib<runtime>.so`: the compiler's own search
