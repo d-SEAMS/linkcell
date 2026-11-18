@@ -174,6 +174,97 @@ jobs:
         run: cargo test --locked ${{ matrix.crate.flags }} --lib simd_paths_exercised -- --nocapture
       - run: cargo clippy --locked --all-targets ${{ matrix.crate.flags }} -- -D warnings
 
+  # The claim in Cargo.toml `rust-version`, tested. The toolchain is that
+  # value, read from the file, so the job cannot name a different one. The
+  # locked dependencies are the ones CI uses everywhere else; none is
+  # downgraded to fit. A rust-version below what the code or a locked
+  # dependency needs fails here, and cargo refuses a dependency that
+  # declares a newer rust-version.
+  msrv:
+    name: msrv (${{ matrix.crate.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: default
+            flags: ""
+          - name: serial
+            flags: --no-default-features --features capi
+          - name: bare
+            flags: --no-default-features
+          - name: tune-timing-minimage-capi
+            flags: --features tune,timing,minimage-capi
+          - name: scotch
+            flags: --features scotch,ptscotch
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: rust-version
+        id: msrv
+        run: echo "version=$(python3 scripts/check-versions.py --msrv linkcell)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: Toolchain is exactly rust-version
+        run: |
+          rustc --version
+          rustc --version | grep -q "^rustc ${{ steps.msrv.outputs.version }} "
+      - name: Install Scotch
+        if: matrix.crate.name == 'scotch'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libscotch-dev libptscotch-dev libopenmpi-dev
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-msrv-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-
+      - run: cargo build --locked --all-targets ${{ matrix.crate.flags }}
+      - run: cargo test --locked ${{ matrix.crate.flags }}
+
+  # The Python module's rust-version in python/Cargo.toml, on exactly that
+  # toolchain: the extension builds under every wheel feature set and the
+  # Python tests pass against it.
+  msrv-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: rust-version
+        id: msrv
+        run: echo "version=$(python3 scripts/check-versions.py --msrv python)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: Toolchain is exactly rust-version
+        run: |
+          rustc --version
+          rustc --version | grep -q "^rustc ${{ steps.msrv.outputs.version }} "
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-msrv-py-${{ hashFiles('Cargo.lock', 'python/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-py-
+      - run: cargo build --locked -p linkcell-python
+      - run: cargo build --locked -p linkcell-python --features abi3
+      - run: cargo build --locked -p linkcell-python --features abi3t
+      - name: maturin develop and pytest
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install maturin pytest numpy
+          maturin develop
+          pytest tests/python -q
+
   # The k-nearest region built by Clang calls libomp. The library, the
   # tests and the Meson build must load libomp alone, never libgomp.
   clang-libomp:
