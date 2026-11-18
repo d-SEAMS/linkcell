@@ -268,9 +268,14 @@ mod tests {
 
     #[test]
     fn native_path_is_usable() {
-        let path = native();
-        assert!(path.usable());
-        assert_eq!(path.name(), simd_path());
+        let native_path = native();
+        assert!(native_path.usable());
+        assert_eq!(select().name(), simd_path());
+        if let Some(forced) = env_path() {
+            assert_eq!(forced.name(), simd_path());
+        } else {
+            assert_eq!(native_path.name(), simd_path());
+        }
     }
 
     #[cfg(feature = "timing")]
