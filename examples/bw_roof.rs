@@ -8,7 +8,7 @@ mod linux {
 
     fn copy_gbps(threads: usize, bytes: usize) -> f64 {
         let n = bytes / 8;
-        let chunk = (n + threads - 1) / threads;
+        let chunk = n.div_ceil(threads);
         let mut srcs = Vec::new();
         let mut dsts = Vec::new();
         for t in 0..threads {
@@ -119,7 +119,7 @@ mod linux {
     }
 
     fn stream_gbps(kind: &str, threads: usize, bytes: usize, nontemporal: bool) -> f64 {
-        let chunk = (bytes + threads - 1) / threads;
+        let chunk = bytes.div_ceil(threads);
         let mut bufs = Vec::new();
         for _ in 0..threads {
             // 64 bytes of headroom so a slice can be aligned.
@@ -231,24 +231,24 @@ mod linux {
         }
     }
 
-    // AVX-512 intrinsics need Rust 1.89; this example is outside the MSRV.
+    // AVX-512 intrinsics need Rust 1.89. build.rs sets `linkcell_avx512`
+    // from the compiler version, so older toolchains take the plain store.
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     #[allow(clippy::incompatible_msrv)]
-    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f"))]
+    #[target_feature(enable = "avx512f")]
     unsafe fn stream_lines(ptr: *mut u8, n: usize) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            use std::arch::x86_64::{_mm512_setzero_si512, _mm512_stream_si512, _mm_sfence};
-            let z = _mm512_setzero_si512();
-            let p = ptr as *mut std::arch::x86_64::__m512i;
-            for i in 0..n {
-                _mm512_stream_si512(p.add(i), z);
-            }
-            _mm_sfence();
+        use std::arch::x86_64::{_mm512_setzero_si512, _mm512_stream_si512, _mm_sfence};
+        let z = _mm512_setzero_si512();
+        let p = ptr as *mut std::arch::x86_64::__m512i;
+        for i in 0..n {
+            _mm512_stream_si512(p.add(i), z);
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (ptr, n);
-        }
+        _mm_sfence();
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", linkcell_avx512)))]
+    unsafe fn stream_lines(ptr: *mut u8, n: usize) {
+        std::ptr::write_bytes(ptr, 0, n * 64);
     }
 }
 

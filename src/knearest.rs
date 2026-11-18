@@ -507,7 +507,7 @@ pub(crate) fn knearest_graph(
         // rows `c * GRAPH_ROWS ..` of `accepted`, `start`, and `offsets`.
         let nom_ro = move || unsafe { std::slice::from_raw_parts(nom_p.get(), nk) };
         let rows = |c: usize| c * GRAPH_ROWS..((c + 1) * GRAPH_ROWS).min(n);
-        let chunks = (n + GRAPH_ROWS - 1) / GRAPH_ROWS;
+        let chunks = n.div_ceil(GRAPH_ROWS);
         let prep = |r: std::ops::Range<usize>| {
             for i in r {
                 lo[i].store(0, Ordering::Relaxed);
@@ -1088,7 +1088,7 @@ fn execute(
                 run: &scatter,
             },
             Stage {
-                chunks: (units + per - 1) / per,
+                chunks: units.div_ceil(per),
                 run: &scan,
             },
         ];

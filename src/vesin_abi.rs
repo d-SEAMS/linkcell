@@ -436,7 +436,7 @@ fn load_foreign_vesin() -> Option<VesinFn> {
         if handle.is_null() {
             return None;
         }
-        let sym = dlsym(handle, b"vesin_neighbors\0".as_ptr().cast());
+        let sym = dlsym(handle, c"vesin_neighbors".as_ptr());
         if sym.is_null() || sym == lc_vesin_neighbors as *mut c_void {
             return None;
         }

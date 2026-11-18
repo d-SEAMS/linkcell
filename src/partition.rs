@@ -635,7 +635,7 @@ fn bin_points(
 ) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
     let n = xyz.len();
     let threads = if n >= 8192 { bin_threads() } else { 1 };
-    let chunk = (n + threads - 1) / threads;
+    let chunk = n.div_ceil(threads);
     let mut bin_of = vec![0u32; n];
     let mut weight = vec![0u64; ncell];
     let bin_range = |t: usize, lo: usize, hi: usize| {
@@ -845,7 +845,7 @@ pub fn owned_cells(assign: &[u32], parts: u32) -> Vec<Vec<u32>> {
         .map(|n| n.get())
         .unwrap_or(1);
     let threads = if n >= 8192 { threads.max(1) } else { 1 };
-    let chunk = (n + threads - 1) / threads;
+    let chunk = n.div_ceil(threads);
     let mut hits: Vec<(usize, Vec<Vec<u32>>)> = Vec::new();
     std::thread::scope(|scope| {
         let mut joins = Vec::new();
@@ -1340,7 +1340,7 @@ fn ptscotch_linked(graph: &CellGraph, parts: u32, ratio: (u64, u64)) -> Result<V
 }
 
 #[cfg(feature = "ptscotch")]
-unsafe extern "C" {
+extern "C" {
     fn lc_ptscotch_part(
         n: i32,
         offsets: *const i32,
@@ -3112,7 +3112,7 @@ fn scotch_assign_linked(
 }
 
 #[cfg(feature = "scotch")]
-unsafe extern "C" {
+extern "C" {
     fn lc_scotch_part(
         n: i32,
         offsets: *const i32,
