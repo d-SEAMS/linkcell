@@ -23,8 +23,9 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [features]
 default = ["capi", "parallel"]
 capi = []
-# minimage's C ABI (mi_*). Off by default so static consumers can link
-# minimage separately without duplicate symbols (for example mimalloc).
+# minimage's C ABI (minimage_*). Off by default so static consumers can
+# link minimage separately without duplicate symbols (for example
+# mimalloc).
 minimage-capi = ["minimage/capi"]
 parallel = ["dep:rayon"]
 # Autotuner hooks (`lc_tune_set`, `lc_tune_pairs`) for scripts/tune-pairs.py.

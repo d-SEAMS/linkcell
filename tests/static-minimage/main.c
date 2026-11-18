@@ -12,7 +12,7 @@ int main(void) {
     double distances[2] = {0.0, 0.0};
     double dr[3];
     if (lc_knearest_d2(xyz, 2, &lc, 1, NULL, 0.0, neighbors, distances) != 0 ||
-        mi_displacement_euclidean(&mi, xyz, xyz + 3, dr) != 0) {
+        minimage_displacement_euclidean(&mi, xyz, xyz + 3, dr) != 0) {
         return 1;
     }
     const double d2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
