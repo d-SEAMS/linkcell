@@ -2701,10 +2701,75 @@ mod fused_agree {
         );
     }
 
+    /// Every thread of this process as `(id, name)`. Linux reads
+    /// `/proc/self/task`. macOS asks Mach for the thread ports and
+    /// pthread for each name.
+    #[cfg(target_os = "linux")]
+    fn threads() -> Vec<(String, String)> {
+        let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .map(|entry| {
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    comm.trim_end().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn threads() -> Vec<(String, String)> {
+        use std::os::raw::{c_char, c_int, c_void};
+        extern "C" {
+            static mach_task_self_: u32;
+            fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> c_int;
+            fn mach_port_deallocate(task: u32, name: u32) -> c_int;
+            fn vm_deallocate(task: u32, address: usize, size: usize) -> c_int;
+            fn pthread_from_mach_thread_np(port: u32) -> *mut c_void;
+            fn pthread_getname_np(thread: *mut c_void, name: *mut c_char, len: usize) -> c_int;
+        }
+        let task = unsafe { mach_task_self_ };
+        let mut list: *mut u32 = std::ptr::null_mut();
+        let mut count = 0u32;
+        if unsafe { task_threads(task, &mut list, &mut count) } != 0 {
+            return Vec::new();
+        }
+        let ports = unsafe { std::slice::from_raw_parts(list, count as usize) };
+        let found = ports
+            .iter()
+            .map(|&port| {
+                let thread = unsafe { pthread_from_mach_thread_np(port) };
+                let mut buf = [0 as c_char; 64];
+                let named = !thread.is_null()
+                    && unsafe { pthread_getname_np(thread, buf.as_mut_ptr(), buf.len()) } == 0;
+                let name = if named {
+                    unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    String::new()
+                };
+                (port.to_string(), name)
+            })
+            .collect();
+        for &port in ports {
+            unsafe { mach_port_deallocate(task, port) };
+        }
+        unsafe {
+            vm_deallocate(
+                task,
+                list as usize,
+                count as usize * std::mem::size_of::<u32>(),
+            )
+        };
+        found
+    }
+
     fn task_count() -> usize {
-        std::fs::read_dir("/proc/self/task")
-            .map(|dir| dir.count())
-            .unwrap_or(0)
+        threads().len()
     }
 
     fn wait_tasks(want: usize) -> usize {
@@ -2725,14 +2790,9 @@ mod fused_agree {
     /// Workers of linkcell's k-nearest team. The caller, rayon's pool and
     /// any thread an OpenMP runtime keeps do not carry the name.
     fn team_workers() -> usize {
-        let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
-            return 0;
-        };
-        dir.flatten()
-            .filter(|entry| {
-                std::fs::read_to_string(entry.path().join("comm"))
-                    .is_ok_and(|comm| comm.trim_end() == TEAM_NAME)
-            })
+        threads()
+            .iter()
+            .filter(|(_, name)| name == TEAM_NAME)
             .count()
     }
 
@@ -2769,14 +2829,10 @@ mod fused_agree {
 
     fn task_names() -> String {
         let mut names = String::new();
-        let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
-            return names;
-        };
-        for entry in dir.flatten() {
-            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-            names.push_str(&entry.file_name().to_string_lossy());
+        for (id, name) in threads() {
+            names.push_str(&id);
             names.push(':');
-            names.push_str(comm.trim());
+            names.push_str(&name);
             names.push('\n');
         }
         names

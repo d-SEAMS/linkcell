@@ -16,7 +16,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
-#include <linux/futex.h>
 #include <omp.h>
 #include <pthread.h>
 #include <sched.h>
@@ -24,14 +23,25 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/syscall.h>
 #include <unistd.h>
+
+/* Linux sleeps on a futex and places workers with CPU affinity masks.
+ * macOS has neither: its barrier sleeps on a condition variable, and a
+ * worker runs wherever the scheduler puts it, so `pin` and the OpenMP
+ * place list have no effect there. */
+#ifdef __linux__
+#define LC_AFFINITY 1
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
 
 typedef void (*lc_knn_phase)(void *ctx, int slot, int nthreads, int64_t begin, int64_t end);
 
+static int g_pinned_once;
+
+#ifdef LC_AFFINITY
 static int g_cpu[256];
 static int g_cpu_n;
-static int g_pinned_once;
 
 static unsigned long long g_prev_busy[256];
 static int g_prev_id[256];
@@ -130,6 +140,7 @@ static void apply_affinity(int pin, int slot) {
         sched_setaffinity(0, sizeof g_orig, &g_orig);
     }
 }
+#endif
 
 static void share(int64_t n, int slot, int nt, int64_t *begin, int64_t *end) {
     *begin = (n * (int64_t)slot) / (int64_t)nt;
@@ -143,14 +154,46 @@ static void share(int64_t n, int slot, int nt, int64_t *begin, int64_t *end) {
 typedef struct {
     unsigned count;
     unsigned phase;
+#ifndef LC_AFFINITY
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+#endif
 } LcBar;
 
+#ifdef LC_AFFINITY
 static void futex_wait(unsigned *addr, unsigned expect) {
     syscall(SYS_futex, addr, FUTEX_WAIT, expect, NULL, NULL, 0);
 }
 
 static void futex_wake(unsigned *addr) {
     syscall(SYS_futex, addr, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
+#endif
+
+/* Open the next phase and wake every sleeper. */
+static void bar_open(LcBar *bar, unsigned next) {
+#ifdef LC_AFFINITY
+    __atomic_store_n(&bar->phase, next, __ATOMIC_RELEASE);
+    futex_wake(&bar->phase);
+#else
+    pthread_mutex_lock(&bar->mu);
+    __atomic_store_n(&bar->phase, next, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&bar->cv);
+    pthread_mutex_unlock(&bar->mu);
+#endif
+}
+
+/* Sleep until the phase moves off `phase`. May return early. */
+static void bar_sleep(LcBar *bar, unsigned phase) {
+#ifdef LC_AFFINITY
+    futex_wait(&bar->phase, phase);
+#else
+    pthread_mutex_lock(&bar->mu);
+    while (__atomic_load_n(&bar->phase, __ATOMIC_ACQUIRE) == phase) {
+        pthread_cond_wait(&bar->cv, &bar->mu);
+    }
+    pthread_mutex_unlock(&bar->mu);
+#endif
 }
 
 static void cpu_relax(void) {
@@ -172,8 +215,7 @@ static void passive_barrier(LcBar *bar, int nt) {
     got = __atomic_add_fetch(&bar->count, 1, __ATOMIC_ACQ_REL);
     if (got == (unsigned)nt) {
         __atomic_store_n(&bar->count, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&bar->phase, phase + 1, __ATOMIC_RELEASE);
-        futex_wake(&bar->phase);
+        bar_open(bar, phase + 1);
         return;
     }
     for (spin = 0; spin < 4000; spin++) {
@@ -183,7 +225,7 @@ static void passive_barrier(LcBar *bar, int nt) {
         cpu_relax();
     }
     while (__atomic_load_n(&bar->phase, __ATOMIC_ACQUIRE) == phase) {
-        futex_wait(&bar->phase, phase);
+        bar_sleep(bar, phase);
     }
 }
 
@@ -235,6 +277,9 @@ static struct {
 } g_team = {
     .mu = PTHREAD_MUTEX_INITIALIZER,
     .cv = PTHREAD_COND_INITIALIZER,
+#ifndef LC_AFFINITY
+    .bar = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER},
+#endif
 };
 
 /* Slot t takes share t of every phase, as `schedule(static)` over nt
@@ -246,6 +291,7 @@ static void run_phases(const LcJob *job, int slot, int nt) {
     LcBar *bar = &g_team.bar;
     int64_t begin, end;
 
+#ifdef LC_AFFINITY
     if (pin || restore) {
         if (slot == 0 && pin) {
             least_loaded(nt);
@@ -253,6 +299,10 @@ static void run_phases(const LcJob *job, int slot, int nt) {
         passive_barrier(bar, nt);
         apply_affinity(pin, slot);
     }
+#else
+    (void)pin;
+    (void)restore;
+#endif
 
     share(job->n_points, slot, nt, &begin, &end);
     job->bin(ctx, slot, nt, begin, end);
@@ -287,7 +337,11 @@ static void *team_worker(void *arg) {
     int slot = (int)(intptr_t)arg;
     int seen = 0;
     int nt;
+#ifdef __APPLE__
+    pthread_setname_np(LC_TEAM_NAME);
+#else
     pthread_setname_np(pthread_self(), LC_TEAM_NAME);
+#endif
     pthread_mutex_lock(&g_team.mu);
     nt = g_team.nt;
     g_team.parked++;
@@ -316,6 +370,7 @@ static void *team_worker(void *arg) {
     return NULL;
 }
 
+#ifdef LC_AFFINITY
 /* The place of slot `slot` in a team of `nt` over `np` places, as libgomp
  * binds a team that a new thread starts: from place 0 of the whole list.
  * `close` and `true` put consecutive slots on consecutive places. `spread`
@@ -367,6 +422,7 @@ static int place_mask(int place, cpu_set_t *set) {
     free(ids);
     return CPU_COUNT(set) > 0;
 }
+#endif
 
 /* libgomp's reading of OMP_STACKSIZE: a decimal size with an optional
  * B, K, M, or G suffix (K when absent), spaces allowed around both. The
@@ -431,6 +487,11 @@ static size_t g_stacksize;
 /* `pthread_attr_setstacksize` returned EINVAL. Later queries do not try
  * that size again. Read and written only with `mu` held. */
 static int g_stack_refused;
+#ifndef LC_AFFINITY
+/* The guard size every worker is created with. Only Linux can read it
+ * back from a running thread. Written with `mu` held. */
+static size_t g_guard;
+#endif
 /* `pthread_create` failed for an explicit size. The warning is once.
  * The next query tries again. Read and written only with `mu` held. */
 static int g_stack_create_warned;
@@ -491,12 +552,25 @@ static void read_stacksize(void) {
         g_stacksize = stack_floor();
         note_stack_raised();
     }
+#ifdef __APPLE__
+    /* `pthread_attr_setstacksize` refuses a size that is not a whole
+     * number of pages. */
+    {
+        long page = sysconf(_SC_PAGESIZE);
+        if (page > 0 && g_stacksize % (size_t)page != 0) {
+            size_t add = (size_t)page - g_stacksize % (size_t)page;
+            if (g_stacksize <= SIZE_MAX - add) {
+                g_stacksize += add;
+            }
+        }
+    }
+#endif
 }
 
 /* 1 started, 0 the place could not be applied, -1
  * `pthread_attr_setstacksize` returned EINVAL, -2 some other start
  * failure. A `pthread_create` failure is -2, including EAGAIN. */
-static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
+static int create_worker(pthread_t *th, void *arg, const void *place) {
     pthread_attr_t attr;
     int set;
     if (pthread_attr_init(&attr) != 0) {
@@ -509,10 +583,16 @@ static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
             return set == EINVAL ? -1 : -2;
         }
     }
-    if (place != NULL && pthread_attr_setaffinity_np(&attr, sizeof *place, place) != 0) {
+#ifdef LC_AFFINITY
+    if (place != NULL &&
+        pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), (const cpu_set_t *)place) != 0) {
         pthread_attr_destroy(&attr);
         return 0;
     }
+#else
+    (void)place;
+    pthread_attr_getguardsize(&attr, &g_guard);
+#endif
     if (pthread_create(th, &attr, team_worker, arg) != 0) {
         pthread_attr_destroy(&attr);
         return -2;
@@ -530,15 +610,16 @@ static int create_worker(pthread_t *th, void *arg, const cpu_set_t *place) {
 static int start_worker(int slot, int nt, int bind, int np) {
     pthread_t *th = &g_team.workers[slot];
     void *arg = (void *)(intptr_t)slot;
-    cpu_set_t set;
-    int want_place;
     int rc;
+#ifdef LC_AFFINITY
+    cpu_set_t set;
+#endif
     pthread_once(&g_stack_once, read_stacksize);
     if (g_stack_refused) {
         return 0;
     }
-    want_place = np > 0 && place_mask(place_of(bind, slot, nt, np), &set);
-    if (want_place) {
+#ifdef LC_AFFINITY
+    if (np > 0 && place_mask(place_of(bind, slot, nt, np), &set)) {
         rc = create_worker(th, arg, &set);
         if (rc == 1) {
             return 1;
@@ -548,6 +629,11 @@ static int start_worker(int slot, int nt, int bind, int np) {
             return 0;
         }
     }
+#else
+    (void)nt;
+    (void)bind;
+    (void)np;
+#endif
     rc = create_worker(th, arg, NULL);
     if (rc == 1) {
         return 1;
@@ -568,8 +654,13 @@ static int start_worker(int slot, int nt, int bind, int np) {
  * short team cannot run the static shares, so a failed start joins the
  * workers it made and leaves the team empty. */
 static int start_team(int want) {
+#ifdef LC_AFFINITY
     int bind = (int)omp_get_proc_bind();
     int np = bind == omp_proc_bind_false ? 0 : omp_get_num_places();
+#else
+    int bind = 0;
+    int np = 0;
+#endif
     int slot;
     pthread_once(&g_stack_once, read_stacksize);
     if (g_stack_refused) {
@@ -689,6 +780,7 @@ void lc_knn_shutdown_impl(void) {
 
 __attribute__((destructor)) static void lc_knn_at_unload(void) { lc_knn_shutdown_impl(); }
 
+#ifdef LC_AFFINITY
 /* Called with `mu` held. */
 static int team_attr(int slot, pthread_attr_t *attr) {
     if (g_team.state != LC_UP || slot < 0 || slot >= g_team.started) {
@@ -696,6 +788,7 @@ static int team_attr(int slot, pthread_attr_t *attr) {
     }
     return pthread_getattr_np(g_team.workers[slot], attr) == 0;
 }
+#endif
 
 /* The stack size of worker `slot` as the C library reports it, or 0 when
  * the standing team has no such worker. This is the stack the thread was
@@ -703,15 +796,23 @@ static int team_attr(int slot, pthread_attr_t *attr) {
  * kernel keeps the guard inside the stack mapping, and a reused stack
  * makes no new mapping at all. */
 size_t lc_knn_team_stack(int slot) {
-    pthread_attr_t attr;
     size_t size = 0;
     pthread_mutex_lock(&g_team.mu);
-    if (team_attr(slot, &attr)) {
-        if (pthread_attr_getstacksize(&attr, &size) != 0) {
-            size = 0;
+#ifdef LC_AFFINITY
+    {
+        pthread_attr_t attr;
+        if (team_attr(slot, &attr)) {
+            if (pthread_attr_getstacksize(&attr, &size) != 0) {
+                size = 0;
+            }
+            pthread_attr_destroy(&attr);
         }
-        pthread_attr_destroy(&attr);
     }
+#else
+    if (g_team.state == LC_UP && slot >= 0 && slot < g_team.started) {
+        size = pthread_get_stacksize_np(g_team.workers[slot]);
+    }
+#endif
     pthread_mutex_unlock(&g_team.mu);
     return size;
 }
@@ -732,15 +833,23 @@ size_t lc_knn_stack_starts(void) {
  * such worker. `pthread_attr_setstacksize` keeps a guard, so a live
  * worker reports a size above zero. */
 size_t lc_knn_team_guard(int slot) {
-    pthread_attr_t attr;
     size_t size = 0;
     pthread_mutex_lock(&g_team.mu);
-    if (team_attr(slot, &attr)) {
-        if (pthread_attr_getguardsize(&attr, &size) != 0) {
-            size = 0;
+#ifdef LC_AFFINITY
+    {
+        pthread_attr_t attr;
+        if (team_attr(slot, &attr)) {
+            if (pthread_attr_getguardsize(&attr, &size) != 0) {
+                size = 0;
+            }
+            pthread_attr_destroy(&attr);
         }
-        pthread_attr_destroy(&attr);
     }
+#else
+    if (g_team.state == LC_UP && slot >= 0 && slot < g_team.started) {
+        size = g_guard;
+    }
+#endif
     pthread_mutex_unlock(&g_team.mu);
     return size;
 }
@@ -788,6 +897,7 @@ static int team_size(int want, int dyn) {
  * the caller takes the CPU or the place slot 0 would have had, then gets
  * its own mask back. */
 static void run_on_caller(const LcJob *job) {
+#ifdef LC_AFFINITY
     cpu_set_t mine;
     cpu_set_t set;
     int moved = 0;
@@ -810,15 +920,18 @@ static void run_on_caller(const LcJob *job) {
     }
     moved = moved && sched_getaffinity(0, sizeof mine, &mine) == 0 &&
             sched_setaffinity(0, sizeof set, &set) == 0;
+#endif
     job->bin(job->ctx, 0, 1, 0, job->n_points);
     job->count(job->ctx, 0, 1, 0, job->n_bins);
     job->scan_base(job->ctx, 0, 1, 0, job->n_bins);
     job->scan(job->ctx, 0, 1, 0, job->n_bins);
     job->fill(job->ctx, 0, 1, 0, job->n_points);
     job->select(job->ctx, 0, 1, 0, job->n_blocks);
+#ifdef LC_AFFINITY
     if (moved) {
         sched_setaffinity(0, sizeof mine, &mine);
     }
+#endif
     if (job->team != NULL) {
         *job->team = 1;
     }
