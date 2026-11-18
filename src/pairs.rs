@@ -940,8 +940,8 @@ impl Boxes {
             self.vstart.push(v);
             self.gstart.push(g);
             let n = w[1] - w[0];
-            v += (n + 7) / 8;
-            g += (n + 3) / 4;
+            v += n.div_ceil(8);
+            g += n.div_ceil(4);
         }
         self.vstart.push(v);
         self.gstart.push(g);
@@ -3465,7 +3465,7 @@ unsafe fn avx512_fused<
                         );
                         let b = _mm512_castpd_si512(dc);
                         let pick = &MIRROR32[mir as usize];
-                        let regs = (5 * k + 7) / 8;
+                        let regs = (5 * k).div_ceil(8);
                         for m in 0..regs {
                             if AHEAD {
                                 prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
@@ -3557,7 +3557,7 @@ unsafe fn avx512_fused<
                         } else {
                             // Two rows per hit are ten words: only the registers that
                             // hold them, so a lone hit takes two stores, not five.
-                            let regs = if k >= 4 { 5 } else { (10 * k + 7) / 8 };
+                            let regs = if k >= 4 { 5 } else { (10 * k).div_ceil(8) };
                             for (m, ix) in words.index32[0].iter().enumerate().take(regs) {
                                 if AHEAD {
                                     prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
@@ -3573,7 +3573,11 @@ unsafe fn avx512_fused<
                             }
                             if k > 4 {
                                 let at = at.add(40);
-                                let regs = if k >= 8 { 5 } else { (10 * (k - 4) + 7) / 8 };
+                                let regs = if k >= 8 {
+                                    5
+                                } else {
+                                    (10 * (k - 4)).div_ceil(8)
+                                };
                                 for (m, ix) in words.index32[1].iter().enumerate().take(regs) {
                                     if AHEAD {
                                         prefetch(at.add(8 * m).wrapping_add(5 * AHEAD_ROWS));
@@ -3653,7 +3657,7 @@ unsafe fn avx512_fused<
         }};
     }
     let j_hi = block.j_hi;
-    let nvec = (j_hi - block.j_lo + 7) / 8;
+    let nvec = (j_hi - block.j_lo).div_ceil(8);
     // Hits of one source stay together, in slot order, which is the
     // scalar walk's order. A run of four sources shares one target load.
     // The bin coordinates are three columns, and reading them once per
@@ -4712,7 +4716,7 @@ unsafe fn avx512_scan(c: TileCols, cut2: f64, margin: f64, block: &Block, scratc
     }
 
     let j_hi = block.j_hi;
-    let nvec = (j_hi - block.j_lo + 7) / 8;
+    let nvec = (j_hi - block.j_lo).div_ceil(8);
     // One source at a time, then its targets in slot order. That is the
     // scalar walk's order. Four sources at once would interleave hits.
     let cull_box = !block.tri && c.cull && nvec >= CULL_RUNS;

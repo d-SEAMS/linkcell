@@ -34,7 +34,7 @@ pub unsafe extern "C" fn pthread_create(
     arg: *mut c_void,
 ) -> c_int {
     CREATED.fetch_add(1, Ordering::SeqCst);
-    let real = dlsym(RTLD_NEXT, b"pthread_create\0".as_ptr().cast());
+    let real = dlsym(RTLD_NEXT, c"pthread_create".as_ptr());
     if real.is_null() {
         abort();
     }

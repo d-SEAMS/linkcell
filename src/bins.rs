@@ -364,7 +364,7 @@ impl<'a> MeshStages<'a> {
     }
 
     pub(crate) fn fold_chunks(&self) -> usize {
-        (self.ids.len() + FOLD_CHUNK - 1) / FOLD_CHUNK
+        self.ids.len().div_ceil(FOLD_CHUNK)
     }
 
     pub(crate) fn scatter_chunks(&self) -> usize {

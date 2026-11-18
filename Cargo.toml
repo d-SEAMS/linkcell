@@ -2,7 +2,7 @@
 name = "linkcell"
 version = "0.4.3"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.80"
 description = "Periodic linked-cell cutoff pairs and k-nearest neighbour search"
 license = "MIT"
 repository = "https://github.com/d-SEAMS/linkcell"
@@ -52,6 +52,10 @@ required-features = ["capi"]
 
 [[test]]
 name = "one_thread"
+required-features = ["capi"]
+
+[[test]]
+name = "open_cell"
 required-features = ["capi"]
 
 [[example]]

@@ -53,9 +53,7 @@ impl Path {
 }
 
 thread_local! {
-    // `const { ... }` is newer than this crate's 1.70 floor.
-    #[allow(clippy::missing_const_for_thread_local)]
-    static FORCE: Cell<Option<Path>> = Cell::new(None);
+    static FORCE: Cell<Option<Path>> = const { Cell::new(None) };
 }
 
 /// Path for the next fold or scan.

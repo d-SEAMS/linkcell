@@ -30,6 +30,11 @@ Rust:
 cargo add linkcell
 ```
 
+The crate needs Rust 1.80 or newer, the `rust-version` in `Cargo.toml`.
+The default `parallel` feature sets that floor, because rayon 1.12 needs Rust 1.80.
+CI builds and tests on exactly that toolchain.
+Building the Python module from source needs Rust 1.88 or newer, the `rust-version` in `python/Cargo.toml`.
+
 C and C++ consumers include `linkcell.h` or `linkcell.hpp` and link the installed library.
 Meson, CMake, and pkg-config install both shared and static CPU libraries.
 The device API is a separate static library with `linkcell_gpu.h` / `linkcell_gpu.hpp`.

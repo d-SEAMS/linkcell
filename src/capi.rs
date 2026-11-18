@@ -126,9 +126,7 @@ thread_local! {
     /// goes idle, so the CSR merge does not pay a second wake. Each thread
     /// sets and clears its own hook, so concurrent searches on different
     /// threads never run each other's callback.
-    // `const { ... }` is newer than this crate's 1.70 floor.
-    #[allow(clippy::missing_const_for_thread_local)]
-    static CONTINUATION: std::cell::Cell<Option<Continuation>> = std::cell::Cell::new(None);
+    static CONTINUATION: std::cell::Cell<Option<Continuation>> = const { std::cell::Cell::new(None) };
 }
 
 /// The hook the calling thread set, read before the search enters the pool.
@@ -1167,9 +1165,7 @@ struct ParkedPairs {
 }
 
 thread_local! {
-    // `const { ... }` is newer than this crate's 1.70 floor.
-    #[allow(clippy::missing_const_for_thread_local)]
-    static PARKED_PAIRS: RefCell<Option<ParkedPairs>> = RefCell::new(None);
+    static PARKED_PAIRS: RefCell<Option<ParkedPairs>> = const { RefCell::new(None) };
 }
 
 fn box_bits(c: &lc_cell) -> [u64; 12] {

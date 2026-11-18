@@ -45,7 +45,7 @@ pub(super) unsafe fn avx2_scan(
     let cut_lo = cut2 - margin;
     let cut_hi = cut2 + margin;
     let j_hi = block.j_hi;
-    let nvec = (j_hi - block.j_lo + 7) / 8;
+    let nvec = (j_hi - block.j_lo).div_ceil(8);
     let do_cull = !block.tri && c.cull && nvec >= CULL_RUNS;
 
     macro_rules! push_scalar {
