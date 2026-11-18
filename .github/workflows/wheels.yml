@@ -20,6 +20,8 @@ on:
       - "src/**"
       - "third_party/**"
       - "include/**"
+      - "build.rs"
+      - "scripts/build-libomp-macos.sh"
       - ".github/workflows/wheels.yml"
 
 concurrency:
@@ -61,6 +63,13 @@ jobs:
           CIBW_SKIP: "*musllinux* *i686* cp3??t-*"
           CIBW_ARCHS: ${{ matrix.arch }}
           CIBW_ENVIRONMENT: MATURIN_PEP517_ARGS="--features abi3"
+          CIBW_BEFORE_ALL_MACOS: >-
+            MACOSX_DEPLOYMENT_TARGET=11.0
+            scripts/build-libomp-macos.sh "$HOME/libomp-prefix"
+          CIBW_ENVIRONMENT_MACOS: >-
+            MATURIN_PEP517_ARGS="--features abi3"
+            MACOSX_DEPLOYMENT_TARGET=11.0
+            LIBOMP_PREFIX="$HOME/libomp-prefix"
           CIBW_TEST_REQUIRES: pytest numpy
           CIBW_TEST_COMMAND: pytest {project}/tests/python -q
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -104,6 +113,13 @@ jobs:
           CIBW_SKIP: "*musllinux* *i686* cp3??t-*"
           CIBW_ARCHS: ${{ matrix.arch }}
           CIBW_ENVIRONMENT: MATURIN_PEP517_ARGS="--features abi3t"
+          CIBW_BEFORE_ALL_MACOS: >-
+            MACOSX_DEPLOYMENT_TARGET=11.0
+            scripts/build-libomp-macos.sh "$HOME/libomp-prefix"
+          CIBW_ENVIRONMENT_MACOS: >-
+            MATURIN_PEP517_ARGS="--features abi3t"
+            MACOSX_DEPLOYMENT_TARGET=11.0
+            LIBOMP_PREFIX="$HOME/libomp-prefix"
           CIBW_AUDIT_COMMAND: ""
           CIBW_TEST_REQUIRES: pytest numpy
           CIBW_TEST_COMMAND: pytest {project}/tests/python -q
