@@ -234,21 +234,10 @@ mod linux {
     // AVX-512 intrinsics need Rust 1.89. build.rs sets `linkcell_avx512`
     // from the compiler version, so older toolchains take the plain store.
     //
-    // The runtime gate mirrors `simd::avx512_ready`: AVX-512F and VL plus
-    // POPCNT and FMA.
-    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-    #[inline]
-    fn avx512_ready() -> bool {
-        std::is_x86_feature_detected!("avx512f")
-            && std::is_x86_feature_detected!("avx512vl")
-            && std::is_x86_feature_detected!("popcnt")
-            && std::is_x86_feature_detected!("fma")
-    }
-
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     #[inline]
     unsafe fn stream_lines_if_ready(ptr: *mut u8, n: usize) {
-        if avx512_ready() {
+        if linkcell::avx512_ready() {
             unsafe { stream_lines(ptr, n) };
             return;
         }

@@ -205,7 +205,7 @@ pub use pop::{
     reset as pop_reset, snapshot as pop_snapshot,
 };
 pub use replica::ReplicaList;
-pub use simd::simd_path;
+pub use simd::{avx512_ready, simd_path};
 #[cfg(feature = "timing")]
 pub use simd::{simd_timing, SimdTiming};
 pub use skin::SkinList;
