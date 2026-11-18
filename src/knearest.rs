@@ -259,9 +259,16 @@ pub struct Neighbors {
 
 /// Write k-nearest indices, nearest first, into caller storage.
 ///
-/// `out` has length `n * k` ([`Error::BufferSize`] otherwise). Unused
-/// slots are `-1`. Neighbours of source `i` occupy `out[i * k ..]`.
-/// `mask` is `None` or length `n` ([`Error::MaskLen`] otherwise).
+/// `out` has length `n * k` ([`Error::BufferSize`] otherwise, including
+/// when `n * k` does not fit in a `usize`). Unused slots are `-1`.
+/// Neighbours of source `i` occupy `out[i * k ..]`.
+///
+/// Returns [`Error::ZeroK`] when `k == 0`, [`Error::Empty`] when `xyz`
+/// is empty, [`Error::MaskLen`] when `mask` is `Some` and its length is
+/// not `n`, and [`Error::TooManyCells`] when an axis needs more than
+/// 1,000,000 bins or the mesh is outside `1..=16,777,216` bins. On a
+/// build with the fused team, a point count that does not fit in `i64`
+/// is [`Error::Overflow`].
 ///
 /// ```
 /// use linkcell::{knearest_into, Cell};
@@ -294,6 +301,15 @@ pub fn knearest_into(
 ///
 /// `out_nn` has length `n * k`. Unused index slots are `-1`.
 /// `out_d2`, when `Some`, has the same length; unused slots are `NaN`.
+///
+/// Returns [`Error::BufferSize`] when `out_nn` is not `n * k` (including
+/// when that product does not fit in a `usize`) or when `out_d2` is
+/// `Some` and its length differs, [`Error::ZeroK`] when `k == 0`,
+/// [`Error::Empty`] when `xyz` is empty, [`Error::MaskLen`] when `mask`
+/// is `Some` and its length is not `n`, and [`Error::TooManyCells`] when
+/// an axis needs more than 1,000,000 bins or the mesh is outside
+/// `1..=16,777,216` bins. On a build with the fused team, a point count
+/// that does not fit in `i64` is [`Error::Overflow`].
 pub fn knearest_into_d2(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -308,6 +324,13 @@ pub fn knearest_into_d2(
 
 /// Frame-major batch: `xyz` is `n_frames * n` points, `out_*` are
 /// `n_frames * n * k`. One shared cell. `mask` is length `n` or `None`.
+///
+/// Returns [`Error::Empty`] when `n_frames == 0`, [`Error::Overflow`]
+/// when `n * n_frames` or that product times `k` does not fit in a
+/// `usize`, and [`Error::BufferSize`] when `xyz` is not `n * n_frames`
+/// points, when `out_nn` is not `n * n_frames * k`, or when `out_d2` is
+/// `Some` and its length differs. Each frame then returns the errors of
+/// [`knearest_into_d2`].
 #[allow(clippy::too_many_arguments)]
 pub fn knearest_into_many(
     xyz: &[[f64; 3]],
@@ -690,6 +713,15 @@ pub(crate) fn knearest_graph(
 
 /// The k-nearest graph as CSR `(offsets, columns)`; see the C entry
 /// `lc_knearest_csr` for the row order.
+///
+/// Returns [`Error::ZeroK`] when `k == 0`, [`Error::Empty`] when `xyz`
+/// is empty, [`Error::MaskLen`] when `mask` is `Some` and its length is
+/// not `n`, [`Error::TooManyCells`] when an axis needs more than
+/// 1,000,000 bins or the mesh is outside `1..=16,777,216` bins, and
+/// [`Error::Overflow`] when `n * k` does not fit in a `usize`, when `n`
+/// exceeds `i32::MAX`, or when the number of CSR edges exceeds
+/// `i32::MAX`. On a build with the fused team, a point count that does
+/// not fit in `i64` is also [`Error::Overflow`].
 pub fn knearest_csr(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -730,9 +762,12 @@ pub fn knearest_csr(
 /// has `min(k, n_active - 1)` entries.
 ///
 /// Returns [`Error::ZeroK`] when `k == 0`, [`Error::Empty`] when `xyz`
-/// is empty, [`Error::Overflow`] when `n * k` does not fit in a slice,
-/// and [`Error::TooManyCells`] when the mesh exceeds the bin cap.
-/// These inputs return `Err`.
+/// is empty, [`Error::MaskLen`] when `mask` is `Some` and its length is
+/// not `n`, [`Error::Overflow`] when `n * k` does not fit in a `usize`,
+/// and [`Error::TooManyCells`] when an axis needs more than 1,000,000
+/// bins or the mesh is outside `1..=16,777,216` bins. On a build with
+/// the fused team, a point count that does not fit in `i64` is also
+/// [`Error::Overflow`]. These inputs return `Err`.
 ///
 /// Fold, bin, then grow a rectangular index box. An orthorhombic cell
 /// is used as stored. A restricted triclinic cell is tilt-reduced
@@ -2119,6 +2154,11 @@ fn visit_cell<const MODE: u8>(q: &mut CellQuery<'_>, jx: i32, jy: i32, jz: i32, 
 /// [`Cell::dist2_euclidean`]: Smith half-edge test, then a
 /// Minkowski-reduced 27-image. A hex-prism body diagonal is a
 /// fractional wrap that is not the nearest image.
+///
+/// Returns [`Error::ZeroK`] when `k == 0`, [`Error::Empty`] when `xyz`
+/// is empty, and [`Error::BadBox`] when an orthorhombic axis length is
+/// not strictly positive. A `mask` shorter than `n` treats the missing
+/// entries as excluded.
 ///
 /// ```
 /// use linkcell::{knearest, knearest_brute, Cell};

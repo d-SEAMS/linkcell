@@ -335,10 +335,25 @@ A null function removes the hook, and the device partition then reports that no 
 
 `Error::Empty` is not a wrong-length buffer.
 `knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, and `TooManyCells`.
+Its `Overflow` is `n * k` not fitting in a slice, and, on a fused-team
+build, a point count that does not fit in `i64`.
+`knearest_into` reports a product that does not fit as `BufferSize`.
 `pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
-`TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
-point count above `u32::MAX` and a relative periodic image offset that
-does not fit the stored shift.
+`TooManyImages`, and `TooManyCells`. Its `Overflow` cases are a point
+count above `u32::MAX` (`i32::MAX` for the column entry points), a
+relative periodic image that is not finite or whose absolute value
+exceeds `i32::MAX`, and an image span on an axis plus
+`ceil(cutoff / width)` on that axis that exceeds `i32::MAX`.
+`pairs_within_pbc` adds `NonFinite`, and on an open or mixed cell an
+`Overflow` when a bin floor or `shift + image_i - image_j` does not fit
+in `i32`. `TooManyImages` is also `ceil(cutoff / width)` or
+`ceil(cutoff / cell_min)` not finite or above `i32::MAX`.
+`halo_width` returns `Overflow` when a positive length over a
+positive width is not finite or its ceiling does not fit in `u32`.
+`partition` returns `Overflow` for the `pairs_within` image cases when
+the method reads arcs, and, with Scotch or PT-Scotch compiled in, when
+a cell count, part count, CSR offset, cell weight, or edge weight does
+not fit in `i32`.
 Positions and cell vectors share one length unit.
 `dist2` is that unit squared.
 `cutoff` and `cell_hint` are lengths in that unit.

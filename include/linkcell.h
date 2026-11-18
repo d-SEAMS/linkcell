@@ -185,6 +185,11 @@ extern "C" {
  * is the cell capacity and `cap_arcs` is the arc capacity.
  * `out_offsets` has length `ncell + 1`.
  *
+ * Nonzero for the input failures of [`lc_cell_grid`], for the
+ * periodic-image failures of [`lc_pairs_within`], when the directed
+ * arc count exceeds `UINT32_MAX`, or when a fill buffer is shorter
+ * than the graph.
+ *
  * # Safety
  *
  * Same point contract as [`lc_cell_grid`]. On a fill, `out_offsets`
@@ -216,6 +221,12 @@ int lc_cell_graph(const double *xyz,
  * `((iz * ny) + iy) * nx + ix`. A null `out_weight` is a query:
  * `*out_ncell` is the cell count and the return is 0.
  *
+ * Nonzero when `out_ncell` is null, `n == 0`, a required pointer is
+ * null, `n` exceeds `INT_MAX` or `PTRDIFF_MAX / 3`, the cell is
+ * singular or a length is not strictly positive, `cutoff` is not
+ * finite and strictly positive, a coordinate is not finite, the mesh
+ * exceeds the bin cap, or a fill buffer is shorter than the cell count.
+ *
  * # Safety
  *
  * `xyz` is readable for `n * 3` doubles. `simbox` points at one
@@ -246,6 +257,11 @@ void lc_for_slabs(int n, void *ctx, void (*cb)(void*, int, int));
 /**
  * Ghost cells of `domain`. A null `out_ghost` queries `*out_count`.
  *
+ * Nonzero when a required pointer is null, `domain` is negative, an
+ * axis count is not strictly positive, `nx * ny * nz` is not `ncell`,
+ * an assignment entry is negative, or the fill buffer is shorter than
+ * the ghost count.
+ *
  * # Safety
  *
  * `nxyz` is readable for 3 ints. `assign` is readable for `ncell`
@@ -263,6 +279,11 @@ int lc_halo(const int *nxyz,
 
 /**
  * Bin radii for `cutoff * depth`. `out_width` receives three counts.
+ *
+ * Nonzero when `bin_width` or `out_width` is null, `cutoff` is not
+ * finite and at least zero, `cutoff * depth` is not finite, or a
+ * positive length divided by a positive width is not finite or its
+ * ceiling does not fit in `uint32_t`.
  *
  * # Safety
  *
@@ -296,6 +317,13 @@ int lc_halo_width(double cutoff,
  * the same thread. The last-error string is thread-local: it is not
  * shared across threads, is valid until the next `lc_*` call on this
  * thread, and must not be freed.
+ *
+ * Nonzero when `n == 0`, `k == 0`, a required pointer is null, the cell
+ * is singular or a length is not strictly positive, or the mesh exceeds
+ * the bin cap (more than 1,000,000 bins on an axis, or a cell count
+ * outside `1..=16777216`). Also nonzero when a size does not fit:
+ * `n * k` does not fit in `size_t`, `n` exceeds `PTRDIFF_MAX / 3`, or
+ * `n * k` exceeds `PTRDIFF_MAX / sizeof(int)`.
  *
  * # Safety
  *
@@ -331,6 +359,15 @@ int lc_knearest(const double *xyz,
  * writable ints for the columns; null fails the call. The search, the
  * degrees, and the fill run in one parallel region.
  *
+ * Returns 0 on success and nonzero on failure. Read `lc_last_error`.
+ * Nonzero when `n == 0`, `k == 0`, `alloc` or another required pointer
+ * is null, the cell is singular or a length is not strictly positive,
+ * the mesh exceeds the bin cap, or `alloc` returns null for a non-empty
+ * column buffer. Also nonzero when `n * k` does not fit in `size_t`,
+ * `n` exceeds `PTRDIFF_MAX / 3`, `n * k` exceeds
+ * `PTRDIFF_MAX / sizeof(int)`, `n` exceeds `INT_MAX`, or the CSR edge
+ * count exceeds `INT_MAX`.
+ *
  * # Safety
  *
  * Same pointer contract as [`lc_knearest`]. `out_offsets` is writable
@@ -353,6 +390,7 @@ int lc_knearest_csr(const double *xyz,
  *
  * `out_d2` is caller-owned, length `n * k`. Unused slots are `NaN`.
  * `out_d2` may be `NULL` to skip distances (same as [`lc_knearest`]).
+ * Failure conditions are those of [`lc_knearest`].
  *
  * # Safety
  *
@@ -372,6 +410,14 @@ int lc_knearest_d2(const double *xyz,
  * Frame-major batch. `xyz` is `n_frames * n` packed triples.
  * `out_nn` / `out_d2` are `n_frames * n * k`. One shared cell.
  * `mask` is length `n` or `NULL`. `out_d2` may be `NULL`.
+ *
+ * Returns 0 on success and nonzero on failure. Read `lc_last_error` on
+ * this thread. Nonzero when `n == 0` or `n_frames == 0`, `k == 0`, a
+ * required pointer is null, the cell is singular or a length is not
+ * strictly positive, or the mesh exceeds the bin cap. Also nonzero
+ * when `n * n_frames` or that product times `k` does not fit in
+ * `size_t`, when `n * n_frames` exceeds `PTRDIFF_MAX / 3`, or when
+ * `n * n_frames * k` exceeds `PTRDIFF_MAX / sizeof(int)`.
  *
  * # Safety
  *
@@ -410,6 +456,10 @@ const char *lc_last_error(void);
  * three ints, `out_width` is three bin widths, `out_domain` is one
  * domain per cell, and `out_point_cell` is one bin per point.
  *
+ * Failure conditions are those of [`lc_partition`]. A fill is also
+ * nonzero when a header pointer is null, a capacity is short, or a
+ * domain id or point bin exceeds `INT_MAX`.
+ *
  * # Safety
  *
  * Same point contract as [`lc_cell_grid`]. On a fill, `out_domain` is
@@ -444,6 +494,11 @@ int lc_num_threads(void);
  * The stencil is the one [`crate::rank_mask`] paints while it visits the
  * cells of `domain`. `width` is three bin radii.
  *
+ * Nonzero when a required pointer is null, `domain` is negative, an
+ * axis count is not strictly positive, `nx * ny * nz` is not `ncell`,
+ * an assignment entry is negative, or a point cell is negative or
+ * outside the mesh.
+ *
  * # Safety
  *
  * `nxyz` is readable for 3 ints. `assign` is readable for `ncell` ints.
@@ -468,6 +523,9 @@ int lc_owned_mask(const int *nxyz,
  * without writing. The bins are the occupied Cartesian cells. Their
  * partner stencil depends on the cutoff and `cell_hint` alone, so it is
  * reused by frames that occupy other bins.
+ *
+ * `n == 0` writes a zero count and returns 0. Otherwise the failure
+ * conditions are those of [`lc_pairs_within_pbc`] with every axis open.
  *
  * # Safety
  *
@@ -502,6 +560,19 @@ int lc_pairs_open(const double *xyz,
  * bit for bit (`xyz`, the box, `cutoff`, `mask`, `cell_hint`, `half`)
  * and writes the rows without searching again. Any other call drops
  * it. A fill that writes does not keep anything.
+ *
+ * Returns 0 on success and nonzero on failure. Read `lc_last_error`.
+ * Nonzero when `out_count` is null, `n == 0`, `xyz` or `simbox` is
+ * null, a fill pointer is null, `cap` is below the row count, the cell
+ * is singular or a length is not strictly positive, `cutoff` is not
+ * finite and strictly positive, an axis repeat is not finite or above
+ * `INT_MAX`, the image count exceeds 2^24, `ceil(cutoff / cell_min)`
+ * is not finite or above `INT_MAX`, or the mesh exceeds the bin cap.
+ * Also nonzero when `n` exceeds `INT_MAX` or `PTRDIFF_MAX / 3`, when
+ * `rows * 3` does not fit in `ptrdiff_t`, or when a relative periodic
+ * image is not finite, its absolute value exceeds `INT_MAX`, or the
+ * image span on an axis plus that axis's repeat count exceeds
+ * `INT_MAX`.
  *
  * # Safety
  *
@@ -538,6 +609,15 @@ int lc_pairs_within(const double *xyz,
  * A query or a short buffer keeps its rows on the calling thread for
  * the next call with the same inputs bit for bit.
  *
+ * `n == 0` writes a zero count and returns 0. Otherwise nonzero when
+ * `out_count` is null, `xyz` is null, `simbox` is null while an axis is
+ * periodic, `cap` is below the row count, `n` exceeds `INT_MAX` or
+ * `PTRDIFF_MAX / 3`, or `pairs_within_pbc`
+ * returns an error (cutoff, mask length, a non-finite coordinate, the
+ * periodic-image and bin caps, a bin floor or image shift that does
+ * not fit in `int`, and a periodic axis length that is not strictly
+ * positive).
+ *
  * # Safety
  *
  * `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
@@ -567,7 +647,9 @@ int lc_pairs_within_pbc(const double *xyz,
  * `*out_count` to the needed count and returns nonzero without
  * writing. A query or a short buffer keeps its search on the calling
  * thread for the next call with the same inputs, as in
- * [`lc_pairs_within`].
+ * [`lc_pairs_within`]. Failure conditions are those of
+ * [`lc_pairs_within`], except a short row buffer is reported directly
+ * and there is no `rows * 3` limit.
  *
  * # Safety
  *
@@ -596,7 +678,16 @@ int lc_pairs_within_rows(const double *xyz,
  * `1 + parts * w_max / total`, where `w_max` is the heaviest cell
  * weight and `total` is the sum of the cell weights. `device` nonzero runs the
  * curve split on the CUDA device and returns nonzero when that device
- * is absent. A null `out_domain` queries `*out_ncell`.
+ * is absent, when the method is not a curve, or when the device
+ * weights disagree with the host. A null `out_domain` queries
+ * `*out_ncell`.
+ *
+ * Also nonzero for the input failures of [`lc_cell_grid`], for the
+ * pair-list failures of an arc method, when `parts == 0` or `parts`
+ * exceeds `UINT32_MAX`, when `method` is not 0..=7, when `balance > 0`
+ * is not a usable bound, when Scotch is unavailable or rejects the
+ * graph, when a Scotch index or weight does not fit in `int`, or when
+ * a domain id exceeds `INT_MAX` or the fill buffer is short.
  *
  * # Safety
  *
@@ -624,6 +715,13 @@ int lc_partition(const double *xyz,
  * order `((iz * ny) + iy) * nx + ix`. `method` and `balance` follow
  * [`lc_partition`]. A plain bisection reads the weights and not the
  * pair arcs. `out_domain` receives one domain per cell.
+ *
+ * Nonzero when a required pointer is null, `parts == 0` or `parts`
+ * exceeds `UINT32_MAX`, an axis count is not strictly positive,
+ * `nx * ny * nz` is not `ncell`, `method` is not 0..=7, `balance > 0`
+ * is not a usable bound, the graph is not a square CSR, Scotch is
+ * unavailable or rejects the graph, a Scotch index or weight does not
+ * fit in `int`, or a domain id exceeds `INT_MAX`.
  *
  * # Safety
  *
@@ -712,6 +810,9 @@ uint64_t lc_stencil_builds(void);
  * call and below [`lc_team_width`], so it can index per-worker scratch.
  * No worker that has not started holds up a stage or the return.
  *
+ * Returns 0 on success. Nonzero when `fn_` is null, or when
+ * `nstages > 0` and `chunks` is null. `nstages == 0` returns 0.
+ *
  * # Safety
  *
  * `chunks` is readable for `nstages` sizes. `fn_` does not unwind and
@@ -735,6 +836,12 @@ const char *lc_version(void);
 
 /**
  * Owned points are 2. Ghosts within `reach` of an owned atom are 1.
+ *
+ * Nonzero when a required pointer is null, `domain` is negative, an
+ * assignment or point-cell entry is negative, `xyz` and `point_cell`
+ * differ in length, `reach` is not finite and at least zero, an axis
+ * count is not strictly positive, `nx * ny * nz` overflows, or
+ * `assign` is not one entry per cell.
  *
  * # Safety
  *

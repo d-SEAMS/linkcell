@@ -119,6 +119,15 @@ impl<'a> PbcQuery<'a> {
 /// other bins. A reach past 16 bins can widen it when a frame spans more
 /// bins on y or z than it covers.
 ///
+/// Returns [`Error::BadCutoff`] when `cutoff` is not finite and
+/// strictly positive, [`Error::Empty`] when `xyz` is empty,
+/// [`Error::NonFinite`] when a coordinate or the located position is
+/// not finite, [`Error::Overflow`] when the floor of a coordinate
+/// divided by the bin edge does not fit in `i32`, [`Error::TooManyCells`]
+/// when an occupied bin span is outside `1..=i32::MAX` or the mesh
+/// exceeds 16,777,216 cells, and [`Error::TooManyImages`] when
+/// `ceil(cutoff / edge)` is not finite or above `i32::MAX - 2`.
+///
 /// ```
 /// use linkcell::pairs_open;
 ///
@@ -144,6 +153,23 @@ pub fn pairs_open(
 /// Any open axis uses occupied Cartesian bins and no periodic padding.
 /// `cell` supplies the periodic lattice. It is not read when every axis
 /// is open.
+///
+/// Returns [`Error::BadCutoff`] when `cutoff` is not finite and
+/// strictly positive, [`Error::Empty`] when `xyz` is empty,
+/// [`Error::MaskLen`] when `mask` is `Some` and its length is not `n`,
+/// and [`Error::NonFinite`] when a coordinate or a located position is
+/// not finite. A fully periodic mask then returns the errors of
+/// [`crate::pairs_within`](crate::pairs_within). An open or mixed mask
+/// returns [`Error::Overflow`] when the floor of an unwrapped fractional
+/// coordinate, or of a Cartesian coordinate divided by the bin edge,
+/// does not fit in `i32`, or when `shift + image_i - image_j` on an
+/// axis does not fit in `i32`; [`Error::BadBox`] when a periodic axis
+/// length is not finite and strictly positive; [`Error::TooManyImages`]
+/// when a repeat count is not finite or above `i32::MAX`, when the
+/// product of `2 * repeats + 1` exceeds 2^24, or when
+/// `ceil(cutoff / edge)` is not finite or above `i32::MAX - 2`; and
+/// [`Error::TooManyCells`] when an occupied bin span is outside
+/// `1..=i32::MAX` or the mesh exceeds 16,777,216 cells.
 pub fn pairs_within_pbc(
     xyz: &[[f64; 3]],
     cell: &Cell,
@@ -190,6 +216,9 @@ pub fn pairs_within_pbc(
 /// Lattice for `periodic`. A zero row on an open axis is replaced by a
 /// unit axis so the periodic rows still define a cell. A fully open
 /// mask does not read `rows`.
+///
+/// Returns [`Error::BadBox`] when the periodic rows do not form a cell:
+/// a length is not strictly positive, or H is singular.
 pub fn cell_for_pbc(
     mut rows: [[f64; 3]; 3],
     origin: [f64; 3],

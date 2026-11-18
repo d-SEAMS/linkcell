@@ -43,7 +43,13 @@ impl ReplicaList {
     /// finite and strictly positive. `skin` must be finite and at least
     /// zero. Otherwise the result is [`Error::BadCutoff`]. `beads == 0`,
     /// an empty `xyz`, or a length that is not a multiple of `beads`
-    /// returns [`Error::Empty`].
+    /// returns [`Error::Empty`]. The centroid list then returns
+    /// [`Error::BadCutoff`] when `cutoff + 2 R + skin` is not finite,
+    /// [`Error::Overflow`] when the atom count exceeds `i32::MAX` or one
+    /// atom has more candidate rows than `u32::MAX`,
+    /// [`Error::TooManyImages`] on the image cap of
+    /// [`crate::pairs_within`], and [`Error::TooManyCells`] on its bin
+    /// cap.
     pub fn build(
         xyz: &[[f64; 3]],
         beads: usize,
@@ -92,6 +98,8 @@ impl ReplicaList {
     }
 
     /// Filtered rows of bead `b` from the last build or update.
+    ///
+    /// Returns [`Error::BufferSize`] when `b` is not a bead index.
     pub fn bead(&self, b: usize) -> Result<&PairColumns, Error> {
         self.frames.get(b).ok_or(Error::BufferSize)
     }
@@ -141,6 +149,10 @@ impl ReplicaList {
     ///
     /// A move inside the skin only filters that bead. A larger move
     /// rebuilds the shared candidates and every bead's rows.
+    ///
+    /// Returns [`Error::BufferSize`] when `b` is not a bead index or
+    /// `xyz` is not one bead. A rebuild returns the errors of
+    /// [`Self::build`]'s centroid list.
     pub fn update_bead(&mut self, b: usize, xyz: &[[f64; 3]]) -> Result<&PairColumns, Error> {
         if b >= self.beads || xyz.len() != self.atoms {
             return Err(Error::BufferSize);
