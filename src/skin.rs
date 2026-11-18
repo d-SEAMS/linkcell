@@ -157,10 +157,10 @@ fn corner_span(h: [[f64; 3]; 3], href: [[f64; 3]; 3]) -> f64 {
             f64::from((bits >> 2) & 1),
         ];
         let mut d = [0.0; 3];
-        for a in 0..3 {
+        for (a, slot) in d.iter_mut().enumerate() {
             let corner = b[0] * h[0][a] + b[1] * h[1][a] + b[2] * h[2][a];
             let old = b[0] * href[0][a] + b[1] * href[1][a] + b[2] * href[2][a];
-            d[a] = corner - old;
+            *slot = corner - old;
         }
         let n2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
         if n2 > best1 {

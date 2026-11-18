@@ -338,7 +338,7 @@ fn filter_coded(
     widths: [f64; 3],
     h: [[f64; 3]; 3],
     use_avx: bool,
-    _d2: &mut Vec<f64>,
+    _d2: &mut [f64],
     out: &mut PairColumns,
 ) -> Result<(), Error> {
     let (tx, ty, tz) = cartesian_tables(ortho, widths, h);
