@@ -46,9 +46,6 @@ _cargo_command = [
   '--out-shared', '@OUTPUT0@',
   '--out-static', '@OUTPUT1@',
   '--depfile', '@DEPFILE@',
-  # The cc crate compiles the OpenMP region with this compiler, so its
-  # runtime matches the one the openmp dependency below links.
-  '--cc', ' '.join(cc.cmd_array()),
 ]
 if host_machine.system() == 'windows'
   _cargo_outputs += [cargo_implib]
@@ -59,6 +56,131 @@ if host_machine.system() == 'windows'
     '--out-implib', '@OUTPUT2@',
   ]
 endif
+
+rust_sys = [dependency('threads')]
+_omp_c_args = []
+_omp_dirs = []
+if host_machine.system() == 'linux' or host_machine.system() == 'darwin'
+  # Linux uses libgomp under GCC and libomp under Clang. Darwin uses libomp.
+  # Keep the runtime as a link dependency without compiling consumer sources
+  # with -fopenmp.
+  if host_machine.system() == 'darwin'
+    _omp_lib = 'omp'
+  else
+    _omp_lib = cc.get_id() == 'clang' ? 'omp' : 'gomp'
+  endif
+  _fs = import('fs')
+  _omp_suffix = host_machine.system() == 'darwin' ? '.dylib' : '.so'
+  _omp_file = 'lib' + _omp_lib + _omp_suffix
+  _cc0 = cc.cmd_array()[0]
+
+  # Homebrew's libomp is keg-only. Ask brew first, then check the standard
+  # Apple Silicon and Intel prefixes in case brew is not on PATH.
+  if host_machine.system() == 'darwin' and cc.get_id() == 'clang'
+    _brew_prefixes = []
+    _brew = find_program('brew', required: false)
+    if _brew.found()
+      _brew_libomp = run_command(_brew, '--prefix', 'libomp', check: false)
+      if _brew_libomp.returncode() == 0
+        _brew_prefixes += _brew_libomp.stdout().strip()
+      endif
+    endif
+    _brew_prefixes += [
+      '/opt/homebrew/opt/libomp',
+      '/usr/local/opt/libomp',
+    ]
+    foreach _prefix : _brew_prefixes
+      _libdir = _prefix / 'lib'
+      _includedir = _prefix / 'include'
+      if _fs.is_file(_libdir / _omp_file)
+        _omp_dirs += _libdir
+      endif
+      if _fs.is_file(_includedir / 'omp.h')
+        _omp_c_args += '-I' + _includedir
+      endif
+    endforeach
+  endif
+
+  # Clang on Debian/Ubuntu reports `-print-file-name=libomp.so` as the bare
+  # name. The linker name is next to the resource dir; only the SONAME is
+  # on the default path. LIBRARY_PATH stays ahead of that fallback.
+  _printed = run_command(_cc0, '-print-file-name=' + _omp_file, check: false)
+  if _printed.returncode() == 0 and _fs.is_file(_printed.stdout().strip())
+    _omp_dirs += _fs.parent(_printed.stdout().strip())
+  endif
+  _lp = run_command(
+    py, '-c', 'import os; print(os.environ.get("LIBRARY_PATH", ""))',
+    check: false,
+  ).stdout().strip()
+  foreach _dir : _lp.split(':')
+    if _dir != '' and _fs.is_file(_dir / _omp_file)
+      _omp_dirs += _dir
+    endif
+  endforeach
+  _res = run_command(_cc0, '-print-resource-dir', check: false)
+  if _res.returncode() == 0 and _res.stdout().strip() != ''
+    _resource_dir = _res.stdout().strip()
+    _resource_include = _resource_dir / 'include'
+    if _fs.is_file(_resource_include / 'omp.h')
+      _omp_c_args += '-I' + _resource_include
+    endif
+    _reslib = _fs.parent(_fs.parent(_resource_dir))
+    if _fs.is_file(_reslib / _omp_file)
+      _omp_dirs += _reslib
+    endif
+  endif
+  # A separately installed libomp, including Homebrew's keg-only formula,
+  # keeps omp.h in include next to its lib directory. Discover that before
+  # the mandatory header probe and pass the same path to Cargo's cc crate.
+  foreach _dir : _omp_dirs
+    _include = _fs.parent(_dir) / 'include'
+    if _fs.is_file(_include / 'omp.h')
+      _omp_c_args += '-I' + _include
+    endif
+  endforeach
+  _omp_probe_args = _omp_c_args
+  if host_machine.system() == 'darwin' and cc.get_id() == 'clang'
+    _omp_probe_args = ['-Xpreprocessor', '-fopenmp'] + _omp_probe_args
+  else
+    _omp_probe_args = ['-fopenmp'] + _omp_probe_args
+  endif
+  if not cc.has_header('omp.h', args: _omp_probe_args)
+    error('the threaded build needs omp.h from ' + cc.get_id() + ' -fopenmp')
+  endif
+  if host_machine.system() == 'linux'
+    rust_sys += [cc.find_library('dl', required: true)]
+  endif
+  rust_sys += [cc.find_library('m', required: true)]
+  _omp_dep = cc.find_library(_omp_lib, dirs: _omp_dirs, required: true)
+  if host_machine.system() == 'linux'
+    # find_library with dirs answers with the file's full path. Link the
+    # runtime by name, with -L for the directory that holds it, so
+    # linkcell.pc names -lomp or -lgomp and a consumer picks up the
+    # runtime's own SONAME.
+    _omp_link = ['-l' + _omp_lib]
+    if _omp_dirs.length() > 0
+      _omp_link = ['-L' + _omp_dirs[0]] + _omp_link
+    endif
+    rust_sys += [declare_dependency(link_args: _omp_link)]
+  else
+    # Homebrew's libomp is keg-only and its install name is the full path.
+    rust_sys += [_omp_dep]
+  endif
+elif host_machine.system() == 'windows'
+  rust_sys += [
+    cc.find_library('ws2_32', required: true),
+    cc.find_library('userenv', required: true),
+    cc.find_library('bcrypt', required: true),
+    cc.find_library('ntdll', required: true),
+  ]
+endif
+
+# Give Cargo's cc crate Meson's compiler and the proven OpenMP paths, keeping
+# the compiled region's runtime aligned with rust_sys.
+_cargo_command += ['--cc', ' '.join(cc.cmd_array() + _omp_c_args)]
+foreach _dir : _omp_dirs
+  _cargo_command += ['--library-path', _dir]
+endforeach
 
 # cargo rustc emits both crate types; the target lists both so Meson
 # does not pretend the static archive is the only artifact.
@@ -77,32 +199,6 @@ linkcell_cargo = custom_target(
   install: _install,
   install_dir: _cargo_install_dirs,
 )
-
-rust_sys = [dependency('threads')]
-if host_machine.system() == 'linux'
-  # libgomp under GCC, libomp under Clang: the runtime of the compiler
-  # that builds the k-nearest region. It is linked by name, as in
-  # build.rs and CMake, so linkcell.pc names it and a consumer's own
-  # sources are not compiled with -fopenmp.
-  _omp_lib = cc.get_id() == 'clang' ? 'omp' : 'gomp'
-  if not cc.has_header('omp.h', args: ['-fopenmp'])
-    error('the k-nearest region needs omp.h from ' + cc.get_id() + ' -fopenmp')
-  endif
-  rust_sys += [
-    cc.find_library('dl', required: true),
-    cc.find_library('m', required: true),
-    cc.find_library(_omp_lib, required: true),
-  ]
-elif host_machine.system() == 'darwin'
-  rust_sys += [cc.find_library('m', required: true)]
-elif host_machine.system() == 'windows'
-  rust_sys += [
-    cc.find_library('ws2_32', required: true),
-    cc.find_library('userenv', required: true),
-    cc.find_library('bcrypt', required: true),
-    cc.find_library('ntdll', required: true),
-  ]
-endif
 
 # link_args rather than link_with: Meson promotes installed static
 # consumers to link_whole, and link_whole rejects custom_targets.

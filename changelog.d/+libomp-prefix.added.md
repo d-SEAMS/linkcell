@@ -1,0 +1,1 @@
+`LIBOMP_PREFIX` names the libomp prefix (`include/omp.h` and `lib/libomp.dylib`) for macOS source builds, ahead of Homebrew's. The macOS wheels build libomp for their deployment target with `scripts/build-libomp-macos.sh` and bundle it.
