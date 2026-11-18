@@ -1,6 +1,6 @@
 [package]
 name = "linkcell"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.70"
 description = "Periodic linked-cell cutoff pairs and k-nearest neighbour search"
@@ -23,6 +23,9 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [features]
 default = ["capi", "parallel"]
 capi = []
+# minimage's C ABI (mi_*). Off by default so static consumers can link
+# minimage separately without duplicate symbols (for example mimalloc).
+minimage-capi = ["minimage/capi"]
 parallel = ["dep:rayon"]
 # Autotuner hooks (`lc_tune_set`, `lc_tune_pairs`) for scripts/tune-pairs.py.
 tune = ["capi"]

@@ -14,7 +14,7 @@ Python crosses it with DLPack.
 
 seams-core calls the linkcell mesh and the linked-cell walk from the analysis engine (cloned from `https://github.com/d-SEAMS/seams-core`, default branch).
 `src/neighbours.cpp` calls `linkcell::pairs_within` and `linkcell::knearest` when `SEAMS_HAS_LINKCELL` is set.
-Meson asks for `linkcell >= 0.4.2`.
+Meson asks for `linkcell >= 0.4.3`.
 `src/ring.cpp` and `src/include/internal/ring.hpp` identify primitive rings (Franzblau) and tag them with the bulk and confined ice criteria.
 `src/cluster.cpp` and `clump::Domain` are Stoddard's connected components of an ice mask.
 That `Domain` names an ice-mask cluster.
