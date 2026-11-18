@@ -111,6 +111,35 @@ by every call with the same cutoff and bin edge, wherever the atoms
 sit. With a periodic axis it is reused while the atoms stay inside the
 same bounding bins.
 
+## Vesin compatibility
+
+`include/linkcell_vesin.h` declares `lc_vesin_neighbors` and
+`lc_vesin_free`. Their device, options, and output structures have the
+same layout as vesin's C API. `lc_vesin_neighbors` computes fully
+periodic CPU lists in linkcell. It forwards a non-periodic list or a
+CUDA list to the platform vesin library when that library is visible to
+the loader.
+
+```c
+int32_t lc_vesin_neighbors(
+    const double (*points)[3], size_t n_points,
+    const double box[3][3], const bool periodic[3],
+    struct lc_vesin_device device, struct lc_vesin_options options,
+    struct lc_vesin_list *neighbors, const char **error_message);
+void lc_vesin_free(struct lc_vesin_list *neighbors);
+```
+
+The caller zero-initializes the output list before its first call and
+may pass it back to reuse its buffers. A zero return is success. On
+failure, `error_message` receives a borrowed string. The output pointers
+remain owned by the list and are valid until its next call or
+`lc_vesin_free`. `lc_vesin_free` accepts a null pointer, releases a list
+filled by linkcell, and zeros it. It must not receive a list allocated
+by another vesin build.
+
+`include/vesin_alias.c` supplies the unprefixed `vesin_neighbors` and
+`vesin_free` names for drop-in use.
+
 ## Errors and version
 
 ```c
@@ -119,11 +148,12 @@ const char *lc_version(void);
 ```
 
 Both return pointers the caller leaves alone.
-`lc_last_error` is thread-local and `NULL` after a successful `lc_knearest` on that thread, or if none has failed yet.
-`lc_version` returns the process-static version string.
-The pointer is invalid after the next `lc_knearest` on the same thread.
-Distinct searches may run concurrently; each thread reads its own slot.
-`lc_version` is process-static.
+`lc_last_error` is the one thread-local error slot shared by the
+status-returning `lc_*` calls in `linkcell.h`. It is `NULL` after a
+successful call on that thread, or if none has failed yet.
+Its pointer is valid until the next such `lc_*` call on that thread.
+`lc_version` returns the process-static version string and does not read or write the error slot.
+Distinct searches may run concurrently; each thread reads its own error slot.
 
 ## C++ wrap
 
@@ -197,6 +227,86 @@ That is the tightest bound a cell-aligned cut can promise, and it is the ratio t
 A null weight or domain pointer queries the count.
 The C++ wrappers are `linkcell::partition`, `linkcell::halo_width`, and `linkcell::halo`.
 
+`lc_partition_weights` assigns domains from caller-supplied weights.
+`nxyz` is `nx, ny, nz`.
+`weight` has one count per cell, in the order `((iz * ny) + iy) * nx + ix`.
+`method` and `balance` follow `lc_partition`.
+A plain bisection reads the weights and not the pair arcs.
+`out_domain` receives one domain per cell.
+
+`lc_mesh_cut` writes the same domain ids and also the bin of each point.
+A null `out_domain` queries `*out_ncell` and leaves the other buffers alone.
+On a fill, `out_nxyz` is three ints, `out_width` is three bin widths, `out_domain` is one domain per cell, and `out_point_cell` is one bin per point.
+
+`lc_owned_mask` writes 2 for an owned point and 1 for a point in a cell the owned walk paints.
+`width` is three bin radii.
+`lc_within_reach` writes 2 for an owned point and 1 for a ghost within `reach` of an owned atom.
+
+`lc_scotch_part` and `lc_ptscotch_part` are the serial and parallel Scotch entry points.
+They are compiled with the `scotch` and `ptscotch` features.
+Both features are off by default.
+See [features](features.md).
+
+## k-nearest graph
+
+```c
+int lc_knearest_csr(const double *xyz, size_t n, const lc_cell *simbox,
+                    size_t k, const int *mask, double cell_hint,
+                    int mutual, int *out_offsets,
+                    int *(*alloc)(void *, size_t), void *ctx);
+```
+
+Inputs match `lc_knearest`.
+`out_offsets` has length `n + 1`.
+`alloc(ctx, total)` is called once, from any thread of the search, and returns `total` writable ints for the columns.
+A null return fails the call.
+With `mutual` nonzero, row `i` holds every `j` that row `i` lists and that lists `i`: the lower indices ascending, then the higher ones nearest first.
+Otherwise an edge that both rows list is stored from the lower index, and an edge that one row lists is stored from that row.
+A row holds edges from lower rows ascending, then its own nearest first, then edges from higher rows ascending.
+The search, the degrees, and the fill run in one parallel region.
+`knearest_csr` is the Rust entry and returns `(offsets, columns)`.
+
+## Thread width
+
+`lc_set_threads(n)` chooses the width of later searches.
+`n == 0` leaves the width unset: the search starts on the calling thread, and Rayon and OpenMP keep their own widths.
+`n == 1` runs the whole search on the calling thread and starts no thread.
+`n < 0` selects one thread.
+`lc_num_threads` returns the selected width, or the global pool width when the selection is unset.
+
+`lc_set_places(cpus, n)` records CPUs that Rayon workers may use.
+Every worker may run on any CPU in the list.
+A pool that has already started keeps the CPUs it was built with.
+`n <= 0` is ignored.
+
+`lc_for_slabs(n, ctx, cb)` calls `cb(ctx, begin, end)` over disjoint spans of `0..n` on that pool.
+One thread runs the whole span on the caller.
+The spans cover `0..n` exactly once.
+
+`lc_team_run` runs `nstages` stages in one parallel region on the same pool.
+Stage `s` is `chunks[s]` calls of `fn_(ctx, s, chunk, worker)`, in any order and on any worker.
+Every chunk of a stage returns before any chunk of the next stage starts.
+`worker` is fixed for one worker during the call and is below `lc_team_width`.
+A null `fn_`, or a null `chunks` when `nstages > 0`, returns nonzero.
+`nstages == 0` returns 0.
+The callback must not unwind.
+
+`lc_set_continuation(ctx, cb)` runs `cb` at the end of this thread's next `lc_knearest`, still inside its pool.
+A null `cb` clears the hook.
+The hook belongs to the calling thread, and a search runs the hook set on the thread that started it.
+The search leaves the hook in place. The caller clears it.
+
+`void lc_knn_shutdown(void)` joins the standing k-nearest worker team before
+library unload. It is safe to call repeatedly, and a later query starts
+a new team. The symbol is present when the `parallel` build uses the
+OpenMP-compatible pthread team.
+
+## Device hook
+
+`lc_set_gpu_curve_split` installs the device curve split used when `lc_partition` is called with `device` nonzero.
+The GPU library calls it from a static initializer when that library is loaded.
+A null function removes the hook, and the device partition then reports that no device is loaded.
+
 ## Rust errors (same crate)
 
 `linkcell::Error`:
@@ -209,12 +319,29 @@ The C++ wrappers are `linkcell::partition`, `linkcell::halo_width`, and `linkcel
 | `BufferSize` | `knearest_into` / `out` length is not `n * k` |
 | `MaskLen` | `mask` is `Some` and `mask.len() != n` |
 | `TooManyCells` | linked-cell mesh overflows the bin cap |
-| `Overflow` | `n * k` overflows a slice |
+| `BadCutoff` | `cutoff` is not finite and strictly positive |
+| `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation |
 | `BadPartition` | The part count is zero, or the balance bound is below 1 |
 | `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |
 | `NoDevice` | A device curve split was requested and no device is loaded |
 | `ScotchDisabled` | Scotch support was not compiled in |
+| `TooManyImages` | The periodic image count exceeds 2^24 |
+| `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
+| `Device` | The device is not the CPU and `libvesin.so` is not loaded |
+| `Padded` | A point has more neighbours than the requested pad |
+| `NonFinite` | A coordinate is not finite. `pairs_within_pbc`, `pairs_open`, and the partition entry points return this variant |
+| `DeviceMismatch` | The device curve split disagreed with the host weights |
+| `ScotchFailed` | The Scotch library rejected the graph |
 
 `Error::Empty` is not a wrong-length buffer.
+`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, and `TooManyCells`.
+`pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
+`TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
+point count above `u32::MAX` and a relative periodic image offset that
+does not fit the stored shift.
+Positions and cell vectors share one length unit.
+`dist2` is that unit squared.
+`cutoff` and `cell_hint` are lengths in that unit.
 
-Walk and stop rule: [algorithm](algorithm.md).
+Walk, stop rule, and cost: [algorithm](algorithm.md).
+Features and instruction-set builds: [features](features.md).

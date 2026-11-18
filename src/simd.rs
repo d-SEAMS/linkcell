@@ -112,7 +112,10 @@ fn avx2_ready() -> bool {
     }
 }
 
-fn avx512_ready() -> bool {
+/// Whether this build contains AVX-512 kernels and this CPU has every
+/// instruction they require.
+#[doc(hidden)]
+pub fn avx512_ready() -> bool {
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     {
         // Pair kernels enable every one of these. Fold and scan need

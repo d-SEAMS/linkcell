@@ -48,6 +48,7 @@ Reduction leaves the Cartesian images unchanged.
 The nearest image is among the 27 shifts only with a step beyond reduction.
 An unreduced dump can need an original shift such as `(-7, 7, 0)`.
 The walk keeps expanding shells until the k-th neighbour is no farther than the unvisited frontier plane, or until the shell covers a space diagonal.
+If tilt reduction or Minkowski reduction fails, `knearest` keeps the caller's cell and still uses that stop.
 `pairs_within` keeps the caller's basis: its shift is the caller's `S`.
 
 ## Cutoff pair lists
@@ -179,3 +180,28 @@ A Voronoi face can be longer than a non-neighbour, so that graph differs from th
 Ruff, Reiser, Stühmer, and Friederich, *Digital Discovery* **3**, 594 (2024), compare periodic k-nearest, radius, and Voronoi edges and keep k = 24.
 NequIP, Allegro, and the multi atomic cluster expansion (MACE) consume a cutoff list.
 None of these is an uncapped Euclidean k-nearest walk, and none of them adds a bin test beyond the one this search already applies.
+
+## Checked identifiers
+
+These dois were resolved for the works named above.
+Allen and Tildesley, *Computer Simulation of Liquids*, second edition (2017), is 10.1093/oso/9780198803195.001.0001.
+Quentrec and Brot, *J. Comput. Phys.* **13**, 430 (1973), is 10.1016/0021-9991(73)90046-6.
+Rapaport, *The Art of Molecular Dynamics Simulation*, second edition (2004), is 10.1017/CBO9780511816581.
+Bentley, Weide, and Yao, ACM *Trans. Math. Softw.* **6**, 563 (1980), is 10.1145/355921.355927.
+Nguyen and Stehlé, ACM *Trans. Algorithms* **5** (2009), is 10.1145/1597036.1597050.
+Conway and Sloane, Proc. R. Soc. Lond. A **436**, 55 (1992), is 10.1098/rspa.1992.0004.
+Welling and Germano, Comput. Phys. Commun. **182**, 611 (2011), is 10.1016/j.cpc.2010.11.002.
+Ramasubramani et al., Comput. Phys. Commun. **254**, 107275 (2020), is 10.1016/j.cpc.2020.107275.
+Howard, Anderson, Nikoubashman, Glotzer, and Panagiotopoulos, Comput. Phys. Commun. **203**, 45 (2016), is 10.1016/j.cpc.2016.02.003.
+Agrell, Eriksson, Vardy, and Zeger, IEEE *Trans. Inf. Theory* **48**, 2201 (2002), is 10.1109/TIT.2002.800499.
+Babai, *Combinatorica* **6**, 1 (1986), is 10.1007/bf02579403.
+McKilliam, Grant, and Clarkson, SIAM Journal on Discrete Mathematics **28**, 1405 (2014), is 10.1137/140952806.
+Yershova and LaValle, IEEE *Trans. Robot.* **23**, 151 (2007), is 10.1109/TRO.2006.886840.
+Lee, IEEE *Trans. Comput.* **C-31**, 478 (1982), is 10.1109/TC.1982.1676031.
+Verlet, Phys. Rev. **159**, 98 (1967), is 10.1103/PhysRev.159.98.
+Xie and Grossman, Physical Review Letters **120**, 145301 (2018), is 10.1103/PhysRevLett.120.145301.
+Park and Wolverton, *Phys. Rev. Materials* **4**, 063801 (2020), is 10.1103/PhysRevMaterials.4.063801.
+Ruff, Reiser, Stühmer, and Friederich, *Digital Discovery* **3**, 594 (2024), is 10.1039/D4DD00018H.
+Goswami, Goswami, and Singh, *J. Chem. Inf. Model.* **60**, 2169 (2020), describe the d-SEAMS engine that calls this library.
+The doi is 10.1021/acs.jcim.0c00031.
+Páll and Hess, and the EESSI build bot, are identified on the [SIMD paths](simd-paths.md) page.

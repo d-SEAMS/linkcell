@@ -34,6 +34,10 @@ pub struct SkinList {
 
 impl SkinList {
     /// Empty list. The first [`Self::update`] builds the candidates.
+    ///
+    /// `cutoff` and `skin` use the cell's length unit. `cutoff` must be
+    /// finite and strictly positive. `skin` must be finite and at least
+    /// zero. Otherwise the result is [`Error::BadCutoff`].
     pub fn new(cell: Cell, cutoff: f64, skin: f64, half: bool) -> Result<Self, Error> {
         if !cutoff.is_finite() || cutoff <= 0.0 {
             return Err(Error::BadCutoff);

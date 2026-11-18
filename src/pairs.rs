@@ -48,9 +48,40 @@ pub(crate) fn keep_half(i: usize, j: usize, shift: [i32; 3]) -> bool {
 
 /// Pairs with `dist2 < cutoff²`, one row per atom-image.
 ///
-/// `half` keeps the canonical side of `(i, j, S)` vs `(j, i, -S)`.
-/// Zero-shift self pairs are omitted. Periodic self-images stay.
-/// Image count above 2^24 is [`Error::TooManyImages`].
+/// `cutoff` is a length in the same unit as the cell vectors. `dist2`
+/// is that unit squared. `half` keeps the canonical side of `(i, j, S)`
+/// versus `(j, i, -S)`. Zero-shift self pairs are omitted. Periodic
+/// self-images stay. The caller's basis is kept, including a triclinic
+/// cell: `S` is an integer combination of that H.
+///
+/// `cell_hint` of `None`, or a value that is not finite and strictly
+/// positive, selects `cutoff / k` with `k` in `1..=6` from the
+/// occupancy rule (the rounded fourth root of the estimated atoms per
+/// cutoff-sized cell after that estimate is divided by 16). The edge
+/// is then clamped to the shortest box width.
+///
+/// Returns [`Error::BadCutoff`] when `cutoff` is not finite and
+/// strictly positive, [`Error::Empty`] when `xyz` is empty,
+/// [`Error::MaskLen`] when `mask` has the wrong length,
+/// [`Error::Overflow`] when `n` exceeds `u32::MAX`,
+/// [`Error::TooManyImages`] when the image count exceeds 2^24, and
+/// [`Error::TooManyCells`] on the same bin cap as [`knearest`](crate::knearest).
+/// These inputs return `Err`.
+///
+/// ```
+/// use linkcell::{pairs_within, Cell};
+///
+/// # fn main() -> Result<(), linkcell::Error> {
+/// let sim = Cell::ortho(10.0, 10.0, 10.0)?;
+/// let xyz = [[0.2, 0.0, 0.0], [9.4, 0.0, 0.0]];
+/// let rows = pairs_within(&xyz, &sim, 1.0, None, None, true)?;
+/// assert_eq!(rows.len(), 1);
+/// assert_eq!((rows[0].i, rows[0].j), (0, 1));
+/// assert_ne!(rows[0].shift, [0, 0, 0]);
+/// assert!((rows[0].dist2 - 0.64).abs() < 1e-12);
+/// # Ok(())
+/// # }
+/// ```
 pub fn pairs_within(
     xyz: &[[f64; 3]],
     simbox: &Cell,

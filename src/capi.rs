@@ -341,14 +341,14 @@ fn fail_msg(msg: &str) -> c_int {
     1
 }
 
-/// Thread-local last-error string from this thread's most recent
-/// [`lc_knearest`].
+/// Thread-local last-error string shared by the status-returning `lc_*`
+/// calls in `linkcell.h`.
 ///
 /// Returns a pointer to a NUL-terminated UTF-8 C string, or `NULL` if
-/// the last `lc_knearest` on this thread succeeded, or if none has
-/// failed yet. [`lc_version`] does not read or write the slot.
+/// the last such call on this thread succeeded, or if none has failed
+/// yet. [`lc_version`] does not read or write the slot.
 /// Distinct threads have independent slots. The pointer is valid until
-/// the next `lc_knearest` on this thread. Do not free it.
+/// the next such `lc_*` call on this thread. Do not free it.
 #[no_mangle]
 pub extern "C" fn lc_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| {

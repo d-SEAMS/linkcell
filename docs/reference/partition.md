@@ -73,3 +73,5 @@ This machine has one node, so the log line for a second node is `multi_node HOST
 
 Ring membership, the Message Passing Interface (MPI) share, and ice clustering stay in seams-core.
 See `PLACEMENT.md`.
+Goswami, Goswami, and Singh describe that engine in *J. Chem. Inf. Model.* **60**, 2169 (2020).
+The doi is 10.1021/acs.jcim.0c00031.

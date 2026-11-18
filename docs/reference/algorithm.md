@@ -58,7 +58,9 @@ An orthorhombic box is already the basis the shells walk.
 A restricted triclinic box is tilt-reduced in place.
 LAMMPS dump bounds, a configuration (CON) file with a non-right angle, and the cells seams and rgsaddle pass all take that reduction.
 GROMACS `correct_box` forms the shift as the triangular product.
-A general orientation is Minkowski-reduced (Nguyen-Stehle).
+A general orientation is Minkowski-reduced (Nguyen and Stehlé, ACM Transactions on Algorithms **5**, 2009).
+The doi is 10.1145/1597036.1597050.
+If tilt reduction or Minkowski reduction fails, the walk keeps the caller's cell and still stops on the frontier plane.
 The basis spans the same Cartesian lattice.
 A 27-image check on that basis can still miss a closer shift; the shell cap is the space diagonal divided by the minimum cell height, and the frontier test stops the walk once the k-th neighbour is certified.
 `pairs_within` keeps the caller's basis, because the returned shift `S` is an integer combination of that H. Each unordered pair is tested once.
@@ -209,6 +211,64 @@ Any other box calls `Cell::dist2_euclidean` per pair: Smith half-edge test, then
 The 27-image of an unreduced H misses lattice points such as `2(a-b)`.
 The fractional wrap of a hex-prism body diagonal misses the nearest image.
 The production walk uses the shell stop.
+
+## Cost
+
+Both searches fold every active point once, count the bins, exclusive-scan those counts, and write the occupant list.
+That work is linear in the number of active points plus the number of bins.
+More than 1,000,000 bins on one axis, or more than 16,777,216 bins in the mesh, returns `TooManyCells`.
+
+`pairs_within` keeps the caller's basis.
+Along each axis the image repeat is `ceil(cutoff / width)`.
+The product of `(2 * repeat + 1)` over the three axes is the image count.
+Above 2^24 the call returns `TooManyImages`.
+`cell_hint` of `None`, or a value that is not finite and strictly positive, selects a bin edge of `cutoff / k`.
+The integer `k` runs from 1 to 6.
+It is the rounded fourth root of the estimated atoms per cutoff-sized cell, after that estimate is divided by 16, so it grows with the point count only until it reaches 6.
+A positive finite hint replaces that edge.
+The edge is then clamped to the shortest box width.
+Each unordered pair of bins that can hold a pair inside the cutoff is visited once.
+When that edge is shorter than every box width, each bin is at least as wide as the edge, and the bin reach `ceil(cutoff / cell_min)` is at most `k`.
+The stencil volume is then bounded by a constant.
+The candidate tests are proportional to the point count times the occupants of that stencil.
+When every point sits in one bin the same stencil still covers it, and the tests are quadratic in the point count.
+A full list writes both `(i, j, S)` and `(j, i, -S)`.
+A half list writes one side.
+Writing the rows is linear in that count.
+The comparison with vesin's ordered 27-cell stencil, for a bin edge equal to the cutoff, is in the paragraph above.
+
+`knearest` takes no cutoff.
+`cell_hint` of `None`, or a value that is not finite and strictly positive, selects a bin edge of 3 in the box length unit, then clamps it to the shortest box width.
+Each source keeps up to `k` pairs `(dist2, index)` and tracks the worst
+entry. For `k <= 16` the storage stays on the stack.
+`KHeap` scans its entries to reject duplicate indices and scans them
+again after replacing the worst entry, so an accepted candidate is
+linear in `k`.
+The first visit is the 3 by 3 by 3 around the home bin.
+An axis then grows only while the squared gap to its unvisited plane is smaller than the worst heap entry, and only while the radius is below `max_reach`.
+`max_reach` is the longest corner vector of the walk cell, `|±a ±b ±c|`, divided by the shortest bin edge, rounded up, plus 3.
+It is also at least half the longest bin count, plus 2.
+A source that stops on the frontier has read every bin that can hold a closer neighbour.
+A source that reaches `max_reach` on every axis has covered a space diagonal.
+On a filled lattice with about one point per bin the frontier stops in
+the first shells. A source then visits a small multiple of `k`
+candidates, with each accepted update taking `O(k)`.
+If the points collapse into a few bins, or `k` is `n - 1`, a source reads every other point and the search is quadratic.
+The output is `n` rows of length at most `k`.
+Reduction changes which integer offsets are short.
+The bounds and the Cartesian distances stay the same.
+
+`pairs_open`, and a mixed `pairs_within_pbc`, bin the occupied Cartesian extent.
+An open axis stays open.
+The partner stencil stores, for each row of bins, the farthest offset still inside the cutoff.
+That offset depends on the cutoff and the bin edge.
+A fully open stencil is reused by later frames with the same cutoff and edge.
+With a periodic axis the stencil is rebuilt when the bounding bins change.
+The same 2^24 image cap applies.
+`lc_stencil_builds` counts builds, not reuses.
+
+Threads change the wall time.
+The candidate tests, the row order, and the stored bits stay the same.
 
 The citations are in [minimum image convention (MIC) and cells](../explanation/mic-and-cells.md).
 The pair kernel is Rapaport's cell shift.
