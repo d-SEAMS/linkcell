@@ -165,8 +165,8 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/cargo-openmp.log"
           grep -F 'knn_region.c' "$RUNNER_TEMP/cargo-openmp.log" \
             | grep -F '"-fopenmp"'
-          grep -F -- "-L native=$prefix/lib -l omp" \
-            "$RUNNER_TEMP/cargo-openmp.log"
+          grep -F -- "-L native=$prefix/lib" "$RUNNER_TEMP/cargo-openmp.log" \
+            | grep -F -- "-l omp"
       - run: cargo test --locked ${{ matrix.crate.flags }}
       - name: SIMD paths exercised
         shell: bash
