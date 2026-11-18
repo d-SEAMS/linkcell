@@ -49,7 +49,7 @@ jobs:
         run: |
           mkdir -p docs/assets && cp -a assets/branding docs/assets/branding
           python -m pip install "mkdocs==1.6.1" "mkdocs-material==9.5.49"
-          mkdocs build --site-dir _site
+          mkdocs build --strict --site-dir _site
       - name: Rust API reference
         env:
           RUSTDOCFLAGS: -D warnings --extend-css assets/rustdoc/dseams-rustdoc.css --html-before-content assets/rustdoc/dseams-rustdoc-before.html --html-in-header assets/rustdoc/dseams-rustdoc-head.html
@@ -58,6 +58,8 @@ jobs:
           cp -a target/doc _site/api
           cp assets/rustdoc-index.html _site/api/index.html
           cp llms.txt _site/llms.txt
+      - name: Doctests
+        run: cargo test --doc --locked
       # The built site as pages.yml assembles it. --root-dir resolves the
       # site-absolute links in 404.html. The site's own URL is skipped:
       # _site is that site. doi.org redirects to publishers that answer CI
