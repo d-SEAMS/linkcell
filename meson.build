@@ -150,10 +150,22 @@ if host_machine.system() == 'linux' or host_machine.system() == 'darwin'
   if host_machine.system() == 'linux'
     rust_sys += [cc.find_library('dl', required: true)]
   endif
-  rust_sys += [
-    cc.find_library('m', required: true),
-    cc.find_library(_omp_lib, dirs: _omp_dirs, required: true),
-  ]
+  rust_sys += [cc.find_library('m', required: true)]
+  _omp_dep = cc.find_library(_omp_lib, dirs: _omp_dirs, required: true)
+  if host_machine.system() == 'linux'
+    # find_library with dirs answers with the file's full path. Link the
+    # runtime by name, with -L for the directory that holds it, so
+    # linkcell.pc names -lomp or -lgomp and a consumer picks up the
+    # runtime's own SONAME.
+    _omp_link = ['-l' + _omp_lib]
+    if _omp_dirs.length() > 0
+      _omp_link = ['-L' + _omp_dirs[0]] + _omp_link
+    endif
+    rust_sys += [declare_dependency(link_args: _omp_link)]
+  else
+    # Homebrew's libomp is keg-only and its install name is the full path.
+    rust_sys += [_omp_dep]
+  endif
 elif host_machine.system() == 'windows'
   rust_sys += [
     cc.find_library('ws2_32', required: true),
