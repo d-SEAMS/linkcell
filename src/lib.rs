@@ -28,8 +28,9 @@
 //! a rectangular film, is used as stored. A restricted triclinic box
 //! (LAMMPS dump bounds, a CON angle, a hexagonal prism) is
 //! tilt-reduced in place and the shift is triangular. A general
-//! orientation is Minkowski-reduced. [`pairs_within`] keeps the
-//! caller's basis, because the reported shift is an integer
+//! orientation is Minkowski-reduced. If either reduction fails, the
+//! walk keeps the caller's cell. [`pairs_within`] keeps the caller's
+//! basis on every call, because the reported shift is an integer
 //! combination of that H.
 //!
 //! Pair distances in the walk are not a per-pair minimum-image wrap.
@@ -57,6 +58,28 @@
 //! [`knearest`] returns one [`Neighbors`] row per input point, nearest
 //! first. [`knearest_into`] writes a packed `n * k` index buffer
 //! (`-1` in unused slots), the same layout as `lc_knearest`.
+//!
+//! # Cost
+//!
+//! Binning is linear in the active points plus the bin count. More
+//! than 1,000,000 bins on one axis, or more than 16,777,216 bins in
+//! the mesh, is [`Error::TooManyCells`].
+//!
+//! [`pairs_within`] keeps the caller's basis. The image count is the
+//! product of `2 * ceil(cutoff / width) + 1` over the three axes, and
+//! a count above 2^24 is [`Error::TooManyImages`]. With the default
+//! bin edge the reach is at most a small constant (the occupancy
+//! integer is clamped to `1..=6`) whenever that edge is shorter than
+//! every box width. One bin that holds every point makes the candidate
+//! tests quadratic.
+//!
+//! [`knearest`] takes no cutoff. Each source keeps a heap of `k`
+//! entries (`k <= 16` stays on the stack) and grows an index box until
+//! the worst entry is at most the squared gap to every unvisited plane,
+//! or until the radius reaches the space diagonal of the walk cell in
+//! units of the shortest bin edge. A filled lattice stops in the first
+//! shells. `k = n - 1`, or every point in a few bins, reads every other
+//! point.
 //!
 //! # Features
 //!

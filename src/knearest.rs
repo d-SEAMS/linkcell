@@ -723,16 +723,24 @@ pub fn knearest_csr(
 ///
 /// `mask[i] == false` drops point `i` from both sources and candidates.
 /// `mask` is `None` or length `n` ([`Error::MaskLen`] otherwise).
-/// `cell_hint` is the target cell edge; `None` uses 3.0 in the same units
-/// as the box. Each row has `min(k, n_active - 1)` entries.
+/// Positions and the cell share one length unit. `dist2` is that unit
+/// squared. `cell_hint` is the target bin edge in that unit. `None`, a
+/// non-finite value, or a value that is not strictly positive selects
+/// 3.0, then the edge is clamped to the shortest box width. Each row
+/// has `min(k, n_active - 1)` entries.
+///
+/// Returns [`Error::ZeroK`] when `k == 0`, [`Error::Empty`] when `xyz`
+/// is empty, [`Error::Overflow`] when `n * k` does not fit in a slice,
+/// and [`Error::TooManyCells`] when the mesh exceeds the bin cap.
+/// These inputs return `Err`.
 ///
 /// Fold, bin, then grow a rectangular index box. An orthorhombic cell
 /// is used as stored. A restricted triclinic cell is tilt-reduced
-/// first. A general orientation is Minkowski-reduced. Distances are
-/// [`Cell::dist2_shifted`] plus [`Cell::lattice_shift`]. The walk does
-/// not stamp unique cells: occupants of one bin can need different
-/// images. A full heap stops when its worst distance is at most the
-/// nearest unvisited face.
+/// first. A general orientation is Minkowski-reduced. A reduction that
+/// fails keeps the caller's cell. Distances are [`Cell::dist2_shifted`]
+/// plus [`Cell::lattice_shift`]. The walk visits every wrap of a bin:
+/// occupants of one bin can need different images. A full heap stops
+/// when its worst distance is at most the nearest unvisited face.
 ///
 /// ```
 /// use linkcell::{knearest, Cell};
@@ -745,6 +753,27 @@ pub fn knearest_csr(
 /// assert!(rows[1].indices.is_empty());
 /// assert_eq!(rows[0].indices, vec![2]);
 /// assert_eq!(rows[2].indices, vec![0]);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A restricted triclinic cell uses the same length unit. Two points
+/// one unit apart on `a` stay neighbours after the tilt reduction.
+///
+/// ```
+/// use linkcell::{knearest, Cell};
+///
+/// # fn main() -> Result<(), linkcell::Error> {
+/// let sheared = Cell::from_vectors(
+///     [10.0, 0.0, 0.0],
+///     [5.0, 8.66, 0.0],
+///     [0.0, 0.0, 10.0],
+///     [0.0, 0.0, 0.0],
+/// )?;
+/// let xyz = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+/// let rows = knearest(&xyz, &sheared, 1, None, None)?;
+/// assert_eq!(rows[0].indices, vec![1]);
+/// assert!((rows[0].dist2[0] - 1.0).abs() < 1e-12);
 /// # Ok(())
 /// # }
 /// ```
