@@ -26,7 +26,8 @@ extern "C" {
 namespace linkcell {
 
 /// Failure from a neighbour search. `status()` is the C ABI return
-/// (0 success, nonzero failure).
+/// (0 success, nonzero failure). The message is `lc_last_error()` when
+/// the C call failed, or the check named on the throwing function.
 class Error : public std::runtime_error {
 public:
   Error(int status, std::string message)
@@ -88,7 +89,9 @@ struct Cell {
 ///
 /// `data()[i * k() + j]` is the j-th neighbour of source i, nearest
 /// first. The slot is -1 when that neighbour is missing (masked or
-/// isolated).
+/// isolated). The constructor throws when `n * k` overflows or a
+/// buffer is not that length. `neighbour` throws `std::out_of_range`
+/// when `i` or `j` is outside the row.
 class Neighbours {
 public:
   Neighbours() = default;
@@ -189,6 +192,9 @@ inline void call_c(const double *xyz, std::size_t n, const Cell &cell,
 
 /// Write packed indices into caller-owned `out` of length `out_len`.
 /// `out_len` must be `n * k`. `mask` is nullptr or n ints.
+/// Throws when `n * k` overflows, `out_len` is not that product, `n` or
+/// `k` is zero, a pointer is null, a count exceeds the C ABI range, or
+/// `lc_knearest_many` fails.
 inline void knearest_into(const double *xyz, std::size_t n, const Cell &cell,
                           std::size_t k, int *out, std::size_t out_len,
                           const int *mask = nullptr, double cell_hint = 0.0,
@@ -203,7 +209,8 @@ inline void knearest_into(const double *xyz, std::size_t n, const Cell &cell,
 }
 
 /// Frame-major batch. `xyz` is `n_frames * n * 3`. `out` / `out_d2`
-/// are `n_frames * n * k`.
+/// are `n_frames * n * k`. Throws when `n * k * n_frames` overflows,
+/// `out_len` is not that product, or [`knearest_into`] would throw.
 inline void knearest_into_many(const double *xyz, std::size_t n,
                                std::size_t n_frames, const Cell &cell,
                                std::size_t k, int *out, std::size_t out_len,
@@ -222,6 +229,8 @@ inline void knearest_into_many(const double *xyz, std::size_t n,
 
 /// The k-nearest graph as CSR into `offsets` (n + 1) and `cols`; see
 /// `lc_knearest_csr` for the row order. `mask` is nullptr or n ints.
+/// Throws when `n` or `k` is zero, `xyz` is null, a count exceeds the
+/// C ABI range, or `lc_knearest_csr` fails.
 inline void knearest_csr(const double *xyz, std::size_t n, const Cell &cell,
                          std::size_t k, bool mutual, std::vector<int> &offsets,
                          std::vector<int> &cols, const int *mask = nullptr,
@@ -261,7 +270,8 @@ inline void knearest_csr(const double *xyz, std::size_t n, const Cell &cell,
 }
 
 /// One allocation of n * k indices. `neighbour(i, j)` is the j-th
-/// neighbour of i, or -1.
+/// neighbour of i, or -1. Throws when `n * k` overflows or
+/// [`knearest_into`] would throw.
 [[nodiscard]] inline Neighbours
 knearest(const double *xyz, std::size_t n, const Cell &cell, std::size_t k,
          const int *mask = nullptr, double cell_hint = 0.0) {
@@ -294,7 +304,9 @@ struct ShiftedPair {
 /// Pairs with squared distance strictly below `cutoff * cutoff`.
 ///
 /// `half` keeps one side of `(i, j, S)` and `(j, i, -S)`. This is the
-/// cutoff list. k-nearest is [`knearest`].
+/// cutoff list. k-nearest is [`knearest`]. `n == 0` or a null `xyz`
+/// returns an empty vector. Otherwise throws when `n` exceeds the C
+/// ABI count range or `lc_pairs_within` fails.
 [[nodiscard]] inline std::vector<ShiftedPair>
 pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
              const int *mask = nullptr, double cell_hint = 0.0,
@@ -347,7 +359,9 @@ pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
 /// Each row has `i < j`, shift zero, and squared distance strictly
 /// below `cutoff * cutoff`. Bins are the occupied Cartesian cells. Their
 /// partner stencil depends on the cutoff and `cell_hint` alone, so it is
-/// reused by frames that occupy other bins.
+/// reused by frames that occupy other bins. `n == 0` or a null `xyz`
+/// returns an empty vector. Otherwise throws when `n` exceeds the C
+/// ABI count range or `lc_pairs_open` fails.
 [[nodiscard]] inline std::vector<ShiftedPair>
 pairs_open(const double *xyz, std::size_t n, double cutoff,
            double cell_hint = 0.0) {
@@ -386,7 +400,9 @@ pairs_open(const double *xyz, std::size_t n, double cutoff,
 ///
 /// `periodic[k]` false is an open axis. `closed` keeps the cutoff
 /// boundary on an open or mixed cell. `exclude_self_images` drops
-/// `i == j`.
+/// `i == j`. `n == 0` or a null `xyz` returns an empty vector.
+/// Otherwise throws when `n` exceeds the C ABI count range or
+/// `lc_pairs_within_pbc` fails.
 [[nodiscard]] inline std::vector<ShiftedPair>
 pairs_within_pbc(const double *xyz, std::size_t n, const Cell &cell,
                  const std::array<bool, 3> &periodic, double cutoff,
@@ -451,6 +467,8 @@ struct CellGraph {
 /// Domain id of each cell. `method` matches `lc_partition`.
 /// `balance <= 0` selects `1 + parts * w_max / total`.
 /// `w_max` is the heaviest cell weight. `device` asks for the CUDA curve split.
+/// Throws when `n == 0`, `xyz` is null, `n` exceeds the C ABI count
+/// range, or `lc_partition` fails.
 [[nodiscard]] inline std::vector<int>
 partition(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
           std::size_t parts, int method = 4, const int *mask = nullptr,
@@ -482,7 +500,7 @@ partition(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
   return out;
 }
 
-/// Bin radii for `cutoff * depth`.
+/// Bin radii for `cutoff * depth`. Throws when `lc_halo_width` fails.
 [[nodiscard]] inline std::array<std::uint32_t, 3>
 halo_width(double cutoff, std::uint32_t depth,
            const std::array<double, 3> &bin_width) {
@@ -495,7 +513,7 @@ halo_width(double cutoff, std::uint32_t depth,
   return out;
 }
 
-/// Ghost cell ids of `domain`.
+/// Ghost cell ids of `domain`. Throws when `lc_halo` fails.
 [[nodiscard]] inline std::vector<int>
 halo(const std::array<int, 3> &nxyz, const std::vector<int> &assign, int domain,
      const std::array<std::uint32_t, 3> &width) {

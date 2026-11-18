@@ -107,6 +107,17 @@ impl SkinList {
     /// Filter `xyz`, rebuilding the candidates first when the skin is spent.
     ///
     /// `want_vector` fills [`Self::vectors`] with `q + H S - p`.
+    ///
+    /// Returns [`Error::Empty`] when `xyz` is empty. A rebuild returns
+    /// [`Error::BadCutoff`] when `cutoff + skin` is not finite,
+    /// [`Error::Overflow`] when `n` exceeds `i32::MAX`, when a relative
+    /// periodic image of a point is not finite or its absolute value
+    /// exceeds `i32::MAX`, when the span of those images on an axis plus
+    /// `ceil((cutoff + skin) / width)` on that axis exceeds `i32::MAX`,
+    /// or when one point has more candidate rows than `u32::MAX`,
+    /// [`Error::TooManyImages`] on the same image cap as
+    /// [`crate::pairs_within`], and [`Error::TooManyCells`] on the same
+    /// bin cap.
     pub fn update(&mut self, xyz: &[[f64; 3]], want_vector: bool) -> Result<&PairColumns, Error> {
         if xyz.is_empty() {
             return Err(Error::Empty);

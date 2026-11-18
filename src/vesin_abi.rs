@@ -164,6 +164,15 @@ impl NeighborCalc {
     ///
     /// `periodic` is three axis flags. A false flag returns
     /// [`Error::Partial`] from this function; the C entry tries vesin.
+    ///
+    /// Returns [`Error::BadCutoff`] when `cutoff` is not finite and
+    /// strictly positive, when `skin` is not finite, or when
+    /// `n_threads` is negative, [`Error::Padded`] when `padded_to > 0`
+    /// on a half list or when a point has more neighbours than
+    /// `padded_to`, [`Error::NonFinite`] when a coordinate is not
+    /// finite, and [`Error::Empty`] when `xyz` is empty. The pair list
+    /// then returns the errors of [`crate::pairs_within_columns`] when
+    /// `skin == 0`, and of [`crate::SkinList::update`] when `skin > 0`.
     pub fn compute(
         &mut self,
         xyz: &[[f64; 3]],
@@ -474,6 +483,13 @@ fn load_foreign_vesin() -> Option<VesinFn> {
 /// The symbol is `lc_vesin_neighbors`, not `vesin_neighbors`. A program
 /// that links both this crate and vesin keeps vesin's symbol. A drop-in
 /// object that calls this function is `include/vesin_alias.c`.
+///
+/// Returns 0 on success. Returns 1 and writes `error_message` when a
+/// required pointer is null, the device is CUDA or not the CPU and
+/// `libvesin` is absent ([`Error::Device`]), an axis is not periodic and
+/// `libvesin` is absent ([`Error::Partial`]), the box is singular or a
+/// length is not strictly positive ([`Error::BadBox`]), or
+/// [`NeighborCalc::compute`] returns an error.
 ///
 /// # Safety
 ///

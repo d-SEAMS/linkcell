@@ -4,6 +4,14 @@
  * here. A non-periodic axis or a CUDA device is forwarded to libvesin.so
  * when that library is on the loader path.
  *
+ * lc_vesin_neighbors returns 0 on success. It returns 1 and writes
+ * error_message when a required pointer is null, the device is not the
+ * CPU and libvesin is absent, an axis is not periodic and libvesin is
+ * absent, the box is singular or a length is not strictly positive, the
+ * cutoff or skin is not usable, a coordinate is not finite, the point
+ * list is empty, the image count exceeds 2^24, the mesh exceeds the bin
+ * cap, or a relative periodic image does not fit in int32.
+ *
  * vesin_free releases a list this library filled. Do not pass it a list
  * allocated by another vesin build.
  */
