@@ -19,7 +19,6 @@ DESCRIPTION = (
 URL = "https://linkcell.dseams.info/"
 REPOSITORY = "https://github.com/d-SEAMS/linkcell"
 IMAGE = "https://dseams.info/images/og-card.png"
-DOI = "https://doi.org/10.1021/acs.jcim.0c00031"
 TITLE = re.compile(r"<title\b[^>]*>(.*?)</title>", re.I | re.S)
 HEAD = re.compile(r"</head\s*>", re.I)
 REMOVE = (
@@ -61,7 +60,6 @@ def tags(title: str, description: str, page_url: str) -> str:
                 "description": DESCRIPTION,
                 "url": URL,
                 "applicationCategory": "DeveloperApplication",
-                "citation": DOI,
             },
             {
                 "@type": "SoftwareSourceCode",
@@ -71,7 +69,6 @@ def tags(title: str, description: str, page_url: str) -> str:
                 "codeRepository": REPOSITORY,
                 "programmingLanguage": ["Rust", "C", "C++", "Python"],
                 "license": "https://opensource.org/license/mit",
-                "citation": DOI,
             },
         ],
     }
@@ -183,7 +180,7 @@ def validate(root: Path) -> None:
         )
         if not any(
             {item.get("@type") for item in json.loads(script).get("@graph", [])}
-            >= {"SoftwareApplication", "SoftwareSourceCode"} and DOI in script
+            >= {"SoftwareApplication", "SoftwareSourceCode"}
             for script in scripts
         ):
             raise RuntimeError(f"{page}: missing required software JSON-LD")
