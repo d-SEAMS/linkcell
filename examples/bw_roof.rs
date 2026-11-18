@@ -162,7 +162,7 @@ mod linux {
     fn fill_lines(ptr: *mut u8, len: usize, nontemporal: bool) {
         let n = len / 64;
         if nontemporal {
-            unsafe { stream_lines(ptr, n) };
+            unsafe { stream_lines_if_ready(ptr, n) };
         } else {
             unsafe {
                 for i in 0..n {
@@ -182,7 +182,7 @@ mod linux {
             if nontemporal {
                 // The packed records stay 40 bytes. Streaming stores still move
                 // whole aligned lines of that byte range.
-                stream_lines(ptr, nbytes / 64);
+                stream_lines_if_ready(ptr, nbytes / 64);
             } else {
                 let n = nbytes / 40;
                 for i in 0..n {
@@ -218,7 +218,7 @@ mod linux {
         for bytes in widths {
             unsafe {
                 if nontemporal {
-                    stream_lines(ptr.add(at), bytes / 64);
+                    stream_lines_if_ready(ptr.add(at), bytes / 64);
                 } else {
                     let words = bytes / 8;
                     let p = ptr.add(at) as *mut u64;
@@ -233,6 +233,34 @@ mod linux {
 
     // AVX-512 intrinsics need Rust 1.89. build.rs sets `linkcell_avx512`
     // from the compiler version, so older toolchains take the plain store.
+    //
+    // The runtime gate mirrors `simd::avx512_ready`: AVX-512F and VL plus
+    // POPCNT and FMA.
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    #[inline]
+    fn avx512_ready() -> bool {
+        std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512vl")
+            && std::is_x86_feature_detected!("popcnt")
+            && std::is_x86_feature_detected!("fma")
+    }
+
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    #[inline]
+    unsafe fn stream_lines_if_ready(ptr: *mut u8, n: usize) {
+        if avx512_ready() {
+            unsafe { stream_lines(ptr, n) };
+            return;
+        }
+        unsafe { std::ptr::write_bytes(ptr, 0, n * 64) };
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", linkcell_avx512)))]
+    #[inline]
+    unsafe fn stream_lines_if_ready(ptr: *mut u8, n: usize) {
+        unsafe { stream_lines(ptr, n) };
+    }
+
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     #[allow(clippy::incompatible_msrv)]
     #[target_feature(enable = "avx512f")]

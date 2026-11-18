@@ -129,6 +129,7 @@ impl Method {
         )
     }
 
+    #[cfg(feature = "capi")]
     fn from_code(code: u8) -> Result<Self, Error> {
         match code {
             0 => Ok(Method::Morton),
@@ -446,9 +447,9 @@ pub fn mark_reached(
                     }
                     for &j in &atoms[start[other]..start[other + 1]] {
                         let mut sum = 0.0;
-                        for d in 0..3 {
+                        for (d, &length) in lengths.iter().enumerate() {
                             let mut delta = xyz[i][d] - xyz[j][d];
-                            delta -= lengths[d] * (delta / lengths[d] + 0.5).floor();
+                            delta -= length * (delta / length + 0.5).floor();
                             sum += delta * delta;
                         }
                         if sum <= reach2 {
@@ -3467,6 +3468,7 @@ pub type DeviceCurveFn = unsafe extern "C" fn(
 static DEVICE_CURVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Install the device curve split. `None` removes it.
+#[cfg(feature = "capi")]
 pub fn register_device_curve(f: Option<DeviceCurveFn>) {
     DEVICE_CURVE.store(f.map_or(0, |f| f as usize), AtomicOrdering::Release);
 }
@@ -3497,6 +3499,7 @@ unsafe fn call_device_curve(
 }
 
 /// C ABI method code. Unknown codes are [`Error::BadPartition`].
+#[cfg(feature = "capi")]
 pub fn method_from_c(code: u8) -> Result<Method, Error> {
     Method::from_code(code)
 }
