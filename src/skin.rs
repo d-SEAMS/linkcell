@@ -5,7 +5,7 @@
 //! reference position, after the box-corner correction of Verlet
 //! (Phys. Rev. **159**, 98, 1967) as used by vesin and LAMMPS. The kept
 //! rows satisfy `|q + H S - p|^2` strictly below `cutoff²`. Shifts inside
-//! `[-3, 3]^3` are a one-byte code; the filter gathers coordinates eight
+//! `[-3, 3]^3` are a 16-bit code; the filter gathers coordinates eight
 //! at a time and compacts the hits. A wider shift keeps the three shift
 //! columns and uses the same test.
 
@@ -533,5 +533,154 @@ mod tests {
         pbc_skin.set_cell(stretched);
         assert_eq!(pbc_skin.cell().widths(), stretched.widths());
         assert!(pbc_skin.needs_rebuild(&xyz));
+        pbc_skin.update(&xyz, true).unwrap();
+        assert_eq!(pbc_skin.builds(), 2);
+        assert_eq!(pbc_skin.reuses(), 0);
+        assert!(!pbc_skin.last_reused());
+    }
+
+    #[test]
+    fn skin_list_matches_pairs_within_across_multi_image_shifts() {
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        let mut next = || -> f64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut saw_shift_2 = false;
+        let mut saw_shift_3 = false;
+        for trial in 0..200 {
+            let lx = 1.25 + 0.45 * next();
+            let ly = 1.35 + 0.55 * next();
+            let lz = 1.45 + 0.55 * next();
+            let cell = if trial % 2 == 0 {
+                Cell::ortho(lx, ly, lz).unwrap()
+            } else {
+                let xy = (next() - 0.5) * 0.7 * lx;
+                let xz = (next() - 0.5) * 0.7 * lx;
+                let yz = (next() - 0.5) * 0.7 * ly;
+                Cell::from_vectors([lx, 0.0, 0.0], [xy, ly, 0.0], [xz, yz, lz], [0.0; 3]).unwrap()
+            };
+            let min_w = cell.widths().into_iter().fold(f64::INFINITY, f64::min);
+            let cutoff = min_w * (1.85 + 0.35 * next());
+            let skin_width = 0.25 * min_w;
+            let n = 16;
+            let xyz: Vec<[f64; 3]> = (0..n)
+                .map(|_| cell.cartesian([next(), next(), next()]))
+                .collect();
+            let step = 0.2 * skin_width;
+            let moved: Vec<[f64; 3]> = xyz
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| {
+                    let phase = idx as f64 * 0.73;
+                    [
+                        p[0] + step * phase.sin(),
+                        p[1] + step * phase.cos() * 0.5,
+                        p[2] - step * (2.0 * phase).sin() * 0.5,
+                    ]
+                })
+                .collect();
+            let half = trial % 3 != 0;
+
+            let mut fresh0 = PairColumns::default();
+            pairs_within_columns(&xyz, &cell, cutoff, None, None, half, &mut fresh0).unwrap();
+            for s in &fresh0.shift {
+                for &c in s {
+                    if c.abs() == 2 {
+                        saw_shift_2 = true;
+                    }
+                    if c.abs() == 3 {
+                        saw_shift_3 = true;
+                    }
+                }
+            }
+            let mut want0_keys: Vec<_> = (0..fresh0.len())
+                .map(|k| {
+                    if half {
+                        canon(fresh0.i[k], fresh0.j[k], fresh0.shift[k])
+                    } else {
+                        (fresh0.i[k], fresh0.j[k], fresh0.shift[k])
+                    }
+                })
+                .collect();
+            want0_keys.sort_unstable();
+
+            let mut fresh1 = PairColumns::default();
+            pairs_within_columns(&moved, &cell, cutoff, None, None, half, &mut fresh1).unwrap();
+            let mut want1_keys: Vec<_> = (0..fresh1.len())
+                .map(|k| {
+                    if half {
+                        canon(fresh1.i[k], fresh1.j[k], fresh1.shift[k])
+                    } else {
+                        (fresh1.i[k], fresh1.j[k], fresh1.shift[k])
+                    }
+                })
+                .collect();
+            want1_keys.sort_unstable();
+
+            let mut ref_rows0 = None;
+            let mut ref_rows1 = None;
+            for path in crate::simd::paths_to_compare() {
+                let _guard = crate::simd::force(path);
+                let mut skin = SkinList::new(cell, cutoff, skin_width, half).unwrap();
+                let (got0_keys, got0_rows): (Vec<_>, Vec<_>) = {
+                    let cols = skin.update(&xyz, false).unwrap();
+                    let keys = (0..cols.len())
+                        .map(|k| (cols.i[k], cols.j[k], cols.shift[k]))
+                        .collect();
+                    let rows = (0..cols.len())
+                        .map(|k| (cols.i[k], cols.j[k], cols.shift[k], cols.dist2[k].to_bits()))
+                        .collect();
+                    (keys, rows)
+                };
+                assert!(skin.soa.is_coded());
+                assert_eq!(skin.builds(), 1);
+                assert_eq!(skin.reuses(), 0);
+                assert!(!skin.last_reused());
+                let mut sorted0_keys = got0_keys;
+                sorted0_keys.sort_unstable();
+                assert_eq!(
+                    sorted0_keys, want0_keys,
+                    "initial build trial={trial} path={path:?}"
+                );
+                if let Some(ref want_bits) = ref_rows0 {
+                    assert_eq!(
+                        &got0_rows, want_bits,
+                        "simd bits0 trial={trial} path={path:?}"
+                    );
+                } else {
+                    ref_rows0 = Some(got0_rows);
+                }
+
+                let (got1_keys, got1_rows): (Vec<_>, Vec<_>) = {
+                    let cols = skin.update(&moved, false).unwrap();
+                    let keys = (0..cols.len())
+                        .map(|k| (cols.i[k], cols.j[k], cols.shift[k]))
+                        .collect();
+                    let rows = (0..cols.len())
+                        .map(|k| (cols.i[k], cols.j[k], cols.shift[k], cols.dist2[k].to_bits()))
+                        .collect();
+                    (keys, rows)
+                };
+                assert_eq!(skin.builds(), 1);
+                assert_eq!(skin.reuses(), 1);
+                assert!(skin.last_reused());
+                let mut sorted1_keys = got1_keys;
+                sorted1_keys.sort_unstable();
+                assert_eq!(
+                    sorted1_keys, want1_keys,
+                    "reused filter trial={trial} path={path:?}"
+                );
+                if let Some(ref want_bits) = ref_rows1 {
+                    assert_eq!(
+                        &got1_rows, want_bits,
+                        "simd bits1 trial={trial} path={path:?}"
+                    );
+                } else {
+                    ref_rows1 = Some(got1_rows);
+                }
+            }
+        }
+        assert!(saw_shift_2 && saw_shift_3);
     }
 }

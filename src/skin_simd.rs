@@ -27,19 +27,19 @@ pub(crate) struct Soa {
     sz: Vec<i32>,
     /// Packed shift in `[-3, 3]^3` when every candidate fits.
     /// Empty when [`Self::coded`] is false and the full shift columns are used.
-    code: Vec<u8>,
+    code: Vec<u16>,
     coded: bool,
 }
 
 /// Integer code of shift `(0, 0, 0)` in [`ISHIFT`].
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-const ZERO_CODE: u8 = (3 * 49 + 3 * 7 + 3) as u8;
+const ZERO_CODE: u16 = 3 * 49 + 3 * 7 + 3;
 
 /// Eight zero-shift codes, for the aligned fast path.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-const ZERO8: u64 = {
-    let b = ZERO_CODE as u64;
-    b | (b << 8) | (b << 16) | (b << 24) | (b << 32) | (b << 40) | (b << 48) | (b << 56)
+const ZERO8: u128 = {
+    let b = ZERO_CODE as u128;
+    b | (b << 16) | (b << 32) | (b << 48) | (b << 64) | (b << 80) | (b << 96) | (b << 112)
 };
 
 const fn ishift_table() -> [[i32; 3]; 343] {
@@ -58,11 +58,11 @@ const fn ishift_table() -> [[i32; 3]; 343] {
 /// `code -> (sx, sy, sz)` for shifts inside `[-3, 3]`.
 const ISHIFT: [[i32; 3]; 343] = ishift_table();
 
-fn encode_shift(sx: i32, sy: i32, sz: i32) -> Option<u8> {
+fn encode_shift(sx: i32, sy: i32, sz: i32) -> Option<u16> {
     if !(-3..=3).contains(&sx) || !(-3..=3).contains(&sy) || !(-3..=3).contains(&sz) {
         return None;
     }
-    Some(((sx + 3) as u8) * 49 + ((sy + 3) as u8) * 7 + (sz + 3) as u8)
+    Some(((sx + 3) as u16) * 49 + ((sy + 3) as u16) * 7 + (sz + 3) as u16)
 }
 
 impl Soa {
@@ -102,7 +102,7 @@ impl Soa {
         let mut sx = vec![0i32; n];
         let mut sy = vec![0i32; n];
         let mut sz = vec![0i32; n];
-        let mut code = vec![0u8; n];
+        let mut code = vec![0u16; n];
         let mut coded = true;
         for k in 0..n {
             let i = cols.i[k] as usize;
@@ -331,7 +331,7 @@ fn filter_coded(
     xyz: &[[f64; 3]],
     offsets: &[u32],
     j: &[u32],
-    code: &[u8],
+    code: &[u16],
     ranges: &[(usize, usize)],
     cut2: f64,
     ortho: bool,
@@ -394,7 +394,7 @@ fn coded_pass<const WRITE: bool>(
     xyz: &[[f64; 3]],
     offsets: &[u32],
     j: &[u32],
-    code: &[u8],
+    code: &[u16],
     ranges: &[(usize, usize)],
     off: &[usize],
     cut2: f64,
@@ -443,7 +443,7 @@ fn coded_scalar<const WRITE: bool>(
     xyz: &[[f64; 3]],
     offsets: &[u32],
     j: &[u32],
-    code: &[u8],
+    code: &[u16],
     lo: usize,
     hi: usize,
     cut2: f64,
@@ -493,7 +493,7 @@ unsafe fn coded_avx<const WRITE: bool>(
     xyz: &[[f64; 3]],
     offsets: &[u32],
     j: &[u32],
-    code: &[u8],
+    code: &[u16],
     lo: usize,
     hi: usize,
     cut2: f64,
@@ -508,12 +508,12 @@ unsafe fn coded_avx<const WRITE: bool>(
     cand: usize,
 ) -> usize {
     use std::arch::x86_64::{
-        __m128i, __m256i, __m512i, _mm256_add_epi32, _mm256_cvtepu8_epi32, _mm256_loadu_si256,
+        __m128i, __m256i, __m512i, _mm256_add_epi32, _mm256_cvtepu16_epi32, _mm256_loadu_si256,
         _mm256_mask_compressstoreu_epi32, _mm256_maskz_compress_epi32, _mm256_mullo_epi32,
         _mm256_set1_epi32, _mm256_setzero_si256, _mm256_storeu_si256, _mm512_add_pd,
         _mm512_cmp_pd_mask, _mm512_i32gather_pd, _mm512_mask_compressstoreu_pd, _mm512_mul_pd,
         _mm512_set1_pd, _mm512_setzero_si512, _mm512_storeu_pd, _mm512_storeu_si512, _mm512_sub_pd,
-        _mm_loadl_epi64, _mm_prefetch, _CMP_LT_OQ, _MM_HINT_T0,
+        _mm_loadu_si128, _mm_prefetch, _CMP_LT_OQ, _MM_HINT_T0,
     };
     let mut hits = 0usize;
     let cut = _mm512_set1_pd(cut2);
@@ -542,7 +542,7 @@ unsafe fn coded_avx<const WRITE: bool>(
                     }
                 }
             }
-            let raw = unsafe { (code.as_ptr().add(t) as *const u64).read_unaligned() };
+            let raw = unsafe { (code.as_ptr().add(t) as *const u128).read_unaligned() };
             let zero = raw == ZERO8;
             let jv = unsafe { _mm256_loadu_si256(j.as_ptr().add(t) as *const __m256i) };
             let ix = _mm256_mullo_epi32(jv, three);
@@ -557,8 +557,8 @@ unsafe fn coded_avx<const WRITE: bool>(
                     _mm256_set1_epi32(i32::from(ZERO_CODE)),
                 )
             } else {
-                let c32 = _mm256_cvtepu8_epi32(unsafe {
-                    _mm_loadl_epi64(code.as_ptr().add(t) as *const __m128i)
+                let c32 = _mm256_cvtepu16_epi32(unsafe {
+                    _mm_loadu_si128(code.as_ptr().add(t) as *const __m128i)
                 });
                 let sx = unsafe { _mm512_i32gather_pd(c32, txp, 8) };
                 let sy = unsafe { _mm512_i32gather_pd(c32, typ, 8) };
@@ -646,7 +646,7 @@ fn bead_pass<const WRITE: bool>(
     beads: usize,
     offsets: &[u32],
     j: &[u32],
-    code: &[u8],
+    code: &[u16],
     ranges: &[(usize, usize)],
     off: &[Vec<usize>],
     cut2: f64,
@@ -692,7 +692,7 @@ fn bead_scalar<const WRITE: bool>(
     beads: usize,
     offsets: &[u32],
     j: &[u32],
-    code: &[u8],
+    code: &[u16],
     lo: usize,
     hi: usize,
     t: usize,
@@ -750,7 +750,7 @@ unsafe fn bead_avx<const WRITE: bool>(
     beads: usize,
     offsets: &[u32],
     j: &[u32],
-    code: &[u8],
+    code: &[u16],
     lo: usize,
     hi: usize,
     t: usize,
@@ -762,11 +762,11 @@ unsafe fn bead_avx<const WRITE: bool>(
     ptrs: &[(usize, usize, usize, usize)],
 ) -> Vec<usize> {
     use std::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_cvtepu8_epi32, _mm256_loadu_si256,
+        __m128i, __m256i, _mm256_add_epi32, _mm256_cvtepu16_epi32, _mm256_loadu_si256,
         _mm256_mask_compressstoreu_epi32, _mm256_maskz_compress_epi32, _mm256_mullo_epi32,
         _mm256_set1_epi32, _mm256_storeu_si256, _mm512_add_pd, _mm512_cmp_pd_mask,
         _mm512_i32gather_pd, _mm512_mask_compressstoreu_pd, _mm512_mul_pd, _mm512_set1_pd,
-        _mm512_sub_pd, _mm_loadl_epi64, _CMP_LT_OQ,
+        _mm512_sub_pd, _mm_loadu_si128, _CMP_LT_OQ,
     };
     let mut hits = vec![0usize; beads];
     let mut at: Vec<usize> = (0..beads)
@@ -784,7 +784,7 @@ unsafe fn bead_avx<const WRITE: bool>(
         let b = offsets[atom + 1] as usize;
         let mut k = a;
         while k + 8 <= b {
-            let raw = unsafe { (code.as_ptr().add(k) as *const u64).read_unaligned() };
+            let raw = unsafe { (code.as_ptr().add(k) as *const u128).read_unaligned() };
             let zero = raw == ZERO8;
             let jv = unsafe { _mm256_loadu_si256(j.as_ptr().add(k) as *const __m256i) };
             let ix = _mm256_mullo_epi32(jv, three);
@@ -796,8 +796,8 @@ unsafe fn bead_avx<const WRITE: bool>(
                     _mm256_set1_epi32(i32::from(ZERO_CODE)),
                 )
             } else {
-                let c32 = _mm256_cvtepu8_epi32(unsafe {
-                    _mm_loadl_epi64(code.as_ptr().add(k) as *const __m128i)
+                let c32 = _mm256_cvtepu16_epi32(unsafe {
+                    _mm_loadu_si128(code.as_ptr().add(k) as *const __m128i)
                 });
                 (
                     unsafe { _mm512_i32gather_pd(c32, txp, 8) },
