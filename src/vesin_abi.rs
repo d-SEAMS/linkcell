@@ -172,7 +172,8 @@ impl NeighborCalc {
     /// `padded_to`, [`Error::NonFinite`] when a coordinate is not
     /// finite, and [`Error::Empty`] when `xyz` is empty. The pair list
     /// then returns the errors of [`crate::pairs_within_columns`] when
-    /// `skin == 0`, and of [`crate::SkinList::update`] when `skin > 0`.
+    /// `skin == 0`, and of [`crate::SkinList::update`] when `skin != 0`
+    /// (a finite negative `skin` selects `0.1 * cutoff`).
     pub fn compute(
         &mut self,
         xyz: &[[f64; 3]],

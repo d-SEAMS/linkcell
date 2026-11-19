@@ -348,9 +348,12 @@ relative periodic image that is not finite or whose absolute value
 exceeds `i32::MAX`, and an image span on an axis plus
 `ceil(cutoff / width)` on that axis that exceeds `i32::MAX`.
 `pairs_within_pbc` adds `NonFinite`, and on an open or mixed cell an
-`Overflow` when a bin floor or `shift + image_i - image_j` does not fit
-in `i32`. `TooManyImages` is also `ceil(cutoff / width)` or
-`ceil(cutoff / cell_min)` not finite or above `i32::MAX`.
+`Overflow` when a bin floor or `shift + image_i - image_j` (or its
+negation on a full list) does not fit in `i32`. `TooManyImages` is also
+`ceil(cutoff / width)` on a periodic axis (or `ceil(cutoff / cell_min)`
+on a fully periodic cell) not finite or above `i32::MAX`, and on an
+open or mixed cell the stencil reach `ceil(cutoff / edge)` not finite or
+above `i32::MAX - 2`.
 `halo_width` returns `Overflow` when a positive length over a
 positive width is not finite or its ceiling does not fit in `u32`.
 `partition` returns `Overflow` for the `pairs_within` image cases when

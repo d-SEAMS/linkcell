@@ -39,4 +39,3 @@ def test_partition_error_paths():
     if not linkcell.gpu_available():
         with pytest.raises(RuntimeError):
             linkcell.partition(xyz, cell, 2.0, 2, method="morton", device=True)
-

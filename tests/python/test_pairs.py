@@ -136,4 +136,3 @@ def test_pairs_error_paths():
 
     with pytest.raises(RuntimeError):
         linkcell.pairs_within_pbc(pts, eye, False, 1e12, cell_hint=1.0)
-

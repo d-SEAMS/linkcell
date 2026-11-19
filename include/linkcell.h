@@ -616,18 +616,20 @@ int lc_pairs_within(const double *xyz,
  * `cap` is below the row count, `n` exceeds `INT_MAX` or
  * `PTRDIFF_MAX / 3`, the periodic cell is singular or a periodic axis
  * length is not finite and strictly positive, or `pairs_within_pbc`
- * returns an error (non-finite or non-positive cutoff, mask length, a
- * non-finite coordinate or located position, the periodic-image and bin
- * caps, or a bin floor, relative periodic image, image span plus
- * repeat count, or image shift—including its negation when `half == 0`—
- * that does not fit in `int`).
+ * returns an error (non-finite or non-positive cutoff, a non-finite
+ * coordinate or located position, the periodic-image and bin caps, or
+ * a bin floor, relative periodic image, image span plus repeat count,
+ * or image shift—including its negation when `half == 0`—that does not
+ * fit in `int`).
  *
  * # Safety
  *
  * `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
  * periodic, points at one `lc_cell`. `pbc`, if non-null, is three
- * ints. `mask`, if non-null, is `n` ints. `out_count` is writable.
- * On a fill, `out` is writable for `cap` rows.
+ * ints. `mask`, if non-null, is readable for `n` ints (caller
+ * precondition: C passes no mask length, and passing a shorter buffer
+ * is undefined behaviour). `out_count` is writable. On a fill, `out`
+ * is writable for `cap` rows.
  */
 int lc_pairs_within_pbc(const double *xyz,
                         size_t n,

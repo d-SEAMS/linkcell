@@ -589,7 +589,8 @@ fn cell_grid_py<'py>(
     ))
 }
 
-/// Periodic adjacency. Edge weights are pair counts from `pairs_within`.
+/// Periodic adjacency. Edge weights are pair counts from Rust's
+/// `linkcell::pairs_within` (not the `int32` column entry point).
 ///
 /// Returns `(nxyz, bin_width, weight, offsets, neighbor, edge_weight)`.
 /// Shape, mask, and CUDA `xyz` failures are those of [`cell_grid`]. A
