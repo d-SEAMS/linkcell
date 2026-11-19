@@ -208,31 +208,23 @@ impl CellGrid {
 ///
 /// Returns [`Error::BadGraph`] when `copies == 0`, a grid axis is not
 /// strictly positive, `nx * ny * nz` does not equal the weight length or
-/// overflows, `offsets` is not `ncell + 1` long, `copies` does not fit
-/// in `i32`, `nx * copies` or `ncell * copies` overflows, a neighbour
-/// index is outside the base cells, or the copied arc count does not
-/// fit in `u32`.
+/// overflows, `offsets` is not `ncell + 1` long, `offsets[0]` is nonzero,
+/// `offsets` is not monotonic, `neighbor` or `edge_weight` length does
+/// not equal `offsets[ncell]`, a neighbour index is outside the base
+/// cells, `copies` does not fit in `i32`, `nx * copies` or
+/// `ncell * copies` overflows, or the copied arc count does not fit in
+/// `u32`.
 pub fn replicate_graph(graph: &CellGraph, copies: usize) -> Result<CellGraph, Error> {
     if copies == 0 {
         return Err(Error::BadGraph);
     }
+    let n = check_graph(graph)?;
     if copies == 1 {
         return Ok(graph.clone());
     }
     let nx = graph.grid.nx;
     let ny = graph.grid.ny;
     let nz = graph.grid.nz;
-    if nx <= 0 || ny <= 0 || nz <= 0 {
-        return Err(Error::BadGraph);
-    }
-    let n = graph.grid.ncell();
-    let expect = (nx as usize)
-        .checked_mul(ny as usize)
-        .and_then(|v| v.checked_mul(nz as usize))
-        .ok_or(Error::BadGraph)?;
-    if expect != n || graph.offsets.len() != n + 1 {
-        return Err(Error::BadGraph);
-    }
     let copies_i = i32::try_from(copies).map_err(|_| Error::BadGraph)?;
     let big_nx = nx.checked_mul(copies_i).ok_or(Error::BadGraph)?;
     let big_n = n.checked_mul(copies).ok_or(Error::BadGraph)?;
@@ -530,8 +522,9 @@ pub fn cell_graph(
 /// [`cell_graph`]. Then [`Error::BadPartition`] when `parts == 0` or
 /// `balance` is `Some` and is not finite, is below 1, does not scale
 /// into a `u64` numerator, or rounds below 1; [`Error::NoDevice`] when
-/// `device` is set and the method is not Morton or Hilbert (with or
-/// without refinement); [`Error::DeviceMismatch`] when a device curve
+/// `device` is set and no device driver is loaded, the device call
+/// fails, or the method is not Morton or Hilbert (with or without
+/// refinement); [`Error::DeviceMismatch`] when a device curve
 /// split disagrees with the host weights or writes a domain id outside
 /// `0..parts`; [`Error::ScotchDisabled`] when Scotch or PT-Scotch was
 /// not compiled in; [`Error::ScotchFailed`] when that library rejects
@@ -593,8 +586,9 @@ pub fn partition_graph(graph: &CellGraph, request: PartRequest) -> Result<Vec<u3
 /// Curve split on the device, including the copies both ways.
 ///
 /// The result is the prefix assignment, with no refinement pass.
-/// [`Error::NoDevice`] means the driver is absent, and is also returned
-/// when `method` is not Morton or Hilbert (with or without refinement).
+/// [`Error::NoDevice`] means the driver is absent or the device call
+/// failed, and is also returned when `method` is not Morton or Hilbert
+/// (with or without refinement).
 /// A mismatch with the host histogram, or a domain id outside
 /// `0..parts`, is [`Error::DeviceMismatch`]. [`Error::BadPartition`]
 /// when `parts == 0`. The point binning returns the errors of

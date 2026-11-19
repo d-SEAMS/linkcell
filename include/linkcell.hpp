@@ -90,15 +90,19 @@ struct Cell {
 /// `data()[i * k() + j]` is the j-th neighbour of source i, nearest
 /// first. The slot is -1 when that neighbour is missing (masked or
 /// isolated). The constructor throws when `n * k` overflows or a
-/// buffer is not that length. `neighbour` throws `std::out_of_range`
-/// when `i` or `j` is outside the row.
+/// buffer is not that length. `neighbour` and `dist2` throw
+/// `std::out_of_range` when `i` or `j` is outside the row.
 class Neighbours {
 public:
   Neighbours() = default;
 
   Neighbours(std::vector<int> idx, std::size_t n, std::size_t k)
       : Neighbours(std::move(idx),
-                   std::vector<double>(n * k, std::numeric_limits<double>::quiet_NaN()),
+                   std::vector<double>(
+                       (k != 0 && n > std::numeric_limits<std::size_t>::max() / k)
+                           ? 0
+                           : n * k,
+                       std::numeric_limits<double>::quiet_NaN()),
                    n, k) {}
 
   Neighbours(std::vector<int> idx, std::vector<double> d2, std::size_t n,
@@ -121,6 +125,7 @@ public:
   }
 
   /// Squared distance of neighbour (i, j). Unused slots are NaN.
+  /// Throws `std::out_of_range` when `i >= n()` or `j >= k()`.
   [[nodiscard]] double dist2(std::size_t i, std::size_t j) const {
     if (i >= n_ || j >= k_) {
       throw std::out_of_range("linkcell: neighbour index out of range");
@@ -466,8 +471,9 @@ struct CellGraph {
 };
 
 /// Domain id of each cell. `method` matches `lc_partition`.
-/// `balance <= 0` selects `1 + parts * w_max / total`.
-/// `w_max` is the heaviest cell weight. `device` asks for the CUDA curve split.
+/// `balance <= 0` (including `-INFINITY`) selects
+/// `1 + parts * w_max / total`. `w_max` is the heaviest cell weight.
+/// `device` asks for the CUDA curve split.
 /// Throws when `n == 0`, `xyz` is null, `n` exceeds the C ABI count
 /// range, or `lc_partition` fails.
 [[nodiscard]] inline std::vector<int>
