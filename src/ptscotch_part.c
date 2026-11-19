@@ -1,11 +1,12 @@
 /* PT-Scotch entry. The library is not vendored.
  * MPI must already be initialized. This file does not call MPI_Init.
- * The standalone driver (LC_PTSCOTCH_MAIN) does. SCOTCH_Num is int32. */
+ * The standalone driver (LC_PTSCOTCH_MAIN) does. SCOTCH_Num is int32.
+ * ptscotch.h includes scotch.h, which names FILE and does not include stdio.h. */
 
+#include <stdio.h>
 #include <ptscotch.h>
 
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
