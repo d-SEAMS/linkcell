@@ -385,6 +385,15 @@ fn replica_list_non_finite_centroid_overflows() {
     assert_overflow(linkcell::ReplicaList::build(&xyz, 1, cell, 0.4, 0.1, true));
 }
 
+#[test]
+fn open_cell_tiny_edge_quotient_overflows() {
+    let xyz = [[1.0e308, 0.0, 0.0]];
+    assert_overflow(pairs_open(&xyz, 1.0, Some(1.0e-10)));
+    let tiny = Cell::ortho(1.0e-10, 1.0, 1.0).unwrap();
+    let query = PbcQuery::new([true, false, false], 1.0e-11);
+    assert_overflow(pairs_within_pbc(&xyz, &tiny, &query));
+}
+
 #[cfg(any(feature = "scotch", feature = "ptscotch"))]
 fn assert_library_i32_overflow(method: linkcell::Method) {
     use linkcell::{partition_graph, CellGraph, CellGrid};

@@ -303,8 +303,11 @@ fn bin_edge(hint: Option<f64>, cutoff: f64) -> f64 {
 }
 
 fn floor_i32(value: f64) -> Result<i32, Error> {
-    if !value.is_finite() {
+    if value.is_nan() {
         return Err(Error::NonFinite);
+    }
+    if !value.is_finite() {
+        return Err(Error::Overflow);
     }
     let floored = value.floor();
     if floored < i32::MIN as f64 || floored > i32::MAX as f64 {
