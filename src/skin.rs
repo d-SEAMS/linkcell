@@ -69,7 +69,9 @@ impl SkinList {
     }
 
     /// Set the periodicity mask per lattice axis.
-    pub fn with_periodic(self, _periodic: [bool; 3]) -> Self {
+    pub fn with_periodic(mut self, periodic: [bool; 3]) -> Self {
+        self.periodic = periodic;
+        self.built = false;
         self
     }
 
@@ -84,7 +86,9 @@ impl SkinList {
     }
 
     /// Update the simulation cell for subsequent [`Self::needs_rebuild`] and [`Self::update`] calls.
-    pub fn set_cell(&mut self, _cell: Cell) {}
+    pub fn set_cell(&mut self, cell: Cell) {
+        self.cell = cell;
+    }
 
     /// Cutoff the rows were filtered to.
     pub fn cutoff(&self) -> f64 {
@@ -113,8 +117,20 @@ impl SkinList {
 
     /// Maximum Euclidean displacement of `xyz` from the stored reference positions,
     /// or `None` before the first build or when `xyz.len()` differs from the reference.
-    pub fn max_displacement(&self, _xyz: &[[f64; 3]]) -> Option<f64> {
-        None
+    pub fn max_displacement(&self, xyz: &[[f64; 3]]) -> Option<f64> {
+        if !self.built || xyz.len() != self.reference.len() {
+            return None;
+        }
+        let max_d2 = xyz
+            .iter()
+            .zip(self.reference.iter())
+            .fold(0.0_f64, |acc, (p, r)| {
+                let dx = p[0] - r[0];
+                let dy = p[1] - r[1];
+                let dz = p[2] - r[2];
+                acc.max(dx * dx + dy * dy + dz * dz)
+            });
+        Some(max_d2.sqrt())
     }
 
     /// Rows from the last [`Self::update`].
@@ -130,11 +146,15 @@ impl SkinList {
 
     /// `true` when `xyz` is not covered by the stored candidates.
     pub fn needs_rebuild(&self, xyz: &[[f64; 3]]) -> bool {
-        if !self.built || xyz.len() != self.reference.len() {
+        if !self.built || self.skin == 0.0 || xyz.len() != self.reference.len() {
             return true;
         }
         let half = self.skin * 0.5;
-        let corner = corner_span(self.cell.h(), self.ref_h) * 0.5;
+        let corner = if self.periodic == [false, false, false] {
+            0.0
+        } else {
+            corner_span(self.cell.h(), self.ref_h) * 0.5
+        };
         if corner > half {
             return true;
         }
@@ -160,6 +180,11 @@ impl SkinList {
         }
         if self.needs_rebuild(xyz) {
             self.rebuild(xyz)?;
+            self.builds += 1;
+            self.last_reused = false;
+        } else {
+            self.reuses += 1;
+            self.last_reused = true;
         }
         self.filter(xyz, want_vector)?;
         Ok(&self.cols)
@@ -167,7 +192,11 @@ impl SkinList {
 
     fn rebuild(&mut self, xyz: &[[f64; 3]]) -> Result<(), Error> {
         let reach = self.cutoff + self.skin;
-        self.soa = gather_candidates(xyz, &self.cell, reach, self.half)?;
+        self.soa = if self.periodic == [true, true, true] {
+            gather_candidates(xyz, &self.cell, reach, self.half)?
+        } else {
+            gather_candidates_pbc(xyz, &self.cell, self.periodic, reach, self.half)?
+        };
         self.reference = xyz.to_vec();
         self.ref_h = self.cell.h();
         self.built = true;
@@ -187,6 +216,38 @@ impl SkinList {
     }
 }
 
+fn canonicalize_half_columns(cols: &mut PairColumns) {
+    let mut rows: Vec<(i32, i32, [i32; 3], f64)> = (0..cols.len())
+        .map(|k| {
+            let i = cols.i[k];
+            let j = cols.j[k];
+            let s = cols.shift[k];
+            let d2 = cols.dist2[k];
+            let swap = if i != j {
+                i > j
+            } else if s[0] != 0 {
+                s[0] > 0
+            } else if s[1] != 0 {
+                s[1] > 0
+            } else {
+                s[2] > 0
+            };
+            if swap {
+                (j, i, [-s[0], -s[1], -s[2]], d2)
+            } else {
+                (i, j, s, d2)
+            }
+        })
+        .collect();
+    rows.sort_unstable_by_key(|a| (a.0, a.1, a.2));
+    for (k, (i, j, s, d2)) in rows.into_iter().enumerate() {
+        cols.i[k] = i;
+        cols.j[k] = j;
+        cols.shift[k] = s;
+        cols.dist2[k] = d2;
+    }
+}
+
 pub(crate) fn gather_candidates(
     xyz: &[[f64; 3]],
     cell: &Cell,
@@ -195,6 +256,36 @@ pub(crate) fn gather_candidates(
 ) -> Result<Soa, Error> {
     let mut cols = PairColumns::default();
     pairs_within_columns(xyz, cell, reach, None, None, half, &mut cols)?;
+    if half {
+        canonicalize_half_columns(&mut cols);
+    }
+    Soa::from_columns(&cols, xyz.len())
+}
+
+fn gather_candidates_pbc(
+    xyz: &[[f64; 3]],
+    cell: &Cell,
+    periodic: [bool; 3],
+    reach: f64,
+    half: bool,
+) -> Result<Soa, Error> {
+    let query = crate::open_cell::PbcQuery::new(periodic, reach).half(half);
+    let pairs = crate::open_cell::pairs_within_pbc(xyz, cell, &query)?;
+    let mut cols = PairColumns {
+        i: Vec::with_capacity(pairs.len()),
+        j: Vec::with_capacity(pairs.len()),
+        shift: Vec::with_capacity(pairs.len()),
+        dist2: Vec::with_capacity(pairs.len()),
+    };
+    for p in pairs {
+        cols.i.push(p.i as i32);
+        cols.j.push(p.j as i32);
+        cols.shift.push(p.shift);
+        cols.dist2.push(p.dist2);
+    }
+    if half {
+        canonicalize_half_columns(&mut cols);
+    }
     Soa::from_columns(&cols, xyz.len())
 }
 
