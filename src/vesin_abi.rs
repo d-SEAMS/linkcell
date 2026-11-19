@@ -452,11 +452,11 @@ fn load_foreign_vesin() -> Option<VesinFn> {
             fn LoadLibraryA(name: *const u8) -> *mut c_void;
             fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
         }
-        let handle = LoadLibraryA(b"libvesin.dll\0".as_ptr());
+        let handle = LoadLibraryA(c"libvesin.dll".as_ptr().cast());
         if handle.is_null() {
             return None;
         }
-        let sym = GetProcAddress(handle, b"vesin_neighbors\0".as_ptr());
+        let sym = GetProcAddress(handle, c"vesin_neighbors".as_ptr().cast());
         if sym.is_null() || sym == lc_vesin_neighbors as *mut c_void {
             return None;
         }
