@@ -1,0 +1,1 @@
+`SkinList` and `ReplicaList` store packed periodic shift codes in `[-3, 3]^3` as `u16` instead of `u8`, so codes `256..=342` (`sx >= 2`) no longer wrap in release builds or panic on overflow in debug builds.
