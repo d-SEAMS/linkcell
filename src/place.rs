@@ -99,14 +99,16 @@ pub(crate) fn build_pool(n: usize) -> rayon::ThreadPool {
         .unwrap_or_else(|_| fallback())
 }
 
-#[cfg(all(test, feature = "parallel", target_os = "linux"))]
+#[cfg(all(test, feature = "parallel"))]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     extern "C" {
         fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i32;
     }
 
+    #[cfg(target_os = "linux")]
     fn allowed() -> Vec<i32> {
         let mut mask = [0u8; 128];
         if unsafe { sched_getaffinity(0, mask.len(), mask.as_mut_ptr()) } != 0 {
@@ -118,6 +120,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn every_worker_may_use_every_listed_cpu() {
         let cpus = allowed();
@@ -128,5 +131,18 @@ mod tests {
         lc_set_places(list.as_ptr(), 2);
         let seen = build_pool(3).broadcast(|_| allowed());
         assert!(seen.iter().all(|mask| mask == &cpus[..2]));
+    }
+
+    // `sched_setaffinity` is Linux-only, so `bind_cpus` is a no-op on every
+    // other target. This still exercises `build_pool` and `places_snapshot`
+    // there, so neither becomes dead code when `capi` is off and the lib is
+    // built with only the `parallel` feature.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn build_pool_runs_without_binding_cpus() {
+        let list: [c_int; 2] = [0, 1];
+        lc_set_places(list.as_ptr(), 2);
+        let sum: i32 = build_pool(2).broadcast(|_| 1).iter().sum();
+        assert_eq!(sum, 2);
     }
 }
