@@ -209,8 +209,9 @@ inline void knearest_into(const double *xyz, std::size_t n, const Cell &cell,
 }
 
 /// Frame-major batch. `xyz` is `n_frames * n * 3`. `out` / `out_d2`
-/// are `n_frames * n * k`. Throws when `n * k * n_frames` overflows,
-/// `out_len` is not that product, or [`knearest_into`] would throw.
+/// are `n_frames * n * k`. Throws when `n_frames` is zero, when
+/// `n * k * n_frames` overflows, `out_len` is not that product, or
+/// [`knearest_into`] would throw.
 inline void knearest_into_many(const double *xyz, std::size_t n,
                                std::size_t n_frames, const Cell &cell,
                                std::size_t k, int *out, std::size_t out_len,
@@ -304,9 +305,9 @@ struct ShiftedPair {
 /// Pairs with squared distance strictly below `cutoff * cutoff`.
 ///
 /// `half` keeps one side of `(i, j, S)` and `(j, i, -S)`. This is the
-/// cutoff list. k-nearest is [`knearest`]. `n == 0` or a null `xyz`
-/// returns an empty vector. Otherwise throws when `n` exceeds the C
-/// ABI count range or `lc_pairs_within` fails.
+/// cutoff list. k-nearest is [`knearest`]. Throws when `n` is zero,
+/// `xyz` is null, `n` exceeds the C ABI count range, or
+/// `lc_pairs_within` fails.
 [[nodiscard]] inline std::vector<ShiftedPair>
 pairs_within(const double *xyz, std::size_t n, const Cell &cell, double cutoff,
              const int *mask = nullptr, double cell_hint = 0.0,

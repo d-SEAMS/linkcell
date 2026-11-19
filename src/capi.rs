@@ -1573,7 +1573,7 @@ pub unsafe extern "C" fn lc_partition(
 /// Bin radii for `cutoff * depth`. `out_width` receives three counts.
 ///
 /// Nonzero when `bin_width` or `out_width` is null, `cutoff` is not
-/// finite and at least zero, `cutoff * depth` is not finite, or a
+/// finite or is negative, `cutoff * depth` is not finite, or a
 /// positive length divided by a positive width is not finite or its
 /// ceiling does not fit in `uint32_t`.
 ///
@@ -1856,8 +1856,8 @@ pub unsafe extern "C" fn lc_partition_weights(
 /// Owned points are 2. Ghosts within `reach` of an owned atom are 1.
 ///
 /// Nonzero when a required pointer is null, `domain` is negative, an
-/// assignment or point-cell entry is negative, `xyz` and `point_cell`
-/// differ in length, `reach` is not finite and at least zero, an axis
+/// assignment or point-cell entry is negative, `reach` is not finite or
+/// is negative, an axis
 /// count is not strictly positive, `nx * ny * nz` overflows, or
 /// `assign` is not one entry per cell.
 ///

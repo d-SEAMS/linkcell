@@ -26,14 +26,15 @@ header = """
  *   - lc_pairs_within writes caller-owned i, j, shift, dist2 rows.
  *     Null outputs query the row count.
  *   - lc_last_error returns a thread-local pointer. Do not free. The
- *     pointer is invalid after the next lc_knearest on the same thread.
+ *     pointer is invalid after the next status-returning lc_* call on
+ *     the same thread.
  *     lc_version does not read or write the slot.
  *   - lc_version returns a process-static pointer. Do not free.
  *
  * Thread safety
  *   - Distinct searches may run concurrently.
  *   - lc_last_error is a thread-local slot. Read it on the same thread
- *     that received a nonzero return from lc_knearest.
+ *     that received a nonzero return from a status-returning lc_* call.
  */
 """
 include_guard = "LINKCELL_H"

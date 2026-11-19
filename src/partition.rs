@@ -330,8 +330,8 @@ pub struct PartScore {
 /// least that length. `depth` is the number of cutoff shells the
 /// caller must cover. Zero cutoff or zero depth is a zero radius.
 ///
-/// Returns [`Error::BadCutoff`] when `cutoff` is not finite and at
-/// least zero, or when `cutoff * depth` is not finite, and
+/// Returns [`Error::BadCutoff`] when `cutoff` is not finite or is
+/// negative, or when `cutoff * depth` is not finite, and
 /// [`Error::Overflow`] when a positive length divided by a positive
 /// width is not finite or its ceiling does not fit in `u32`.
 pub fn halo_width(cutoff: f64, depth: u32, bin_width: [f64; 3]) -> Result<[u32; 3], Error> {
@@ -392,7 +392,7 @@ pub fn halo(
 /// most `reach`. Owned points are `2`. Reached ghosts are `1`.
 ///
 /// Returns [`Error::BadGraph`] when `xyz` and `point_cell` differ in
-/// length, `reach` is not finite and at least zero, an axis count is
+/// length, `reach` is not finite or is negative, an axis count is
 /// not strictly positive, `nx * ny * nz` overflows, or `assign` is not
 /// one entry per cell.
 pub fn mark_reached(

@@ -556,8 +556,9 @@ fn frame_points<'py>(
 /// Returns `(nxyz, bin_width, weight)`. `weight[i]` is the point count
 /// of cell `i` in the order `((iz * ny) + iy) * nx + ix`.
 /// A wrong shape, an empty frame, a singular cell, and a mask of the
-/// wrong length raise `ValueError`. A non-positive cutoff, a non-finite
-/// coordinate, and a mesh past the bin cap raise `RuntimeError`.
+/// wrong length, and a CUDA `xyz` raise `ValueError`. A non-positive
+/// cutoff, a non-finite coordinate, and a mesh past the bin cap raise
+/// `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "cell_grid", signature = (xyz, cell, cutoff, mask=None, cell_hint=None))]
 fn cell_grid_py<'py>(
@@ -590,8 +591,8 @@ fn cell_grid_py<'py>(
 /// Periodic adjacency. Edge weights are pair counts from `pairs_within`.
 ///
 /// Returns `(nxyz, bin_width, weight, offsets, neighbor, edge_weight)`.
-/// Shape and mask failures are those of [`cell_grid`]. A non-positive
-/// cutoff, a non-finite coordinate, a mesh past the bin cap,
+/// Shape, mask, and CUDA `xyz` failures are those of [`cell_grid`]. A
+/// non-positive cutoff, a non-finite coordinate, a mesh past the bin cap,
 /// `ceil(cutoff / width)` or `ceil(cutoff / cell_min)` that is not
 /// finite or above `2**31 - 1`, an image count above 2**24, a point
 /// count above `2**32 - 1`, and a relative periodic image that is not
@@ -649,7 +650,8 @@ fn cell_graph_py<'py>(
 /// `device` runs the curve split on CUDA and raises `RuntimeError` when
 /// that device is absent, the method is not a curve, or the device
 /// split disagrees with the host. An unknown `method`, a wrong shape,
-/// an empty frame, and a mask of the wrong length raise `ValueError`.
+/// an empty frame, a mask of the wrong length, and a CUDA `xyz` raise
+/// `ValueError`.
 /// `parts == 0`, a `balance` that is not finite, is below 1, does not
 /// scale into a `u64`, or rounds below 1, a non-positive cutoff, a
 /// non-finite coordinate, a mesh past the bin cap, and, for a method
@@ -700,7 +702,7 @@ fn partition_py<'py>(
 
 /// Three bin radii for `cutoff * depth`.
 /// `bin_width` must have length 3 (`ValueError` otherwise). A cutoff
-/// that is not finite and at least zero, a non-finite `cutoff * depth`,
+/// that is not finite or is negative, a non-finite `cutoff * depth`,
 /// and a positive length over a positive width whose ratio is not
 /// finite or whose ceiling does not fit in `uint32` raise `RuntimeError`.
 #[pyfunction]
@@ -718,7 +720,8 @@ fn halo_width_py(cutoff: f64, depth: u32, bin_width: Vec<f64>) -> PyResult<(u32,
 ///
 /// `nxyz` or `width` of the wrong length, an `nxyz` product that
 /// overflows, an `assign` length other than that product, and a
-/// negative domain id raise `ValueError`. A ghost cell id above
+/// negative assignment entry raise `ValueError`. `domain` is a `u32`.
+/// A ghost cell id above
 /// `2**31 - 1` raises `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "halo")]
