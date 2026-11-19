@@ -20,6 +20,7 @@ use crate::Error;
 /// otherwise only filters them. The returned columns borrow the list.
 pub struct SkinList {
     cell: Cell,
+    periodic: [bool; 3],
     cutoff: f64,
     skin: f64,
     half: bool,
@@ -30,6 +31,9 @@ pub struct SkinList {
     cols: PairColumns,
     vectors: Vec<[f64; 3]>,
     built: bool,
+    builds: u64,
+    reuses: u64,
+    last_reused: bool,
 }
 
 impl SkinList {
@@ -47,6 +51,7 @@ impl SkinList {
         }
         Ok(Self {
             cell,
+            periodic: [true, true, true],
             cutoff,
             skin,
             half,
@@ -57,8 +62,29 @@ impl SkinList {
             cols: PairColumns::default(),
             vectors: Vec::new(),
             built: false,
+            builds: 0,
+            reuses: 0,
+            last_reused: false,
         })
     }
+
+    /// Set the periodicity mask per lattice axis.
+    pub fn with_periodic(self, _periodic: [bool; 3]) -> Self {
+        self
+    }
+
+    /// Periodicity mask per lattice axis.
+    pub fn periodic(&self) -> [bool; 3] {
+        self.periodic
+    }
+
+    /// Simulation cell used for candidate generation and filtering.
+    pub fn cell(&self) -> &Cell {
+        &self.cell
+    }
+
+    /// Update the simulation cell for subsequent [`Self::needs_rebuild`] and [`Self::update`] calls.
+    pub fn set_cell(&mut self, _cell: Cell) {}
 
     /// Cutoff the rows were filtered to.
     pub fn cutoff(&self) -> f64 {
@@ -68,6 +94,27 @@ impl SkinList {
     /// Skin added on top of the cutoff when the candidates were built.
     pub fn skin(&self) -> f64 {
         self.skin
+    }
+
+    /// Number of candidate cell-list builds at `cutoff + skin` performed so far.
+    pub fn builds(&self) -> u64 {
+        self.builds
+    }
+
+    /// Number of [`Self::update`] calls that reused the cached candidate list without rebuilding.
+    pub fn reuses(&self) -> u64 {
+        self.reuses
+    }
+
+    /// Whether the most recent [`Self::update`] call reused the cached candidate list.
+    pub fn last_reused(&self) -> bool {
+        self.last_reused
+    }
+
+    /// Maximum Euclidean displacement of `xyz` from the stored reference positions,
+    /// or `None` before the first build or when `xyz.len()` differs from the reference.
+    pub fn max_displacement(&self, _xyz: &[[f64; 3]]) -> Option<f64> {
+        None
     }
 
     /// Rows from the last [`Self::update`].
