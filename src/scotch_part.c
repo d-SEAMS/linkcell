@@ -1,6 +1,8 @@
 /* Serial Scotch entry. Compiled only with `--features scotch`.
- * The library is not vendored. SCOTCH_Num is the header's integer. */
+ * The library is not vendored. SCOTCH_Num is the header's integer.
+ * scotch.h names FILE and does not include stdio.h. */
 
+#include <stdio.h>
 #include <scotch.h>
 
 #include <stdint.h>
