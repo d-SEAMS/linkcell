@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import linkcell
 
@@ -108,3 +109,31 @@ def test_sheared_rows_match_a_shift_scan():
     assert set(got) == set(want)
     for key, dist2 in want.items():
         assert abs(got[key] - dist2) < 1e-8
+
+
+def test_pairs_error_paths():
+    pts = np.ascontiguousarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    eye = np.eye(3, dtype=np.float64)
+    singular = np.ascontiguousarray(
+        [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+    )
+    span_pts = np.ascontiguousarray(
+        [[0.0, 0.0, 0.0], [float(2**31 - 1), 0.0, 0.0]], dtype=np.float64
+    )
+
+    nl = linkcell.NeighborList(0.5, True)
+    with pytest.raises(RuntimeError):
+        nl.compute(span_pts, eye)
+
+    with pytest.raises(RuntimeError):
+        linkcell.pairs_open(pts, float("nan"))
+
+    with pytest.raises(ValueError):
+        linkcell.pairs_within_pbc(pts, singular, True, 0.5)
+
+    with pytest.raises(RuntimeError):
+        linkcell.pairs_within_pbc(pts, eye, [True, False, False], 1e12, cell_hint=1.0)
+
+    with pytest.raises(RuntimeError):
+        linkcell.pairs_within_pbc(pts, eye, False, 1e12, cell_hint=1.0)
+

@@ -311,6 +311,80 @@ fn vesin_image_span_overflows() {
     assert_overflow(calc.compute(&xyz, &cell, [true, true, true], opt));
 }
 
+#[cfg(feature = "capi")]
+#[test]
+fn vesin_null_error_message_returns_one() {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VesinDevice {
+        kind: i32,
+        device_id: i32,
+    }
+    #[repr(C)]
+    struct VesinNeighborList {
+        length: usize,
+        device: VesinDevice,
+        pairs: *mut [usize; 2],
+        shifts: *mut [i32; 3],
+        distances: *mut f64,
+        vectors: *mut [f64; 3],
+        opaque: *mut std::ffi::c_void,
+    }
+    extern "C" {
+        fn lc_vesin_neighbors(
+            points: *const [f64; 3],
+            n_points: usize,
+            box_: *const [[f64; 3]; 3],
+            periodic: *const [bool; 3],
+            device: VesinDevice,
+            options: linkcell::VesinOptions,
+            neighbors: *mut VesinNeighborList,
+            error_message: *mut *const std::os::raw::c_char,
+        ) -> i32;
+    }
+
+    let points = [[0.0_f64, 0.0, 0.0]];
+    let box_ = [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]];
+    let periodic = [true, true, true];
+    let device = VesinDevice {
+        kind: 1,
+        device_id: 0,
+    };
+    let options = linkcell::VesinOptions::cpu(1.0, false, 0.0, 1, false, false, false);
+    let mut list = VesinNeighborList {
+        length: 0,
+        device: VesinDevice {
+            kind: 0,
+            device_id: 0,
+        },
+        pairs: std::ptr::null_mut(),
+        shifts: std::ptr::null_mut(),
+        distances: std::ptr::null_mut(),
+        vectors: std::ptr::null_mut(),
+        opaque: std::ptr::null_mut(),
+    };
+    let rc = unsafe {
+        lc_vesin_neighbors(
+            points.as_ptr(),
+            points.len(),
+            &box_,
+            &periodic,
+            device,
+            options,
+            &mut list,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 1);
+}
+
+#[test]
+fn replica_list_non_finite_centroid_overflows() {
+    let cell = unit();
+    let xyz = [[0.0, 0.0, 0.0], [f64::NAN, 0.0, 0.0]];
+    assert_overflow(linkcell::ReplicaList::build(&xyz, 1, cell, 0.4, 0.1, true));
+}
+
 #[cfg(any(feature = "scotch", feature = "ptscotch"))]
 fn assert_library_i32_overflow(method: linkcell::Method) {
     use linkcell::{partition_graph, CellGraph, CellGrid};

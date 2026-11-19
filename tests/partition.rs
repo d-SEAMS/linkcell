@@ -441,3 +441,254 @@ fn reach_keeps_the_neighbour_and_drops_the_next_cell() {
     assert_eq!(hit[1], 1);
     assert_eq!(hit[2], 0);
 }
+
+#[test]
+fn replicate_graph_validates_single_copy_and_csr_invariants() {
+    let valid_grid = CellGrid {
+        nx: 2,
+        ny: 1,
+        nz: 1,
+        bin_width: [1.0; 3],
+        weight: vec![1, 2],
+    };
+
+    // Non-positive grid axis.
+    let bad_axis = CellGraph {
+        grid: CellGrid {
+            nx: 0,
+            weight: vec![],
+            ..valid_grid.clone()
+        },
+        offsets: vec![0],
+        neighbor: vec![],
+        edge_weight: vec![],
+    };
+    assert_eq!(
+        linkcell::replicate_graph(&bad_axis, 1).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+
+    // Weight length != nx * ny * nz.
+    let bad_weight = CellGraph {
+        grid: CellGrid {
+            weight: vec![1],
+            ..valid_grid.clone()
+        },
+        offsets: vec![0, 0],
+        neighbor: vec![],
+        edge_weight: vec![],
+    };
+    assert_eq!(
+        linkcell::replicate_graph(&bad_weight, 1).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+
+    // Out-of-range neighbour index.
+    let bad_nbr = CellGraph {
+        grid: valid_grid.clone(),
+        offsets: vec![0, 1, 1],
+        neighbor: vec![2],
+        edge_weight: vec![1],
+    };
+    assert_eq!(
+        linkcell::replicate_graph(&bad_nbr, 1).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+
+    // Non-zero first CSR offset, non-monotonic offsets, or mismatched edge arrays.
+    let bad_off0 = CellGraph {
+        grid: valid_grid.clone(),
+        offsets: vec![1, 1, 1],
+        neighbor: vec![0],
+        edge_weight: vec![1],
+    };
+    assert_eq!(
+        linkcell::replicate_graph(&bad_off0, 1).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+    assert_eq!(
+        linkcell::replicate_graph(&bad_off0, 2).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+
+    let non_mono = CellGraph {
+        grid: valid_grid.clone(),
+        offsets: vec![0, 2, 1],
+        neighbor: vec![0],
+        edge_weight: vec![1],
+    };
+    assert_eq!(
+        linkcell::replicate_graph(&non_mono, 1).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+    assert_eq!(
+        linkcell::replicate_graph(&non_mono, 2).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+
+    let short_edges = CellGraph {
+        grid: valid_grid,
+        offsets: vec![0, 1, 1],
+        neighbor: vec![1],
+        edge_weight: vec![],
+    };
+    assert_eq!(
+        linkcell::replicate_graph(&short_edges, 1).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+    assert_eq!(
+        linkcell::replicate_graph(&short_edges, 2).err(),
+        Some(linkcell::Error::BadGraph)
+    );
+}
+
+#[test]
+fn partition_device_without_driver_returns_no_device() {
+    let sim = Cell::ortho(12.0, 12.0, 12.0).unwrap();
+    let xyz = cloud(12, 12.0, 5);
+    for method in [Method::Morton, Method::Hilbert, Method::Rcb] {
+        let request = PartRequest {
+            parts: 2,
+            method,
+            balance: None,
+            device: true,
+        };
+        assert_eq!(
+            partition(&xyz, &sim, 3.0, None, None, request).err(),
+            Some(linkcell::Error::NoDevice)
+        );
+    }
+    assert_eq!(
+        curve_split_device(&xyz, &sim, 3.0, None, None, 2, Method::Morton).err(),
+        Some(linkcell::Error::NoDevice)
+    );
+}
+
+#[cfg(feature = "capi")]
+#[test]
+fn c_partition_balance_nonfinite_and_pbc_singular_cell() {
+    let xyz = [0.5, 0.5, 0.5, 1.5, 0.5, 0.5];
+    let sim = linkcell::lc_cell {
+        ax: 4.0,
+        ay: 0.0,
+        az: 0.0,
+        bx: 0.0,
+        by: 4.0,
+        bz: 0.0,
+        cx: 0.0,
+        cy: 0.0,
+        cz: 4.0,
+        ox: 0.0,
+        oy: 0.0,
+        oz: 0.0,
+    };
+    let mut ncell = 0usize;
+    let mut out = vec![0i32; 64];
+    let rc_neg_inf = unsafe {
+        linkcell::lc_partition(
+            xyz.as_ptr(),
+            2,
+            &sim,
+            2.0,
+            std::ptr::null(),
+            0.0,
+            2,
+            0,
+            f64::NEG_INFINITY,
+            0,
+            out.as_mut_ptr(),
+            out.len(),
+            &mut ncell,
+        )
+    };
+    assert_eq!(rc_neg_inf, 0);
+    for bad in [f64::NAN, f64::INFINITY] {
+        let rc = unsafe {
+            linkcell::lc_partition(
+                xyz.as_ptr(),
+                2,
+                &sim,
+                2.0,
+                std::ptr::null(),
+                0.0,
+                2,
+                0,
+                bad,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut ncell,
+            )
+        };
+        assert_ne!(rc, 0);
+    }
+
+    let nxyz = [2i32, 1, 1];
+    let weight = [1u64, 1];
+    let mut dom = [0i32; 2];
+    assert_eq!(
+        unsafe {
+            linkcell::lc_partition_weights(
+                nxyz.as_ptr(),
+                weight.as_ptr(),
+                2,
+                2,
+                0,
+                f64::NEG_INFINITY,
+                dom.as_mut_ptr(),
+            )
+        },
+        0
+    );
+    for bad in [f64::NAN, f64::INFINITY] {
+        assert_ne!(
+            unsafe {
+                linkcell::lc_partition_weights(
+                    nxyz.as_ptr(),
+                    weight.as_ptr(),
+                    2,
+                    2,
+                    0,
+                    bad,
+                    dom.as_mut_ptr(),
+                )
+            },
+            0
+        );
+    }
+
+    let singular = linkcell::lc_cell {
+        ax: 4.0,
+        ay: 0.0,
+        az: 0.0,
+        bx: 4.0,
+        by: 0.0,
+        bz: 0.0,
+        cx: 0.0,
+        cy: 0.0,
+        cz: 4.0,
+        ox: 0.0,
+        oy: 0.0,
+        oz: 0.0,
+    };
+    let pbc = [1i32, 1, 1];
+    let mut count = 0usize;
+    let rc_pbc = unsafe {
+        linkcell::lc_pairs_within_pbc(
+            xyz.as_ptr(),
+            2,
+            &singular,
+            pbc.as_ptr(),
+            1.5,
+            std::ptr::null(),
+            0.0,
+            1,
+            0,
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    assert_ne!(rc_pbc, 0);
+}
