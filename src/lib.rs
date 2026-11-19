@@ -169,6 +169,7 @@ mod knearest;
 mod open_cell;
 mod pairs;
 mod partition;
+#[cfg(any(feature = "capi", test))]
 mod place;
 mod pop;
 mod replica;
