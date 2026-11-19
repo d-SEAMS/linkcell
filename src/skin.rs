@@ -683,4 +683,60 @@ mod tests {
         }
         assert!(saw_shift_2 && saw_shift_3);
     }
+
+    #[test]
+    fn skin_keeps_shifts_whose_table_slot_exceeds_u8_max() {
+        let cell = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        // Every candidate shift among these three atoms lies in [-3, 3]^3:
+        // (0, 1) has shift [1, 1, 0] (slot 227), (0, 2) has shift [3, 0, 0]
+        // (sx = 3, slot 318 > u8::MAX), and (1, 2) has shift [2, -1, 0]
+        // (slot 262 > u8::MAX).
+        let explicit = [[30.2, 0.1, 0.0], [20.3, -9.8, 0.0], [0.4, 0.1, 0.0]];
+        let mut fresh = PairColumns::default();
+        pairs_within_columns(&explicit, &cell, 1.0, None, None, true, &mut fresh).unwrap();
+        let mut skin = SkinList::new(cell, 1.0, 0.4, true).unwrap();
+        let cols = skin.update(&explicit, false).unwrap();
+        assert_eq!(set_of(cols), set_of(&fresh));
+        assert!(cols.shift.contains(&[2, -1, 0]));
+        assert!(cols.shift.contains(&[3, 0, 0]));
+
+        // Also test wrapped coordinates in a 3 A box with reach 8.8 < 3 * 3.0,
+        // where every candidate shift lies in [-3, 3]^3 and images (2, -1, 0)
+        // and (3, 0, 0) are inside the cutoff.
+        let small = Cell::ortho(3.0, 3.0, 3.0).unwrap();
+        let wrapped = [[2.5, 0.1, 0.1], [0.2, 0.1, 0.1]];
+        let mut fresh_small = PairColumns::default();
+        pairs_within_columns(&wrapped, &small, 8.6, None, None, true, &mut fresh_small).unwrap();
+        let mut skin_small = SkinList::new(small, 8.6, 0.2, true).unwrap();
+        let cols_small = skin_small.update(&wrapped, false).unwrap();
+        assert_eq!(set_of(cols_small), set_of(&fresh_small));
+        assert!(cols_small.shift.contains(&[2, -1, 0]));
+        assert!(cols_small.shift.contains(&[3, 0, 0]));
+
+        let mut s = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..200 {
+            let xyz: Vec<[f64; 3]> = (0..40)
+                .map(|k| {
+                    let mut p = [next() * 10.0, next() * 10.0, next() * 10.0];
+                    if k % 2 == 1 {
+                        for slot in &mut p {
+                            *slot += 10.0 * (next() * 3.0).floor();
+                        }
+                    }
+                    p
+                })
+                .collect();
+            let mut want = PairColumns::default();
+            pairs_within_columns(&xyz, &cell, 3.0, None, None, true, &mut want).unwrap();
+            let mut list = SkinList::new(cell, 3.0, 0.5, true).unwrap();
+            let got = list.update(&xyz, false).unwrap();
+            assert_eq!(set_of(got), set_of(&want));
+        }
+    }
 }
