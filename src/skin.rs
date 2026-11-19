@@ -1,13 +1,19 @@
 //! Verlet skin over a cutoff pair list.
 //!
 //! The candidate list is [`pairs_within_columns`] at `cutoff + skin`.
-//! A later frame reuses it while every atom is within `skin / 2` of its
-//! reference position, after the box-corner correction of Verlet
-//! (Phys. Rev. **159**, 98, 1967) as used by vesin and LAMMPS. The kept
-//! rows satisfy `|q + H S - p|^2` strictly below `cutoff²`. Shifts inside
+//! A later frame reuses it while the cell lattice is unchanged and every
+//! atom's minimum-image displacement from its reference position is at
+//! most `skin / 2`. When an atom crosses a periodic boundary within the
+//! skin, the filter unwraps it onto the reference image and shifts the
+//! surviving candidate indices into the caller's frame. The kept rows
+//! satisfy `|q + H S - p|^2` strictly below `cutoff²`. Shifts inside
 //! `[-3, 3]^3` are a 16-bit code; the filter gathers coordinates eight
 //! at a time and compacts the hits. A wider shift keeps the three shift
 //! columns and uses the same test.
+//!
+//! A list with an open axis (see [`SkinList::with_periodic`]) measures raw
+//! displacement and applies the box-corner correction of Verlet
+//! (Phys. Rev. **159**, 98, 1967) instead of unwrapping.
 
 use crate::cell::Cell;
 use crate::pairs::{pairs_within_columns, PairColumns};
@@ -16,14 +22,17 @@ use crate::Error;
 
 /// Cutoff list with a Verlet skin.
 ///
-/// `update` rebuilds the candidates when an atom has moved too far and
-/// otherwise only filters them. The returned columns borrow the list.
+/// `update` rebuilds the candidates when an atom's minimum-image
+/// displacement exceeds `skin / 2` or the cell changes, and otherwise
+/// only filters them. The returned columns borrow the list.
 pub struct SkinList {
     cell: Cell,
     periodic: [bool; 3],
     cutoff: f64,
     skin: f64,
     half: bool,
+    sorted: bool,
+    ref_sorted: bool,
     reference: Vec<[f64; 3]>,
     ref_h: [[f64; 3]; 3],
     soa: Soa,
@@ -55,6 +64,8 @@ impl SkinList {
             cutoff,
             skin,
             half,
+            sorted: false,
+            ref_sorted: false,
             reference: Vec::new(),
             ref_h: cell.h(),
             soa: Soa::empty(),
@@ -100,6 +111,25 @@ impl SkinList {
         self.skin
     }
 
+    /// `true` when the list stores only the canonical half of each pair.
+    pub fn half(&self) -> bool {
+        self.half
+    }
+
+    /// `true` when candidate and filtered rows are ordered by `(i, j, shift)`.
+    pub fn sorted(&self) -> bool {
+        self.sorted
+    }
+
+    /// Enable or disable canonical `(i, j, shift)` row sorting on rebuild and filter.
+    ///
+    /// Off by default. Half candidate lists are always built in canonical
+    /// order; this flag additionally orders full lists and the rows rewritten
+    /// when an atom crosses a periodic boundary.
+    pub fn set_sorted(&mut self, sorted: bool) {
+        self.sorted = sorted;
+    }
+
     /// Number of candidate cell-list builds at `cutoff + skin` performed so far.
     pub fn builds(&self) -> u64 {
         self.builds
@@ -138,22 +168,48 @@ impl SkinList {
         &self.cols
     }
 
-    /// Shifted vectors from the last update that asked for them.
+    /// Shifted vectors `q + H S - p` from the last update that asked for them.
     /// Empty when that update did not.
     pub fn vectors(&self) -> &[[f64; 3]] {
         &self.vectors
     }
 
-    /// `true` when `xyz` is not covered by the stored candidates.
+    /// Unique unordered atom pairs `(i, j)` with `i < j` from the last update.
+    ///
+    /// Periodic self-images (`i == j`) are omitted.
+    pub fn sparsity(&self) -> Vec<(usize, usize)> {
+        self.cols.sparsity()
+    }
+
+    /// `true` when `xyz` in the stored cell is not covered by the candidates.
     pub fn needs_rebuild(&self, xyz: &[[f64; 3]]) -> bool {
-        if !self.built || self.skin == 0.0 || xyz.len() != self.reference.len() {
+        self.needs_rebuild_in(&self.cell, xyz)
+    }
+
+    /// `true` when `xyz` in `cell` is not covered by the stored candidates.
+    pub fn needs_rebuild_in(&self, cell: &Cell, xyz: &[[f64; 3]]) -> bool {
+        if !self.built
+            || self.skin == 0.0
+            || xyz.len() != self.reference.len()
+            || self.sorted != self.ref_sorted
+        {
             return true;
         }
+        if self.periodic != [true, true, true] {
+            return self.open_needs_rebuild(cell, xyz);
+        }
+        if !same_lattice(cell.h(), self.ref_h) {
+            return true;
+        }
+        moved_past_skin(cell, &self.reference, xyz, self.skin)
+    }
+
+    fn open_needs_rebuild(&self, cell: &Cell, xyz: &[[f64; 3]]) -> bool {
         let half = self.skin * 0.5;
         let corner = if self.periodic == [false, false, false] {
             0.0
         } else {
-            corner_span(self.cell.h(), self.ref_h) * 0.5
+            corner_span(cell.h(), self.ref_h) * 0.5
         };
         if corner > half {
             return true;
@@ -171,48 +227,102 @@ impl SkinList {
         false
     }
 
-    /// Filter `xyz`, rebuilding the candidates first when the skin is spent.
+    /// Filter `xyz`, rebuilding the candidates first when the skin is spent
+    /// or the cell has changed.
     ///
-    /// `want_vector` fills [`Self::vectors`] with `q + H S - p`.
+    /// `want_vector` fills [`Self::vectors`] with `q + H S - p`. If an error
+    /// is returned, the stored candidates, rows, reference coordinates, and
+    /// counters are left unchanged.
     pub fn update(&mut self, xyz: &[[f64; 3]], want_vector: bool) -> Result<&PairColumns, Error> {
         if xyz.is_empty() {
             return Err(Error::Empty);
         }
+        for p in xyz {
+            if !p[0].is_finite() || !p[1].is_finite() || !p[2].is_finite() {
+                return Err(Error::NonFinite);
+            }
+        }
         if self.needs_rebuild(xyz) {
-            self.rebuild(xyz)?;
+            let reach = self.cutoff + self.skin;
+            let soa = if self.periodic == [true, true, true] {
+                gather_candidates(xyz, &self.cell, reach, self.half, self.sorted)?
+            } else {
+                gather_candidates_pbc(
+                    xyz,
+                    &self.cell,
+                    self.periodic,
+                    reach,
+                    self.half,
+                    self.sorted,
+                )?
+            };
+            soa.filter(
+                xyz,
+                &self.cell,
+                self.cutoff * self.cutoff,
+                want_vector,
+                &mut self.d2,
+                &mut self.cols,
+                &mut self.vectors,
+            )?;
+            self.soa = soa;
+            self.reference.clear();
+            self.reference.extend_from_slice(xyz);
+            self.ref_h = self.cell.h();
+            self.ref_sorted = self.sorted;
+            self.built = true;
             self.builds += 1;
             self.last_reused = false;
         } else {
+            if self.periodic == [true, true, true] {
+                filter_with_wraps(
+                    &self.soa,
+                    WrapFrame {
+                        cell: &self.cell,
+                        anchor: &self.reference,
+                        reference: &self.reference,
+                        xyz,
+                        sorted: self.sorted,
+                    },
+                    self.cutoff * self.cutoff,
+                    want_vector,
+                    &mut self.d2,
+                    &mut self.cols,
+                    &mut self.vectors,
+                )?;
+            } else {
+                self.soa.filter(
+                    xyz,
+                    &self.cell,
+                    self.cutoff * self.cutoff,
+                    want_vector,
+                    &mut self.d2,
+                    &mut self.cols,
+                    &mut self.vectors,
+                )?;
+            }
             self.reuses += 1;
             self.last_reused = true;
         }
-        self.filter(xyz, want_vector)?;
         Ok(&self.cols)
     }
 
-    fn rebuild(&mut self, xyz: &[[f64; 3]]) -> Result<(), Error> {
-        let reach = self.cutoff + self.skin;
-        self.soa = if self.periodic == [true, true, true] {
-            gather_candidates(xyz, &self.cell, reach, self.half)?
-        } else {
-            gather_candidates_pbc(xyz, &self.cell, self.periodic, reach, self.half)?
-        };
-        self.reference = xyz.to_vec();
-        self.ref_h = self.cell.h();
-        self.built = true;
-        Ok(())
-    }
-
-    fn filter(&mut self, xyz: &[[f64; 3]], want_vector: bool) -> Result<(), Error> {
-        self.soa.filter(
-            xyz,
-            &self.cell,
-            self.cutoff * self.cutoff,
-            want_vector,
-            &mut self.d2,
-            &mut self.cols,
-            &mut self.vectors,
-        )
+    /// Replace the cell and filter `xyz`, rebuilding first if needed.
+    ///
+    /// Restores the previous cell if the update returns an error.
+    pub fn update_in(
+        &mut self,
+        cell: Cell,
+        xyz: &[[f64; 3]],
+        want_vector: bool,
+    ) -> Result<&PairColumns, Error> {
+        let prev = self.cell;
+        self.cell = cell;
+        if let Err(err) = self.update(xyz, want_vector) {
+            self.cell = prev;
+            return Err(err);
+        }
+        Ok(&self.cols)
     }
 }
 
@@ -253,13 +363,14 @@ pub(crate) fn gather_candidates(
     cell: &Cell,
     reach: f64,
     half: bool,
+    sorted: bool,
 ) -> Result<Soa, Error> {
     let mut cols = PairColumns::default();
     pairs_within_columns(xyz, cell, reach, None, None, half, &mut cols)?;
     if half {
         canonicalize_half_columns(&mut cols);
     }
-    Soa::from_columns(&cols, xyz.len())
+    Soa::from_columns_ordered(&cols, xyz.len(), sorted)
 }
 
 fn gather_candidates_pbc(
@@ -268,6 +379,7 @@ fn gather_candidates_pbc(
     periodic: [bool; 3],
     reach: f64,
     half: bool,
+    sorted: bool,
 ) -> Result<Soa, Error> {
     let query = crate::open_cell::PbcQuery::new(periodic, reach).half(half);
     let pairs = crate::open_cell::pairs_within_pbc(xyz, cell, &query)?;
@@ -286,7 +398,226 @@ fn gather_candidates_pbc(
     if half {
         canonicalize_half_columns(&mut cols);
     }
-    Soa::from_columns(&cols, xyz.len())
+    Soa::from_columns_ordered(&cols, xyz.len(), sorted)
+}
+
+pub(crate) fn same_lattice(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> bool {
+    a == b
+}
+
+pub(crate) fn moved_past_skin(
+    cell: &Cell,
+    reference: &[[f64; 3]],
+    xyz: &[[f64; 3]],
+    skin: f64,
+) -> bool {
+    if reference.len() != xyz.len() {
+        return true;
+    }
+    let half = 0.5 * skin;
+    let room2 = half * half;
+    for (r, p) in reference.iter().zip(xyz.iter()) {
+        let d2 = cell.dist2(*r, *p);
+        if !d2.is_finite() || d2 > room2 {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) struct UnwrappedFrame {
+    pub(crate) wraps: Vec<[i32; 3]>,
+    pub(crate) xyz: Vec<[f64; 3]>,
+}
+
+pub(crate) fn step_wrap(cell: &Cell, from: [f64; 3], to: [f64; 3]) -> Result<[i32; 3], Error> {
+    let raw = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let wrapped = cell.displacement(from, to);
+    let jump = [
+        raw[0] - wrapped[0],
+        raw[1] - wrapped[1],
+        raw[2] - wrapped[2],
+    ];
+    if jump[0] == 0.0 && jump[1] == 0.0 && jump[2] == 0.0 {
+        return Ok([0, 0, 0]);
+    }
+    let hinv = cell.hinv();
+    let mut out = [0i32; 3];
+    for (a, slot) in out.iter_mut().enumerate() {
+        let s = (hinv[0][a] * jump[0] + hinv[1][a] * jump[1] + hinv[2][a] * jump[2]).round();
+        if !s.is_finite() || s.abs() > i32::MAX as f64 {
+            return Err(Error::Overflow);
+        }
+        *slot = s as i32;
+    }
+    Ok(out)
+}
+
+pub(crate) fn lattice_wraps(
+    cell: &Cell,
+    anchor: &[[f64; 3]],
+    reference: &[[f64; 3]],
+    xyz: &[[f64; 3]],
+) -> Result<Option<UnwrappedFrame>, Error> {
+    if anchor.len() != xyz.len() || reference.len() != xyz.len() {
+        return Err(Error::BufferSize);
+    }
+    let same_anchor = std::ptr::eq(anchor.as_ptr(), reference.as_ptr());
+    let mut wraps = Vec::new();
+    for a in 0..xyz.len() {
+        let w_ref = if same_anchor {
+            [0, 0, 0]
+        } else {
+            step_wrap(cell, anchor[a], reference[a])?
+        };
+        let w_move = step_wrap(cell, reference[a], xyz[a])?;
+        let w = [
+            w_ref[0].checked_add(w_move[0]).ok_or(Error::Overflow)?,
+            w_ref[1].checked_add(w_move[1]).ok_or(Error::Overflow)?,
+            w_ref[2].checked_add(w_move[2]).ok_or(Error::Overflow)?,
+        ];
+        if wraps.is_empty() && w != [0, 0, 0] {
+            wraps.resize(xyz.len(), [0, 0, 0]);
+        }
+        if !wraps.is_empty() {
+            wraps[a] = w;
+        }
+    }
+    if wraps.is_empty() {
+        return Ok(None);
+    }
+    let mut unwrapped = Vec::with_capacity(xyz.len());
+    for (p, w) in xyz.iter().zip(wraps.iter()) {
+        let shift = cell.lattice_shift(w[0], w[1], w[2]);
+        unwrapped.push([p[0] - shift[0], p[1] - shift[1], p[2] - shift[2]]);
+    }
+    Ok(Some(UnwrappedFrame {
+        wraps,
+        xyz: unwrapped,
+    }))
+}
+
+pub(crate) struct WrapFrame<'a> {
+    pub(crate) cell: &'a Cell,
+    pub(crate) anchor: &'a [[f64; 3]],
+    pub(crate) reference: &'a [[f64; 3]],
+    pub(crate) xyz: &'a [[f64; 3]],
+    pub(crate) sorted: bool,
+}
+
+pub(crate) fn filter_with_wraps(
+    soa: &Soa,
+    frame: WrapFrame<'_>,
+    cut2: f64,
+    want_vector: bool,
+    d2: &mut Vec<f64>,
+    cols: &mut PairColumns,
+    vectors: &mut Vec<[f64; 3]>,
+) -> Result<(), Error> {
+    let cell = frame.cell;
+    let xyz = frame.xyz;
+    let Some(unwrapped) = lattice_wraps(cell, frame.anchor, frame.reference, xyz)? else {
+        soa.filter(xyz, cell, cut2, want_vector, d2, cols, vectors)?;
+        if frame.sorted {
+            sort_columns_in_place(cols, vectors, want_vector);
+        }
+        return Ok(());
+    };
+    let mut tmp_d2 = Vec::new();
+    let mut tmp_cols = PairColumns::default();
+    let mut tmp_vecs = Vec::new();
+    soa.filter(
+        &unwrapped.xyz,
+        cell,
+        cut2,
+        want_vector,
+        &mut tmp_d2,
+        &mut tmp_cols,
+        &mut tmp_vecs,
+    )?;
+    let wraps = &unwrapped.wraps;
+    let mut keep = 0usize;
+    for t in 0..tmp_cols.len() {
+        let i = tmp_cols.i[t] as usize;
+        let j = tmp_cols.j[t] as usize;
+        let s_ref = tmp_cols.shift[t];
+        let wi = wraps[i];
+        let wj = wraps[j];
+        let s_now = [
+            s_ref[0]
+                .checked_add(wi[0])
+                .and_then(|v| v.checked_sub(wj[0]))
+                .ok_or(Error::Overflow)?,
+            s_ref[1]
+                .checked_add(wi[1])
+                .and_then(|v| v.checked_sub(wj[1]))
+                .ok_or(Error::Overflow)?,
+            s_ref[2]
+                .checked_add(wi[2])
+                .and_then(|v| v.checked_sub(wj[2]))
+                .ok_or(Error::Overflow)?,
+        ];
+        let shift = cell.lattice_shift(s_now[0], s_now[1], s_now[2]);
+        let dist2 = cell.dist2_shifted(xyz[i], xyz[j], shift);
+        if dist2 < cut2 {
+            tmp_cols.i[keep] = tmp_cols.i[t];
+            tmp_cols.j[keep] = tmp_cols.j[t];
+            tmp_cols.shift[keep] = s_now;
+            tmp_cols.dist2[keep] = dist2;
+            if want_vector {
+                let p = xyz[i];
+                let q = xyz[j];
+                tmp_vecs[keep] = [
+                    q[0] + shift[0] - p[0],
+                    q[1] + shift[1] - p[1],
+                    q[2] + shift[2] - p[2],
+                ];
+            }
+            keep += 1;
+        }
+    }
+    tmp_cols.i.truncate(keep);
+    tmp_cols.j.truncate(keep);
+    tmp_cols.shift.truncate(keep);
+    tmp_cols.dist2.truncate(keep);
+    if want_vector {
+        tmp_vecs.truncate(keep);
+    }
+    if frame.sorted {
+        sort_columns_in_place(&mut tmp_cols, &mut tmp_vecs, want_vector);
+    }
+    *cols = tmp_cols;
+    *vectors = tmp_vecs;
+    Ok(())
+}
+
+fn sort_columns_in_place(cols: &mut PairColumns, vectors: &mut [[f64; 3]], want_vector: bool) {
+    let n = cols.len();
+    if (1..n).all(|q| {
+        let prev = (cols.i[q - 1], cols.j[q - 1], cols.shift[q - 1]);
+        let curr = (cols.i[q], cols.j[q], cols.shift[q]);
+        prev <= curr
+    }) {
+        return;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by_key(|&t| (cols.i[t], cols.j[t], cols.shift[t]));
+    let old_i = cols.i.clone();
+    let old_j = cols.j.clone();
+    let old_shift = cols.shift.clone();
+    let old_dist2 = cols.dist2.clone();
+    for (dst, &src) in order.iter().enumerate() {
+        cols.i[dst] = old_i[src];
+        cols.j[dst] = old_j[src];
+        cols.shift[dst] = old_shift[src];
+        cols.dist2[dst] = old_dist2[src];
+    }
+    if want_vector {
+        let old_vec = vectors.to_vec();
+        for (dst, &src) in order.iter().enumerate() {
+            vectors[dst] = old_vec[src];
+        }
+    }
 }
 
 fn corner_span(h: [[f64; 3]; 3], href: [[f64; 3]; 3]) -> f64 {
@@ -368,6 +699,9 @@ mod tests {
         };
         assert_eq!(got, set_of(&fresh));
         assert_eq!(skin.vectors().len(), n);
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.builds() + skin.reuses(), 1);
+        assert!(!skin.last_reused());
         let mut moved = xyz.clone();
         for p in &mut moved {
             p[0] += 0.02;
@@ -381,6 +715,9 @@ mod tests {
         pairs_within_columns(&moved, &cell, 3.5, None, None, true, &mut again).unwrap();
         assert_eq!(got, set_of(&again));
         assert!(skin.vectors().is_empty());
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.builds() + skin.reuses(), 2);
+        assert!(skin.last_reused());
     }
 
     #[test]
@@ -537,6 +874,27 @@ mod tests {
         assert_eq!(pbc_skin.builds(), 2);
         assert_eq!(pbc_skin.reuses(), 0);
         assert!(!pbc_skin.last_reused());
+    }
+
+    #[test]
+    fn mixed_boundary_list_rebuilds_on_a_periodic_crossing_and_matches_a_fresh_list() {
+        let cell = Cell::ortho(6.0, 6.0, 6.0).unwrap();
+        let periodic = [true, false, false];
+        let before = [[0.1, 3.0, 3.0], [5.9, 3.0, 3.0], [3.0, 3.0, 3.0]];
+        let after = [[5.95, 3.0, 3.0], [5.9, 3.0, 3.0], [3.0, 3.0, 3.0]];
+        let mut skin = SkinList::new(cell, 1.0, 0.4, true)
+            .unwrap()
+            .with_periodic(periodic);
+        let first = set_of(skin.update(&before, false).unwrap());
+        assert_eq!(first, vec![(0, 1, [-1, 0, 0])]);
+        assert!(skin.needs_rebuild(&after));
+        let crossed = set_of(skin.update(&after, false).unwrap());
+        assert_eq!(skin.builds(), 2);
+        assert_eq!(skin.reuses(), 0);
+        let mut fresh = SkinList::new(cell, 1.0, 0.0, true)
+            .unwrap()
+            .with_periodic(periodic);
+        assert_eq!(crossed, set_of(fresh.update(&after, false).unwrap()));
     }
 
     #[test]
@@ -738,5 +1096,123 @@ mod tests {
             let got = list.update(&xyz, false).unwrap();
             assert_eq!(set_of(got), set_of(&want));
         }
+    }
+
+    #[test]
+    fn pbc_crossing_within_skin_reuses_and_rewrites_shifts() {
+        let cell = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let mut skin = SkinList::new(cell, 1.0, 0.5, true).unwrap();
+        let xyz0 = [[0.2, 0.0, 0.0], [9.95, 0.0, 0.0]];
+        skin.update(&xyz0, true).unwrap();
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.columns().shift, vec![[-1, 0, 0]]);
+        let xyz1 = [[0.2, 0.0, 0.0], [0.05, 0.0, 0.0]];
+        assert!(!skin.needs_rebuild(&xyz1));
+        skin.update(&xyz1, true).unwrap();
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.builds() + skin.reuses(), 2);
+        assert!(skin.last_reused());
+        assert_eq!(skin.columns().i, vec![0]);
+        assert_eq!(skin.columns().j, vec![1]);
+        assert_eq!(skin.columns().shift, vec![[0, 0, 0]]);
+        assert!((skin.columns().dist2[0] - 0.0225).abs() <= 16.0 * f64::EPSILON);
+        assert!((skin.vectors()[0][0] + 0.15).abs() <= 16.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn cell_change_triggers_rebuild() {
+        let cell0 = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let cell1 = Cell::from_vectors(
+            [10.0, 0.0, 0.0],
+            [0.2, 10.0, 0.0],
+            [0.0, 0.0, 10.0],
+            [0.0; 3],
+        )
+        .unwrap();
+        let mut skin = SkinList::new(cell0, 1.5, 0.6, true).unwrap();
+        let xyz = [[0.1, 0.2, 0.3], [1.0, 0.2, 0.3]];
+        skin.update(&xyz, true).unwrap();
+        assert_eq!(skin.builds(), 1);
+        assert!(skin.needs_rebuild_in(&cell1, &xyz));
+        skin.update_in(cell1, &xyz, true).unwrap();
+        assert_eq!(skin.builds(), 2);
+        assert_eq!(skin.builds() + skin.reuses(), 2);
+        assert!(!skin.last_reused());
+        assert!(!skin.needs_rebuild(&xyz));
+    }
+
+    #[test]
+    fn triclinic_pbc_crossing_and_pair_ordering() {
+        let cell = Cell::from_vectors(
+            [10.0, 0.0, 0.0],
+            [2.0, 10.0, 0.0],
+            [1.0, 1.5, 10.0],
+            [0.0; 3],
+        )
+        .unwrap();
+        let mut skin = SkinList::new(cell, 1.2, 0.6, true).unwrap();
+        skin.set_sorted(true);
+        let xyz0 = [[0.3, 0.4, 0.5], [2.2, 10.3, 0.5], [0.8, 0.4, 0.5]];
+        skin.update(&xyz0, true).unwrap();
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.columns().i, vec![0, 0, 1]);
+        assert_eq!(skin.columns().j, vec![1, 2, 2]);
+        assert_eq!(skin.columns().shift[0], [0, -1, 0]);
+        assert_eq!(skin.sparsity(), vec![(0, 1), (0, 2), (1, 2)]);
+
+        let xyz1 = [[0.3, 0.4, 0.5], [0.35, 0.45, 0.5], [0.8, 0.4, 0.5]];
+        assert!(!skin.needs_rebuild(&xyz1));
+        skin.update(&xyz1, true).unwrap();
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.builds() + skin.reuses(), 2);
+        assert!(skin.last_reused());
+        assert_eq!(skin.columns().i, vec![0, 0, 1]);
+        assert_eq!(skin.columns().j, vec![1, 2, 2]);
+        assert_eq!(skin.columns().shift, vec![[0, 0, 0], [0, 0, 0], [0, 0, 0]]);
+        let mut fresh = PairColumns::default();
+        pairs_within_columns(&xyz1, &cell, 1.2, None, None, true, &mut fresh).unwrap();
+        assert_eq!(set_of(skin.columns()), set_of(&fresh));
+    }
+
+    #[test]
+    fn failed_update_leaves_skin_state_and_counters_unchanged() {
+        let cell = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let mut skin = SkinList::new(cell, 1.5, 0.5, true).unwrap();
+        let xyz = [[0.2, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        skin.update(&xyz, true).unwrap();
+        let cols_before = skin.columns().clone();
+        let vecs_before = skin.vectors().to_vec();
+
+        let bad_nan = [[f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        assert_eq!(skin.update(&bad_nan, true), Err(Error::NonFinite));
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.builds() + skin.reuses(), 1);
+        assert!(!skin.last_reused());
+        assert_eq!(skin.columns(), &cols_before);
+        assert_eq!(skin.vectors(), &vecs_before[..]);
+
+        let bad_overflow = [[1.0e12, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        assert_eq!(skin.update(&bad_overflow, true), Err(Error::Overflow));
+        assert_eq!(skin.builds(), 1);
+        assert_eq!(skin.builds() + skin.reuses(), 1);
+        assert!(!skin.last_reused());
+        assert_eq!(skin.columns(), &cols_before);
+        assert_eq!(skin.vectors(), &vecs_before[..]);
+        assert!(!skin.needs_rebuild(&xyz));
+
+        let wrap_initial = [[9.9, 0.0, 0.0], [0.1, 0.0, 0.0]];
+        let mut wrap_list = SkinList::new(cell, 1.0, 0.5, true).unwrap();
+        wrap_list.update(&wrap_initial, true).unwrap();
+        let wrap_cols_before = wrap_list.columns().clone();
+        let wrap_vecs_before = wrap_list.vectors().to_vec();
+        assert_eq!(wrap_cols_before.shift, vec![[1, 0, 0]]);
+        let wrap_moved = [[9.9 + 10.0 * i32::MAX as f64, 0.0, 0.0], [0.1, 0.0, 0.0]];
+        assert!(!wrap_list.needs_rebuild(&wrap_moved));
+        assert_eq!(wrap_list.update(&wrap_moved, true), Err(Error::Overflow));
+        assert_eq!(wrap_list.builds(), 1);
+        assert_eq!(wrap_list.builds() + wrap_list.reuses(), 1);
+        assert!(!wrap_list.last_reused());
+        assert_eq!(wrap_list.columns(), &wrap_cols_before);
+        assert_eq!(wrap_list.vectors(), &wrap_vecs_before[..]);
     }
 }

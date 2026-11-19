@@ -423,6 +423,46 @@ impl PairColumns {
         self.i.is_empty()
     }
 
+    /// Unique unordered atom pairs `(i, j)` with `i < j`.
+    ///
+    /// Periodic self-images (`i == j`) are omitted.
+    pub fn sparsity(&self) -> Vec<(usize, usize)> {
+        let mut pairs = Vec::with_capacity(self.i.len());
+        for (&i, &j) in self.i.iter().zip(self.j.iter()) {
+            if i != j && i >= 0 && j >= 0 {
+                let a = i as usize;
+                let b = j as usize;
+                pairs.push(if a < b { (a, b) } else { (b, a) });
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
+
+    /// Sort the stored rows in place by `(i, j, shift)`.
+    pub fn sort_rows(&mut self) {
+        let n = self.len();
+        if (1..n).all(|q| {
+            (self.i[q - 1], self.j[q - 1], self.shift[q - 1])
+                <= (self.i[q], self.j[q], self.shift[q])
+        }) {
+            return;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&t| (self.i[t], self.j[t], self.shift[t]));
+        let old_i = self.i.clone();
+        let old_j = self.j.clone();
+        let old_shift = self.shift.clone();
+        let old_dist2 = self.dist2.clone();
+        for (dst, &src) in order.iter().enumerate() {
+            self.i[dst] = old_i[src];
+            self.j[dst] = old_j[src];
+            self.shift[dst] = old_shift[src];
+            self.dist2[dst] = old_dist2[src];
+        }
+    }
+
     /// [`advise_huge`] for every column.
     fn advise_huge(&mut self) {
         advise_huge(&mut self.i);
