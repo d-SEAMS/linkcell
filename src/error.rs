@@ -32,11 +32,13 @@ pub enum Error {
     Padded,
     /// A coordinate is not finite.
     NonFinite,
-    /// The part count is zero, or the balance bound is below one.
+    /// The part count is zero, or the balance bound is not usable
+    /// (not finite, below one, or does not scale into `u64`).
     BadPartition,
     /// The cell graph is not a square CSR of that grid.
     BadGraph,
-    /// A device curve split was requested and no device is loaded.
+    /// A device curve split was requested and no device is loaded, the
+    /// device call failed, or the method is not a curve.
     NoDevice,
     /// The device curve split disagreed with the host weights.
     DeviceMismatch,

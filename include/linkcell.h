@@ -610,14 +610,17 @@ int lc_pairs_within(const double *xyz,
  * A query or a short buffer keeps its rows on the calling thread for
  * the next call with the same inputs bit for bit.
  *
- * `n == 0` writes a zero count and returns 0. Otherwise nonzero when
- * `out_count` is null, `xyz` is null, `simbox` is null while an axis is
- * periodic, `cap` is below the row count, `n` exceeds `INT_MAX` or
- * `PTRDIFF_MAX / 3`, or `pairs_within_pbc`
- * returns an error (cutoff, mask length, a non-finite coordinate, the
- * periodic-image and bin caps, a bin floor or image shift that does
- * not fit in `int`, and a periodic axis length that is not strictly
- * positive).
+ * Nonzero when `out_count` is null; otherwise `n == 0` writes a zero
+ * count and returns 0. For `n > 0`, nonzero when `xyz` is null,
+ * `simbox` is null while an axis is periodic (including `pbc == NULL`),
+ * `cap` is below the row count, `n` exceeds `INT_MAX` or
+ * `PTRDIFF_MAX / 3`, the periodic cell is singular or a periodic axis
+ * length is not finite and strictly positive, or `pairs_within_pbc`
+ * returns an error (non-finite or non-positive cutoff, mask length, a
+ * non-finite coordinate or located position, the periodic-image and bin
+ * caps, or a bin floor, relative periodic image, image span plus
+ * repeat count, or image shift—including its negation when `half == 0`—
+ * that does not fit in `int`).
  *
  * # Safety
  *
@@ -675,20 +678,22 @@ int lc_pairs_within_rows(const double *xyz,
  *
  * `method` is 0 Morton, 1 Hilbert, 2 recursive coordinate bisection,
  * 3 Hilbert plus Fiduccia-Mattheyses, 4 bisection plus that pass,
- * 5 Scotch, 6 multilevel, 7 PT-Scotch. `balance <= 0` selects
- * `1 + parts * w_max / total`, where `w_max` is the heaviest cell
- * weight and `total` is the sum of the cell weights. `device` nonzero runs the
- * curve split on the CUDA device and returns nonzero when that device
- * is absent, when the method is not a curve, or when the device
- * weights disagree with the host. A null `out_domain` queries
- * `*out_ncell`.
+ * 5 Scotch, 6 multilevel, 7 PT-Scotch. `balance <= 0` (including
+ * `-INFINITY`) selects `1 + parts * w_max / total`, where `w_max` is
+ * the heaviest cell weight and `total` is the sum of the cell weights.
+ * `device` nonzero runs the curve split on the CUDA device and returns
+ * nonzero when no device driver is loaded, the device call fails, the
+ * method is not Morton or Hilbert, or the device weights disagree with
+ * the host or write a domain outside `0..parts`. A null `out_domain`
+ * queries `*out_ncell`.
  *
  * Also nonzero for the input failures of [`lc_cell_grid`], for the
  * pair-list failures of an arc method, when `parts == 0` or `parts`
- * exceeds `UINT32_MAX`, when `method` is not 0..=7, when `balance > 0`
- * is not a usable bound, when Scotch is unavailable or rejects the
- * graph, when a Scotch index or weight does not fit in `int`, or when
- * a domain id exceeds `INT_MAX` or the fill buffer is short.
+ * exceeds `UINT32_MAX`, when `method` is not 0..=7, when `balance` is
+ * `NaN`, `+INFINITY`, in `(0, 1)`, or scales past `UINT64_MAX`, when
+ * Scotch is unavailable or rejects the graph, when a Scotch index or
+ * weight does not fit in `int`, or when a domain id exceeds `INT_MAX`
+ * or the fill buffer is short.
  *
  * # Safety
  *
@@ -719,10 +724,11 @@ int lc_partition(const double *xyz,
  *
  * Nonzero when a required pointer is null, `parts == 0` or `parts`
  * exceeds `UINT32_MAX`, an axis count is not strictly positive,
- * `nx * ny * nz` is not `ncell`, `method` is not 0..=7, `balance > 0`
- * is not a usable bound, the graph is not a square CSR, Scotch is
- * unavailable or rejects the graph, a Scotch index or weight does not
- * fit in `int`, or a domain id exceeds `INT_MAX`.
+ * `nx * ny * nz` is not `ncell`, `method` is not 0..=7, `balance` is
+ * `NaN`, `+INFINITY`, in `(0, 1)`, or scales past `UINT64_MAX`, the
+ * graph is not a square CSR, Scotch is unavailable or rejects the
+ * graph, a Scotch index or weight does not fit in `int`, or a domain
+ * id exceeds `INT_MAX`.
  *
  * # Safety
  *

@@ -484,18 +484,20 @@ fn load_foreign_vesin() -> Option<VesinFn> {
 /// that links both this crate and vesin keeps vesin's symbol. A drop-in
 /// object that calls this function is `include/vesin_alias.c`.
 ///
-/// Returns 0 on success. Returns 1 and writes `error_message` when a
-/// required pointer is null, the device is CUDA or not the CPU and
-/// `libvesin` is absent ([`Error::Device`]), an axis is not periodic and
-/// `libvesin` is absent ([`Error::Partial`]), the box is singular or a
-/// length is not strictly positive ([`Error::BadBox`]), or
-/// [`NeighborCalc::compute`] returns an error.
+/// Returns 0 on success (`*error_message` is set to null). If
+/// `error_message` is null, returns 1 immediately without writing it.
+/// Otherwise returns 1 and writes `error_message` when a required
+/// pointer is null, the device is CUDA or not the CPU and `libvesin` is
+/// absent ([`Error::Device`]), an axis is not periodic and `libvesin` is
+/// absent ([`Error::Partial`]), the box is singular or a length is not
+/// strictly positive ([`Error::BadBox`]), or [`NeighborCalc::compute`]
+/// returns an error (or `libvesin` fails when forwarded).
 ///
 /// # Safety
 ///
 /// `points` is `n_points` coordinate triples. `box_` is three lattice
 /// rows. `periodic` is three booleans. `neighbors` is a zero-initialised
-/// or previously returned list. `error_message` is writable.
+/// or previously returned list. `error_message`, if non-null, is writable.
 #[no_mangle]
 pub unsafe extern "C" fn lc_vesin_neighbors(
     points: *const [f64; 3],

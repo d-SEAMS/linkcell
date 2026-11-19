@@ -45,9 +45,12 @@ impl ReplicaList {
     /// an empty `xyz`, or a length that is not a multiple of `beads`
     /// returns [`Error::Empty`]. The centroid list then returns
     /// [`Error::BadCutoff`] when `cutoff + 2 R + skin` is not finite,
-    /// [`Error::Overflow`] when the atom count exceeds `i32::MAX` or one
-    /// atom has more candidate rows than `u32::MAX`,
-    /// [`Error::TooManyImages`] on the image cap of
+    /// [`Error::Overflow`] when the atom count exceeds `i32::MAX`, a
+    /// relative periodic image of a centroid point is not finite or its
+    /// absolute value exceeds `i32::MAX`, the span of those images on an
+    /// axis plus `ceil((cutoff + 2 R + skin) / width)` on that axis
+    /// exceeds `i32::MAX`, or one atom has more candidate rows than
+    /// `u32::MAX`, [`Error::TooManyImages`] on the image cap of
     /// [`crate::pairs_within`], and [`Error::TooManyCells`] on its bin
     /// cap.
     pub fn build(

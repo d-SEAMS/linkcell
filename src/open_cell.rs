@@ -163,7 +163,8 @@ pub fn pairs_open(
 /// returns [`Error::Overflow`] when the floor of an unwrapped fractional
 /// coordinate, or of a Cartesian coordinate divided by the bin edge,
 /// does not fit in `i32`, or when `shift + image_i - image_j` on an
-/// axis does not fit in `i32`; [`Error::BadBox`] when a periodic axis
+/// axis (or its negation on a full list when `half` is false) does not
+/// fit in `i32`; [`Error::BadBox`] when a periodic axis
 /// length is not finite and strictly positive; [`Error::TooManyImages`]
 /// when a repeat count is not finite or above `i32::MAX`, when the
 /// product of `2 * repeats + 1` exceeds 2^24, or when
