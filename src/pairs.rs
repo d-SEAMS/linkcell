@@ -62,11 +62,18 @@ pub(crate) fn keep_half(i: usize, j: usize, shift: [i32; 3]) -> bool {
 ///
 /// Returns [`Error::BadCutoff`] when `cutoff` is not finite and
 /// strictly positive, [`Error::Empty`] when `xyz` is empty,
-/// [`Error::MaskLen`] when `mask` has the wrong length,
-/// [`Error::Overflow`] when `n` exceeds `u32::MAX`,
-/// [`Error::TooManyImages`] when the image count exceeds 2^24, and
-/// [`Error::TooManyCells`] on the same bin cap as [`knearest`](crate::knearest).
-/// These inputs return `Err`.
+/// [`Error::MaskLen`] when `mask` is `Some` and its length is not `n`,
+/// [`Error::TooManyImages`] when `ceil(cutoff / width)` on an axis is
+/// not finite or above `i32::MAX`, when the product of
+/// `2 * ceil(cutoff / width) + 1` over the three axes exceeds 2^24, or
+/// when `ceil(cutoff / cell_min)` is not finite or above `i32::MAX`
+/// (`cell_min` is the shortest bin edge), [`Error::TooManyCells`] when
+/// an axis needs more than 1,000,000 bins or the mesh is outside
+/// `1..=16,777,216` bins, and [`Error::Overflow`] when `n` exceeds
+/// `u32::MAX`, when a relative periodic image of an active point is not
+/// finite or its absolute value exceeds `i32::MAX`, or when the span of
+/// those images on an axis plus `ceil(cutoff / width)` on that axis
+/// exceeds `i32::MAX`. These inputs return `Err`.
 ///
 /// ```
 /// use linkcell::{pairs_within, Cell};
@@ -155,6 +162,21 @@ pub fn pairs_within(
 /// store a `Pair` row, so the time is the search rather than the row
 /// stream. The count matches `pairs_within(...).len()` for the same
 /// arguments.
+///
+/// Returns the same errors as [`pairs_within`]: [`Error::BadCutoff`]
+/// when `cutoff` is not finite and strictly positive, [`Error::Empty`]
+/// when `xyz` is empty, [`Error::MaskLen`] when `mask` is `Some` and
+/// its length is not `n`, [`Error::TooManyImages`] when
+/// `ceil(cutoff / width)` on an axis is not finite or above `i32::MAX`,
+/// when the product of `2 * ceil(cutoff / width) + 1` over the three
+/// axes exceeds 2^24, or when `ceil(cutoff / cell_min)` is not finite or
+/// above `i32::MAX` (`cell_min` is the shortest bin edge),
+/// [`Error::TooManyCells`] when an axis needs more than 1,000,000 bins
+/// or the mesh is outside `1..=16,777,216` bins, and [`Error::Overflow`]
+/// when `n` exceeds `u32::MAX`, when a relative periodic image of an
+/// active point is not finite or its absolute value exceeds `i32::MAX`,
+/// or when the span of those images on an axis plus
+/// `ceil(cutoff / width)` on that axis exceeds `i32::MAX`.
 pub fn pairs_within_count(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -176,6 +198,21 @@ pub fn pairs_within_count(
 /// A rank that calls this twice reuses the pages from the first call.
 /// A fresh `Vec` on every call is unmapped and faulted again, which on
 /// a half-frame list costs more than walking the pairs.
+///
+/// Returns the same errors as [`pairs_within`]: [`Error::BadCutoff`]
+/// when `cutoff` is not finite and strictly positive, [`Error::Empty`]
+/// when `xyz` is empty, [`Error::MaskLen`] when `mask` is `Some` and
+/// its length is not `n`, [`Error::TooManyImages`] when
+/// `ceil(cutoff / width)` on an axis is not finite or above `i32::MAX`,
+/// when the product of `2 * ceil(cutoff / width) + 1` over the three
+/// axes exceeds 2^24, or when `ceil(cutoff / cell_min)` is not finite or
+/// above `i32::MAX` (`cell_min` is the shortest bin edge),
+/// [`Error::TooManyCells`] when an axis needs more than 1,000,000 bins
+/// or the mesh is outside `1..=16,777,216` bins, and [`Error::Overflow`]
+/// when `n` exceeds `u32::MAX`, when a relative periodic image of an
+/// active point is not finite or its absolute value exceeds `i32::MAX`,
+/// or when the span of those images on an axis plus
+/// `ceil(cutoff / width)` on that axis exceeds `i32::MAX`.
 pub fn pairs_within_into(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -246,8 +283,22 @@ fn row_guess(hits: usize, half: bool) -> usize {
 /// `i`, `j`, and `shift` are the vesin / tonari `ijS` layout and
 /// `dist2` is the squared distance. Row `t` of each column is one
 /// atom-image. The vectors are cleared, then filled once; their
-/// capacity is kept for the next call. An index above `i32::MAX` is
-/// [`Error::Overflow`].
+/// capacity is kept for the next call.
+///
+/// Returns [`Error::BadCutoff`] when `cutoff` is not finite and
+/// strictly positive, [`Error::Empty`] when `xyz` is empty,
+/// [`Error::MaskLen`] when `mask` is `Some` and its length is not `n`,
+/// [`Error::TooManyImages`] when `ceil(cutoff / width)` on an axis is
+/// not finite or above `i32::MAX`, when the product of
+/// `2 * ceil(cutoff / width) + 1` over the three axes exceeds 2^24, or
+/// when `ceil(cutoff / cell_min)` is not finite or above `i32::MAX`
+/// (`cell_min` is the shortest bin edge), [`Error::TooManyCells`] when
+/// an axis needs more than 1,000,000 bins or the mesh is outside
+/// `1..=16,777,216` bins, and [`Error::Overflow`] when `n` exceeds
+/// `i32::MAX`, when a relative periodic image of an active point is not
+/// finite or its absolute value exceeds `i32::MAX`, or when the span of
+/// those images on an axis plus `ceil(cutoff / width)` on that axis
+/// exceeds `i32::MAX`.
 pub fn pairs_within_columns(
     xyz: &[[f64; 3]],
     simbox: &Cell,

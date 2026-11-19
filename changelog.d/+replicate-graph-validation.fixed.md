@@ -1,0 +1,1 @@
+Validate `CellGraph` (including `copies == 1` and CSR offset/length invariants) in `replicate_graph`, and guard the `n * k` distance buffer allocation in the 3-argument `linkcell::Neighbours` C++ constructor against `std::size_t` wraparound.

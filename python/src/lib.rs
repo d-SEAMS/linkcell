@@ -338,11 +338,13 @@ where
 /// `xyz` is passed by device pointer into `lc_gpu_*`. A CUDA `cell`
 /// is inverted on device; the host only reads the four launch ints.
 ///
-/// `k == 0`, a cell of the wrong shape, and a singular cell raise
-/// `ValueError`. An empty frame and a mask whose length is not `n` also
-/// raise `ValueError`. A mesh past the bin cap raises `RuntimeError`
-/// with the crate's error text. Lengths are the cell's unit. `dist2` is
-/// that unit squared.
+/// `k == 0`, a cell of the wrong shape, a singular cell, an empty frame,
+/// a mask whose length is not `n`, a wrong tensor dtype or layout, and
+/// `n * k * n_frames` that does not fit in a slice raise `ValueError`. A
+/// mesh past the bin cap, on a fused-team build a point count that does
+/// not fit in `i64`, and on a CUDA `xyz` an absent CUDA driver/NVRTC,
+/// `k > 16`, or a device failure raise `RuntimeError` with the crate's
+/// error text. Lengths are the cell's unit. `dist2` is that unit squared.
 /// `cell_hint` defaults to `None`, which selects a bin edge of 3 in
 /// that unit.
 #[pyfunction]
@@ -436,10 +438,14 @@ fn knearest<'py>(
 /// false. `cell_hint` defaults to `None`, which selects `cutoff / k`
 /// with `k` in `1..=6` (`k` is the rounded fourth root of the estimated
 /// atoms per cutoff-sized cell after that estimate is divided by 16).
-/// A singular cell, a cell of the wrong shape, an empty frame, and a
-/// mask of the wrong length raise `ValueError`. A non-positive cutoff,
-/// an image count above 2**24, and a mesh past the bin cap raise
-/// `RuntimeError`.
+/// A singular cell, a cell of the wrong shape, an empty frame, a mask
+/// of the wrong length, and a CUDA `xyz` raise `ValueError`. A
+/// non-finite or non-positive cutoff, `ceil(cutoff / width)` or
+/// `ceil(cutoff / cell_min)` that is not finite or above `2**31 - 1`,
+/// an image count above 2**24, a mesh past the bin cap, a point count
+/// above `2**31 - 1`, a relative periodic image that is not finite or
+/// whose absolute value exceeds `2**31 - 1`, and an image span plus the
+/// repeat count that exceeds `2**31 - 1` raise `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "pairs_within", signature = (xyz, cell, cutoff, mask=None, cell_hint=None, half=false))]
 fn pairs_within_py<'py>(
@@ -550,6 +556,10 @@ fn frame_points<'py>(
 ///
 /// Returns `(nxyz, bin_width, weight)`. `weight[i]` is the point count
 /// of cell `i` in the order `((iz * ny) + iy) * nx + ix`.
+/// A wrong shape, an empty frame, a singular cell, a mask of the
+/// wrong length, and a CUDA `xyz` raise `ValueError`. A non-finite or
+/// non-positive cutoff, a non-finite coordinate, and a mesh past the
+/// bin cap raise `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "cell_grid", signature = (xyz, cell, cutoff, mask=None, cell_hint=None))]
 fn cell_grid_py<'py>(
@@ -579,9 +589,18 @@ fn cell_grid_py<'py>(
     ))
 }
 
-/// Periodic adjacency. Edge weights are pair counts from `pairs_within`.
+/// Periodic adjacency. Edge weights are pair counts from Rust's
+/// `linkcell::pairs_within` (not the `int32` column entry point).
 ///
 /// Returns `(nxyz, bin_width, weight, offsets, neighbor, edge_weight)`.
+/// Shape, mask, and CUDA `xyz` failures are those of [`cell_grid`]. A
+/// non-finite or non-positive cutoff, a non-finite coordinate, a mesh
+/// past the bin cap, `ceil(cutoff / width)` or `ceil(cutoff / cell_min)`
+/// that is not finite or above `2**31 - 1`, an image count above 2**24,
+/// a point count above `2**32 - 1`, and a relative periodic image that is
+/// not finite or does not fit in `int32` (including an image span plus
+/// the repeat count) raise `RuntimeError`. An arc count above `2**32 - 1`
+/// also raises `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "cell_graph", signature = (xyz, cell, cutoff, mask=None, cell_hint=None))]
 fn cell_graph_py<'py>(
@@ -630,8 +649,20 @@ fn cell_graph_py<'py>(
 /// `rcb-fm`, `multi`, or `scotch`. `balance` of `None` selects
 /// `1 + parts * w_max / total`, where `w_max` is the heaviest cell
 /// weight and `total` is the sum of the cell weights.
-/// `device` runs the curve split on CUDA and raises when that device
-/// is absent.
+/// `device` runs the curve split on CUDA and raises `RuntimeError` when
+/// that device is absent, the device call fails, the method is not a
+/// curve, or the device split disagrees with the host or writes a
+/// domain id outside `0..parts`. An unknown `method`, a wrong shape, a
+/// singular cell, an empty frame, a mask of the wrong length, and a
+/// CUDA `xyz` raise `ValueError`.
+/// `parts == 0`, a `balance` that is not finite, is below 1, does not
+/// scale into a `u64`, or rounds below 1, a non-finite or non-positive
+/// cutoff, a non-finite coordinate, a mesh past the bin cap, and, for a
+/// method that reads pair arcs, the image and periodic-image failures
+/// of [`cell_graph`] raise `RuntimeError`. Scotch raises `RuntimeError`
+/// when it is not compiled in, rejects the graph, or a cell count,
+/// part count, CSR offset, cell weight, or edge weight does not fit
+/// in `int32`. A domain id above `2**31 - 1` raises `RuntimeError`.
 #[pyfunction]
 #[pyo3(
     name = "partition",
@@ -673,6 +704,10 @@ fn partition_py<'py>(
 }
 
 /// Three bin radii for `cutoff * depth`.
+/// `bin_width` must have length 3 (`ValueError` otherwise). A cutoff
+/// that is not finite or is negative, a non-finite `cutoff * depth`,
+/// and a positive length over a positive width whose ratio is not
+/// finite or whose ceiling does not fit in `uint32` raise `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "halo_width")]
 fn halo_width_py(cutoff: f64, depth: u32, bin_width: Vec<f64>) -> PyResult<(u32, u32, u32)> {
@@ -685,6 +720,12 @@ fn halo_width_py(cutoff: f64, depth: u32, bin_width: Vec<f64>) -> PyResult<(u32,
 }
 
 /// Ghost cell ids of `domain`.
+///
+/// `nxyz` or `width` of the wrong length, an `nxyz` product that
+/// overflows, an `assign` length other than that product, and a
+/// negative assignment entry raise `ValueError`. `domain` is a `u32`.
+/// A ghost cell id above
+/// `2**31 - 1` raises `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "halo")]
 fn halo_py<'py>(
@@ -772,8 +813,11 @@ fn columns_of(rows: Vec<linkcell::Pair>) -> PyResult<PairColumns> {
 /// `xyz` is float64 `(n, 3)`. Each row has `i < j`, shift zero, and
 /// squared distance strictly below `cutoff` squared. `cutoff` is a
 /// length. `cell_hint` defaults to `None`. Returns `(i, j, S, dist2)`
-/// in the same layout as [`pairs_within`]. An empty frame raises
-/// `ValueError`. A non-positive cutoff or a non-finite coordinate raises
+/// in the same layout as [`pairs_within`]. A wrong shape, an empty
+/// frame, or a CUDA `xyz` raises `ValueError`. A non-finite or
+/// non-positive cutoff, a non-finite coordinate, a bin floor that does
+/// not fit in `int32`, a bin span past the cell cap, a stencil reach
+/// past `2**31 - 3`, and a pair index above `2**31 - 1` raise
 /// `RuntimeError`.
 #[pyfunction]
 #[pyo3(name = "pairs_open", signature = (xyz, cutoff, cell_hint=None))]
@@ -807,11 +851,22 @@ fn pairs_open_py<'py>(
 /// `periodic` is a bool or three bools. False is an open axis. A fully
 /// periodic mask is [`pairs_within`]. Returns `(i, j, S, dist2)`.
 /// `cutoff` is a length in the cell's unit. `half` defaults to false.
-/// An empty frame or a mask of the wrong length raises `ValueError`. A
-/// non-positive cutoff or a non-finite coordinate raises `RuntimeError`.
-/// A singular cell raises `ValueError` when any axis is periodic. For a
-/// fully non-periodic search, the cell is ignored and replaced by a unit
-/// orthorhombic cell.
+/// A bad `periodic` flag, a wrong shape, an empty frame, a mask of the
+/// wrong length, or a CUDA `xyz` raises `ValueError`. A singular cell
+/// (or a cell of the wrong shape) raises `ValueError` when any axis is
+/// periodic; for a fully non-periodic search, the cell is ignored and
+/// replaced by a unit orthorhombic cell. A non-finite or non-positive
+/// cutoff, a non-finite coordinate or located position, a bin floor or
+/// `shift + image_i - image_j` (or its negation when `half` is false)
+/// that does not fit in `int32`, `ceil(cutoff / width)` on a periodic
+/// axis (or `ceil(cutoff / cell_min)` on a fully periodic mask) that is
+/// not finite or above `2**31 - 1`, `ceil(cutoff / edge)` on an open or
+/// mixed mask that is not finite or above `2**31 - 3`, an image count
+/// above `2**24`, a mesh past the bin cap, and a pair index above
+/// `2**31 - 1` raise `RuntimeError`. A fully periodic mask also raises
+/// `RuntimeError` for a point count above `2**32 - 1` and for a relative
+/// periodic image that is not finite or does not fit in `int32`,
+/// including an image span plus the repeat count.
 #[pyfunction]
 #[pyo3(
     name = "pairs_within_pbc",
@@ -937,6 +992,19 @@ impl PyNeighborList {
     }
 
     /// Rows for `quantities`, in that letter order.
+    ///
+    /// An empty frame, a wrong shape, a bad `periodic` flag, an unknown
+    /// letter, and a singular cell raise `ValueError`. A non-periodic
+    /// axis, a non-finite `cutoff + skin` (where `skin < 0` selects
+    /// `0.1 * cutoff`), a non-finite coordinate, `ceil(reach / width)` or
+    /// `ceil(reach / cell_min)` that is not finite or above `2**31 - 1`
+    /// (`reach = cutoff` for `skin == 0`, else `cutoff + skin`), an
+    /// image count above `2**24`, a mesh past the bin cap, a point
+    /// count above `2**31 - 1`, a relative periodic image that is not
+    /// finite or whose absolute value exceeds `2**31 - 1`, an image
+    /// span on an axis plus `ceil(reach / width)` on that axis that
+    /// exceeds `2**31 - 1`, and more candidate rows on one point than
+    /// `2**32 - 1` raise `RuntimeError`.
     #[pyo3(signature = (points, cell, periodic=None, quantities="ij"))]
     fn compute<'py>(
         &mut self,

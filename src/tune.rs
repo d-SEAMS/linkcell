@@ -18,8 +18,8 @@ use crate::Cell;
 /// threads, 2 = one thread writes a full list from the tile (nonzero) or
 /// buffers its hits first (zero), 3 = bin ranges per thread in a split
 /// search, 4 = output bytes per thread from which the row writers
-/// prefetch ahead of their stores. Returns 0, or 1 for an unknown key or
-/// a negative value.
+/// prefetch ahead of their stores. Returns 0, or 1 for an unknown key,
+/// `NaN`, or a negative value.
 #[no_mangle]
 pub extern "C" fn lc_tune_set(key: c_int, value: f64) -> c_int {
     let slot = match key {

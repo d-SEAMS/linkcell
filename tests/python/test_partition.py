@@ -1,6 +1,7 @@
 """DLPack partition: one domain per cell, stable under a lattice shift."""
 
 import numpy as np
+import pytest
 
 import linkcell
 
@@ -21,3 +22,20 @@ def test_partition_covers_each_cell_once():
     assert np.array_equal(domain, again)
     width = linkcell.halo_width(3.0, 1, [2.0, 2.0, 2.0])
     assert width == (2, 2, 2)
+
+
+def test_partition_error_paths():
+    xyz = np.array([[0.2, 0.2, 0.2], [3.2, 0.2, 0.2]], dtype=np.float64)
+    cell = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+    singular = np.array(
+        [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+    )
+    with pytest.raises(ValueError):
+        linkcell.partition(xyz, singular, 2.0, 2)
+    with pytest.raises(RuntimeError):
+        linkcell.partition(xyz, cell, 2.0, 2, balance=float("nan"))
+    with pytest.raises(RuntimeError):
+        linkcell.partition(xyz, cell, 2.0, 2, balance=float("inf"))
+    if not linkcell.gpu_available():
+        with pytest.raises(RuntimeError):
+            linkcell.partition(xyz, cell, 2.0, 2, method="morton", device=True)

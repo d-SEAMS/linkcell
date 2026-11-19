@@ -205,27 +205,26 @@ impl CellGrid {
 /// Cell count and arc count both equal the base counts times `copies`.
 /// Each copy keeps the base neighbourhood, so the work per copy stays
 /// the base cell count and the base arc count.
+///
+/// Returns [`Error::BadGraph`] when `copies == 0`, a grid axis is not
+/// strictly positive, `nx * ny * nz` does not equal the weight length or
+/// overflows, `offsets` is not `ncell + 1` long, `offsets[0]` is nonzero,
+/// `offsets` is not monotonic, `neighbor` or `edge_weight` length does
+/// not equal `offsets[ncell]`, a neighbour index is outside the base
+/// cells, `copies` does not fit in `i32`, `nx * copies` or
+/// `ncell * copies` overflows, or the copied arc count does not fit in
+/// `u32`.
 pub fn replicate_graph(graph: &CellGraph, copies: usize) -> Result<CellGraph, Error> {
     if copies == 0 {
         return Err(Error::BadGraph);
     }
+    let n = check_graph(graph)?;
     if copies == 1 {
         return Ok(graph.clone());
     }
     let nx = graph.grid.nx;
     let ny = graph.grid.ny;
     let nz = graph.grid.nz;
-    if nx <= 0 || ny <= 0 || nz <= 0 {
-        return Err(Error::BadGraph);
-    }
-    let n = graph.grid.ncell();
-    let expect = (nx as usize)
-        .checked_mul(ny as usize)
-        .and_then(|v| v.checked_mul(nz as usize))
-        .ok_or(Error::BadGraph)?;
-    if expect != n || graph.offsets.len() != n + 1 {
-        return Err(Error::BadGraph);
-    }
     let copies_i = i32::try_from(copies).map_err(|_| Error::BadGraph)?;
     let big_nx = nx.checked_mul(copies_i).ok_or(Error::BadGraph)?;
     let big_n = n.checked_mul(copies).ok_or(Error::BadGraph)?;
@@ -322,6 +321,11 @@ pub struct PartScore {
 /// Axis `i` gets the smallest integer `r` with `r * bin_width[i]` at
 /// least that length. `depth` is the number of cutoff shells the
 /// caller must cover. Zero cutoff or zero depth is a zero radius.
+///
+/// Returns [`Error::BadCutoff`] when `cutoff` is not finite or is
+/// negative, or when `cutoff * depth` is not finite, and
+/// [`Error::Overflow`] when a positive length divided by a positive
+/// width is not finite or its ceiling does not fit in `u32`.
 pub fn halo_width(cutoff: f64, depth: u32, bin_width: [f64; 3]) -> Result<[u32; 3], Error> {
     if !cutoff.is_finite() || cutoff < 0.0 {
         return Err(Error::BadCutoff);
@@ -342,6 +346,10 @@ pub fn halo_width(cutoff: f64, depth: u32, bin_width: [f64; 3]) -> Result<[u32; 
 /// `width` is a bin radius on each axis, from [`halo_width`] or from
 /// the caller. The result is sorted and does not include cells whose
 /// assignment equals `domain`.
+///
+/// Returns [`Error::BadPartition`] when `assign` is not one entry per
+/// cell, and [`Error::BadGraph`] when `nx * ny * nz` does not equal the
+/// weight length.
 pub fn halo(
     grid: &CellGrid,
     assign: &[u32],
@@ -374,6 +382,11 @@ pub fn halo(
 /// The cell stencil from `hwidth` is only the candidate list. A point in
 /// a painted cell is kept when its minimum image to an owned atom is at
 /// most `reach`. Owned points are `2`. Reached ghosts are `1`.
+///
+/// Returns [`Error::BadGraph`] when `xyz` and `point_cell` differ in
+/// length, `reach` is not finite or is negative, an axis count is
+/// not strictly positive, `nx * ny * nz` overflows, or `assign` is not
+/// one entry per cell.
 pub fn mark_reached(
     xyz: &[[f64; 3]],
     lengths: [f64; 3],
@@ -468,6 +481,13 @@ pub fn mark_reached(
 }
 
 /// Point counts on the mesh `pairs_within` would use.
+///
+/// Returns [`Error::BadCutoff`] when `cutoff` is not finite and
+/// strictly positive, [`Error::Empty`] when `xyz` is empty,
+/// [`Error::MaskLen`] when `mask` is `Some` and its length is not `n`,
+/// [`Error::NonFinite`] when a coordinate is not finite, and
+/// [`Error::TooManyCells`] when an axis needs more than 1,000,000 bins
+/// or the mesh is outside `1..=16,777,216` bins.
 pub fn cell_grid(
     xyz: &[[f64; 3]],
     sim: &Cell,
@@ -479,6 +499,11 @@ pub fn cell_grid(
 }
 
 /// Cell grid plus pair-count arcs from [`pairs_within`].
+///
+/// Returns the errors of [`cell_grid`], then the errors of
+/// [`crate::pairs_within`] (including its [`Error::Overflow`] and
+/// [`Error::TooManyImages`] cases), and [`Error::Overflow`] when the
+/// directed arc count exceeds `u32::MAX`.
 pub fn cell_graph(
     xyz: &[[f64; 3]],
     sim: &Cell,
@@ -490,6 +515,23 @@ pub fn cell_graph(
 }
 
 /// Domain id of each cell. See [`PartRequest`].
+///
+/// Returns the errors of [`cell_grid`]. A method that reads pair arcs
+/// ([`Method::HilbertFm`], [`Method::RcbFm`], [`Method::Scotch`],
+/// [`Method::PtScotch`], [`Method::Multi`]) also returns the errors of
+/// [`cell_graph`]. Then [`Error::BadPartition`] when `parts == 0` or
+/// `balance` is `Some` and is not finite, is below 1, does not scale
+/// into a `u64` numerator, or rounds below 1; [`Error::NoDevice`] when
+/// `device` is set and no device driver is loaded, the device call
+/// fails, or the method is not Morton or Hilbert (with or without
+/// refinement); [`Error::DeviceMismatch`] when a device curve
+/// split disagrees with the host weights or writes a domain id outside
+/// `0..parts`; [`Error::ScotchDisabled`] when Scotch or PT-Scotch was
+/// not compiled in; [`Error::ScotchFailed`] when that library rejects
+/// the graph or returns a domain outside `0..parts`. With the `scotch`
+/// or `ptscotch` feature, [`Error::Overflow`] when the cell count,
+/// `parts`, a CSR offset, a cell weight, or an edge weight does not
+/// fit in `i32`.
 pub fn partition(
     xyz: &[[f64; 3]],
     sim: &Cell,
@@ -516,6 +558,15 @@ pub fn partition(
 /// Partition an existing graph. `device` needs the point bins, so it
 /// returns [`Error::NoDevice`] here. Build the assignment from points
 /// with [`partition`] when the device path is required.
+///
+/// Also returns the [`Error::BadGraph`] cases of a square CSR (a
+/// non-positive axis, `nx * ny * nz` not equal to the weight length,
+/// `offsets` not `ncell + 1` long or not starting at 0 or not
+/// non-decreasing, neighbour or edge-weight length not equal to the
+/// last offset, or a neighbour outside the cells), [`Error::BadPartition`]
+/// when `parts == 0` or `balance` is `Some` and is not finite, is below
+/// 1, does not scale into a `u64` numerator, or rounds below 1, and the
+/// Scotch errors of [`partition`] when the method is Scotch or PT-Scotch.
 pub fn partition_graph(graph: &CellGraph, request: PartRequest) -> Result<Vec<u32>, Error> {
     if request.device {
         return Err(Error::NoDevice);
@@ -535,8 +586,13 @@ pub fn partition_graph(graph: &CellGraph, request: PartRequest) -> Result<Vec<u3
 /// Curve split on the device, including the copies both ways.
 ///
 /// The result is the prefix assignment, with no refinement pass.
-/// [`Error::NoDevice`] means the driver is absent. A mismatch with the
-/// host histogram is [`Error::DeviceMismatch`].
+/// [`Error::NoDevice`] means the driver is absent or the device call
+/// failed, and is also returned when `method` is not Morton or Hilbert
+/// (with or without refinement).
+/// A mismatch with the host histogram, or a domain id outside
+/// `0..parts`, is [`Error::DeviceMismatch`]. [`Error::BadPartition`]
+/// when `parts == 0`. The point binning returns the errors of
+/// [`cell_grid`].
 pub fn curve_split_device(
     xyz: &[[f64; 3]],
     sim: &Cell,
@@ -557,6 +613,11 @@ pub fn curve_split_device(
 }
 
 /// Cut, imbalance, and halo fraction.
+///
+/// Returns the [`Error::BadGraph`] cases of [`partition_graph`],
+/// [`Error::BadPartition`] when `assign` is not one entry per cell,
+/// when `parts == 0`, or when a domain id is outside `0..parts`, and
+/// the errors of [`halo`].
 pub fn score(
     graph: &CellGraph,
     assign: &[u32],
@@ -763,6 +824,8 @@ pub struct MeshCut {
 }
 
 /// Cut the mesh once and keep the point bins.
+///
+/// Returns the same errors as [`partition`] for `request`.
 pub fn mesh_cut(
     xyz: &[[f64; 3]],
     sim: &Cell,
@@ -802,6 +865,11 @@ pub struct RankMask {
 /// The owned lists come from one shared pass over the assignment. Each
 /// rank then paints its stencil from those cells and reads the point
 /// bins already stored on the cut. The ghost count matches [`halo`].
+///
+/// Returns [`Error::BadPartition`] when `assign` is not one entry per
+/// cell, `parts == 0`, a domain id is outside `0..parts`, or a point's
+/// cell is outside the mesh, and [`Error::BadGraph`] when
+/// `nx * ny * nz` does not equal the weight length.
 pub fn fused_masks(
     grid: &CellGrid,
     assign: &[u32],

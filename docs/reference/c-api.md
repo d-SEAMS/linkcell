@@ -130,7 +130,9 @@ void lc_vesin_free(struct lc_vesin_list *neighbors);
 ```
 
 The caller zero-initializes the output list before its first call and
-may pass it back to reuse its buffers. A zero return is success. On
+may pass it back to reuse its buffers. A zero return is success (and
+sets `*error_message` to `NULL`). If `error_message` itself is `NULL`,
+the call returns `1` immediately without writing it. Otherwise, on
 failure, `error_message` receives a borrowed string. The output pointers
 remain owned by the list and are valid until its next call or
 `lc_vesin_free`. `lc_vesin_free` accepts a null pointer, releases a list
@@ -206,7 +208,8 @@ std::vector<ShiftedPair> pairs_within(const double *xyz, std::size_t n,
 `knearest` returns an owning packed `Neighbours` (`n * k` ints).
 `knearest_into` writes a caller buffer and requires `out_len == n * k`.
 Neither returns `std::vector<std::vector<int>>`.
-Failure throws `linkcell::Error`.
+Failure throws `linkcell::Error`, and `Neighbours::neighbour` and
+`Neighbours::dist2` throw `std::out_of_range` when `i >= n()` or `j >= k()`.
 Requires C++17.
 
 `ShiftedPair` has the layout of `lc_pair`.
@@ -219,7 +222,7 @@ Requires C++17.
 Edge weights are pair counts from `lc_pairs_within` with `half` set.
 `lc_partition` writes one domain id per cell.
 `method` is 0 Morton, 1 Hilbert, 2 recursive coordinate bisection (RCB), 3 Hilbert plus Fiduccia-Mattheyses, 4 bisection plus that pass, 5 Scotch, 6 multilevel, 7 parallel Scotch.
-`balance <= 0` selects `1 + parts * w_max / total`, where `w_max` is the heaviest cell weight and `total` is the sum of the cell weights.
+`balance <= 0` (including `-INFINITY`) selects `1 + parts * w_max / total`, where `w_max` is the heaviest cell weight and `total` is the sum of the cell weights; `NaN`, `+INFINITY`, a value in `(0, 1)`, or a value that scales past `UINT64_MAX` fails.
 That is the tightest bound a cell-aligned cut can promise, and it is the ratio the d-SEAMS domain driver derives per frame.
 `lc_halo_width` writes three bin radii for `cutoff * depth`.
 `lc_halo` writes the ghost cell ids.
@@ -321,9 +324,9 @@ A null function removes the hook, and the device partition then reports that no 
 | `TooManyCells` | linked-cell mesh overflows the bin cap |
 | `BadCutoff` | `cutoff` is not finite and strictly positive |
 | `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation |
-| `BadPartition` | The part count is zero, or the balance bound is below 1 |
+| `BadPartition` | The part count is zero, or the balance bound is not usable |
 | `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |
-| `NoDevice` | A device curve split was requested and no device is loaded |
+| `NoDevice` | A device curve split was requested and no device is loaded, the device call failed, or the method is not a curve |
 | `ScotchDisabled` | Scotch support was not compiled in |
 | `TooManyImages` | The periodic image count exceeds 2^24 |
 | `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
@@ -335,10 +338,28 @@ A null function removes the hook, and the device partition then reports that no 
 
 `Error::Empty` is not a wrong-length buffer.
 `knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, and `TooManyCells`.
+Its `Overflow` is `n * k` not fitting in a slice, and, on a fused-team
+build, a point count that does not fit in `i64`.
+`knearest_into` reports a product that does not fit as `BufferSize`.
 `pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
-`TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
-point count above `u32::MAX` and a relative periodic image offset that
-does not fit the stored shift.
+`TooManyImages`, and `TooManyCells`. Its `Overflow` cases are a point
+count above `u32::MAX` (`i32::MAX` for the column entry points), a
+relative periodic image that is not finite or whose absolute value
+exceeds `i32::MAX`, and an image span on an axis plus
+`ceil(cutoff / width)` on that axis that exceeds `i32::MAX`.
+`pairs_within_pbc` adds `NonFinite`, and on an open or mixed cell an
+`Overflow` when a bin floor or `shift + image_i - image_j` (or its
+negation on a full list) does not fit in `i32`. `TooManyImages` is also
+`ceil(cutoff / width)` on a periodic axis (or `ceil(cutoff / cell_min)`
+on a fully periodic cell) not finite or above `i32::MAX`, and on an
+open or mixed cell the stencil reach `ceil(cutoff / edge)` not finite or
+above `i32::MAX - 2`.
+`halo_width` returns `Overflow` when a positive length over a
+positive width is not finite or its ceiling does not fit in `u32`.
+`partition` returns `Overflow` for the `pairs_within` image cases when
+the method reads arcs, and, with Scotch or PT-Scotch compiled in, when
+a cell count, part count, CSR offset, cell weight, or edge weight does
+not fit in `i32`.
 Positions and cell vectors share one length unit.
 `dist2` is that unit squared.
 `cutoff` and `cell_hint` are lengths in that unit.
