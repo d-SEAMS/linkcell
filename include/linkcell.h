@@ -10,14 +10,15 @@
  *   - lc_pairs_within writes caller-owned i, j, shift, dist2 rows.
  *     Null outputs query the row count.
  *   - lc_last_error returns a thread-local pointer. Do not free. The
- *     pointer is invalid after the next lc_knearest on the same thread.
+ *     pointer is invalid after the next status-returning lc_* call on
+ *     the same thread.
  *     lc_version does not read or write the slot.
  *   - lc_version returns a process-static pointer. Do not free.
  *
  * Thread safety
  *   - Distinct searches may run concurrently.
  *   - lc_last_error is a thread-local slot. Read it on the same thread
- *     that received a nonzero return from lc_knearest.
+ *     that received a nonzero return from a status-returning lc_* call.
  */
 
 
@@ -281,7 +282,7 @@ int lc_halo(const int *nxyz,
  * Bin radii for `cutoff * depth`. `out_width` receives three counts.
  *
  * Nonzero when `bin_width` or `out_width` is null, `cutoff` is not
- * finite and at least zero, `cutoff * depth` is not finite, or a
+ * finite or is negative, `cutoff * depth` is not finite, or a
  * positive length divided by a positive width is not finite or its
  * ceiling does not fit in `uint32_t`.
  *
@@ -838,8 +839,8 @@ const char *lc_version(void);
  * Owned points are 2. Ghosts within `reach` of an owned atom are 1.
  *
  * Nonzero when a required pointer is null, `domain` is negative, an
- * assignment or point-cell entry is negative, `xyz` and `point_cell`
- * differ in length, `reach` is not finite and at least zero, an axis
+ * assignment or point-cell entry is negative, `reach` is not finite or
+ * is negative, an axis
  * count is not strictly positive, `nx * ny * nz` overflows, or
  * `assign` is not one entry per cell.
  *
