@@ -217,6 +217,7 @@ impl NeighborCalc {
                     self.skin_list = Some(SkinList::new(*cell, opt.cutoff, opt.skin, half)?);
                 }
                 let list = self.skin_list.as_mut().unwrap();
+                list.set_cell(*cell);
                 list.update(xyz, want_vec)?;
                 list.columns().clone()
             } else {
@@ -646,5 +647,16 @@ mod tests {
             .compute(&xyz, &cell, [true, true, true], opt2)
             .unwrap();
         assert_eq!(again.pairs.len(), calc.pairs.len());
+
+        let strained = Cell::ortho(20.0, 20.0, 20.0).unwrap();
+        again
+            .compute(&xyz, &strained, [true, true, true], opt2)
+            .unwrap();
+        let mut ref_strained = NeighborCalc::default();
+        ref_strained
+            .compute(&xyz, &strained, [true, true, true], opt)
+            .unwrap();
+        assert_eq!(again.pairs(), ref_strained.pairs());
+        assert_eq!(again.shifts(), ref_strained.shifts());
     }
 }

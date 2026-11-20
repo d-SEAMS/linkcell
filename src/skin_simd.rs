@@ -78,9 +78,14 @@ impl Soa {
         }
     }
 
-    /// Group `cols` by source atom. Order inside an atom is the order
-    /// the columns arrived in.
-    pub(crate) fn from_columns(cols: &PairColumns, n_atoms: usize) -> Result<Self, Error> {
+    /// Group `cols` by source atom. When `sorted` is `false`, order inside
+    /// an atom is the order the columns arrived in. When `sorted` is `true`,
+    /// each atom's candidates are ordered by `(j, shift)`.
+    pub(crate) fn from_columns_ordered(
+        cols: &PairColumns,
+        n_atoms: usize,
+        sorted: bool,
+    ) -> Result<Self, Error> {
         let n = cols.len();
         if cols.j.len() != n || cols.shift.len() != n {
             return Err(Error::BufferSize);
@@ -102,7 +107,7 @@ impl Soa {
         let mut sx = vec![0i32; n];
         let mut sy = vec![0i32; n];
         let mut sz = vec![0i32; n];
-        let mut code = vec![0u16; n];
+        let mut code = if sorted { Vec::new() } else { vec![0u16; n] };
         let mut coded = true;
         for k in 0..n {
             let i = cols.i[k] as usize;
@@ -113,11 +118,36 @@ impl Soa {
             sx[at] = s[0];
             sy[at] = s[1];
             sz[at] = s[2];
-            if coded {
+            if !sorted && coded {
                 if let Some(c) = encode_shift(s[0], s[1], s[2]) {
                     code[at] = c;
                 } else {
                     coded = false;
+                }
+            }
+        }
+        if sorted {
+            let mut row: Vec<(u32, [i32; 3])> = Vec::new();
+            for i in 0..n_atoms {
+                let a = offsets[i] as usize;
+                let b = offsets[i + 1] as usize;
+                row.clear();
+                row.extend((a..b).map(|q| (j[q], [sx[q], sy[q], sz[q]])));
+                row.sort_unstable();
+                for (q, (jj, s)) in (a..b).zip(row.iter()) {
+                    j[q] = *jj;
+                    sx[q] = s[0];
+                    sy[q] = s[1];
+                    sz[q] = s[2];
+                }
+            }
+            code.resize(n, 0);
+            for k in 0..n {
+                if let Some(c) = encode_shift(sx[k], sy[k], sz[k]) {
+                    code[k] = c;
+                } else {
+                    coded = false;
+                    break;
                 }
             }
         }

@@ -423,6 +423,53 @@ impl PairColumns {
         self.i.is_empty()
     }
 
+    /// Unique unordered atom pairs `(i, j)` with `i < j`.
+    ///
+    /// Periodic self-images (`i == j`) are omitted.
+    pub fn sparsity(&self) -> Vec<(usize, usize)> {
+        let mut pairs = Vec::with_capacity(self.i.len());
+        for (&i, &j) in self.i.iter().zip(self.j.iter()) {
+            if i != j && i >= 0 && j >= 0 {
+                let a = i as usize;
+                let b = j as usize;
+                pairs.push(if a < b { (a, b) } else { (b, a) });
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
+
+    /// Sort the stored rows in place by `(i, j, shift)`.
+    ///
+    /// Columns of unequal length return [`Error::BufferSize`] and leave the
+    /// rows unchanged.
+    pub fn sort_rows(&mut self) -> Result<(), Error> {
+        let n = self.i.len();
+        if self.j.len() != n || self.shift.len() != n || self.dist2.len() != n {
+            return Err(Error::BufferSize);
+        }
+        if (1..n).all(|q| {
+            (self.i[q - 1], self.j[q - 1], self.shift[q - 1])
+                <= (self.i[q], self.j[q], self.shift[q])
+        }) {
+            return Ok(());
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&t| (self.i[t], self.j[t], self.shift[t]));
+        let old_i = self.i.clone();
+        let old_j = self.j.clone();
+        let old_shift = self.shift.clone();
+        let old_dist2 = self.dist2.clone();
+        for (dst, &src) in order.iter().enumerate() {
+            self.i[dst] = old_i[src];
+            self.j[dst] = old_j[src];
+            self.shift[dst] = old_shift[src];
+            self.dist2[dst] = old_dist2[src];
+        }
+        Ok(())
+    }
+
     /// [`advise_huge`] for every column.
     fn advise_huge(&mut self) {
         advise_huge(&mut self.i);
@@ -6032,5 +6079,42 @@ mod tests {
             })
             .expect("sha256 entry");
         assert_eq!(got, want, "update tests/golden/isa-hashes.toml");
+    }
+
+    #[test]
+    fn sort_rows_orders_rows_and_rejects_ragged_columns() {
+        let mut cols = PairColumns {
+            i: vec![1, 0, 0],
+            j: vec![2, 2, 1],
+            shift: vec![[0, 0, 0], [0, 0, 1], [0, 0, 0]],
+            dist2: vec![3.0, 2.0, 1.0],
+        };
+        cols.sort_rows().unwrap();
+        assert_eq!(cols.i, vec![0, 0, 1]);
+        assert_eq!(cols.j, vec![1, 2, 2]);
+        assert_eq!(cols.dist2, vec![1.0, 2.0, 3.0]);
+
+        for ragged in 0..4 {
+            let mut bad = PairColumns {
+                i: vec![1, 0],
+                j: vec![2, 2],
+                shift: vec![[0; 3], [0; 3]],
+                dist2: vec![1.0, 2.0],
+            };
+            match ragged {
+                0 => bad.j.pop(),
+                1 => bad.shift.pop().map(|_| 0),
+                2 => bad.dist2.pop().map(|_| 0),
+                _ => bad.i.pop(),
+            };
+            let before = (
+                bad.i.clone(),
+                bad.j.clone(),
+                bad.shift.clone(),
+                bad.dist2.clone(),
+            );
+            assert_eq!(bad.sort_rows(), Err(Error::BufferSize));
+            assert_eq!((bad.i, bad.j, bad.shift, bad.dist2), before);
+        }
     }
 }

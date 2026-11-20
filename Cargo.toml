@@ -40,7 +40,7 @@ scotch = []
 ptscotch = []
 
 [dependencies]
-minimage = { version = "0.2", default-features = false }
+minimage = { version = "0.2.3", default-features = false }
 rayon = { version = "1.10", optional = true }
 
 [build-dependencies]
