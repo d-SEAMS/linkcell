@@ -12,14 +12,15 @@
 //! the centroid, and unwraps any boundary-straddling bead onto the
 //! centroid otherwise. A bead whose minimum-image displacement from the
 //! positions at the last candidate build exceeds `skin / 2`, or a cell
-//! change, rebuilds the shared candidates from the stored bead coordinates.
+//! deformation that can move a pair by more than the remaining skin,
+//! rebuilds the shared candidates from the stored bead coordinates.
 
 use minimage::ring_centroid;
 
 use crate::cell::Cell;
 use crate::pairs::PairColumns;
 use crate::skin::{
-    filter_with_wraps, gather_candidates, lattice_wraps, moved_past_skin, same_lattice, WrapFrame,
+    filter_with_wraps, gather_candidates, lattice_wraps, same_lattice, skin_spent, WrapFrame,
 };
 use crate::skin_simd::Soa;
 use crate::Error;
@@ -27,7 +28,8 @@ use crate::Error;
 /// Shared candidate list and one filtered frame per bead.
 pub struct ReplicaList {
     cell: Cell,
-    ref_h: [[f64; 3]; 3],
+    ref_cell: Cell,
+    frames_cell: Cell,
     cutoff: f64,
     skin: f64,
     half: bool,
@@ -82,7 +84,8 @@ impl ReplicaList {
         let atoms = xyz.len() / beads;
         let mut list = Self {
             cell,
-            ref_h: cell.h(),
+            ref_cell: cell,
+            frames_cell: cell,
             cutoff,
             skin,
             half,
@@ -144,6 +147,10 @@ impl ReplicaList {
     }
 
     /// Replace the periodic cell for subsequent rebuild checks and updates.
+    ///
+    /// The stored rows keep the cell they were filtered in until the next
+    /// [`Self::update`], [`Self::update_bead`] or [`Self::filter_all`], each
+    /// of which refilters or rebuilds in the new cell.
     pub fn set_cell(&mut self, cell: Cell) {
         self.cell = cell;
     }
@@ -213,7 +220,8 @@ impl ReplicaList {
         self.frames.get(b).ok_or(Error::BufferSize)
     }
 
-    /// Single-shift vectors `q + H S - p` for the filtered rows of bead `b`.
+    /// Single-shift vectors `q + H S - p` for the filtered rows of bead `b`,
+    /// in the cell those rows were filtered in.
     pub fn vectors_of(&self, b: usize) -> Result<Vec<[f64; 3]>, Error> {
         let cols = self.bead(b)?;
         let base = b * self.atoms;
@@ -223,7 +231,7 @@ impl ReplicaList {
             let i = cols.i[t] as usize;
             let j = cols.j[t] as usize;
             let s = cols.shift[t];
-            let shift = self.cell.lattice_shift(s[0], s[1], s[2]);
+            let shift = self.frames_cell.lattice_shift(s[0], s[1], s[2]);
             let p = xyz[i];
             let q = xyz[j];
             out.push([
@@ -270,10 +278,20 @@ impl ReplicaList {
         {
             return true;
         }
-        if !same_lattice(cell.h(), self.ref_h) {
-            return true;
-        }
-        moved_past_skin(cell, &self.reference, xyz, self.skin)
+        skin_spent(
+            cell,
+            &self.ref_cell,
+            &self.reference,
+            xyz,
+            self.skin,
+            self.margin(),
+        )
+    }
+
+    /// Distance a lattice strain acts on: the shared reach less the ring
+    /// spread terms that cancel in `skin_spent`, `cutoff + skin`.
+    fn margin(&self) -> f64 {
+        self.cutoff + self.skin
     }
 
     /// `true` when per-bead `frames` are not covered by the shared candidate list.
@@ -284,20 +302,19 @@ impl ReplicaList {
         {
             return true;
         }
-        if !same_lattice(self.cell.h(), self.ref_h) {
-            return true;
-        }
         for (b, frame) in frames.iter().enumerate() {
             let slice = frame.as_ref();
             if slice.len() != self.atoms {
                 return true;
             }
             let base = b * self.atoms;
-            if moved_past_skin(
+            if skin_spent(
                 &self.cell,
+                &self.ref_cell,
                 &self.reference[base..base + self.atoms],
                 slice,
                 self.skin,
+                self.margin(),
             ) {
                 return true;
             }
@@ -312,15 +329,33 @@ impl ReplicaList {
     /// boundary relative to the centroid. A shift outside the packed code
     /// or a bead that straddles a periodic boundary relative to the
     /// centroid uses a pass per bead.
+    ///
+    /// When the cell or the sort mode no longer matches the shared build, or
+    /// the cell deformation has spent the skin, the shared candidates are
+    /// rebuilt from the stored bead coordinates first (counted in
+    /// [`Self::builds`]). If an error is returned, the stored frames and
+    /// candidates are unchanged.
     pub fn filter_all(&mut self) -> Result<(), Error> {
-        let frames =
-            self.filter_beads_from(&self.soa, &self.centroid, &self.reference, &self.last)?;
+        if self.needs_rebuild(&self.last) {
+            let last = self.last.clone();
+            self.rebuild_from(&last)?;
+            self.last_reused = false;
+            return Ok(());
+        }
+        let frames = self.filter_beads_from(
+            &self.soa,
+            &self.centroid,
+            &self.ref_cell,
+            &self.reference,
+            &self.last,
+        )?;
         self.frames = frames;
+        self.frames_cell = self.cell;
         Ok(())
     }
 
     /// Update all beads from bead-major `xyz`, rebuilding the shared
-    /// candidate list only when the skin is spent or the cell has changed.
+    /// candidate list only when the skin is spent by bead motion or cell strain.
     ///
     /// If an error is returned, all stored frames, reference coordinates,
     /// and counters are left unchanged.
@@ -337,9 +372,16 @@ impl ReplicaList {
             self.rebuild_from(xyz)?;
             self.last_reused = false;
         } else {
-            let frames = self.filter_beads_from(&self.soa, &self.centroid, &self.reference, xyz)?;
+            let frames = self.filter_beads_from(
+                &self.soa,
+                &self.centroid,
+                &self.ref_cell,
+                &self.reference,
+                xyz,
+            )?;
             self.last.copy_from_slice(xyz);
             self.frames = frames;
+            self.frames_cell = self.cell;
             self.reuses += 1;
             self.last_reused = true;
         }
@@ -377,8 +419,10 @@ impl ReplicaList {
 
     /// Replace bead `b` and return its filtered rows.
     ///
-    /// A move inside the skin only filters that bead. A larger move
-    /// or a cell change rebuilds the shared candidates and every bead's rows.
+    /// A move inside the skin only filters that bead. A larger move or a
+    /// cell strain that spends the skin rebuilds the shared candidates and
+    /// every bead's rows. After [`Self::set_cell`] without a rebuild, every
+    /// bead is refiltered in the new cell.
     /// If an error is returned, all stored frames, reference coordinates,
     /// and counters are left unchanged.
     pub fn update_bead(&mut self, b: usize, xyz: &[[f64; 3]]) -> Result<&PairColumns, Error> {
@@ -390,8 +434,14 @@ impl ReplicaList {
                 return Err(Error::NonFinite);
             }
         }
-        let moved = self.bead_moved(b, xyz);
         let base = b * self.atoms;
+        if !same_lattice(self.cell.h(), self.frames_cell.h()) {
+            let mut next = self.last.clone();
+            next[base..base + self.atoms].copy_from_slice(xyz);
+            self.update(&next)?;
+            return Ok(&self.frames[b]);
+        }
+        let moved = self.bead_moved(b, xyz);
         if moved {
             let mut next = self.last.clone();
             next[base..base + self.atoms].copy_from_slice(xyz);
@@ -403,6 +453,7 @@ impl ReplicaList {
                 &self.soa,
                 WrapFrame {
                     cell: &self.cell,
+                    ref_cell: &self.ref_cell,
                     anchor: &self.centroid,
                     reference: &self.reference[base..base + self.atoms],
                     xyz,
@@ -422,15 +473,17 @@ impl ReplicaList {
     }
 
     fn bead_moved(&self, b: usize, xyz: &[[f64; 3]]) -> bool {
-        if !same_lattice(self.cell.h(), self.ref_h) || self.sorted != self.ref_sorted {
+        if self.sorted != self.ref_sorted {
             return true;
         }
         let base = b * self.atoms;
-        moved_past_skin(
+        skin_spent(
             &self.cell,
+            &self.ref_cell,
             &self.reference[base..base + self.atoms],
             xyz,
             self.skin,
+            self.margin(),
         )
     }
 
@@ -451,14 +504,15 @@ impl ReplicaList {
         let spread = spread2.sqrt();
         let reach = self.cutoff + 2.0 * spread + self.skin;
         let soa = gather_candidates(&centroid, &self.cell, reach, self.half, self.sorted)?;
-        let frames = self.filter_beads_from(&soa, &centroid, xyz, xyz)?;
+        let frames = self.filter_beads_from(&soa, &centroid, &self.cell, xyz, xyz)?;
         self.soa = soa;
         self.centroid = centroid;
         self.reference.clear();
         self.reference.extend_from_slice(xyz);
         self.last.clear();
         self.last.extend_from_slice(xyz);
-        self.ref_h = self.cell.h();
+        self.ref_cell = self.cell;
+        self.frames_cell = self.cell;
         self.ref_sorted = self.sorted;
         self.spread = spread;
         self.frames = frames;
@@ -470,6 +524,7 @@ impl ReplicaList {
         &self,
         soa: &Soa,
         centroid: &[[f64; 3]],
+        ref_cell: &Cell,
         reference: &[[f64; 3]],
         xyz: &[[f64; 3]],
     ) -> Result<Vec<PairColumns>, Error> {
@@ -479,7 +534,7 @@ impl ReplicaList {
             let base = b * self.atoms;
             let ref_bead = &reference[base..base + self.atoms];
             let now_bead = &xyz[base..base + self.atoms];
-            if lattice_wraps(&self.cell, centroid, ref_bead, now_bead)?.is_some() {
+            if lattice_wraps(&self.cell, ref_cell, centroid, ref_bead, now_bead)?.is_some() {
                 any_wrapped = true;
                 break;
             }
@@ -498,6 +553,7 @@ impl ReplicaList {
                 soa,
                 WrapFrame {
                     cell: &self.cell,
+                    ref_cell,
                     anchor: centroid,
                     reference: &reference[start..start + self.atoms],
                     xyz: &xyz[start..start + self.atoms],
@@ -722,5 +778,269 @@ mod tests {
         assert!(!wrap_rep.last_reused());
         assert_eq!(wrap_rep.bead(0).unwrap(), &wrap_b0_before);
         assert_eq!(wrap_rep.bead(1).unwrap(), &wrap_b1_before);
+    }
+
+    fn fresh_rows(
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+        cutoff: f64,
+        half: bool,
+    ) -> Vec<(i32, i32, [i32; 3])> {
+        let mut fresh = PairColumns::default();
+        pairs_within_columns(xyz, cell, cutoff, None, None, half, &mut fresh).unwrap();
+        canon(&fresh)
+    }
+
+    #[test]
+    fn filter_all_after_a_shrinking_cell_finds_the_new_periodic_pair() {
+        let big = Cell::ortho(20.0, 20.0, 20.0).unwrap();
+        let small = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let bead = [[0.1, 5.0, 5.0], [9.9, 5.0, 5.0]];
+        let xyz: Vec<[f64; 3]> = bead.iter().chain(bead.iter()).copied().collect();
+        let mut rep = ReplicaList::build(&xyz, 2, big, 1.0, 0.2, true).unwrap();
+        assert!(rep.bead(0).unwrap().is_empty());
+        rep.set_cell(small);
+        assert!(rep.needs_rebuild(&xyz));
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 2);
+        let want = fresh_rows(&bead, &small, 1.0, true);
+        assert_eq!(want.len(), 1);
+        for b in 0..2 {
+            assert_eq!(canon(rep.bead(b).unwrap()), want);
+            let v = rep.vectors_of(b).unwrap();
+            assert_eq!(v.len(), 1);
+            assert!((v[0][0].abs() - 0.2).abs() <= 1e-12);
+        }
+        assert!(!rep.needs_rebuild(&xyz));
+    }
+
+    #[test]
+    fn update_bead_after_set_cell_refilters_every_bead() {
+        let big = Cell::ortho(20.0, 20.0, 20.0).unwrap();
+        let small = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let bead = [[0.1, 5.0, 5.0], [9.9, 5.0, 5.0]];
+        let xyz: Vec<[f64; 3]> = bead.iter().chain(bead.iter()).copied().collect();
+        let mut rep = ReplicaList::build(&xyz, 2, big, 1.0, 0.2, true).unwrap();
+        rep.set_cell(small);
+        let want = fresh_rows(&bead, &small, 1.0, true);
+        assert_eq!(canon(rep.update_bead(0, &bead).unwrap()), want);
+        assert_eq!(canon(rep.bead(1).unwrap()), want);
+    }
+
+    #[test]
+    fn set_sorted_after_a_build_is_honoured_by_filter_all() {
+        let cell = Cell::ortho(12.0, 12.0, 12.0).unwrap();
+        let mut state = 3_u64;
+        let mut next = || -> f64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 12.0
+        };
+        let bead: Vec<[f64; 3]> = (0..50).map(|_| [next(), next(), next()]).collect();
+        let xyz: Vec<[f64; 3]> = bead.iter().chain(bead.iter()).copied().collect();
+        let mut rep = ReplicaList::build(&xyz, 2, cell, 3.0, 0.4, false).unwrap();
+        rep.set_sorted(true);
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 2);
+        let c = rep.bead(0).unwrap();
+        assert!((1..c.len())
+            .all(|q| { (c.i[q - 1], c.j[q - 1], c.shift[q - 1]) <= (c.i[q], c.j[q], c.shift[q]) }));
+        assert_eq!(canon(c), fresh_rows(&bead, &cell, 3.0, false));
+    }
+
+    #[test]
+    fn filter_all_after_a_small_strain_reuses_and_vectors_follow_the_rows() {
+        let cell0 = Cell::ortho(14.0, 14.0, 14.0).unwrap();
+        let cell1 = Cell::from_vectors(
+            [14.02, 0.0, 0.0],
+            [0.05, 13.99, 0.0],
+            [0.0, 0.03, 14.01],
+            [0.0; 3],
+        )
+        .unwrap();
+        let mut state = 9_u64;
+        let mut next = || -> f64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 14.0
+        };
+        let bead: Vec<[f64; 3]> = (0..60).map(|_| [next(), next(), next()]).collect();
+        let xyz: Vec<[f64; 3]> = bead.iter().chain(bead.iter()).copied().collect();
+        let mut rep = ReplicaList::build(&xyz, 2, cell0, 3.0, 0.8, true).unwrap();
+        rep.set_cell(cell1);
+        assert!(!rep.needs_rebuild(&xyz));
+        let stale = rep.vectors_of(0).unwrap();
+        assert_eq!(stale.len(), rep.bead(0).unwrap().len());
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 1);
+        assert_eq!(
+            canon(rep.bead(0).unwrap()),
+            fresh_rows(&bead, &cell1, 3.0, true)
+        );
+        let c = rep.bead(1).unwrap();
+        let v = rep.vectors_of(1).unwrap();
+        for t in 0..c.len() {
+            let s = cell1.lattice_shift(c.shift[t][0], c.shift[t][1], c.shift[t][2]);
+            let (p, q) = (bead[c.i[t] as usize], bead[c.j[t] as usize]);
+            assert_eq!(
+                v[t],
+                [q[0] + s[0] - p[0], q[1] + s[1] - p[1], q[2] + s[2] - p[2]]
+            );
+        }
+    }
+
+    #[test]
+    fn npt_like_strain_sequence_matches_brute_force_for_every_bead() {
+        let (cutoff, skin_width, beads, atoms) = (2.4, 0.9, 3, 40);
+        for seed in [5_u64, 17] {
+            for half in [true, false] {
+                let mut state = seed;
+                let mut next = move || -> f64 {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state >> 11) as f64 / (1u64 << 53) as f64
+                };
+                let mut par = [9.0, 8.5, 9.5, 1.5, -1.0, 2.0];
+                let build = |par: &[f64; 6]| {
+                    Cell::from_vectors(
+                        [par[0], 0.0, 0.0],
+                        [par[3], par[1], 0.0],
+                        [par[4], par[5], par[2]],
+                        [0.0; 3],
+                    )
+                    .unwrap()
+                };
+                let mut cell = build(&par);
+                let mut xyz = vec![[0.0; 3]; beads * atoms];
+                for a in 0..atoms {
+                    let c = cell.cartesian([next(), next(), next()]);
+                    for b in 0..beads {
+                        xyz[b * atoms + a] = [
+                            c[0] + (next() - 0.5) * 0.3,
+                            c[1] + (next() - 0.5) * 0.3,
+                            c[2] + (next() - 0.5) * 0.3,
+                        ];
+                    }
+                }
+                let mut rep =
+                    ReplicaList::build(&xyz, beads, cell, cutoff, skin_width, half).unwrap();
+                let frames = 200;
+                for _ in 1..frames {
+                    let old = cell;
+                    for e in par.iter_mut().take(3) {
+                        *e *= 1.0 + (next() - 0.5) * 0.03;
+                    }
+                    for e in par.iter_mut().skip(3) {
+                        *e += (next() - 0.5) * 0.2;
+                    }
+                    cell = build(&par);
+                    let (h1, hinv0) = (cell.h(), old.hinv());
+                    for p in xyz.iter_mut() {
+                        let s = [
+                            hinv0[0][0] * p[0] + hinv0[1][0] * p[1] + hinv0[2][0] * p[2],
+                            hinv0[0][1] * p[0] + hinv0[1][1] * p[1] + hinv0[2][1] * p[2],
+                            hinv0[0][2] * p[0] + hinv0[1][2] * p[1] + hinv0[2][2] * p[2],
+                        ];
+                        *p = [
+                            h1[0][0] * s[0]
+                                + h1[1][0] * s[1]
+                                + h1[2][0] * s[2]
+                                + (next() - 0.5) * 0.03,
+                            h1[0][1] * s[0]
+                                + h1[1][1] * s[1]
+                                + h1[2][1] * s[2]
+                                + (next() - 0.5) * 0.03,
+                            h1[0][2] * s[0]
+                                + h1[1][2] * s[1]
+                                + h1[2][2] * s[2]
+                                + (next() - 0.5) * 0.03,
+                        ];
+                    }
+                    for a in 0..atoms {
+                        if next() < 0.1 {
+                            let n = [
+                                (next() * 3.0).floor() as i32 - 1,
+                                0,
+                                (next() * 3.0).floor() as i32 - 1,
+                            ];
+                            let t = cell.lattice_shift(n[0], n[1], n[2]);
+                            for b in 0..beads {
+                                let p = &mut xyz[b * atoms + a];
+                                *p = [p[0] + t[0], p[1] + t[1], p[2] + t[2]];
+                            }
+                        }
+                    }
+                    rep.set_cell(cell);
+                    rep.update(&xyz).unwrap();
+                    for b in 0..beads {
+                        let bead = &xyz[b * atoms..(b + 1) * atoms];
+                        assert_eq!(
+                            canon(rep.bead(b).unwrap()),
+                            fresh_rows(bead, &cell, cutoff, half)
+                        );
+                    }
+                }
+                assert_eq!(rep.builds() + rep.reuses(), frames as u64);
+                assert!(rep.builds() >= 3, "strain never spent the skin");
+                assert!(
+                    rep.reuses() * 4 >= frames as u64,
+                    "rebuilt on almost every frame"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn isotropic_strain_of_a_ring_list_rebuilds_at_the_skin_threshold() {
+        let (cutoff, skin_width, beads, atoms) = (2.0, 0.8, 2, 60);
+        let cell0 =
+            Cell::from_vectors([9.0, 0.0, 0.0], [1.5, 8.0, 0.0], [-1.0, 2.0, 7.5], [0.0; 3])
+                .unwrap();
+        let mut state = 0xface_u64;
+        let mut next = || -> f64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut xyz = vec![[0.0; 3]; beads * atoms];
+        for a in 0..atoms {
+            let c = cell0.cartesian([next(), next(), next()]);
+            let d = [
+                (next() - 0.5) * 0.5,
+                (next() - 0.5) * 0.5,
+                (next() - 0.5) * 0.5,
+            ];
+            xyz[a] = [c[0] + d[0], c[1] + d[1], c[2] + d[2]];
+            xyz[atoms + a] = [c[0] - d[0], c[1] - d[1], c[2] - d[2]];
+        }
+        let edge = skin_width / (cutoff + skin_width);
+        for (scale, rebuilds) in [(0.5, false), (0.97, false), (1.03, true), (1.5, true)] {
+            for sign in [1.0, -1.0] {
+                let f = 1.0 + sign * scale * edge;
+                let h = cell0.h();
+                let cell = Cell::from_vectors(
+                    [h[0][0] * f, h[0][1] * f, h[0][2] * f],
+                    [h[1][0] * f, h[1][1] * f, h[1][2] * f],
+                    [h[2][0] * f, h[2][1] * f, h[2][2] * f],
+                    [0.0; 3],
+                )
+                .unwrap();
+                let scaled: Vec<[f64; 3]> =
+                    xyz.iter().map(|p| [p[0] * f, p[1] * f, p[2] * f]).collect();
+                let mut rep =
+                    ReplicaList::build(&xyz, beads, cell0, cutoff, skin_width, true).unwrap();
+                rep.set_cell(cell);
+                assert_eq!(
+                    rep.needs_rebuild(&scaled),
+                    rebuilds,
+                    "scale {scale} sign {sign}"
+                );
+                rep.update(&scaled).unwrap();
+                assert_eq!(rep.builds(), if rebuilds { 2 } else { 1 });
+                for b in 0..beads {
+                    let bead = &scaled[b * atoms..(b + 1) * atoms];
+                    assert_eq!(
+                        canon(rep.bead(b).unwrap()),
+                        fresh_rows(bead, &cell, cutoff, true)
+                    );
+                }
+            }
+        }
     }
 }
