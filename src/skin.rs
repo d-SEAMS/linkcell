@@ -242,6 +242,9 @@ impl SkinList {
         if xyz.is_empty() {
             return Err(Error::Empty);
         }
+        if self.reuse_inside_primary_image(xyz, want_vector)? {
+            return Ok(&self.cols);
+        }
         for p in xyz {
             if !p[0].is_finite() || !p[1].is_finite() || !p[2].is_finite() {
                 return Err(Error::NonFinite);
@@ -311,6 +314,47 @@ impl SkinList {
             self.last_reused = true;
         }
         Ok(&self.cols)
+    }
+
+    /// Reuse when every raw displacement is the orthorhombic minimum image
+    /// and lies inside the skin.
+    ///
+    /// Returns `Ok(true)` after filtering. `Ok(false)` leaves the list
+    /// untouched: the atom may have crossed into another image, or the skin
+    /// is already spent, and the caller takes the general path.
+    fn reuse_inside_primary_image(
+        &mut self,
+        xyz: &[[f64; 3]],
+        want_vector: bool,
+    ) -> Result<bool, Error> {
+        if self.periodic != [true, true, true]
+            || !self.built
+            || self.skin == 0.0
+            || xyz.len() != self.reference.len()
+            || self.sorted != self.ref_sorted
+            || !self.cell.is_ortho()
+            || !same_lattice(self.cell.h(), self.ref_cell.h())
+        {
+            return Ok(false);
+        }
+        if !ortho_primary_inside(&self.cell, &self.reference, xyz, self.skin)? {
+            return Ok(false);
+        }
+        self.soa.filter(
+            xyz,
+            &self.cell,
+            self.cutoff * self.cutoff,
+            want_vector,
+            &mut self.d2,
+            &mut self.cols,
+            &mut self.vectors,
+        )?;
+        if self.sorted {
+            sort_columns_in_place(&mut self.cols, &mut self.vectors, want_vector);
+        }
+        self.reuses += 1;
+        self.last_reused = true;
+        Ok(true)
     }
 
     /// Replace the cell and filter `xyz`, rebuilding first if needed.
@@ -467,6 +511,71 @@ pub(crate) fn map_reference(ref_cell: &Cell, cell: &Cell, p: [f64; 3]) -> [f64; 
     let o = ref_cell.origin();
     let s = mul_cols(ref_cell.hinv(), [p[0] - o[0], p[1] - o[1], p[2] - o[2]]);
     cell.cartesian(s)
+}
+
+/// `true` when every raw displacement is the orthorhombic minimum image
+/// and lies within `skin / 2`.
+///
+/// The orthorhombic wrap returns the raw vector on `(-L/2, L/2)`. When
+/// `(skin / 2)^2` is strictly below `(L/2)^2` on every axis, a raw length
+/// inside the skin is already inside that interval, and the per-atom test
+/// is the raw length alone. Otherwise each component is compared with
+/// `L/2`. Either failure leaves the minimum-image path to the caller.
+/// A NaN displacement is [`Error::NonFinite`]. Infinite distances fall
+/// through so a finite coordinate whose difference overflows is handled
+/// by that path.
+fn ortho_primary_inside(
+    cell: &Cell,
+    reference: &[[f64; 3]],
+    xyz: &[[f64; 3]],
+    skin: f64,
+) -> Result<bool, Error> {
+    if reference.len() != xyz.len() {
+        return Ok(false);
+    }
+    let w = cell.widths();
+    let half = [0.5 * w[0], 0.5 * w[1], 0.5 * w[2]];
+    let room = 0.5 * skin;
+    let room2 = room * room;
+    let inside_skin_is_primary =
+        room2 < half[0] * half[0] && room2 < half[1] * half[1] && room2 < half[2] * half[2];
+    if inside_skin_is_primary {
+        for (r, p) in reference.iter().zip(xyz.iter()) {
+            let dx = p[0] - r[0];
+            let dy = p[1] - r[1];
+            let dz = p[2] - r[2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2.is_nan() {
+                return Err(Error::NonFinite);
+            }
+            if d2 > room2 {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    for (r, p) in reference.iter().zip(xyz.iter()) {
+        let dx = p[0] - r[0];
+        let dy = p[1] - r[1];
+        let dz = p[2] - r[2];
+        let primary = dx > -half[0]
+            && dx < half[0]
+            && dy > -half[1]
+            && dy < half[1]
+            && dz > -half[2]
+            && dz < half[2];
+        if !primary {
+            return Ok(false);
+        }
+        let d2 = dx * dx + dy * dy + dz * dz;
+        if d2.is_nan() {
+            return Err(Error::NonFinite);
+        }
+        if d2 > room2 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn moved_past_skin(
@@ -1610,5 +1719,23 @@ mod tests {
         assert!(!wrap_list.last_reused());
         assert_eq!(wrap_list.columns(), &wrap_cols_before);
         assert_eq!(wrap_list.vectors(), &wrap_vecs_before[..]);
+    }
+
+    #[test]
+    fn half_box_shift_is_not_treated_as_a_primary_image() {
+        let cell = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let mut skin = SkinList::new(cell, 6.0, 12.0, true).unwrap();
+        let xyz0 = [[1.0, 1.0, 1.0], [1.5, 1.0, 1.0]];
+        skin.update(&xyz0, false).unwrap();
+        let xyz1 = [[1.0, 1.0, 1.0], [6.5, 1.0, 1.0]];
+        assert!(!skin.needs_rebuild(&xyz1));
+        skin.update(&xyz1, false).unwrap();
+        assert!(skin.last_reused());
+        assert_eq!(skin.builds(), 1);
+        let mut fresh = PairColumns::default();
+        pairs_within_columns(&xyz1, &cell, 6.0, None, None, true, &mut fresh).unwrap();
+        let fresh_rows = set_of(&fresh);
+        assert!(fresh_rows.iter().any(|row| row.2 != [0, 0, 0]));
+        assert_eq!(set_of(skin.columns()), fresh_rows);
     }
 }

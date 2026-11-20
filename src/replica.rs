@@ -51,6 +51,12 @@ pub struct ReplicaList {
     builds: u64,
     reuses: u64,
     last_reused: bool,
+    /// `last`, the cell, and the sort mode have been classified for `filter_all`.
+    /// Cleared when any of those inputs change.
+    filter_known: bool,
+    /// A stored bead crosses a periodic boundary relative to the centroid.
+    /// Meaningful only while `filter_known` is set.
+    filter_wrapped: bool,
 }
 
 impl ReplicaList {
@@ -103,6 +109,8 @@ impl ReplicaList {
             builds: 0,
             reuses: 0,
             last_reused: false,
+            filter_known: false,
+            filter_wrapped: false,
         };
         list.rebuild_from(&list.last.clone())?;
         Ok(list)
@@ -153,6 +161,7 @@ impl ReplicaList {
     /// of which refilters or rebuilds in the new cell.
     pub fn set_cell(&mut self, cell: Cell) {
         self.cell = cell;
+        self.filter_known = false;
     }
 
     /// Cutoff the bead rows were filtered to.
@@ -178,6 +187,7 @@ impl ReplicaList {
     /// Enable or disable canonical `(i, j, shift)` row sorting on rebuild and filter.
     pub fn set_sorted(&mut self, sorted: bool) {
         self.sorted = sorted;
+        self.filter_known = false;
     }
 
     /// Number of beads.
@@ -336,18 +346,61 @@ impl ReplicaList {
     /// [`Self::builds`]). If an error is returned, the stored frames and
     /// candidates are unchanged.
     pub fn filter_all(&mut self) -> Result<(), Error> {
+        if self.filter_known {
+            self.refill_cached()?;
+            return Ok(());
+        }
         if self.needs_rebuild(&self.last) {
             let last = self.last.clone();
             self.rebuild_from(&last)?;
             self.last_reused = false;
             return Ok(());
         }
-        let frames = self.filter_beads_from(
+        let wrapped = any_bead_wrapped(
+            &self.cell,
+            &self.ref_cell,
+            &self.centroid,
+            &self.reference,
+            &self.last,
+            self.beads,
+            self.atoms,
+        )?;
+        let frames = self.frames_from(
             &self.soa,
             &self.centroid,
             &self.ref_cell,
             &self.reference,
             &self.last,
+            wrapped,
+        )?;
+        self.frames = frames;
+        self.frames_cell = self.cell;
+        self.filter_wrapped = wrapped;
+        self.filter_known = true;
+        Ok(())
+    }
+
+    /// Filter the stored beads with the classification `filter_all` already made.
+    ///
+    /// The coded no-wrap path writes the existing frames. `filter_beads` reports
+    /// [`Error::BufferSize`] before it stores a row, so a failure leaves them
+    /// unchanged. A wrapped bead still builds new frames and installs them
+    /// only after every bead succeeds.
+    fn refill_cached(&mut self) -> Result<(), Error> {
+        let cut2 = self.cutoff * self.cutoff;
+        if self.soa.is_coded() && !self.filter_wrapped {
+            self.soa
+                .filter_beads(&self.last, self.beads, &self.cell, cut2, &mut self.frames)?;
+            self.frames_cell = self.cell;
+            return Ok(());
+        }
+        let frames = self.frames_from(
+            &self.soa,
+            &self.centroid,
+            &self.ref_cell,
+            &self.reference,
+            &self.last,
+            self.filter_wrapped,
         )?;
         self.frames = frames;
         self.frames_cell = self.cell;
@@ -384,6 +437,7 @@ impl ReplicaList {
             self.frames_cell = self.cell;
             self.reuses += 1;
             self.last_reused = true;
+            self.filter_known = false;
         }
         Ok(())
     }
@@ -468,6 +522,7 @@ impl ReplicaList {
             self.last[base..base + self.atoms].copy_from_slice(xyz);
             self.reuses += 1;
             self.last_reused = true;
+            self.filter_known = false;
         }
         Ok(&self.frames[b])
     }
@@ -517,6 +572,7 @@ impl ReplicaList {
         self.spread = spread;
         self.frames = frames;
         self.builds += 1;
+        self.filter_known = false;
         Ok(())
     }
 
@@ -528,17 +584,22 @@ impl ReplicaList {
         reference: &[[f64; 3]],
         xyz: &[[f64; 3]],
     ) -> Result<Vec<PairColumns>, Error> {
+        let any_wrapped = any_bead_wrapped(
+            &self.cell, ref_cell, centroid, reference, xyz, self.beads, self.atoms,
+        )?;
+        self.frames_from(soa, centroid, ref_cell, reference, xyz, any_wrapped)
+    }
+
+    fn frames_from(
+        &self,
+        soa: &Soa,
+        centroid: &[[f64; 3]],
+        ref_cell: &Cell,
+        reference: &[[f64; 3]],
+        xyz: &[[f64; 3]],
+        any_wrapped: bool,
+    ) -> Result<Vec<PairColumns>, Error> {
         let cut2 = self.cutoff * self.cutoff;
-        let mut any_wrapped = false;
-        for b in 0..self.beads {
-            let base = b * self.atoms;
-            let ref_bead = &reference[base..base + self.atoms];
-            let now_bead = &xyz[base..base + self.atoms];
-            if lattice_wraps(&self.cell, ref_cell, centroid, ref_bead, now_bead)?.is_some() {
-                any_wrapped = true;
-                break;
-            }
-        }
         let mut frames: Vec<PairColumns> =
             (0..self.beads).map(|_| PairColumns::default()).collect();
         if soa.is_coded() && !any_wrapped {
@@ -568,6 +629,33 @@ impl ReplicaList {
         }
         Ok(frames)
     }
+}
+
+fn any_bead_wrapped(
+    cell: &Cell,
+    ref_cell: &Cell,
+    centroid: &[[f64; 3]],
+    reference: &[[f64; 3]],
+    xyz: &[[f64; 3]],
+    beads: usize,
+    atoms: usize,
+) -> Result<bool, Error> {
+    for b in 0..beads {
+        let base = b * atoms;
+        let end = base + atoms;
+        if lattice_wraps(
+            cell,
+            ref_cell,
+            centroid,
+            &reference[base..end],
+            &xyz[base..end],
+        )?
+        .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1042,5 +1130,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn repeated_filter_all_stays_cached_until_cell_sort_or_bead_changes() {
+        let big = Cell::ortho(20.0, 20.0, 20.0).unwrap();
+        let small = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let bead = [[0.1, 5.0, 5.0], [9.9, 5.0, 5.0]];
+        let xyz: Vec<[f64; 3]> = bead.iter().chain(bead.iter()).copied().collect();
+        let mut rep = ReplicaList::build(&xyz, 2, big, 1.0, 0.2, true).unwrap();
+        rep.filter_all().unwrap();
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 1);
+        assert!(rep.bead(0).unwrap().is_empty());
+
+        rep.set_cell(small);
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 2);
+        let want = fresh_rows(&bead, &small, 1.0, true);
+        assert_eq!(want.len(), 1);
+        assert_eq!(canon(rep.bead(0).unwrap()), want);
+        assert_eq!(canon(rep.bead(1).unwrap()), want);
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 2);
+        assert_eq!(canon(rep.bead(0).unwrap()), want);
+
+        rep.set_sorted(true);
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 3);
+        let sorted_rows = canon(rep.bead(0).unwrap());
+        assert_eq!(sorted_rows, want);
+        rep.filter_all().unwrap();
+        assert_eq!(rep.builds(), 3);
+        assert_eq!(canon(rep.bead(0).unwrap()), sorted_rows);
+
+        let moved = [[0.15, 5.0, 5.0], [9.85, 5.0, 5.0]];
+        rep.update_bead(0, &moved).unwrap();
+        rep.filter_all().unwrap();
+        assert_eq!(
+            canon(rep.bead(0).unwrap()),
+            fresh_rows(&moved, &small, 1.0, true)
+        );
+        assert_eq!(canon(rep.bead(1).unwrap()), want);
     }
 }
