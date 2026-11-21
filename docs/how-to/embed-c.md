@@ -19,7 +19,7 @@ On failure, read `lc_last_error()` on the same thread and keep the pointer.
 ```
 [wrap-git]
 url = https://github.com/d-SEAMS/linkcell.git
-revision = v0.4.3
+revision = v0.5.0
 depth = 1
 
 [provide]
@@ -50,7 +50,7 @@ After `cmake --install` into `$PREFIX`:
 ```cmake
 cmake_minimum_required(VERSION 3.22)
 project(app LANGUAGES C)
-find_package(linkcell 0.4 REQUIRED)
+find_package(linkcell 0.5 REQUIRED)
 add_executable(app app.c)
 target_link_libraries(app PRIVATE linkcell::linkcell)
 ```

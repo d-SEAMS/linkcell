@@ -1,1 +1,0 @@
-Fully periodic orthorhombic `SkinList` reuse filters at once when every raw displacement stays inside the primary image and the skin, instead of scanning minimum-image motion and lattice wraps first. Repeated `ReplicaList::filter_all` calls keep that classification for the stored coordinates, cell, and sort mode, and drop it when any of those change.

@@ -26,7 +26,7 @@ executable('app', 'app.cpp', dependencies: linkcell_dep)
 cmake_minimum_required(VERSION 3.22)
 project(app LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
-find_package(linkcell 0.4 REQUIRED)
+find_package(linkcell 0.5 REQUIRED)
 add_executable(app app.cpp)
 target_link_libraries(app PRIVATE linkcell::cpp)
 ```

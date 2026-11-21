@@ -1,1 +1,0 @@
-The algorithm reference states the cost of the cutoff list and the k-nearest walk, including the triclinic basis and the caps on images and bins. The C reference lists the remaining entry points. A features page records the Cargo flags and the instruction-set builds.

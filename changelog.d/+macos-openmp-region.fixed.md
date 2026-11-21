@@ -1,1 +1,0 @@
-The k-nearest team builds and runs on macOS with libomp. Its barrier sleeps on a condition variable where Linux uses a futex, and `pin_knearest_to_least_loaded` and the OpenMP place list leave workers where the scheduler puts them, since macOS has no CPU affinity.
