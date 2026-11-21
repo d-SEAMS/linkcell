@@ -1,1 +1,0 @@
-Rayon workers started after `lc_set_places` may each run on any cpu of the list instead of one cpu each. Tied to a cpu that another process was using, a worker held up the search while work stealing could not move it: the 110592-molecule k-nearest search beside an 8-thread spinner took 78 ms instead of 36. Idle timings are unchanged.

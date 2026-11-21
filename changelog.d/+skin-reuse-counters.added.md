@@ -1,1 +1,0 @@
-`SkinList` now tracks build and reuse counts (`builds`, `reuses`, `last_reused`), reports `max_displacement`, accepts cell updates (`set_cell`) and per-axis periodicity (`with_periodic`), and canonicalizes half-list candidate rows so filtered pair order is independent of skin width.
