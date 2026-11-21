@@ -6,3 +6,5 @@ option('with_examples', type: 'boolean', value: true,
   description: 'Build C and C++ example programs')
 option('with_gpulite', type: 'feature', value: 'auto',
   description: 'Device k-nearest via gpulite (NVRTC, no CUDA SDK)')
+option('use_openmp', type: 'boolean', value: true,
+  description: 'Compile the fused k-nearest OpenMP region and link the compiler OpenMP runtime')
