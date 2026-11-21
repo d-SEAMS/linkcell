@@ -3,7 +3,7 @@ project(linkcell-consumer LANGUAGES C CXX)
 
 # Installed-prefix contract: find_package(linkcell) yields CPU and GPU targets
 # with their include, language, and transitive link requirements.
-find_package(linkcell 0.4 REQUIRED CONFIG)
+find_package(linkcell 0.5 REQUIRED CONFIG)
 if(NOT TARGET linkcell::linkcell)
   message(FATAL_ERROR "find_package(linkcell) did not define linkcell::linkcell")
 endif()

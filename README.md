@@ -77,7 +77,7 @@ As a wrap, Meson exposes `linkcell_dep`:
 ```
 [wrap-git]
 url = https://github.com/d-SEAMS/linkcell.git
-revision = v0.4.3
+revision = v0.5.0
 depth = 1
 
 [provide]
@@ -104,7 +104,7 @@ cmake --install build
 ```
 
 ```cmake
-find_package(linkcell 0.4 REQUIRED)
+find_package(linkcell 0.5 REQUIRED)
 target_link_libraries(c_app PRIVATE linkcell::linkcell)
 target_link_libraries(cpp_app PRIVATE linkcell::cpp)
 target_link_libraries(device_app PRIVATE linkcell::gpu)
