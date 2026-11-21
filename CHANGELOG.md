@@ -11,12 +11,13 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 <!-- towncrier release notes start -->
 #skip_lint_end
 
-## [0.5.0] - 2026-11-21
+## [0.5.0] - 2026-11-20
 
 ### Added
 
 - Add `ReplicaList::from_frames`, `update`, `update_in`, `update_frames`, `needs_rebuild`, `needs_rebuild_in`, `needs_rebuild_frames`, `vectors_of`, `centroid`, cell and query accessors, and `builds`, `reuses` and `last_reused` counters matching `SkinList`. Add `PairColumns::sparsity`, `PairColumns::sort_rows` (returns `Error::BufferSize` for columns of unequal length), `SkinList::sparsity`, `half`, `sorted`, `set_sorted`, `needs_rebuild_in` and `update_in`.
 - The Python package has a `numpy` extra: `pip install linkcell[numpy]` installs `numpy>=1.26` for ndarray output. NumPy stays optional, and without it results are DLPack arrays.
+- `scripts/seo.py` is the MkDocs hook named in `mkdocs.yml`. After the site is built it gives every HTML page one title, a description, a canonical link, Open Graph and Twitter card tags, and JSON-LD for `SoftwareApplication` and `SoftwareSourceCode`. It writes `sitemap.xml` and a `robots.txt` that allows crawling and names that sitemap. `python3 scripts/seo.py --check` rejects a page that is missing any of those, a duplicate title or description, or a sitemap that does not match the canonical URLs.
 - `LIBOMP_PREFIX` names the libomp prefix (`include/omp.h` and `lib/libomp.dylib`) for macOS source builds, ahead of Homebrew's. The macOS wheels build libomp for their deployment target with `scripts/build-libomp-macos.sh` and bundle it.
 - `SkinList` now tracks build and reuse counts (`builds`, `reuses`, `last_reused`), reports `max_displacement`, accepts cell updates (`set_cell`) and per-axis periodicity (`with_periodic`), and canonicalizes half-list candidate rows so filtered pair order is independent of skin width.
 
@@ -25,6 +26,7 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 - Fully periodic orthorhombic `SkinList` reuse filters at once when every raw displacement stays inside the primary image and the skin, instead of scanning minimum-image motion and lattice wraps first. Repeated `ReplicaList::filter_all` calls keep that classification for the stored coordinates, cell, and sort mode, and drop it when any of those change.
 - The algorithm reference states the cost of the cutoff list and the k-nearest walk, including the triclinic basis and the caps on images and bins. The C reference lists the remaining entry points. A features page records the Cargo flags and the instruction-set builds.
 - The documentation site moves to https://linkcell.dseams.info/; the package metadata, README, mkdocs `site_url` and `llms.txt` name the new address.
+- The documentation site and the rustdoc pages use the shared d-SEAMS theme. `mkdocs.yml` sets `theme` to Material with `custom_dir: overrides`, and the site loads `docs/stylesheets/dseams-tokens.css`, `dseams-family.css` and `dseams-mkdocs.css`. The family bar is `overrides/partials/dseams-family.html`. rustdoc applies the same tokens and header with `--extend-css assets/rustdoc/dseams-rustdoc.css`, `--html-before-content assets/rustdoc/dseams-rustdoc-before.html` and `--html-in-header assets/rustdoc/dseams-rustdoc-head.html`. The header, palette, type scale and logo follow dseams.info.
 - The k-nearest mesh is scattered by bin owner.
   Each worker counts and places the points of its own run of bins, so the build has no atomic counters.
   Each bin still lists its points in ascending order, so the neighbour order is unchanged at every pool width.
@@ -54,7 +56,7 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
   A team of one runs on the calling thread. For that query it takes the pinned CPU, or the place of slot 0, and then gets its own mask back. A standing team is joined when the size drops to one.
   Under libomp, clang uses libomp's bind kind and place list. A `libgomp.so.1` that resolves to libomp does the same. With `OMP_PLACES` set and `OMP_PROC_BIND` unset, libomp reports `spread` where libgomp reports `true`. The workers take that placement.
 - The k-nearest team now compiles on macOS with libomp, and its searches complete there. Its barrier sleeps on a condition variable where Linux uses a futex, and `pin_knearest_to_least_loaded` and the OpenMP place list leave workers where the scheduler puts them, since macOS has no CPU affinity.
-- `NeighborCalc::compute` updates its stored `SkinList` cell on every call so periodic box changes rebuild the candidate list instead of reusing shifts from the initial cell.
+- `NeighborCalc::compute` updates its stored `SkinList` cell on every call. A changed cell no longer forces a rebuild: the candidates are kept while twice the largest displacement from the fractionally carried reference plus `|H' H0^-1 - I| (cutoff + skin)` stays within `skin`, which is valid for any triclinic cell. The stored list no longer reuses shifts from the initial cell.
 - `SkinList` and `ReplicaList` store packed periodic shift codes in `[-3, 3]^3` as `u16` instead of `u8`, so codes `256..=342` (`sx >= 2`) no longer wrap in release builds or panic on overflow in debug builds.
 - `rust-version` in `Cargo.toml` is now 1.80, the oldest Rust that builds and
   tests the default `parallel` feature: the locked rayon 1.12 and rayon-core 1.13
