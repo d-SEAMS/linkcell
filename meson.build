@@ -31,6 +31,11 @@ else
 endif
 
 _profile = get_option('buildtype') == 'debug' ? 'debug' : 'release'
+_omp_supported = host_machine.system() == 'linux' or host_machine.system() == 'darwin'
+_use_openmp = get_option('use_openmp') and _omp_supported
+if get_option('use_openmp') and not _omp_supported
+  warning('use_openmp=true is not supported on ' + host_machine.system() + '; building without OpenMP')
+endif
 
 _cargo_outputs = [cargo_shared, cargo_static]
 _cargo_install_dirs = [get_option('libdir'), get_option('libdir')]
@@ -46,6 +51,7 @@ _cargo_command = [
   '--out-shared', '@OUTPUT0@',
   '--out-static', '@OUTPUT1@',
   '--depfile', '@DEPFILE@',
+  '--openmp', _use_openmp ? 'true' : 'false',
 ]
 if host_machine.system() == 'windows'
   _cargo_outputs += [cargo_implib]
@@ -60,7 +66,23 @@ endif
 rust_sys = [dependency('threads')]
 _omp_c_args = []
 _omp_dirs = []
-if host_machine.system() == 'linux' or host_machine.system() == 'darwin'
+if host_machine.system() == 'linux'
+  rust_sys += [
+    cc.find_library('dl', required: true),
+    cc.find_library('m', required: true),
+  ]
+elif host_machine.system() == 'darwin'
+  rust_sys += [cc.find_library('m', required: true)]
+elif host_machine.system() == 'windows'
+  rust_sys += [
+    cc.find_library('ws2_32', required: true),
+    cc.find_library('userenv', required: true),
+    cc.find_library('bcrypt', required: true),
+    cc.find_library('ntdll', required: true),
+  ]
+endif
+
+if _use_openmp
   # Linux uses libgomp under GCC and libomp under Clang. Darwin uses libomp.
   # Keep the runtime as a link dependency without compiling consumer sources
   # with -fopenmp.
@@ -74,10 +96,18 @@ if host_machine.system() == 'linux' or host_machine.system() == 'darwin'
   _omp_file = 'lib' + _omp_lib + _omp_suffix
   _cc0 = cc.cmd_array()[0]
 
-  # Homebrew's libomp is keg-only. Ask brew first, then check the standard
-  # Apple Silicon and Intel prefixes in case brew is not on PATH.
+  # Homebrew's libomp is keg-only. Check LIBOMP_PREFIX first, then ask brew,
+  # then check the standard Apple Silicon and Intel prefixes in case brew is
+  # not on PATH.
   if host_machine.system() == 'darwin' and cc.get_id() == 'clang'
     _brew_prefixes = []
+    _libomp_env = run_command(
+      py, '-c', 'import os; print(os.environ.get("LIBOMP_PREFIX", ""))',
+      check: false,
+    ).stdout().strip()
+    if _libomp_env != ''
+      _brew_prefixes += _libomp_env
+    endif
     _brew = find_program('brew', required: false)
     if _brew.found()
       _brew_libomp = run_command(_brew, '--prefix', 'libomp', check: false)
@@ -147,10 +177,6 @@ if host_machine.system() == 'linux' or host_machine.system() == 'darwin'
   if not cc.has_header('omp.h', args: _omp_probe_args)
     error('the threaded build needs omp.h from ' + cc.get_id() + ' -fopenmp')
   endif
-  if host_machine.system() == 'linux'
-    rust_sys += [cc.find_library('dl', required: true)]
-  endif
-  rust_sys += [cc.find_library('m', required: true)]
   _omp_dep = cc.find_library(_omp_lib, dirs: _omp_dirs, required: true)
   if host_machine.system() == 'linux'
     # find_library with dirs answers with the file's full path. Link the
@@ -166,13 +192,6 @@ if host_machine.system() == 'linux' or host_machine.system() == 'darwin'
     # Homebrew's libomp is keg-only and its install name is the full path.
     rust_sys += [_omp_dep]
   endif
-elif host_machine.system() == 'windows'
-  rust_sys += [
-    cc.find_library('ws2_32', required: true),
-    cc.find_library('userenv', required: true),
-    cc.find_library('bcrypt', required: true),
-    cc.find_library('ntdll', required: true),
-  ]
 endif
 
 # Give Cargo's cc crate Meson's compiler and the proven OpenMP paths, keeping
@@ -316,6 +335,7 @@ if _install
 endif
 
 summary({
+  'OpenMP k-nearest region': _use_openmp,
   'Device k-nearest (gpulite)': _gpu_on,
 }, section: 'Configuration')
 
@@ -324,6 +344,7 @@ if get_option('with_tests')
     'cargo-tests',
     cargo_prog,
     args: ['test', '--manifest-path', _msproot / 'Cargo.toml'],
+    env: {'LINKCELL_OPENMP': _use_openmp ? '1' : '0'},
     timeout: 300,
   )
 endif

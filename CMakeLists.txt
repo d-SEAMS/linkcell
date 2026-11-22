@@ -29,6 +29,32 @@ option(LINKCELL_BUILD_EXAMPLES "Build C and C++ example programs" ON)
 option(LINKCELL_INSTALL "Install headers, libraries, pkg-config, and CMake package" ON)
 option(LINKCELL_WITH_GPULITE "Build the device k-nearest C and C++ APIs" ON)
 option(LINKCELL_CARGO_VERBOSE "Show Cargo and build-script commands" OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
+  set(_linkcell_openmp_supported TRUE)
+else()
+  set(_linkcell_openmp_supported FALSE)
+endif()
+option(LINKCELL_USE_OPENMP
+  "Compile the fused k-nearest OpenMP region and link the compiler OpenMP runtime"
+  ${_linkcell_openmp_supported})
+
+if(LINKCELL_USE_OPENMP AND NOT _linkcell_openmp_supported)
+  message(WARNING
+    "LINKCELL_USE_OPENMP=ON is not supported on ${CMAKE_SYSTEM_NAME}; "
+    "building without OpenMP")
+  set(_linkcell_use_openmp FALSE)
+elseif(LINKCELL_USE_OPENMP)
+  set(_linkcell_use_openmp TRUE)
+else()
+  set(_linkcell_use_openmp FALSE)
+endif()
+
+if(_linkcell_use_openmp)
+  set(_linkcell_openmp_env "LINKCELL_OPENMP=1")
+else()
+  set(_linkcell_openmp_env "LINKCELL_OPENMP=0")
+endif()
+
 set(LINKCELL_CARGO_VERBOSITY)
 if(LINKCELL_CARGO_VERBOSE)
   set(LINKCELL_CARGO_VERBOSITY -vv)
@@ -92,12 +118,16 @@ if(WIN32)
 endif()
 
 # The cc crate compiles the OpenMP region with the C compiler CMake uses,
-# so its runtime matches LINKCELL_OMP_LIB below.
-set(LINKCELL_CARGO_CC "${CMAKE_COMMAND}" -E env "CC=${CMAKE_C_COMPILER}")
+# so build.rs and CMake's OpenMP probe select the same runtime
+# (LINKCELL_OMP_LIB below). LINKCELL_OPENMP=0 skips the region so the
+# archive carries no OpenMP symbols or runtime dependency.
+set(LINKCELL_CARGO_ENV "${CMAKE_COMMAND}" -E env
+  "CC=${CMAKE_C_COMPILER}"
+  "${_linkcell_openmp_env}")
 
 add_custom_command(
   OUTPUT ${LINKCELL_CARGO_OUTPUTS}
-  COMMAND ${LINKCELL_CARGO_CC} "${CARGO_EXECUTABLE}" ${LINKCELL_CARGO_VERBOSITY}
+  COMMAND ${LINKCELL_CARGO_ENV} "${CARGO_EXECUTABLE}" ${LINKCELL_CARGO_VERBOSITY}
           rustc --lib ${LINKCELL_CARGO_ARGS}
           --features capi
           --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
@@ -128,90 +158,96 @@ if(WIN32)
 endif()
 
 set(LINKCELL_OMP_DIR "")
-if(APPLE)
-  set(LINKCELL_OMP_LIB omp)
-  set(_linkcell_omp_prefixes)
-  find_program(_linkcell_brew brew)
-  if(_linkcell_brew)
-    execute_process(
-      COMMAND "${_linkcell_brew}" --prefix libomp
-      RESULT_VARIABLE _linkcell_brew_result
-      OUTPUT_VARIABLE _linkcell_brew_prefix
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      ERROR_QUIET
-    )
-    if(_linkcell_brew_result EQUAL 0)
-      list(APPEND _linkcell_omp_prefixes "${_linkcell_brew_prefix}")
-    endif()
-  endif()
-  list(APPEND _linkcell_omp_prefixes
-    /opt/homebrew/opt/libomp
-    /usr/local/opt/libomp
-  )
-  foreach(_prefix IN LISTS _linkcell_omp_prefixes)
-    if(EXISTS "${_prefix}/include/omp.h"
-       AND EXISTS "${_prefix}/lib/libomp.dylib")
-      set(OpenMP_ROOT "${_prefix}")
-      set(LINKCELL_OMP_DIR "${_prefix}/lib")
-      set(OpenMP_C_FLAGS
-        "-Xpreprocessor -fopenmp -I${_prefix}/include")
-      set(OpenMP_CXX_FLAGS
-        "-Xpreprocessor -fopenmp -I${_prefix}/include")
-      set(OpenMP_C_LIB_NAMES omp)
-      set(OpenMP_CXX_LIB_NAMES omp)
-      set(OpenMP_omp_LIBRARY "${_prefix}/lib/libomp.dylib")
-      break()
-    endif()
-  endforeach()
-  if(NOT LINKCELL_OMP_DIR)
-    message(FATAL_ERROR
-      "the threaded build needs Homebrew libomp; install it with brew install libomp")
-  endif()
-elseif(UNIX)
-  # Clang's -fopenmp calls libomp, GCC's calls libgomp.
-  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+set(LINKCELL_OMP_LIB "")
+if(_linkcell_use_openmp)
+  if(APPLE)
     set(LINKCELL_OMP_LIB omp)
-  else()
-    set(LINKCELL_OMP_LIB gomp)
-  endif()
-  # Directory of lib<runtime>.so when it is not on the default linker path.
-  # Ubuntu's libomp-dev keeps the linker name beside the Clang resource dir.
-  set(_linkcell_omp_file "lib${LINKCELL_OMP_LIB}.so")
-  execute_process(
-    COMMAND "${CMAKE_C_COMPILER}" "-print-file-name=${_linkcell_omp_file}"
-    OUTPUT_VARIABLE _linkcell_omp_printed
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
-  if(EXISTS "${_linkcell_omp_printed}")
-    get_filename_component(LINKCELL_OMP_DIR "${_linkcell_omp_printed}" DIRECTORY)
-  endif()
-  if(NOT LINKCELL_OMP_DIR AND DEFINED ENV{LIBRARY_PATH})
-    string(REPLACE ":" ";" _linkcell_lp "$ENV{LIBRARY_PATH}")
-    foreach(_dir IN LISTS _linkcell_lp)
-      if(EXISTS "${_dir}/${_linkcell_omp_file}")
-        set(LINKCELL_OMP_DIR "${_dir}")
+    set(_linkcell_omp_prefixes)
+    if(DEFINED ENV{LIBOMP_PREFIX} AND NOT "$ENV{LIBOMP_PREFIX}" STREQUAL "")
+      list(APPEND _linkcell_omp_prefixes "$ENV{LIBOMP_PREFIX}")
+    endif()
+    find_program(_linkcell_brew brew)
+    if(_linkcell_brew)
+      execute_process(
+        COMMAND "${_linkcell_brew}" --prefix libomp
+        RESULT_VARIABLE _linkcell_brew_result
+        OUTPUT_VARIABLE _linkcell_brew_prefix
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+      )
+      if(_linkcell_brew_result EQUAL 0)
+        list(APPEND _linkcell_omp_prefixes "${_linkcell_brew_prefix}")
+      endif()
+    endif()
+    list(APPEND _linkcell_omp_prefixes
+      /opt/homebrew/opt/libomp
+      /usr/local/opt/libomp
+    )
+    foreach(_prefix IN LISTS _linkcell_omp_prefixes)
+      if(EXISTS "${_prefix}/include/omp.h"
+         AND EXISTS "${_prefix}/lib/libomp.dylib")
+        set(OpenMP_ROOT "${_prefix}")
+        set(LINKCELL_OMP_DIR "${_prefix}/lib")
+        set(OpenMP_C_FLAGS
+          "-Xpreprocessor -fopenmp -I${_prefix}/include")
+        set(OpenMP_CXX_FLAGS
+          "-Xpreprocessor -fopenmp -I${_prefix}/include")
+        set(OpenMP_C_LIB_NAMES omp)
+        set(OpenMP_CXX_LIB_NAMES omp)
+        set(OpenMP_omp_LIBRARY "${_prefix}/lib/libomp.dylib")
         break()
       endif()
     endforeach()
-  endif()
-  if(NOT LINKCELL_OMP_DIR)
+    if(NOT LINKCELL_OMP_DIR)
+      message(FATAL_ERROR
+        "the threaded build needs Homebrew libomp; install it with brew install libomp")
+    endif()
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Clang's -fopenmp calls libomp, GCC's calls libgomp. Because Cargo runs
+    # with CC=${CMAKE_C_COMPILER}, this matches the compiler build.rs uses
+    # for src/knn_region.c.
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+      set(LINKCELL_OMP_LIB omp)
+    else()
+      set(LINKCELL_OMP_LIB gomp)
+    endif()
+    # Directory of lib<runtime>.so when it is not on the default linker path.
+    # Ubuntu's libomp-dev keeps the linker name beside the Clang resource dir.
+    set(_linkcell_omp_file "lib${LINKCELL_OMP_LIB}.so")
     execute_process(
-      COMMAND "${CMAKE_C_COMPILER}" -print-resource-dir
-      OUTPUT_VARIABLE _linkcell_resdir
+      COMMAND "${CMAKE_C_COMPILER}" "-print-file-name=${_linkcell_omp_file}"
+      OUTPUT_VARIABLE _linkcell_omp_printed
       OUTPUT_STRIP_TRAILING_WHITESPACE
       ERROR_QUIET
     )
-    if(_linkcell_resdir)
-      get_filename_component(_linkcell_res_parent "${_linkcell_resdir}" DIRECTORY)
-      get_filename_component(_linkcell_res_lib "${_linkcell_res_parent}" DIRECTORY)
-      if(EXISTS "${_linkcell_res_lib}/${_linkcell_omp_file}")
-        set(LINKCELL_OMP_DIR "${_linkcell_res_lib}")
+    if(IS_ABSOLUTE "${_linkcell_omp_printed}" AND EXISTS "${_linkcell_omp_printed}")
+      get_filename_component(LINKCELL_OMP_DIR "${_linkcell_omp_printed}" DIRECTORY)
+    endif()
+    if(NOT LINKCELL_OMP_DIR AND DEFINED ENV{LIBRARY_PATH})
+      string(REPLACE ":" ";" _linkcell_lp "$ENV{LIBRARY_PATH}")
+      foreach(_dir IN LISTS _linkcell_lp)
+        if(EXISTS "${_dir}/${_linkcell_omp_file}")
+          set(LINKCELL_OMP_DIR "${_dir}")
+          break()
+        endif()
+      endforeach()
+    endif()
+    if(NOT LINKCELL_OMP_DIR)
+      execute_process(
+        COMMAND "${CMAKE_C_COMPILER}" -print-resource-dir
+        OUTPUT_VARIABLE _linkcell_resdir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+      )
+      if(_linkcell_resdir)
+        get_filename_component(_linkcell_res_parent "${_linkcell_resdir}" DIRECTORY)
+        get_filename_component(_linkcell_res_lib "${_linkcell_res_parent}" DIRECTORY)
+        if(EXISTS "${_linkcell_res_lib}/${_linkcell_omp_file}")
+          set(LINKCELL_OMP_DIR "${_linkcell_res_lib}")
+        endif()
       endif()
     endif()
   endif()
-endif()
-if(UNIX)
   find_package(OpenMP REQUIRED COMPONENTS C CXX)
   target_link_libraries(linkcell INTERFACE
     OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
@@ -219,10 +255,15 @@ endif()
 
 set(_linkcell_sys Threads::Threads)
 if(UNIX AND NOT APPLE)
-  list(APPEND _linkcell_sys ${CMAKE_DL_LIBS} m
-    OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+  list(APPEND _linkcell_sys ${CMAKE_DL_LIBS} m)
+  if(_linkcell_use_openmp)
+    list(APPEND _linkcell_sys OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+  endif()
 elseif(APPLE)
-  list(APPEND _linkcell_sys m OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+  list(APPEND _linkcell_sys m)
+  if(_linkcell_use_openmp)
+    list(APPEND _linkcell_sys OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+  endif()
 elseif(WIN32)
   list(APPEND _linkcell_sys ws2_32 userenv bcrypt ntdll)
 endif()
@@ -293,16 +334,24 @@ endif()
 
 if(LINKCELL_INSTALL)
   if(UNIX AND NOT APPLE)
-    if(LINKCELL_OMP_DIR)
-      set(LINKCELL_PKG_LIBS_PRIVATE
-        "-ldl -lpthread -lm -L${LINKCELL_OMP_DIR} -l${LINKCELL_OMP_LIB}")
+    if(_linkcell_use_openmp)
+      if(LINKCELL_OMP_DIR)
+        set(LINKCELL_PKG_LIBS_PRIVATE
+          "-ldl -lpthread -lm -L${LINKCELL_OMP_DIR} -l${LINKCELL_OMP_LIB}")
+      else()
+        set(LINKCELL_PKG_LIBS_PRIVATE "-ldl -lpthread -lm -l${LINKCELL_OMP_LIB}")
+      endif()
     else()
-      set(LINKCELL_PKG_LIBS_PRIVATE "-ldl -lpthread -lm -l${LINKCELL_OMP_LIB}")
+      set(LINKCELL_PKG_LIBS_PRIVATE "-ldl -lpthread -lm")
     endif()
     set(LINKCELL_GPU_PKG_LIBS "-ldl -lpthread")
   elseif(APPLE)
-    set(LINKCELL_PKG_LIBS_PRIVATE
-      "-lpthread -lm -L${LINKCELL_OMP_DIR} -l${LINKCELL_OMP_LIB}")
+    if(_linkcell_use_openmp)
+      set(LINKCELL_PKG_LIBS_PRIVATE
+        "-lpthread -lm -L${LINKCELL_OMP_DIR} -l${LINKCELL_OMP_LIB}")
+    else()
+      set(LINKCELL_PKG_LIBS_PRIVATE "-lpthread -lm")
+    endif()
     set(LINKCELL_GPU_PKG_LIBS "-lpthread")
   else()
     set(LINKCELL_PKG_LIBS_PRIVATE "")

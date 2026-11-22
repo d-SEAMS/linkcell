@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/knn_region.c");
+    println!("cargo:rerun-if-env-changed=LINKCELL_OPENMP");
     #[cfg(feature = "scotch")]
     build_scotch();
     #[cfg(feature = "ptscotch")]
@@ -15,9 +16,25 @@ fn main() {
         println!("cargo:rustc-cfg=linkcell_avx512");
     }
     // Linux and macOS with `parallel` link the fused OpenMP region. A failed
-    // probe is a build error on glibc Linux and macOS.
-    if std::env::var_os("CARGO_FEATURE_PARALLEL").is_some() && compile_knn_region() {
+    // probe is a build error on glibc Linux and macOS. LINKCELL_OPENMP=0
+    // keeps rayon and skips the region, so the archive does not reference
+    // libgomp or libomp.
+    if std::env::var_os("CARGO_FEATURE_PARALLEL").is_some()
+        && openmp_requested()
+        && compile_knn_region()
+    {
         println!("cargo:rustc-cfg=linkcell_openmp");
+    }
+}
+
+/// Meson and CMake set LINKCELL_OPENMP. Unset keeps the historical default.
+fn openmp_requested() -> bool {
+    match std::env::var("LINKCELL_OPENMP") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            value != "0" && value != "false" && value != "off" && value != "no"
+        }
+        Err(_) => true,
     }
 }
 

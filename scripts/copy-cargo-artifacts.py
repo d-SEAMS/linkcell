@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--implib")
     parser.add_argument("--out-implib", type=Path)
     parser.add_argument("--depfile", type=Path)
+    parser.add_argument(
+        "--openmp",
+        choices=("true", "false"),
+        default="true",
+        help="Compile the fused k-nearest OpenMP region (LINKCELL_OPENMP).",
+    )
     args = parser.parse_args()
     if (args.implib is None) != (args.out_implib is None):
         parser.error("--implib and --out-implib must be supplied together")
@@ -74,6 +80,9 @@ def main() -> None:
         rustc.append(f"-Clink-arg=-Wl,-install_name,@rpath/{args.shared}")
     command.extend(["--", *rustc])
     env = os.environ.copy()
+    # Unset keeps the historical default inside build.rs. Meson always
+    # passes the flag so a use_openmp=false build does not emit the region.
+    env["LINKCELL_OPENMP"] = "1" if args.openmp == "true" else "0"
     # The OpenMP runtime Meson links follows its own C compiler. An
     # activated environment may export a different CC, so this wins.
     if args.cc:
