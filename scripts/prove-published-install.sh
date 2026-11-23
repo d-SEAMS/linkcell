@@ -5,11 +5,12 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKS=${CHECKS:-$SCRIPT_DIR/prove-published}
-ROOT=${PROVE_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/linkcell-prove.XXXXXX")}
-LOG_DIR=${PROVE_LOG_DIR:-$ROOT/logs}
+# main fills these in. They stay empty when the file is sourced so the
+# recipe parser can be checked without creating a work directory.
+ROOT=${PROVE_ROOT:-}
+LOG_DIR=${PROVE_LOG_DIR:-}
 RECIPE_COMMIT=8c81464f1dac30fd6d9967c71e5257c82375e0ab
 RECIPE_URL=https://raw.githubusercontent.com/HaoZeke/staged-recipes/${RECIPE_COMMIT}/recipes/linkcell
-mkdir -p "$ROOT" "$LOG_DIR"
 
 log() { printf '%s\n' "$*"; }
 
@@ -156,31 +157,68 @@ PY
   (cd "$ROOT/pypi" && "$venv/bin/python" -I "$CHECKS/periodic.py" "$ver")
 }
 
+# Print the recipe's tag version and source sha256, one per line.
+# context.version is what the recipe's ${{ version }} expands to, including
+# the tag in source.url. source.sha256 is that tarball. Other version or
+# sha256 fields are ignored.
+read_recipe_source() {
+  local recipe=$1
+  python3 - "$recipe" << 'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    text = path.read_text(encoding="utf-8")
+except OSError as exc:
+    raise SystemExit(f"cannot read recipe: {exc}") from exc
+
+
+def section(name):
+    match = re.search(rf"(?m)^{re.escape(name)}:\n((?:[ \t].*\n)*)", text)
+    if not match:
+        raise SystemExit(f"recipe has no {name} section")
+    return match.group(1)
+
+
+context = section("context")
+source = section("source")
+version = re.search(r'(?m)^[ \t]+version:\s*"([^"]+)"\s*$', context)
+if not version:
+    raise SystemExit("recipe context has no version")
+version = version.group(1)
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+    raise SystemExit(f"recipe context version is not X.Y.Z: {version}")
+sha = re.search(r"(?m)^[ \t]+sha256:\s*([0-9a-f]{64})\s*$", source)
+if not sha:
+    raise SystemExit("recipe source has no sha256")
+print(version)
+print(sha.group(1))
+PY
+}
+
 prepare_source() {
-  local ver=$1
-  local tar=$ROOT/source/linkcell-$ver.tar.gz
-  local recipe_sha
-  mkdir -p "$ROOT/source"
-  if [[ ! -f "$ROOT/source/recipe.yaml" ]]; then
-    mkdir -p "$ROOT/source/recipe"
+  local ver sha tar fields
+  mkdir -p "$ROOT/source/recipe"
+  if [[ ! -f "$ROOT/source/recipe/recipe.yaml" ]]; then
     curl -fsSL -o "$ROOT/source/recipe/recipe.yaml" "$RECIPE_URL/recipe.yaml"
   fi
-  recipe_sha=$(python3 - << PY
-import re
-text = open("$ROOT/source/recipe/recipe.yaml").read()
-m = re.search(r"sha256:\s*([0-9a-f]{64})", text)
-if not m:
-    raise SystemExit("recipe has no sha256")
-print(m.group(1))
-PY
-)
-  log "recipe sha256 $recipe_sha"
+  fields=$(read_recipe_source "$ROOT/source/recipe/recipe.yaml")
+  ver=${fields%%$'\n'*}
+  sha=${fields#*$'\n'}
+  [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+  [[ "$sha" =~ ^[0-9a-f]{64}$ ]]
+  log "recipe version $ver"
+  log "recipe sha256 $sha"
+  tar=$ROOT/source/linkcell-$ver.tar.gz
   curl -fsSL -L -o "$tar" "https://github.com/d-SEAMS/linkcell/archive/refs/tags/v${ver}.tar.gz"
-  echo "$recipe_sha  $tar" | sha256sum -c -
+  echo "$sha  $tar" | sha256sum -c -
   tar -C "$ROOT/source" -xzf "$tar"
   test -f "$ROOT/source/linkcell-$ver/Cargo.lock"
   test -f "$ROOT/source/linkcell-$ver/meson.build"
   test -f "$ROOT/source/linkcell-$ver/CMakeLists.txt"
+  SOURCE_VERSION=$ver
 }
 
 route_source_meson() {
@@ -250,13 +288,21 @@ EOF
   log "wrap quickstart ok"
 }
 
+# Prove the pinned recipe's source. context.version selects the tag
+# tarball and source.sha256 is checked with sha256sum -c. A recipe version
+# that differs from the crates.io max is not a failure here. The conda
+# route requires that match, because it installs this recipe and checks the
+# built package against the published crate. This workflow has no schedule;
+# published-install runs on push and pull request, and `all` runs this
+# route before conda and stops at the first failure. The PyPI route
+# likewise follows its own version, which may lag crates.io.
 route_source() {
   local ver
   require_cmd curl python3 meson cmake cc c++ pkg-config sha256sum
-  ver=$(crate_version)
+  prepare_source
+  ver=$SOURCE_VERSION
   [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
   log "source tag v$ver"
-  prepare_source "$ver"
   route_source_meson "$ver"
   route_source_cmake "$ver"
   route_source_wrap "$ver"
@@ -425,6 +471,16 @@ dispatch() {
 
 main() {
   local which=${1:-all}
+  if [[ -z "$ROOT" ]]; then
+    ROOT=$(mktemp -d "${TMPDIR:-/tmp}/linkcell-prove.XXXXXX")
+  fi
+  if [[ -z "$LOG_DIR" ]]; then
+    LOG_DIR=$ROOT/logs
+  fi
+  mkdir -p "$ROOT" "$LOG_DIR"
+  EXPECT=${EXPECT:-}
+  REPORT=${REPORT:-$ROOT/pypi/report.json}
+  export EXPECT REPORT
   log "root $ROOT"
   log "logs $LOG_DIR"
   case "$which" in
@@ -446,7 +502,6 @@ main() {
   esac
 }
 
-EXPECT=${EXPECT:-}
-REPORT=${REPORT:-$ROOT/pypi/report.json}
-export EXPECT REPORT
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

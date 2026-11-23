@@ -31,6 +31,7 @@ jobs:
       - run: python3 scripts/check-llms-txt.py
       - run: python3 scripts/check-versions.py
       - run: scripts/check-minimage-features.sh
+      - run: scripts/check-recipe-source.sh
       - name: The tag names the version
         if: github.ref_type == 'tag'
         run: python3 scripts/check-versions.py --tag "$GITHUB_REF_NAME"
@@ -727,11 +728,11 @@ jobs:
           pkg-config --exists --print-errors linkcell
           pkg-config --modversion linkcell
 
-  # Published crates.io, PyPI, the staged-recipes conda recipe, and the
-  # release tag (Meson, CMake, and a Meson wrap), each in a clean prefix.
-  # The tag is built with gcc. Clang then installs this tree: Ubuntu's
-  # libomp-dev keeps the linker name beside the resource directory, off
-  # the default search path.
+  # Published crates.io, PyPI, the staged-recipes conda recipe, and that
+  # recipe's tag tarball (Meson, CMake, and a Meson wrap), each in a clean
+  # prefix. The tarball is built with gcc. Clang then installs this tree:
+  # Ubuntu's libomp-dev keeps the linker name beside the resource
+  # directory, off the default search path.
   published-install:
     runs-on: ubuntu-24.04
     permissions:
