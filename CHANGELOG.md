@@ -11,7 +11,7 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 <!-- towncrier release notes start -->
 #skip_lint_end
 
-## [0.5.0] - 2026-11-20
+## [0.5.0] - 2026-11-22
 
 ### Added
 
@@ -20,6 +20,7 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 - `scripts/seo.py` is the MkDocs hook named in `mkdocs.yml`. After the site is built it gives every HTML page one title, a description, a canonical link, Open Graph and Twitter card tags, and JSON-LD for `SoftwareApplication` and `SoftwareSourceCode`. It writes `sitemap.xml` and a `robots.txt` that allows crawling and names that sitemap. `python3 scripts/seo.py --check` rejects a page that is missing any of those, a duplicate title or description, or a sitemap that does not match the canonical URLs.
 - `LIBOMP_PREFIX` names the libomp prefix (`include/omp.h` and `lib/libomp.dylib`) for macOS source builds, ahead of Homebrew's. The macOS wheels build libomp for their deployment target with `scripts/build-libomp-macos.sh` and bundle it.
 - `SkinList` now tracks build and reuse counts (`builds`, `reuses`, `last_reused`), reports `max_displacement`, accepts cell updates (`set_cell`) and per-axis periodicity (`with_periodic`), and canonicalizes half-list candidate rows so filtered pair order is independent of skin width.
+- `LINKCELL_USE_OPENMP` (CMake), `use_openmp` (Meson), and `LINKCELL_OPENMP=0` (Cargo) disable the fused OpenMP k-nearest region so the archive and `linkcell.pc` omit OpenMP symbols and runtime links.
 
 ### Changed
 
