@@ -175,54 +175,503 @@ try:
 except OSError as exc:
     raise SystemExit(f"cannot read recipe: {exc}") from exc
 
+if text.startswith("\ufeff"):
+    text = text[1:]
+raw_lines = text.splitlines()
+
+ESCAPES = {
+    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t",
+    "n": "\n", "v": "\v", "f": "\f", "r": "\r", "e": "\x1b",
+    " ": " ", '"': '"', "/": "/", "\\": "\\",
+    "N": "\u0085", "_": "\u00a0", "L": "\u2028", "P": "\u2029",
+}
+HEX_ESCAPES = {"x": 2, "u": 4, "U": 8}
+BLOCK_HEADER = re.compile(r"^[|>](?:[+-][1-9]?|[1-9][+-]?)?$")
+NODE_PROP = re.compile(r"^(?:&[^\s,\[\]{}]+|!(?:<[^>]*>|[^\s,\[\]{}]*))(?=$|[ \t])")
+DOC_MARKER = re.compile(r"^(?:---|\.\.\.)(?:$|[ \t])")
+STRICT_KEY = re.compile(r"^([A-Za-z0-9_-]+)[ \t]*:(?:[ \t]+(.*)|[ \t]*)$")
+LOOSE_KEY = re.compile(r"""^([^#"'{\[\]}:,][^:"']*?)[ \t]*:(?:[ \t]+(.*)|[ \t]*)$""")
+MERGE_KEY = re.compile(r"^<<[ \t]*:(?:[ \t]+(.*)|[ \t]*)$")
+
+
+def strip_plain_comment(s):
+    for i, ch in enumerate(s):
+        if ch == "#" and (i == 0 or s[i - 1] in (" ", "\t")):
+            return s[:i].rstrip(" \t")
+    return s.rstrip(" \t")
+
+
+def strip_props(s):
+    s = s.lstrip(" \t")
+    while s:
+        m = NODE_PROP.match(s)
+        if not m:
+            break
+        s = s[m.end():].lstrip(" \t")
+    return s
+
+
+def scan_quoted_inline(s, start):
+    quote = s[start]
+    out = []
+    i = start + 1
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if quote == '"':
+            if ch == "\\":
+                if i + 1 >= n:
+                    return False, n, ""
+                esc = s[i + 1]
+                if esc in ESCAPES:
+                    out.append(ESCAPES[esc])
+                    i += 2
+                elif esc in HEX_ESCAPES:
+                    width = HEX_ESCAPES[esc]
+                    hex_part = s[i + 2:i + 2 + width]
+                    if len(hex_part) != width or not re.fullmatch(r"[0-9a-fA-F]+", hex_part):
+                        raise SystemExit(f"recipe has invalid escape sequence: \\{esc}{hex_part}")
+                    out.append(chr(int(hex_part, 16)))
+                    i += 2 + width
+                else:
+                    raise SystemExit(f"recipe has unsupported escape sequence: \\{esc}")
+                continue
+            if ch == '"':
+                return True, i + 1, "".join(out)
+        else:
+            if ch == "'":
+                if i + 1 < n and s[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                return True, i + 1, "".join(out)
+        out.append(ch)
+        i += 1
+    return False, n, ""
+
+
+def advance_quoted(line, pos, quote):
+    n = len(line)
+    i = pos
+    while i < n:
+        ch = line[i]
+        if quote == '"':
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                return True, i + 1
+        else:
+            if ch == "'":
+                if i + 1 < n and line[i + 1] == "'":
+                    i += 2
+                    continue
+                return True, i + 1
+        i += 1
+    return False, n
+
+
+def check_trailing_comment(tail, where):
+    t = tail.lstrip(" \t")
+    if t and not t.startswith("#"):
+        raise SystemExit(f"recipe {where} has unexpected trailing tokens: {t}")
+
+
+def scan_flow_line(line, pos, stack, quote, where):
+    n = len(line)
+    i = pos
+    while i < n:
+        if quote is not None:
+            closed, i = advance_quoted(line, i, quote)
+            if not closed:
+                return stack, quote, n
+            quote = None
+            continue
+        ch = line[i]
+        if ch == "#" and (i == 0 or line[i - 1] in (" ", "\t")):
+            return stack, None, n
+        if ch in ('"', "'") and (i == 0 or line[i - 1] in (" ", "\t", "{", "[", ",", ":")):
+            quote = ch
+            i += 1
+            continue
+        if ch in ("{", "["):
+            stack.append("}" if ch == "{" else "]")
+        elif ch in ("}", "]"):
+            if not stack or stack[-1] != ch:
+                raise SystemExit(f"recipe {where} has mismatched flow delimiter: {ch}")
+            stack.pop()
+            if not stack:
+                return stack, None, i + 1
+        i += 1
+    return stack, quote, n
+
+
+def parse_key(s, strict_key):
+    if s[0] in ('"', "'"):
+        closed, end, key_name = scan_quoted_inline(s, 0)
+        if not closed:
+            return "multiline_quoted_key", s[0], ""
+        after = s[end:].lstrip(" \t")
+        if after.startswith(":") and (len(after) == 1 or after[1] in (" ", "\t")):
+            return "key", key_name, after[1:].lstrip(" \t")
+        return "not_a_key", s, ""
+    if s == "?" or s.startswith(("? ", "?\t")):
+        return "explicit_key", "?", s[1:].lstrip(" \t")
+    m = MERGE_KEY.match(s)
+    if m:
+        return "merge_key", "<<", (m.group(1) or "").lstrip(" \t")
+    pat = STRICT_KEY if strict_key else LOOSE_KEY
+    m = pat.match(s)
+    if m:
+        return "key", m.group(1), (m.group(2) or "").lstrip(" \t")
+    return "not_a_key", s, ""
+
+
+def consume_value(lines, val_rest, line_idx, parent_col, where):
+    val = strip_props(val_rest)
+    if not val or val.startswith("#"):
+        return "empty", "", line_idx + 1
+    plain_head = strip_plain_comment(val)
+    if BLOCK_HEADER.fullmatch(plain_head):
+        j = line_idx + 1
+        while j < len(lines):
+            ln = lines[j]
+            if not ln.strip():
+                j += 1
+                continue
+            lead = len(ln) - len(ln.lstrip(" \t"))
+            if lead > parent_col:
+                j += 1
+                continue
+            break
+        return "block", "", j
+    if val[0] in ('"', "'"):
+        closed, end, decoded = scan_quoted_inline(val, 0)
+        if closed:
+            check_trailing_comment(val[end:], where)
+            return "quoted", decoded, line_idx + 1
+        quote = val[0]
+        j = line_idx + 1
+        while j < len(lines):
+            closed, end = advance_quoted(lines[j], 0, quote)
+            if closed:
+                check_trailing_comment(lines[j][end:], where)
+                return "multiline_quoted", "", j + 1
+            j += 1
+        raise SystemExit(f"recipe {where} has an unterminated quoted string")
+    if val[0] in ("{", "["):
+        stack, quote, end = scan_flow_line(val, 0, [], None, where)
+        if not stack and quote is None:
+            check_trailing_comment(val[end:], where)
+            return "flow", val[:end], line_idx + 1
+        chunks = [val]
+        j = line_idx + 1
+        while j < len(lines):
+            stack, quote, end = scan_flow_line(lines[j], 0, stack, quote, where)
+            if not stack and quote is None:
+                chunks.append(lines[j][:end])
+                check_trailing_comment(lines[j][end:], where)
+                return "flow", "\n".join(chunks), j + 1
+            chunks.append(lines[j])
+            j += 1
+        raise SystemExit(f"recipe {where} has an unterminated flow collection")
+    return "plain", plain_head, line_idx + 1
+
+
+def advance_node(lines, idx, col, where):
+    s = lines[idx][col:]
+    while s == "-" or s.startswith(("- ", "-\t")):
+        s = s[1:]
+        step = len(s) - len(s.lstrip(" \t"))
+        col += 1 + step
+        s = s[step:]
+    if not s or s.startswith("#"):
+        return idx + 1
+    kind, _, rest = parse_key(s, strict_key=False)
+    if kind == "key":
+        _, _, next_idx = consume_value(lines, rest, idx, col, where)
+        return next_idx
+    _, _, next_idx = consume_value(lines, s, idx, col, where)
+    return next_idx
+
+
+def parse_flow_mapping(flow_text, name):
+    if flow_text[0] == "[":
+        raise SystemExit(f"recipe {name} is a list, not one mapping")
+    if flow_text[0] != "{" or flow_text[-1] != "}":
+        raise SystemExit(f"recipe {name} is not a mapping")
+    inner = flow_text[1:-1]
+    n = len(inner)
+    i = 0
+
+    def skip_ws_comments(pos):
+        while pos < n:
+            if inner[pos] in (" ", "\t", "\n"):
+                pos += 1
+            elif inner[pos] == "#":
+                nl = inner.find("\n", pos)
+                pos = n if nl == -1 else nl + 1
+            else:
+                break
+        return pos
+
+    keys = {}
+    while True:
+        i = skip_ws_comments(i)
+        if i >= n:
+            break
+        if inner[i] in ('"', "'"):
+            closed, i, key = scan_quoted_inline(inner, i)
+            if not closed:
+                raise SystemExit(f"recipe {name} has an unterminated quoted key")
+        else:
+            start = i
+            while i < n and inner[i] not in (":", ",", "{", "}", "[", "]", "\n", "#"):
+                i += 1
+            key = inner[start:i].rstrip(" \t")
+            if key == "<<" or key.startswith("?"):
+                raise SystemExit(f"recipe {name} uses unsupported key syntax: {key}")
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+                raise SystemExit(f"recipe {name} line is not a key: {key}")
+        i = skip_ws_comments(i)
+        if i >= n or inner[i] != ":":
+            raise SystemExit(f"recipe {name} mapping is missing ':' after {key}")
+        i += 1
+        i = skip_ws_comments(i)
+        while i < n:
+            m = NODE_PROP.match(inner[i:])
+            if not m:
+                break
+            i = skip_ws_comments(i + m.end())
+        if i >= n or inner[i] == ",":
+            entry = ("empty", "")
+        elif inner[i] in ("{", "["):
+            stack = []
+            quote = None
+            while i < n:
+                ch = inner[i]
+                if quote is not None:
+                    if quote == '"':
+                        if ch == "\\":
+                            i += 2
+                            continue
+                        if ch == '"':
+                            quote = None
+                    else:
+                        if ch == "'":
+                            if i + 1 < n and inner[i + 1] == "'":
+                                i += 2
+                                continue
+                            quote = None
+                    i += 1
+                    continue
+                if ch == "#" and (i == 0 or inner[i - 1] in (" ", "\t", "\n")):
+                    nl = inner.find("\n", i)
+                    i = n if nl == -1 else nl + 1
+                    continue
+                if ch in ('"', "'") and (i == 0 or inner[i - 1] in (" ", "\t", "\n", "{", "[", ",", ":")):
+                    quote = ch
+                    i += 1
+                    continue
+                if ch in ("{", "["):
+                    stack.append("}" if ch == "{" else "]")
+                elif ch in ("}", "]"):
+                    if not stack or stack[-1] != ch:
+                        raise SystemExit(f"recipe {name} has mismatched flow delimiter: {ch}")
+                    stack.pop()
+                    if not stack:
+                        i += 1
+                        break
+                i += 1
+            if stack or quote is not None:
+                raise SystemExit(f"recipe {name} has an unterminated flow collection")
+            entry = ("flow", "")
+        elif inner[i] in ('"', "'"):
+            closed, i, val = scan_quoted_inline(inner, i)
+            if not closed:
+                raise SystemExit(f"recipe {name} has an unterminated quoted string")
+            entry = ("quoted", val)
+        else:
+            start = i
+            while i < n and inner[i] != ",":
+                if inner[i] == "#" and (i == start or inner[i - 1] in (" ", "\t", "\n")):
+                    break
+                i += 1
+            val = inner[start:i].strip()
+            entry = ("plain", val)
+        if key in keys:
+            raise SystemExit(f"recipe {name} repeats {key}")
+        keys[key] = entry
+        i = skip_ws_comments(i)
+        if i < n:
+            if inner[i] != ",":
+                raise SystemExit(f"recipe {name} flow mapping expected ','")
+            i += 1
+    if not keys:
+        raise SystemExit(f"recipe {name} section is empty")
+    return keys
+
+
+def parse_block_section(section_lines, name):
+    i = 0
+    while i < len(section_lines):
+        ln = section_lines[i]
+        if ln.strip() and not ln.lstrip(" \t").startswith("#"):
+            break
+        i += 1
+    if i >= len(section_lines):
+        raise SystemExit(f"recipe {name} section is empty")
+    first = section_lines[i]
+    ws = first[:len(first) - len(first.lstrip(" \t"))]
+    if "\t" in ws:
+        raise SystemExit(f"recipe {name} indentation is inconsistent")
+    rest0 = first[len(ws):]
+    if rest0 == "-" or rest0.startswith(("- ", "-\t")):
+        raise SystemExit(f"recipe {name} is a list, not one mapping")
+    if not ws:
+        raise SystemExit(f"recipe {name} indentation is inconsistent")
+    indent = ws
+    indent_len = len(indent)
+
+    keys = {}
+    seq_state = "none"
+    last_plain_key = None
+    while i < len(section_lines):
+        ln = section_lines[i]
+        if not ln.strip() or ln.lstrip(" \t").startswith("#"):
+            i += 1
+            continue
+        if not ln.startswith(indent):
+            raise SystemExit(f"recipe {name} indentation is inconsistent")
+        rest = ln[indent_len:]
+        if rest[0] in (" ", "\t"):
+            if seq_state == "maybe":
+                seq_state = "none"
+            if last_plain_key is not None:
+                keys[last_plain_key] = ("multiline_plain", "")
+                last_plain_key = None
+            lead = len(ln) - len(ln.lstrip(" \t"))
+            i = advance_node(section_lines, i, lead, name)
+            continue
+        if rest == "-" or rest.startswith(("- ", "-\t")):
+            if seq_state == "none":
+                raise SystemExit(f"recipe {name} is a list, not one mapping")
+            seq_state = "in_seq"
+            i = advance_node(section_lines, i, indent_len, name)
+            continue
+        last_plain_key = None
+        seq_state = "none"
+        kind, key_name, val_rest = parse_key(rest, strict_key=True)
+        if kind in ("merge_key", "explicit_key"):
+            raise SystemExit(f"recipe {name} uses unsupported key syntax: {rest}")
+        if kind != "key":
+            raise SystemExit(f"recipe {name} line is not a key: {rest}")
+        if key_name in keys:
+            raise SystemExit(f"recipe {name} repeats {key_name}")
+        vkind, vval, next_i = consume_value(section_lines, val_rest, i, indent_len, name)
+        keys[key_name] = (vkind, vval)
+        if vkind == "empty":
+            seq_state = "maybe"
+        elif vkind == "plain":
+            last_plain_key = key_name
+        i = next_i
+    return keys
+
+
+sections = {}
+doc_started = False
+doc_ended = False
+current_top = None
+idx = 0
+while idx < len(raw_lines):
+    line = raw_lines[idx]
+    if not line.strip() or line.lstrip(" \t").startswith("#"):
+        idx += 1
+        continue
+    if line.startswith("%") and not doc_started and not doc_ended:
+        idx += 1
+        continue
+    if DOC_MARKER.match(line):
+        check_trailing_comment(line[3:], "document marker")
+        if line.startswith("---"):
+            if doc_started or doc_ended:
+                raise SystemExit("recipe has multiple YAML documents")
+            doc_started = True
+        else:
+            if current_top is not None:
+                top_name, start_idx = current_top
+                sections.setdefault(top_name, []).append(("block", raw_lines[start_idx:idx]))
+                current_top = None
+            doc_ended = True
+        idx += 1
+        continue
+    if doc_ended:
+        raise SystemExit("recipe has multiple YAML documents")
+    lead = len(line) - len(line.lstrip(" \t"))
+    if lead == 0:
+        if line == "-" or line.startswith(("- ", "-\t")):
+            if current_top is None:
+                raise SystemExit("recipe root is a list, not a mapping")
+            idx = advance_node(raw_lines, idx, 0, current_top[0])
+            continue
+        if current_top is not None:
+            top_name, start_idx = current_top
+            sections.setdefault(top_name, []).append(("block", raw_lines[start_idx:idx]))
+            current_top = None
+        doc_started = True
+        kind, key_name, val_rest = parse_key(line, strict_key=False)
+        if kind in ("merge_key", "explicit_key"):
+            raise SystemExit(f"recipe uses unsupported top-level key syntax: {line}")
+        if kind == "multiline_quoted_key":
+            raise SystemExit("recipe has an unsupported multiline top-level key")
+        if kind != "key":
+            raise SystemExit(f"recipe top-level line is not a key: {line}")
+        vkind, vval, next_idx = consume_value(raw_lines, val_rest, idx, 0, key_name)
+        if vkind == "empty":
+            current_top = (key_name, next_idx)
+        else:
+            sections.setdefault(key_name, []).append((vkind, vval))
+        idx = next_idx
+        continue
+    if not doc_started:
+        raise SystemExit(f"recipe has unexpected indented line before any section: {line}")
+    idx = advance_node(raw_lines, idx, lead, current_top[0] if current_top is not None else "top-level")
+
+if current_top is not None:
+    top_name, start_idx = current_top
+    sections.setdefault(top_name, []).append(("block", raw_lines[start_idx:]))
+
 
 def section(name):
-    header = rf"(?m)^{re.escape(name)}:[ \t]*$"
-    count = len(re.findall(header, text))
-    if count == 0:
+    entries = sections.get(name, [])
+    if not entries:
         raise SystemExit(f"recipe has no {name} section")
-    if count > 1:
-        raise SystemExit(f"recipe has {count} {name} sections")
-    match = re.search(rf"(?m)^{re.escape(name)}:[ \t]*\n((?:[ \t].*\n)*)", text)
-    lines = [
-        line
-        for line in match.group(1).splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    if not lines:
-        raise SystemExit(f"recipe {name} section is empty")
-    indent = re.match(r"[ \t]*", lines[0]).group(0)
-    keys = {}
-    for line in lines:
-        if not line.startswith(indent):
-            raise SystemExit(f"recipe {name} indentation is inconsistent")
-        rest = line[len(indent):]
-        if rest[:1] in (" ", "\t"):
-            continue
-        if rest.startswith("-"):
-            raise SystemExit(f"recipe {name} is a list, not one mapping")
-        key = re.fullmatch(r"([A-Za-z0-9_-]+):(.*)", rest)
-        if not key:
-            raise SystemExit(f"recipe {name} line is not a key: {rest}")
-        if key.group(1) in keys:
-            raise SystemExit(f"recipe {name} repeats {key.group(1)}")
-        keys[key.group(1)] = key.group(2).strip()
-    return keys
+    if len(entries) > 1:
+        raise SystemExit(f"recipe has {len(entries)} {name} sections")
+    kind, payload = entries[0]
+    if kind == "block":
+        return parse_block_section(payload, name)
+    if kind == "flow":
+        return parse_flow_mapping(payload, name)
+    raise SystemExit(f"recipe {name} is not a mapping")
 
 
 context = section("context")
 source = section("source")
-version = re.fullmatch(r'"([^"]+)"', context.get("version", ""))
-if not version:
+v_entry = context.get("version")
+if not v_entry or v_entry[0] not in ("quoted", "plain") or not v_entry[1]:
     raise SystemExit("recipe context has no version")
-version = version.group(1)
+version = v_entry[1]
 if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
     raise SystemExit(f"recipe context version is not X.Y.Z: {version}")
-sha = re.fullmatch(r"[0-9a-f]{64}", source.get("sha256", ""))
+s_entry = source.get("sha256")
+if not s_entry or s_entry[0] not in ("quoted", "plain") or not s_entry[1]:
+    raise SystemExit("recipe source has no sha256")
+sha = re.fullmatch(r"[0-9a-fA-F]{64}", s_entry[1])
 if not sha:
     raise SystemExit("recipe source has no sha256")
 print(version)
-print(sha.group(0))
+print(sha.group(0).lower())
 PY
 }
 
