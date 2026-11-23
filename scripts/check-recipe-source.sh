@@ -52,4 +52,70 @@ if ! grep -q 'recipe has no source section' "$tmp/err"; then
   exit 1
 fi
 
+# Nested keys inside context and source are not the recipe's own fields.
+cat > "$tmp/nested.yaml" << EOF
+context:
+  extra:
+    version: "6.6.6"
+  version: "9.8.7"
+source:
+  mirror:
+    sha256: $decoy
+  # sha256: $decoy
+  url: https://github.com/d-SEAMS/linkcell/archive/refs/tags/v\${{ version }}.tar.gz
+  sha256: $real
+EOF
+got=$(read_recipe_source "$tmp/nested.yaml")
+if [[ "$got" != "$expected" ]]; then
+  printf 'nested decoys: parser returned:\n%s\nexpected:\n%s\n' "$got" "$expected" >&2
+  exit 1
+fi
+
+# A form with more than one candidate sha256 has no single answer.
+reject() {
+  local name=$1 message=$2
+  if read_recipe_source "$tmp/$name.yaml" >/dev/null 2>"$tmp/err"; then
+    echo "parser accepted the $name recipe" >&2
+    exit 1
+  fi
+  if ! grep -q -- "$message" "$tmp/err"; then
+    echo "$name recipe did not report: $message" >&2
+    cat "$tmp/err" >&2
+    exit 1
+  fi
+}
+
+cat > "$tmp/repeated-key.yaml" << EOF
+context:
+  version: "9.8.7"
+source:
+  url: u
+  sha256: $decoy
+  sha256: $real
+EOF
+reject repeated-key 'recipe source repeats sha256'
+
+cat > "$tmp/repeated-section.yaml" << EOF
+context:
+  version: "9.8.7"
+source:
+  url: u
+  sha256: $decoy
+source:
+  url: u
+  sha256: $real
+EOF
+reject repeated-section 'recipe has 2 source sections'
+
+cat > "$tmp/list.yaml" << EOF
+context:
+  version: "9.8.7"
+source:
+  - url: a
+    sha256: $decoy
+  - url: b
+    sha256: $real
+EOF
+reject list 'recipe source is a list, not one mapping'
+
 echo "recipe source fields ok"

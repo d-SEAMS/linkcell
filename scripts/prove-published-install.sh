@@ -159,8 +159,9 @@ PY
 
 # Print the recipe's tag version and source sha256, one per line.
 # context.version is what the recipe's ${{ version }} expands to, including
-# the tag in source.url. source.sha256 is that tarball. Other version or
-# sha256 fields are ignored.
+# the tag in source.url. source.sha256 is that tarball. Only direct keys of
+# the single context and source mappings count; a nested, repeated or list
+# form is rejected rather than guessed at.
 read_recipe_source() {
   local recipe=$1
   python3 - "$recipe" << 'PY'
@@ -176,25 +177,52 @@ except OSError as exc:
 
 
 def section(name):
-    match = re.search(rf"(?m)^{re.escape(name)}:\n((?:[ \t].*\n)*)", text)
-    if not match:
+    header = rf"(?m)^{re.escape(name)}:[ \t]*$"
+    count = len(re.findall(header, text))
+    if count == 0:
         raise SystemExit(f"recipe has no {name} section")
-    return match.group(1)
+    if count > 1:
+        raise SystemExit(f"recipe has {count} {name} sections")
+    match = re.search(rf"(?m)^{re.escape(name)}:[ \t]*\n((?:[ \t].*\n)*)", text)
+    lines = [
+        line
+        for line in match.group(1).splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not lines:
+        raise SystemExit(f"recipe {name} section is empty")
+    indent = re.match(r"[ \t]*", lines[0]).group(0)
+    keys = {}
+    for line in lines:
+        if not line.startswith(indent):
+            raise SystemExit(f"recipe {name} indentation is inconsistent")
+        rest = line[len(indent):]
+        if rest[:1] in (" ", "\t"):
+            continue
+        if rest.startswith("-"):
+            raise SystemExit(f"recipe {name} is a list, not one mapping")
+        key = re.fullmatch(r"([A-Za-z0-9_-]+):(.*)", rest)
+        if not key:
+            raise SystemExit(f"recipe {name} line is not a key: {rest}")
+        if key.group(1) in keys:
+            raise SystemExit(f"recipe {name} repeats {key.group(1)}")
+        keys[key.group(1)] = key.group(2).strip()
+    return keys
 
 
 context = section("context")
 source = section("source")
-version = re.search(r'(?m)^[ \t]+version:\s*"([^"]+)"\s*$', context)
+version = re.fullmatch(r'"([^"]+)"', context.get("version", ""))
 if not version:
     raise SystemExit("recipe context has no version")
 version = version.group(1)
 if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
     raise SystemExit(f"recipe context version is not X.Y.Z: {version}")
-sha = re.search(r"(?m)^[ \t]+sha256:\s*([0-9a-f]{64})\s*$", source)
+sha = re.fullmatch(r"[0-9a-f]{64}", source.get("sha256", ""))
 if not sha:
     raise SystemExit("recipe source has no sha256")
 print(version)
-print(sha.group(1))
+print(sha.group(0))
 PY
 }
 
