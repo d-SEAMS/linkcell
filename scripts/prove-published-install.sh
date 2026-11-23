@@ -9,7 +9,7 @@ CHECKS=${CHECKS:-$SCRIPT_DIR/prove-published}
 # recipe parser can be checked without creating a work directory.
 ROOT=${PROVE_ROOT:-}
 LOG_DIR=${PROVE_LOG_DIR:-}
-RECIPE_COMMIT=8c81464f1dac30fd6d9967c71e5257c82375e0ab
+RECIPE_COMMIT=b3b7623eac5e51d645673d4c0da4569a29495e95
 RECIPE_URL=https://raw.githubusercontent.com/HaoZeke/staged-recipes/${RECIPE_COMMIT}/recipes/linkcell
 
 log() { printf '%s\n' "$*"; }
@@ -376,7 +376,7 @@ route_conda() {
   rm -rf "$ROOT/conda/recipe" "$ROOT/conda/output" "$ROOT/conda/env" "$ROOT/conda/rattler"
   mkdir -p "$ROOT/conda/recipe"
   local f
-  for f in recipe.yaml build.sh build.bat test_knearest.c; do
+  for f in recipe.yaml build.sh build.bat test_knearest.c test_knearest_csr.cpp; do
     curl -fsSL -o "$ROOT/conda/recipe/$f" "$RECIPE_URL/$f"
   done
   chmod +x "$ROOT/conda/recipe/build.sh"
