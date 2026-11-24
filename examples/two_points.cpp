@@ -37,6 +37,15 @@ int main() {
         run("sheared", xyz, n, sheared, k) != 0) {
       return 1;
     }
+    linkcell::PairCsr rows;
+    linkcell::pairs_within_csr(xyz, n, ortho, 1.5, rows, false, {true, true, true},
+                               nullptr, 0.0, true);
+    if (rows.offsets != std::vector<int>{0, 1, 2} ||
+        rows.cols != std::vector<int>{1, 0} || rows.dist2[0] != 1.0) {
+      std::cerr << "unexpected CSR rows\n";
+      return 1;
+    }
+    std::cout << "csr: 0 -> " << rows.cols[0] << ", 1 -> " << rows.cols[1] << "\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << "\n";
     return 1;

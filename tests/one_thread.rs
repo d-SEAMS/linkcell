@@ -179,6 +179,58 @@ fn one_thread_calls_create_no_thread() {
     assert_eq!(filled, rows, "pair fill row count");
     same("pair fill");
 
+    let mut need = (0usize, 0usize);
+    let csr = |offsets: *mut c_int, cols: *mut c_int, cap: usize, need: &mut (usize, usize)| unsafe {
+        linkcell::lc_pairs_within_csr(
+            xyz.as_ptr(),
+            n,
+            &cell,
+            std::ptr::null(),
+            cutoff,
+            null,
+            0.0,
+            0,
+            offsets,
+            n + 1,
+            cols,
+            std::ptr::null_mut(),
+            cap,
+            &mut need.0,
+            &mut need.1,
+        )
+    };
+    let rc = csr(std::ptr::null_mut(), std::ptr::null_mut(), 0, &mut need);
+    assert_eq!(rc, 0, "CSR query");
+    assert!(need.1 > 0, "the frame has CSR columns");
+    same("CSR query");
+    let mut offsets = vec![0 as c_int; n + 1];
+    let mut cols = vec![0 as c_int; need.1];
+    let rc = csr(offsets.as_mut_ptr(), cols.as_mut_ptr(), need.1, &mut need);
+    assert_eq!(rc, 0, "CSR fill");
+    same("CSR fill");
+    // A different cutoff drops the kept rows, so this one searches.
+    let rc = unsafe {
+        linkcell::lc_pairs_within_csr(
+            xyz.as_ptr(),
+            n,
+            &cell,
+            std::ptr::null(),
+            cutoff - 0.25,
+            null,
+            0.0,
+            1,
+            offsets.as_mut_ptr(),
+            n + 1,
+            cols.as_mut_ptr(),
+            std::ptr::null_mut(),
+            need.1,
+            &mut need.0,
+            &mut need.1,
+        )
+    };
+    assert_eq!(rc, 0, "CSR fill straight from the search");
+    same("CSR search and fill");
+
     let mut ncell = 0usize;
     let rc = unsafe {
         linkcell::lc_cell_grid(

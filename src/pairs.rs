@@ -19,6 +19,12 @@ use crate::Error;
 #[path = "pair_wide.rs"]
 mod wide;
 
+#[path = "pair_csr.rs"]
+mod csr;
+#[cfg(feature = "capi")]
+pub(crate) use csr::{check as csr_check, csr_rows, CsrDest, CsrWrite};
+pub use csr::{pairs_within_csr, PairCsr};
+
 const MAX_IMAGES: i64 = 1 << 24;
 
 /// One atom-image pair inside the cutoff.
@@ -613,6 +619,31 @@ pub(crate) fn plan(
     cell_hint: Option<f64>,
     half: bool,
 ) -> Result<Plan, Error> {
+    plan_with(xyz, simbox, cutoff, mask, cell_hint, half, true)
+}
+
+/// [`plan`] for a caller that never reads a shift. The per-atom images
+/// are one serial pass over every atom, and only shifts read them.
+pub(crate) fn plan_unshifted(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+) -> Result<Plan, Error> {
+    plan_with(xyz, simbox, cutoff, mask, cell_hint, half, false)
+}
+
+fn plan_with(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    half: bool,
+    shifts: bool,
+) -> Result<Plan, Error> {
     if !cutoff.is_finite() || cutoff <= 0.0 {
         return Err(Error::BadCutoff);
     }
@@ -698,7 +729,11 @@ pub(crate) fn plan(
     let partners = partners_for(&grid, simbox, reach, cut2);
     let margin = expanded_margin(&grid, &partners, cutoff);
     Ok(Plan {
-        images: ImageOffsets::new(xyz, simbox, active.as_deref(), repeats)?,
+        images: if shifts {
+            ImageOffsets::new(xyz, simbox, active.as_deref(), repeats)?
+        } else {
+            ImageOffsets::default()
+        },
         grid,
         partners,
         cut2,

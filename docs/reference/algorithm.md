@@ -157,6 +157,22 @@ Buffers a caller passes in are left alone.
 The bindings write their own layout from the same hits: Python and `pairs_within_columns` get the `ijS` columns without a `Pair` vector, `lc_pairs_within` writes the caller's columns, and a count query keeps its search for the matching fill on the same thread.
 `lc_pairs_within_rows` writes `lc_pair` rows, which the C++ `ShiftedPair` vector uses directly.
 
+`pairs_within_csr` / `lc_pairs_within_csr` groups the same hits by source, with no shift.
+The walk stores each unordered pair once, in per-thread chunks, so a row's entries are spread over every chunk.
+Each worker counts the rows its chunks feed.
+A scan over blocks of rows then gives each chunk its own start in every row, in chunk order.
+Each worker writes its chunks from those starts, and each row is then sorted by column on the pool.
+Those four passes are linear in the hits and need no atomic counter and no sort of the whole list.
+The starts depend on the chunks, and the chunks depend on the thread count, but the sorted row does not, so the output is the same bits at every width.
+When twice the cutoff reaches the narrowest periodic width, one atom can meet another through two images.
+The rows are then staged, sorted, and reduced to the nearest image before they are packed.
+The plan behind a CSR search skips the per-atom image offsets, which only the shift of a row reads.
+
+At 110,592 random points at water density and cutoff 3.5 on an 8-core AVX-512 host, a full list takes 7 to 10 ms on 8 threads, compared with 33 to 42 ms on one thread.
+In a timed 10.3 ms call on 8 threads, 5.4 ms is the walk, which scales about 5x.
+Another 2.3 ms is the bin build, whose bin scan is serial, and 1.8 ms is the count, place, fill, and row sort.
+`examples/pairs_csr_bench.rs` reproduces the totals.
+
 With the bin edge equal to the cutoff the search radius is 1, and the gap between any two cells inside that stencil is 0, so the bin test keeps every cell. vesin's cell list then evaluates `27 ρ − 1` ordered distances per atom (`ρ` atoms in the cell).
 This walk evaluates `(ρ − 1) / 2 + 13 ρ`, which is exactly half: `scripts/cutoff_work.py` simplifies the ratio to 2. vesin also forms `S H` with a 3 by 3 product on every candidate.
 This walk forms that shift once per cell pair.

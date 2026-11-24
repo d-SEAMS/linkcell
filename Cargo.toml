@@ -65,6 +65,10 @@ required-features = ["timing"]
 [[example]]
 name = "partition_panel"
 
+[[example]]
+name = "pairs_csr_bench"
+required-features = ["capi"]
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -427,6 +427,69 @@ pairs_within_pbc(const double *xyz, std::size_t n, const Cell &cell,
   return out;
 }
 
+/// Cutoff neighbours as CSR rows; see `lc_pairs_within_csr`. Row `i` is
+/// `cols[offsets[i]] .. cols[offsets[i + 1] - 1]`, ascending, each
+/// neighbour once. `dist2` is filled when `with_dist2` is set.
+struct PairCsr {
+  std::vector<int> offsets;
+  std::vector<int> cols;
+  std::vector<double> dist2;
+};
+
+/// `lc_pairs_within_csr` into `out`, keeping its capacity. One call
+/// writes the rows when `out.cols` already has room for them; otherwise
+/// a second call copies the rows the first kept.
+inline void pairs_within_csr(const double *xyz, std::size_t n,
+                             const Cell &cell, double cutoff, PairCsr &out,
+                             bool half = false,
+                             const std::array<bool, 3> &periodic = {true, true,
+                                                                    true},
+                             const int *mask = nullptr, double cell_hint = 0.0,
+                             bool with_dist2 = false) {
+  const int pbc[3] = {periodic[0] ? 1 : 0, periodic[1] ? 1 : 0,
+                      periodic[2] ? 1 : 0};
+  const lc_cell raw = cell.raw();
+  out.offsets.resize(n + 1);
+  out.cols.resize(out.cols.capacity());
+  if (with_dist2) {
+    out.dist2.resize(out.cols.size());
+  } else {
+    out.dist2.clear();
+  }
+  std::size_t need_offsets = 0;
+  std::size_t need_cols = 0;
+  // A non-null buffer of zero length still takes part in the fill.
+  int spare_col = 0;
+  double spare_d2 = 0.0;
+  const auto call = [&]() {
+    int *cols = out.cols.empty() ? &spare_col : out.cols.data();
+    double *d2 = !with_dist2 ? nullptr
+                 : out.dist2.empty() ? &spare_d2
+                                     : out.dist2.data();
+    return lc_pairs_within_csr(xyz, n, &raw, pbc, cutoff, mask, cell_hint,
+                               half ? 1 : 0, out.offsets.data(),
+                               out.offsets.size(), cols, d2, out.cols.size(),
+                               &need_offsets, &need_cols);
+  };
+  int status = call();
+  if (status != 0 && need_offsets == n + 1 && need_cols > out.cols.size()) {
+    out.cols.resize(need_cols);
+    if (with_dist2) {
+      out.dist2.resize(need_cols);
+    }
+    status = call();
+  }
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg)
+                            : std::string("linkcell: pairs_within_csr failed"));
+  }
+  out.cols.resize(need_cols);
+  if (with_dist2) {
+    out.dist2.resize(need_cols);
+  }
+}
+
 [[nodiscard]] inline const char *version() noexcept { return lc_version(); }
 
 /// Fractional bins and a point count per bin.
