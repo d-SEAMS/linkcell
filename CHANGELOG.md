@@ -15,12 +15,12 @@ Unreleased notes live in [`changelog.d/`](changelog.d/) and are assembled by [to
 
 ### Added
 
-- Add `pairs_within_csr` and `lc_pairs_within_csr`: the cutoff neighbours of every point as CSR rows (`offsets`, ascending `cols`, optional nearest-image squared distances) for full or half (`j > i`) lists on orthorhombic, triclinic, open, and mixed cells, with minimum-image semantics past half the box. The rows are counted, placed, filled, and sorted per row on the pool set by `lc_set_threads`, with no global sort, and are the same bits at every thread count. The C call sizes in two calls (a null-buffer query keeps its rows for the fill) and rejects a non-finite coordinate. The C++ header adds `linkcell::PairCsr` and `linkcell::pairs_within_csr`, and `examples/pairs_csr_bench.rs` times it against `lc_pairs_within_rows`.
+- Add `pairs_within_csr` and `lc_pairs_within_csr`: the cutoff neighbours of every point as compressed sparse row (CSR) rows (`offsets`, ascending `cols`, optional nearest-image squared distances) for full or half (`j > i`) lists on orthorhombic, triclinic, open, and mixed cells, with minimum-image semantics past half the box. Each row is counted, then filled and sorted in place on the pool set by `lc_set_threads`, with no global sort, and the output matches bit for bit at every thread count. The C call sizes in two calls (a null-buffer query keeps its rows for the fill) and rejects a non-finite coordinate. The C++ header adds `linkcell::PairCsr` and `linkcell::pairs_within_csr`, and `examples/pairs_csr_bench.rs` times it against `lc_pairs_within_rows`.
 
 ### Fixed
 
 - Folded the optional-OpenMP release note into the `0.5.0` changelog section and matched `CITATION.cff` `date-released` to the `v0.5.0` tag date (`2026-11-22`).
-- `scripts/prove-published-install.sh` now reads both `context.version` and `source.sha256` from the pinned staged-recipes `recipe.yaml` via a stdlib-only YAML-aware parser (`read_recipe_source`) that checks direct mapping keys and rejects nested, repeated, list, or decoy entries, pins the recipe to the `0.5.0` staged-recipes commit (`b3b7623e`, including `test_knearest_csr.cpp`), and is covered by `scripts/check-recipe-source.sh` in the CI `fmt` job.
+- `scripts/prove-published-install.sh` reads `context.version` and `source.sha256` from the pinned staged-recipes `recipe.yaml`. A stdlib-only YAML-aware parser (`read_recipe_source`) takes only direct mapping keys and rejects nested, repeated, list or decoy entries. The recipe is pinned to the `0.5.0` staged-recipes commit (`b3b7623e`, which carries `test_knearest_csr.cpp`), and `scripts/check-recipe-source.sh` checks the parser in the CI `fmt` job.
 
 ## [0.5.0] - 2026-11-22
 
