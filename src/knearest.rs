@@ -340,13 +340,20 @@ pub fn knearest_into_many(
             return Err(Error::BufferSize);
         }
     }
+    if let Err(err) = check(xyz, n, simbox, k, mask) {
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
+        return Err(err);
+    }
     for f in 0..n_frames {
         let lo = f * n;
         let hi = lo + n;
         let nn_lo = f * n * k;
         let nn_hi = nn_lo + n * k;
         let frame_d2 = out_d2.as_mut().map(|d| &mut d[nn_lo..nn_hi]);
-        write_one(
+        write_checked(
             &xyz[lo..hi],
             simbox,
             k,
@@ -355,6 +362,47 @@ pub fn knearest_into_many(
             &mut out_nn[nn_lo..nn_hi],
             frame_d2,
         )?;
+    }
+    Ok(())
+}
+
+/// The argument checks every k-nearest entry runs once, before any
+/// search: `xyz` is frames of `n` points sharing `mask` and `simbox`.
+///
+/// [`Error::ZeroK`], [`Error::Empty`], [`Error::MaskLen`], then
+/// [`Error::NonFinite`] when a coordinate (masked or not) or the cell
+/// origin is not finite. The lattice vectors are finite by
+/// construction: [`Cell`] rejects any other as [`Error::BadBox`].
+fn check(
+    xyz: &[[f64; 3]],
+    n: usize,
+    simbox: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+) -> Result<(), Error> {
+    if k == 0 {
+        return Err(Error::ZeroK);
+    }
+    if n == 0 || xyz.is_empty() {
+        return Err(Error::Empty);
+    }
+    if let Some(m) = mask {
+        if m.len() != n {
+            return Err(Error::MaskLen);
+        }
+    }
+    finite(xyz, simbox)
+}
+
+/// One pass over the coordinates and the cell origin.
+fn finite(xyz: &[[f64; 3]], simbox: &Cell) -> Result<(), Error> {
+    if xyz
+        .iter()
+        .flatten()
+        .chain(&simbox.origin())
+        .any(|v| !v.is_finite())
+    {
+        return Err(Error::NonFinite);
     }
     Ok(())
 }
@@ -377,6 +425,26 @@ fn write_one(
             return Err(Error::BufferSize);
         }
     }
+    if let Err(err) = check(xyz, n, simbox, k, mask) {
+        out_nn.fill(-1);
+        if let Some(d2) = out_d2.as_mut() {
+            d2.fill(f64::NAN);
+        }
+        return Err(err);
+    }
+    write_checked(xyz, simbox, k, mask, cell_hint, out_nn, out_d2)
+}
+
+/// [`write_one`] after [`check`] passed and the buffers are `n * k`.
+fn write_checked(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    k: usize,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+    out_nn: &mut [i32],
+    mut out_d2: Option<&mut [f64]>,
+) -> Result<(), Error> {
     #[cfg(feature = "timing")]
     let started = std::time::Instant::now();
     let found = execute(
@@ -473,6 +541,7 @@ pub(crate) fn knearest_graph(
     if n > i32::MAX as usize {
         return Err(Error::Overflow);
     }
+    check(xyz, n, simbox, k, mask)?;
     let mut bufs = GRAPH_POOL
         .lock()
         .unwrap_or_else(|err| err.into_inner())
@@ -731,8 +800,11 @@ pub fn knearest_csr(
 ///
 /// Returns [`Error::ZeroK`] when `k == 0`, [`Error::Empty`] when `xyz`
 /// is empty, [`Error::Overflow`] when `n * k` does not fit in a slice,
-/// and [`Error::TooManyCells`] when the mesh exceeds the bin cap.
-/// These inputs return `Err`.
+/// [`Error::NonFinite`] when a coordinate (masked or not) or the cell
+/// origin is NaN or infinite, and [`Error::TooManyCells`] when the mesh
+/// exceeds the bin cap. These inputs return `Err`. [`knearest_into`],
+/// [`knearest_into_d2`], [`knearest_into_many`], [`knearest_csr`] and
+/// [`knearest_brute`] return the same errors.
 ///
 /// Fold, bin, then grow a rectangular index box. An orthorhombic cell
 /// is used as stored. A restricted triclinic cell is tilt-reduced
@@ -910,6 +982,8 @@ fn scan_chunk(units: usize, width: usize) -> usize {
     (units / (16 * width.max(1))).max(1)
 }
 
+/// The search. The caller has run [`check`] on `xyz`, `simbox`, `k` and
+/// `mask`.
 #[allow(clippy::too_many_arguments)]
 fn execute(
     xyz: &[[f64; 3]],
@@ -922,18 +996,7 @@ fn execute(
     prep: Option<&(dyn Fn(std::ops::Range<usize>) + Sync)>,
     tail: &[Stage<'_, Scratch>],
 ) -> Result<(), Error> {
-    if k == 0 {
-        return Err(Error::ZeroK);
-    }
-    if xyz.is_empty() {
-        return Err(Error::Empty);
-    }
     let n = xyz.len();
-    if let Some(m) = mask {
-        if m.len() != n {
-            return Err(Error::MaskLen);
-        }
-    }
     let n_active = match mask {
         Some(m) => m.iter().filter(|&&on| on).count(),
         None => n,
@@ -2145,6 +2208,7 @@ pub fn knearest_brute(
     if xyz.is_empty() {
         return Err(Error::Empty);
     }
+    finite(xyz, simbox)?;
     let n = xyz.len();
     let active: Vec<usize> = (0..n)
         .filter(|&i| {

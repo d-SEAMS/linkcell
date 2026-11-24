@@ -52,6 +52,9 @@ int lc_knearest_many(const double *xyz, size_t n, size_t n_frames,
 
 `lc_knearest` is the one-frame, indices-only entry.
 Returns 0 on success, nonzero on failure.
+A NaN or infinite coordinate, masked or not and in any frame, or a non-finite `simbox` origin returns nonzero with `lc_last_error()` set to `a coordinate is not finite`, before any search; `out_nn` is filled with `-1` and `out_d2` with `NaN`.
+A non-finite lattice entry returns nonzero as a singular or non-positive cell.
+The device entries `lc_gpu_knearest*` in `linkcell_gpu.h` do not scan their device coordinates for non-finite values.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
@@ -307,7 +310,7 @@ int lc_knearest_csr(const double *xyz, size_t n, const lc_cell *simbox,
                     int *(*alloc)(void *, size_t), void *ctx);
 ```
 
-Inputs match `lc_knearest`.
+Inputs and argument errors match `lc_knearest`, including the non-finite coordinate and origin check.
 `out_offsets` has length `n + 1`.
 `alloc(ctx, total)` is called once, from any thread of the search, and returns `total` writable ints for the columns.
 A null return fails the call.
@@ -380,12 +383,16 @@ A null function removes the hook, and the device partition then reports that no 
 | `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
 | `Device` | The device is not the CPU and `libvesin.so` is not loaded |
 | `Padded` | A point has more neighbours than the requested pad |
-| `NonFinite` | A coordinate is not finite. `pairs_within_pbc`, `pairs_within_csr`, `pairs_open`, and the partition entry points return this variant |
+| `NonFinite` | A coordinate is not finite. `knearest`, `knearest_into`, `knearest_into_d2`, `knearest_into_many`, `knearest_csr`, `knearest_brute` (and through them `lc_knearest`, `lc_knearest_d2`, `lc_knearest_many`, `lc_knearest_csr`), `pairs_within_pbc`, `pairs_within_csr`, `pairs_open`, and the partition entry points return this variant. The k-nearest entries also return it for a non-finite cell origin |
 | `DeviceMismatch` | The device curve split disagreed with the host weights |
 | `ScotchFailed` | The Scotch library rejected the graph |
 
 `Error::Empty` is not a wrong-length buffer.
-`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, and `TooManyCells`.
+`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`.
+`knearest_csr` returns the same variants.
+`knearest_into`, `knearest_into_d2`, and `knearest_into_many` return them and `BufferSize`.
+`knearest_brute` returns `ZeroK`, `Empty`, and `NonFinite`.
+A non-finite lattice vector is `BadBox` from the `Cell` constructor, before any search.
 `pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
 `TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
 point count above `u32::MAX` and a relative periodic image offset that

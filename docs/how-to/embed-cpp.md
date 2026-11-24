@@ -61,6 +61,8 @@ ws.knearest_into_many_dcell(xyz_dev, n, 1, cell_dev, 9, k, out_dev,
 The device k-nearest workspace writes that same packed buffer and reports `available()` as false when the CUDA driver or NVIDIA Runtime Compilation (NVRTC) fails to load.
 gpulite loads both at runtime.
 The build skips the CUDA SDK.
+The device workspace does not scan its device coordinates for non-finite values; check them before the call.
+The host calls `linkcell::knearest`, `knearest_into`, `knearest_into_many`, and `knearest_csr` throw `linkcell::Error` (`a coordinate is not finite`) for a NaN or infinite coordinate or cell origin.
 
 A general parallelepiped cell is `linkcell::Cell::from_vectors(a, b, c, origin)`.
 `Cell::raw()` is the `lc_cell` the ABI consumes.

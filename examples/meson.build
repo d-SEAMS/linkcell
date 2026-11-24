@@ -30,6 +30,21 @@ test('two-points-c', two_points_c, env: _test_env)
 test('two-points-cpp', two_points_cpp, env: _test_env)
 test('pairs-csr-c', pairs_csr_c, env: _test_env)
 
+knearest_non_finite_c = executable(
+  'knearest_non_finite',
+  meson.project_source_root() / 'tests/knearest_non_finite.c',
+  dependencies: [linkcell_dep, cc.find_library('m', required: false)],
+  build_rpath: meson.project_build_root(),
+)
+knearest_non_finite_cpp = executable(
+  'knearest_non_finite_cpp',
+  meson.project_source_root() / 'tests/knearest_non_finite.cpp',
+  dependencies: linkcell_dep,
+  build_rpath: meson.project_build_root(),
+)
+test('knearest-non-finite-c', knearest_non_finite_c, env: _test_env)
+test('knearest-non-finite-cpp', knearest_non_finite_cpp, env: _test_env)
+
 if _gpu_on
   gpu_agree = executable(
     'gpu_agree',

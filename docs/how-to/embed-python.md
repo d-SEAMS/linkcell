@@ -27,11 +27,15 @@ The return is `(indices, dist2)`.
 Indices are int32 (`-1` unused).
 `dist2` is float64 (`NaN` unused).
 A batched `xyz` yields shape `(n_frames, n, k)`.
+A NaN or infinite host coordinate, masked or not and in any frame, or a non-finite origin row raises `RuntimeError("a coordinate is not finite")` before any search.
+A NaN or infinite lattice entry raises `ValueError`.
 
 CUDA `xyz` (`kDLCUDA`, including a `torch.Tensor` on GPU) is passed by device pointer into `lc_gpu_*`.
 A CUDA `cell` is inverted on device; the host only reads the four launch ints (`nx`, `ny`, `nz`, `nC`).
 The result capsules are on the same CUDA device; `torch.from_dlpack` takes them without a host bounce.
 `linkcell.gpu_available()` is true when the driver and nvrtc load (gpulite, no CUDA SDK at build time).
+CUDA `xyz` is not scanned for non-finite values: a NaN or infinite device coordinate does not raise.
+Check device coordinates before the call (for example `torch.isfinite(xyz).all()`) or pass a host copy to get the `RuntimeError`.
 
 An open cluster is `pairs_open(xyz, cutoff)`. The return is
 `(i, j, S, dist2)` with `i < j` and shift zero.
