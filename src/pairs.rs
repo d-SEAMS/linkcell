@@ -644,6 +644,75 @@ fn plan_with(
     half: bool,
     shifts: bool,
 ) -> Result<Plan, Error> {
+    let Some(binned) = bin_atoms(xyz, simbox, cutoff, mask, cell_hint)? else {
+        return Ok(Plan {
+            images: ImageOffsets::default(),
+            grid: Grid::empty(),
+            partners: std::sync::Arc::new(PartnerList {
+                key: ([0; 12], [1, 1, 1], [0; 3], 0),
+                off: vec![0],
+                items: Vec::new(),
+                s_max: 0.0,
+                d_max: 0.0,
+            }),
+            cut2: cutoff * cutoff,
+            margin: 0.0,
+            path: Path::Scalar,
+            half,
+            threads: 1,
+        });
+    };
+    let Binned {
+        grid,
+        reach,
+        repeats,
+        active,
+        cut2,
+        path,
+        threads,
+    } = binned;
+    let partners = partners_for(&grid, simbox, reach, cut2);
+    let margin = expanded_margin(&grid, &partners, cutoff);
+    Ok(Plan {
+        images: if shifts {
+            ImageOffsets::new(xyz, simbox, active.as_deref(), repeats)?
+        } else {
+            ImageOffsets::default()
+        },
+        grid,
+        partners,
+        cut2,
+        margin,
+        path,
+        half,
+        threads,
+    })
+}
+
+/// The bins of one search, before any stencil.
+pub(crate) struct Binned {
+    grid: Grid,
+    /// Bins each bin looks across, per axis.
+    reach: [i32; 3],
+    /// Images per axis each side of the box.
+    repeats: [i32; 3],
+    /// Atom numbers of the masked-in atoms, under a mask.
+    active: Option<Vec<usize>>,
+    cut2: f64,
+    /// [`Path`] chosen once on the calling thread.
+    path: Path,
+    threads: usize,
+}
+
+/// Check the arguments, then bin the active atoms. `None` when no atom
+/// is active.
+fn bin_atoms(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+) -> Result<Option<Binned>, Error> {
     if !cutoff.is_finite() || cutoff <= 0.0 {
         return Err(Error::BadCutoff);
     }
@@ -662,22 +731,7 @@ fn plan_with(
     let active: Option<Vec<usize>> = mask.map(|m| (0..n).filter(|&i| m[i]).collect());
     let n_act = active.as_ref().map_or(n, |a| a.len());
     if n_act == 0 {
-        return Ok(Plan {
-            images: ImageOffsets::default(),
-            grid: Grid::empty(),
-            partners: std::sync::Arc::new(PartnerList {
-                key: ([0; 12], [1, 1, 1], [0; 3], 0),
-                off: vec![0],
-                items: Vec::new(),
-                s_max: 0.0,
-                d_max: 0.0,
-            }),
-            cut2: cutoff * cutoff,
-            margin: 0.0,
-            path: Path::Scalar,
-            half,
-            threads: 1,
-        });
+        return Ok(None);
     }
     retain_pair_pages();
 
@@ -726,22 +780,15 @@ fn plan_with(
     // Read on this thread, before the grid's rayon fan-out.
     let path = crate::simd::select();
     let grid = Grid::build(xyz, simbox, active.as_deref(), dims, grid_threads, path);
-    let partners = partners_for(&grid, simbox, reach, cut2);
-    let margin = expanded_margin(&grid, &partners, cutoff);
-    Ok(Plan {
-        images: if shifts {
-            ImageOffsets::new(xyz, simbox, active.as_deref(), repeats)?
-        } else {
-            ImageOffsets::default()
-        },
+    Ok(Some(Binned {
         grid,
-        partners,
+        reach,
+        repeats,
+        active,
         cut2,
-        margin,
         path,
-        half,
         threads,
-    })
+    }))
 }
 
 /// Threads for one search with `hits` expected pairs: one without
