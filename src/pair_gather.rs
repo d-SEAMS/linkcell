@@ -480,9 +480,15 @@ impl<'a> Walker<'a> {
                 }
                 let packed = stage.pack.cols();
                 let Stage { cols, d2, runs, .. } = stage;
+                let bin = Bin {
+                    runs: &runs[..],
+                    packed,
+                    k,
+                    room,
+                };
                 for s in s_lo..s_hi {
                     let out = (&mut *cols, &mut *d2);
-                    self.row::<D2, HALF, W>(out, runs, s, packed, k, room, repeat, rows);
+                    self.row::<D2, HALF, W>(out, bin, s, repeat, rows);
                 }
             }
             bx += 1;
@@ -556,26 +562,21 @@ impl<'a> Walker<'a> {
         self.range::<D2, HALF, 0>(stage, lo, hi, repeat, rows);
     }
 
-    /// Stage the row of slot `s` from the bin's `k` packed candidates
-    /// and the runs it reads in place, fewer than `room` slots in all.
+    /// Stage the row of slot `s` from `bin`.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     fn row<const D2: bool, const HALF: bool, const W: usize>(
         &self,
         (out_cols, out_d2): (&mut Vec<i32>, &mut Vec<f64>),
-        runs: &[Run],
+        bin: Bin,
         s: usize,
-        packed: Cols,
-        k: usize,
-        room: usize,
         repeat: bool,
         rows: RowOut,
     ) {
         let c: &Coords = &self.grid.coords;
         let start = out_cols.len();
-        out_cols.reserve(room);
+        out_cols.reserve(bin.room);
         if D2 {
-            out_d2.reserve(room);
+            out_d2.reserve(bin.room);
         }
         let cols = unsafe { out_cols.as_mut_ptr().add(start) };
         let d2s = if D2 {
@@ -585,19 +586,23 @@ impl<'a> Walker<'a> {
         };
         let i = c.id[s];
         let p = [c.x[s], c.y[s], c.z[s]];
-        let cut2 = self.cut2;
-        // Safety: `room` covers every candidate and the wide kernel's
-        // last store; the packed list holds `k` and the runs are slots of
-        // the grid.
+        let probe = Probe {
+            p,
+            i,
+            cut2: self.cut2,
+        };
+        // Safety: `bin.room` covers every candidate and the wide kernel's
+        // last store; the packed list holds `bin.k` and the runs are
+        // slots of the grid.
         let mut len =
-            unsafe { scan_w::<D2, HALF, W>(packed, k, p, i, cut2, Out { cols, d2s, len: 0 }) };
+            unsafe { scan_w::<D2, HALF, W>(bin.packed, bin.k, probe, Out { cols, d2s, len: 0 }) };
         let grid = c.cols();
-        for run in runs {
+        for run in bin.runs {
             let at = Out { cols, d2s, len };
             len = unsafe {
                 match run.kind {
                     Kind::Plain => {
-                        scan::<D2, HALF, false>(grid, run.lo, run.hi, p, [0.0; 3], i, cut2, at)
+                        scan::<D2, HALF, false>(grid, run.lo, run.hi, probe, [0.0; 3], at)
                     }
                     Kind::Source => {
                         let q = [
@@ -605,10 +610,11 @@ impl<'a> Walker<'a> {
                             p[1] - run.shift[1],
                             p[2] - run.shift[2],
                         ];
-                        scan::<D2, HALF, false>(grid, run.lo, run.hi, q, [0.0; 3], i, cut2, at)
+                        let probe = Probe { p: q, ..probe };
+                        scan::<D2, HALF, false>(grid, run.lo, run.hi, probe, [0.0; 3], at)
                     }
                     Kind::Target => {
-                        scan::<D2, HALF, true>(grid, run.lo, run.hi, p, run.shift, i, cut2, at)
+                        scan::<D2, HALF, true>(grid, run.lo, run.hi, probe, run.shift, at)
                     }
                 }
             };
@@ -643,6 +649,25 @@ fn fold(v: i32, n: i32) -> (i32, i32) {
     } else {
         (v.rem_euclid(n), v.div_euclid(n))
     }
+}
+
+/// What every row of a bin reads: the runs read in place, the `k`
+/// packed candidates, and `room`, more slots than a row can stage.
+#[derive(Clone, Copy)]
+struct Bin<'a> {
+    runs: &'a [Run],
+    packed: Cols,
+    k: usize,
+    room: usize,
+}
+
+/// The atom a row belongs to: its number `i`, its position `p` (less
+/// the run's shift, for a shifted source run), and the squared cutoff.
+#[derive(Clone, Copy)]
+struct Probe {
+    p: [f64; 3],
+    i: u32,
+    cut2: f64,
 }
 
 /// A row's staged entries and how many it holds.
@@ -873,9 +898,7 @@ unsafe fn scan4<const D2: bool, const HALF: bool>(
     c: Cols,
     lo: usize,
     hi: usize,
-    p: [f64; 3],
-    i: u32,
-    cut2: f64,
+    probe: Probe,
     out: Out,
 ) -> usize {
     use std::arch::x86_64::{
@@ -887,6 +910,7 @@ unsafe fn scan4<const D2: bool, const HALF: bool>(
         _mm_storeu_si128, _CMP_LT_OQ,
     };
     let Out { cols, d2s, mut len } = out;
+    let Probe { p, i, cut2 } = probe;
     unsafe {
         let (px, py, pz) = (
             _mm256_set1_pd(p[0]),
@@ -931,27 +955,24 @@ unsafe fn scan4<const D2: bool, const HALF: bool>(
     len
 }
 
-/// Test candidates `lo..hi` against the row of atom `i` at `p` (less
-/// the run's shift, for a shifted source run) and append its hits at
-/// `out.cols[out.len..]` (and `out.d2s`) as `q - p`, with `q` less
-/// `shift` under `SHIFTED` (a target run). Returns the new length.
+/// Test candidates `lo..hi` against the row of `probe` and append its
+/// hits at `out.cols[out.len..]` (and `out.d2s`) as `q - p`, with `q`
+/// less `shift` under `SHIFTED` (a target run). Returns the new length.
 ///
 /// # Safety
 /// `lo..hi` are candidates of `c`, and `out.cols` (and `out.d2s` under
 /// `D2`) have room for `hi - lo` entries past `out.len`.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 unsafe fn scan<const D2: bool, const HALF: bool, const SHIFTED: bool>(
     c: Cols,
     lo: usize,
     hi: usize,
-    p: [f64; 3],
+    probe: Probe,
     shift: [f64; 3],
-    i: u32,
-    cut2: f64,
     out: Out,
 ) -> usize {
     let Out { cols, d2s, mut len } = out;
+    let Probe { p, i, cut2 } = probe;
     for t in lo..hi {
         let (mut q, j) = unsafe { ([*c.x.add(t), *c.y.add(t), *c.z.add(t)], *c.id.add(t)) };
         if SHIFTED {
@@ -1009,21 +1030,19 @@ unsafe fn pack_w<const W: usize>(
 unsafe fn scan_w<const D2: bool, const HALF: bool, const W: usize>(
     packed: Cols,
     k: usize,
-    p: [f64; 3],
-    i: u32,
-    cut2: f64,
+    probe: Probe,
     out: Out,
 ) -> usize {
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if W == 8 {
-        return unsafe { scan8::<D2, HALF>(packed, 0, k, p, i, cut2, out) };
+        return unsafe { scan8::<D2, HALF>(packed, 0, k, probe, out) };
     }
     #[cfg(target_arch = "x86_64")]
     if W == 4 {
-        return unsafe { scan4::<D2, HALF>(packed, 0, k, p, i, cut2, out) };
+        return unsafe { scan4::<D2, HALF>(packed, 0, k, probe, out) };
     }
     if W != 0 {
-        return unsafe { scan::<D2, HALF, false>(packed, 0, k, p, [0.0; 3], i, cut2, out) };
+        return unsafe { scan::<D2, HALF, false>(packed, 0, k, probe, [0.0; 3], out) };
     }
     out.len
 }
@@ -1043,9 +1062,7 @@ unsafe fn scan8<const D2: bool, const HALF: bool>(
     c: Cols,
     lo: usize,
     hi: usize,
-    p: [f64; 3],
-    i: u32,
-    cut2: f64,
+    probe: Probe,
     out: Out,
 ) -> usize {
     use std::arch::x86_64::{
@@ -1056,6 +1073,7 @@ unsafe fn scan8<const D2: bool, const HALF: bool>(
         _CMP_LT_OQ,
     };
     let Out { cols, d2s, mut len } = out;
+    let Probe { p, i, cut2 } = probe;
     let (px, py, pz) = (
         _mm512_set1_pd(p[0]),
         _mm512_set1_pd(p[1]),
