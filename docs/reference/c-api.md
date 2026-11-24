@@ -111,6 +111,43 @@ by every call with the same cutoff and bin edge, wherever the atoms
 sit. With a periodic axis it is reused while the atoms stay inside the
 same bounding bins.
 
+```c
+int lc_pairs_within_csr(const double *xyz, size_t n, const lc_cell *simbox,
+                        const int *pbc, double cutoff, const int *mask,
+                        double cell_hint, int half,
+                        int *out_offsets, size_t cap_offsets,
+                        int *out_cols, double *out_d2, size_t cap_cols,
+                        size_t *need_offsets, size_t *need_cols);
+```
+
+`lc_pairs_within_csr` writes the cutoff neighbours of each point as compressed sparse row (CSR) rows.
+Row `i` is `out_cols[out_offsets[i] .. out_offsets[i + 1]]`.
+It holds every `j != i` with an image strictly within `cutoff`, once, in ascending order.
+On a periodic axis that is the minimum-image distance, also when `cutoff` is past half the box, where one atom meets another through several images.
+A periodic image of `i` is not listed.
+`half` nonzero keeps `j > i` only.
+`out_d2`, if non-null, receives the squared distance of the nearest image of each column.
+A masked-out point has an empty row and appears in no row.
+`pbc` and `mask` are those of `lc_pairs_within_pbc`.
+`simbox` may be null when every axis is open.
+
+| Call | Result |
+| --- | --- |
+| `out_offsets`, `out_cols`, `out_d2` all null | Query: sets `*need_offsets = n + 1` and `*need_cols`, returns 0 |
+| `cap_offsets >= n + 1` and `cap_cols >= *need_cols` | Writes the rows, sets both counts, returns 0 |
+| Either buffer short | Sets both counts, writes nothing, returns nonzero |
+| `n == 0` | Returns 0 with one offset, `0` |
+| Bad cutoff, non-finite coordinate, null count pointer, more than `INT_MAX` columns | Returns nonzero with `lc_last_error` set |
+
+A query or a short buffer keeps its rows on the calling thread, like the other count queries.
+The next call there with the same inputs bit for bit copies them out without searching again.
+A buffer large enough on the first call takes the rows straight from the search.
+The rows and distances are the same bits at every `lc_set_threads` width and SIMD path.
+A periodic cell is searched, counted, placed, filled, and sorted per row on the pool.
+No step sorts the whole list.
+A cell with an open axis is searched on the calling thread, and its rows are then built on the pool.
+`pairs_within_csr` is the Rust entry and fills a `PairCsr`.
+
 ## Vesin compatibility
 
 `include/linkcell_vesin.h` declares `lc_vesin_neighbors` and
@@ -200,6 +237,18 @@ std::vector<ShiftedPair> pairs_within(const double *xyz, std::size_t n,
                                       const int *mask = nullptr,
                                       double cell_hint = 0.0,
                                       bool half = false);
+
+struct PairCsr {
+  std::vector<int> offsets;
+  std::vector<int> cols;
+  std::vector<double> dist2;
+};
+
+void pairs_within_csr(const double *xyz, std::size_t n, const Cell &cell,
+                      double cutoff, PairCsr &out, bool half = false,
+                      const std::array<bool, 3> &periodic = {true, true, true},
+                      const int *mask = nullptr, double cell_hint = 0.0,
+                      bool with_dist2 = false);
 }
 ```
 
@@ -211,6 +260,8 @@ Requires C++17.
 
 `ShiftedPair` has the layout of `lc_pair`.
 `pairs_within` queries the count, then `lc_pairs_within_rows` writes the returned vector from that same search.
+`pairs_within_csr` calls `lc_pairs_within_csr` into the capacity `out` already holds.
+When that is short it resizes `out` and copies the kept rows, so a reused `PairCsr` costs one search per frame.
 
 ## Partition
 
@@ -329,7 +380,7 @@ A null function removes the hook, and the device partition then reports that no 
 | `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
 | `Device` | The device is not the CPU and `libvesin.so` is not loaded |
 | `Padded` | A point has more neighbours than the requested pad |
-| `NonFinite` | A coordinate is not finite. `pairs_within_pbc`, `pairs_open`, and the partition entry points return this variant |
+| `NonFinite` | A coordinate is not finite. `pairs_within_pbc`, `pairs_within_csr`, `pairs_open`, and the partition entry points return this variant |
 | `DeviceMismatch` | The device curve split disagreed with the host weights |
 | `ScotchFailed` | The Scotch library rejected the graph |
 
