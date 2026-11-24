@@ -1003,15 +1003,13 @@ unsafe fn scan_w<const D2: bool, const HALF: bool, const W: usize>(
     out: Out,
 ) -> usize {
     let _ = (packed, k, p, i, cut2);
-    unsafe {
-        #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
-        if W == 8 {
-            return scan8::<D2, HALF>(packed, 0, k, p, i, cut2, out);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if W == 4 {
-            return scan4::<D2, HALF>(packed, 0, k, p, i, cut2, out);
-        }
+    #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+    if W == 8 {
+        return unsafe { scan8::<D2, HALF>(packed, 0, k, p, i, cut2, out) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if W == 4 {
+        return unsafe { scan4::<D2, HALF>(packed, 0, k, p, i, cut2, out) };
     }
     out.len
 }
