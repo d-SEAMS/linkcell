@@ -507,7 +507,6 @@ impl<'a> Walker<'a> {
     ///
     /// # Safety
     /// The CPU has AVX-512F, AVX-512VL, and POPCNT.
-    #[allow(clippy::incompatible_msrv)]
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     #[target_feature(enable = "avx512f,avx512vl,popcnt")]
     unsafe fn range_avx512<const D2: bool, const HALF: bool>(
@@ -750,8 +749,10 @@ unsafe fn pack(from: Cols, lo: usize, hi: usize, shift: [f64; 3], to: Cols, k: u
 /// # Safety
 /// As [`pack`], with [`SLACK`] more room in `to`, on a CPU with
 /// AVX-512F and AVX-512VL.
-#[allow(clippy::incompatible_msrv)]
+// `linkcell_avx512` builds this only from rustc 1.89, which stabilised
+// these intrinsics.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[clippy::msrv = "1.89"]
 #[inline(always)]
 unsafe fn pack8(from: Cols, lo: usize, hi: usize, shift: [f64; 3], to: Cols, k: usize) {
     use std::arch::x86_64::{
@@ -1055,8 +1056,10 @@ unsafe fn scan_w<const D2: bool, const HALF: bool, const W: usize>(
 /// # Safety
 /// As [`scan`], with [`SLACK`] more room, on a CPU with AVX-512F,
 /// AVX-512VL, and POPCNT.
-#[allow(clippy::incompatible_msrv)]
+// `linkcell_avx512` builds this only from rustc 1.89, which stabilised
+// these intrinsics.
 #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
+#[clippy::msrv = "1.89"]
 #[inline(always)]
 unsafe fn scan8<const D2: bool, const HALF: bool>(
     c: Cols,
