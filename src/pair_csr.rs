@@ -527,8 +527,8 @@ struct Rows<'a> {
     n: usize,
     half: bool,
     blocks: usize,
-    /// `next[l][i]`: lane `l`'s next slot in row `i`.
-    next: Vec<Vec<u32>>,
+    /// `next[l * n + i]`: lane `l`'s next slot in row `i`.
+    next: Vec<u32>,
     /// Row starts before repeated columns are dropped, `n + 1` values.
     start: Vec<usize>,
     /// The rows of a search that can repeat a column, already sorted
@@ -610,8 +610,12 @@ impl<'a> Rows<'a> {
         let n = self.n;
         let half = self.half;
         let lanes = &self.lanes;
-        self.next = map_index(lanes.len(), |l| {
-            let mut count = vec![0u32; n];
+        self.next.clear();
+        self.next.resize(lanes.len() * n, 0);
+        let next = Shared(self.next.as_mut_ptr());
+        each_index(lanes.len(), |l| {
+            // Safety: lane `l` counts into its own `n` entries alone.
+            let count = unsafe { std::slice::from_raw_parts_mut(next.at(l * n), n) };
             lanes[l].each(|a, b, _| {
                 if a == b {
                     return;
@@ -623,7 +627,6 @@ impl<'a> Rows<'a> {
                     count[b as usize] += 1;
                 }
             });
-            count
         });
     }
 
@@ -634,14 +637,14 @@ impl<'a> Rows<'a> {
         let next = &self.next;
         let sums = map_index(blocks, |b| {
             let (lo, hi) = span(n, blocks, b);
-            next.iter()
+            next.chunks(n)
                 .map(|count| count[lo..hi].iter().map(|&c| c as usize).sum::<usize>())
                 .sum()
         });
         let (base, total) = bases(&sums);
         let lanes: Vec<Shared<u32>> = self
             .next
-            .iter_mut()
+            .chunks_mut(n)
             .map(|c| Shared(c.as_mut_ptr()))
             .collect();
         let start = Shared(self.start.as_mut_ptr());
@@ -676,10 +679,10 @@ impl<'a> Rows<'a> {
         let lanes = &self.lanes;
         let next: Vec<Shared<u32>> = self
             .next
-            .iter_mut()
+            .chunks_mut(self.n)
             .map(|c| Shared(c.as_mut_ptr()))
             .collect();
-        // Lane `l` owns `next[l]`, and its slots in `cols` are its own.
+        // Lane `l` owns its row of `next`, and its slots in `cols` are its own.
         each_index(lanes.len(), |l| {
             let next = next[l];
             let put = |row: u32, col: u32, d: f64| unsafe {
