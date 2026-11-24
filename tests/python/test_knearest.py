@@ -68,3 +68,73 @@ def test_k_zero():
 
 def test_gpu_available_is_bool():
     assert isinstance(linkcell.gpu_available(), bool)
+
+
+_NON_FINITE = [float("nan"), float("inf"), float("-inf")]
+
+
+def _points():
+    return np.ascontiguousarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float64
+    )
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE)
+@pytest.mark.parametrize("axis", [0, 1, 2])
+@pytest.mark.parametrize(
+    "cell",
+    [
+        np.array([10.0, 10.0, 10.0]),
+        np.array([[10.0, 0.0, 0.0], [3.0, 9.0, 0.0], [1.0, 2.0, 8.0]]),
+    ],
+)
+def test_non_finite_coordinate_raises(bad, axis, cell):
+    xyz = _points()
+    xyz[1, axis] = bad
+    with pytest.raises(RuntimeError, match="a coordinate is not finite"):
+        linkcell.knearest(xyz, np.ascontiguousarray(cell, dtype=np.float64), 2)
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE)
+def test_non_finite_coordinate_raises_in_a_later_frame(bad):
+    second = _points()
+    second[2, 2] = bad
+    xyz = np.ascontiguousarray(np.stack([_points(), second]))
+    cell = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+    with pytest.raises(RuntimeError, match="a coordinate is not finite"):
+        linkcell.knearest(xyz, cell, 2)
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE)
+def test_non_finite_masked_coordinate_raises(bad):
+    xyz = _points()
+    xyz[0, 0] = bad
+    cell = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+    mask = np.ascontiguousarray([0, 1, 1], dtype=np.int32)
+    with pytest.raises(RuntimeError, match="a coordinate is not finite"):
+        linkcell.knearest(xyz, cell, 1, mask=mask)
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE)
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_non_finite_origin_raises(bad, axis):
+    cell = np.array(
+        [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0], [0.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    cell[3, axis] = bad
+    with pytest.raises(RuntimeError, match="a coordinate is not finite"):
+        linkcell.knearest(_points(), cell, 2)
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE)
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_non_finite_box_length_raises(bad, axis):
+    lengths = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+    lengths[axis] = bad
+    with pytest.raises(ValueError, match="singular or non-positive cell"):
+        linkcell.knearest(_points(), lengths, 2)
+    rows = np.diag([10.0, 10.0, 10.0]).astype(np.float64)
+    rows[axis, axis] = bad
+    with pytest.raises(ValueError, match="singular or non-positive cell"):
+        linkcell.knearest(_points(), np.ascontiguousarray(rows), 2)
