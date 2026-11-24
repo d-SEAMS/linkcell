@@ -157,7 +157,8 @@ fn gathered(
     query: &PbcQuery<'_>,
     dist2: bool,
 ) -> Result<Option<Gathered>, Error> {
-    let Some(binned) = bin_atoms(xyz, cell, query.cutoff, query.mask, query.cell_hint)? else {
+    let Some(binned) = bin_atoms(xyz, cell, query.cutoff, query.mask, query.cell_hint, true)?
+    else {
         return Ok(None);
     };
     let repeat = repeats(cell, query);

@@ -648,7 +648,7 @@ fn plan_with(
     half: bool,
     shifts: bool,
 ) -> Result<Plan, Error> {
-    let Some(binned) = bin_atoms(xyz, simbox, cutoff, mask, cell_hint)? else {
+    let Some(binned) = bin_atoms(xyz, simbox, cutoff, mask, cell_hint, false)? else {
         return Ok(Plan {
             images: ImageOffsets::default(),
             grid: Grid::empty(),
@@ -709,13 +709,15 @@ pub(crate) struct Binned {
 }
 
 /// Check the arguments, then bin the active atoms. `None` when no atom
-/// is active.
+/// is active. `lean` builds the grid of [`Grid::build`] for a walk that
+/// reads only the folded positions.
 fn bin_atoms(
     xyz: &[[f64; 3]],
     simbox: &Cell,
     cutoff: f64,
     mask: Option<&[bool]>,
     cell_hint: Option<f64>,
+    lean: bool,
 ) -> Result<Option<Binned>, Error> {
     if !cutoff.is_finite() || cutoff <= 0.0 {
         return Err(Error::BadCutoff);
@@ -783,7 +785,15 @@ fn bin_atoms(
     // One path for the fold, the cull, the tile, and the writers.
     // Read on this thread, before the grid's rayon fan-out.
     let path = crate::simd::select();
-    let grid = Grid::build(xyz, simbox, active.as_deref(), dims, grid_threads, path);
+    let grid = Grid::build(
+        xyz,
+        simbox,
+        active.as_deref(),
+        dims,
+        grid_threads,
+        path,
+        lean,
+    );
     Ok(Some(Binned {
         grid,
         reach,
@@ -1018,17 +1028,16 @@ struct Coords {
 }
 
 impl Coords {
-    /// Empty columns with room for `nslot` slots each.
-    fn clear_for(&mut self, nslot: usize) {
-        for v in [
-            &mut self.x,
-            &mut self.y,
-            &mut self.z,
-            &mut self.rx,
-            &mut self.ry,
-            &mut self.rz,
-            &mut self.r2,
-        ] {
+    /// Empty columns with room for `nslot` slots each; a `lean` grid
+    /// leaves the relative columns empty.
+    fn clear_for(&mut self, nslot: usize, lean: bool) {
+        for v in [&mut self.rx, &mut self.ry, &mut self.rz, &mut self.r2] {
+            v.clear();
+            if !lean {
+                v.reserve(nslot);
+            }
+        }
+        for v in [&mut self.x, &mut self.y, &mut self.z] {
             v.clear();
             v.reserve(nslot);
         }
@@ -1037,17 +1046,15 @@ impl Coords {
     }
 
     /// # Safety
-    /// Every column holds `nslot` written slots.
-    unsafe fn set_len(&mut self, nslot: usize) {
-        for v in [
-            &mut self.x,
-            &mut self.y,
-            &mut self.z,
-            &mut self.rx,
-            &mut self.ry,
-            &mut self.rz,
-            &mut self.r2,
-        ] {
+    /// Every column holds `nslot` written slots, but the relative ones
+    /// of a `lean` grid.
+    unsafe fn set_len(&mut self, nslot: usize, lean: bool) {
+        if !lean {
+            for v in [&mut self.rx, &mut self.ry, &mut self.rz, &mut self.r2] {
+                v.set_len(nslot);
+            }
+        }
+        for v in [&mut self.x, &mut self.y, &mut self.z] {
             v.set_len(nslot);
         }
         self.id.set_len(nslot);
@@ -1505,10 +1512,12 @@ struct SlotPtrs {
     rz: RowPtr<f64>,
     r2: RowPtr<f64>,
     id: RowPtr<u32>,
+    /// Write the folded positions and atom numbers only.
+    lean: bool,
 }
 
 impl SlotPtrs {
-    fn of(c: &mut Coords) -> Self {
+    fn of(c: &mut Coords, lean: bool) -> Self {
         let raw = |v: &mut Vec<f64>| RowPtr(v.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>);
         SlotPtrs {
             x: raw(&mut c.x),
@@ -1519,29 +1528,31 @@ impl SlotPtrs {
             rz: raw(&mut c.rz),
             r2: raw(&mut c.r2),
             id: RowPtr(c.id.as_mut_ptr() as *mut std::mem::MaybeUninit<u32>),
+            lean,
         }
     }
 
     /// Write atom `i` at `slot`; returns the largest |component| of the
-    /// folded and of the relative position.
+    /// folded and of the relative position (zero on a lean grid).
     ///
     /// # Safety
     /// `slot` is in range and no other thread writes it.
     #[inline(always)]
     unsafe fn put(self, slot: usize, i: usize, p: [f64; 3], o: [f64; 3]) -> (f64, f64) {
-        let (rx, ry, rz) = (p[0] - o[0], p[1] - o[1], p[2] - o[2]);
         (*self.x.at(slot)).write(p[0]);
         (*self.y.at(slot)).write(p[1]);
         (*self.z.at(slot)).write(p[2]);
+        (*self.id.at(slot)).write(i as u32);
+        let abs = p[0].abs().max(p[1].abs()).max(p[2].abs());
+        if self.lean {
+            return (abs, 0.0);
+        }
+        let (rx, ry, rz) = (p[0] - o[0], p[1] - o[1], p[2] - o[2]);
         (*self.rx.at(slot)).write(rx);
         (*self.ry.at(slot)).write(ry);
         (*self.rz.at(slot)).write(rz);
         (*self.r2.at(slot)).write(rx * rx + ry * ry + rz * rz);
-        (*self.id.at(slot)).write(i as u32);
-        (
-            p[0].abs().max(p[1].abs()).max(p[2].abs()),
-            rx.abs().max(ry.abs()).max(rz.abs()),
-        )
+        (abs, rx.abs().max(ry.abs()).max(rz.abs()))
     }
 }
 
@@ -1552,6 +1563,10 @@ impl Grid {
     /// staging area; then each thread owns a run of bins, reads them from
     /// every staging area in thread order, sorts them by sub-cell, and
     /// writes its run of slots alone. The order is one thread's.
+    ///
+    /// A `lean` grid, for a walk that reads only the folded positions,
+    /// has no corners, relative columns, or boxes.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         xyz: &[[f64; 3]],
         simbox: &Cell,
@@ -1559,6 +1574,7 @@ impl Grid {
         n: [i32; 3],
         threads: usize,
         path: Path,
+        lean: bool,
     ) -> Grid {
         let ncell = (n[0] as usize) * (n[1] as usize) * (n[2] as usize);
         let n_act = active.map_or(xyz.len(), |a| a.len());
@@ -1579,15 +1595,18 @@ impl Grid {
         offsets.reserve(ncell + 1);
         corners.clear();
         corners.reserve(ncell);
-        coords.clear_for(n_act);
+        coords.clear_for(n_act, lean);
         // The fold is read only through `fp`; its vectors stay empty.
         fold.clear_for(n_act);
         let fp = fold.ptrs();
         let cp = RowPtr(corners.as_mut_ptr() as *mut std::mem::MaybeUninit<[f64; 3]>);
-        let slots = SlotPtrs::of(&mut coords);
+        let slots = SlotPtrs::of(&mut coords, lean);
         // Corners of bins `lo..hi`, stepping the bin indices rather than
         // dividing the flat index.
         let corners_of = |lo: usize, hi: usize| {
+            if lean {
+                return;
+            }
             let (nx, ny) = (n[0] as usize, n[1] as usize);
             let (mut ix, mut iy, mut iz) = (lo % nx, (lo / nx) % ny, lo / (nx * ny));
             for c in lo..hi {
@@ -1616,7 +1635,7 @@ impl Grid {
         };
         let per = keys.per_bin();
         let nkey = ncell * per;
-        let cull = path != Path::Scalar && n_act >= 8 * CULL_RUNS * ncell && !no_cull();
+        let cull = !lean && path != Path::Scalar && n_act >= 8 * CULL_RUNS * ncell && !no_cull();
         #[cfg(feature = "parallel")]
         let parallel = threads > 1;
         #[cfg(not(feature = "parallel"))]
@@ -1668,7 +1687,9 @@ impl Grid {
                     (stage, first)
                 });
                 // Safety: pass 1 wrote every corner; the grid keeps no fold.
-                unsafe { corners.set_len(ncell) };
+                if !lean {
+                    unsafe { corners.set_len(ncell) };
+                }
                 // Scan: bin `c` starts at `offsets[c]`.
                 let mut at = 0usize;
                 for c in 0..ncell {
@@ -1714,8 +1735,9 @@ impl Grid {
                                 bucket[e.sub as usize] += 1;
                                 // Safety: bin `c`, and so its slots, belongs to
                                 // this thread alone.
+                                let corner = if lean { [0.0; 3] } else { corners[c] };
                                 let (a, r) =
-                                    unsafe { slots.put(dest, e.atom as usize, e.p, corners[c]) };
+                                    unsafe { slots.put(dest, e.atom as usize, e.p, corner) };
                                 ma = ma.max(a);
                                 mr = mr.max(r);
                             }
@@ -1742,8 +1764,10 @@ impl Grid {
                 simbox, xyz, active, keys, false, path, 0, n_act, fp, &mut tally,
             );
             corners_of(0, ncell);
-            // Safety: `corners_of` wrote every corner.
-            unsafe { corners.set_len(ncell) };
+            if !lean {
+                // Safety: `corners_of` wrote every corner.
+                unsafe { corners.set_len(ncell) };
+            }
             // `tally` becomes the next free slot of each key.
             let mut at = 0usize;
             for bin in tally.chunks_exact_mut(per) {
@@ -1774,7 +1798,7 @@ impl Grid {
             boxes.starts(&offsets, cull);
             let bp = boxes.ptrs();
             for c in 0..ncell {
-                let corner = corners[c];
+                let corner = if lean { [0.0; 3] } else { corners[c] };
                 for dest in offsets[c]..offsets[c + 1] {
                     // Safety: every slot below `n_act` holds an atom number,
                     // the fold wrote that atom, and one thread writes.
@@ -1801,7 +1825,7 @@ impl Grid {
             }
         }
         // Safety: the scatter wrote every slot of every column once.
-        unsafe { coords.set_len(n_act) };
+        unsafe { coords.set_len(n_act, lean) };
         Grid {
             n,
             widths: simbox.widths(),
