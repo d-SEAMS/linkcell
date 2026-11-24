@@ -304,7 +304,12 @@ pub(crate) fn check(xyz: &[[f64; 3]], query: &PbcQuery<'_>) -> Result<(), Error>
     if xyz.len() > i32::MAX as usize {
         return Err(Error::Overflow);
     }
-    if xyz.iter().flatten().any(|v| !v.is_finite()) {
+    // A fold rather than `any`: no early exit, so it vectorizes.
+    if !xyz
+        .as_flattened()
+        .iter()
+        .fold(true, |ok, v| ok & v.is_finite())
+    {
         return Err(Error::NonFinite);
     }
     Ok(())
