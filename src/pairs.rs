@@ -1566,7 +1566,6 @@ impl Grid {
     ///
     /// A `lean` grid, for a walk that reads only the folded positions,
     /// has no corners, relative columns, or boxes.
-    #[allow(clippy::too_many_arguments)]
     fn build(
         xyz: &[[f64; 3]],
         simbox: &Cell,
