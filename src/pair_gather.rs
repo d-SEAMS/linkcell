@@ -21,6 +21,7 @@
 use super::{bins_too_far, keep_dir, Binned, Coords, Grid};
 use crate::bins;
 use crate::cell::Cell;
+#[cfg(target_arch = "x86_64")]
 use crate::simd::Path;
 use crate::Error;
 
@@ -278,7 +279,7 @@ struct Walker<'a> {
     /// last): flat offsets, roles, and shifts. Otherwise empty.
     steps: Vec<Vec<Step>>,
     /// [`Path`] the search chose on the calling thread.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    #[cfg(target_arch = "x86_64")]
     path: Path,
 }
 
@@ -300,6 +301,7 @@ impl<'a> Walker<'a> {
             width,
             shifts: Shifts::new(cell, grid.n, binned.reach),
             steps: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
             path: binned.path,
         };
         if binned.reach == [1, 1, 1] && nx >= 3 && ny >= 3 && nz >= 3 {
@@ -1362,7 +1364,10 @@ mod tests {
         let got = staged(n, |s, out| walk.range::<D2, HALF, 1>(s, 0, hi, repeat, out));
         assert_eq!(got, want, "{label} packed one at a time");
         for path in crate::simd::paths_to_compare() {
-            walk.path = path;
+            #[cfg(target_arch = "x86_64")]
+            {
+                walk.path = path;
+            }
             let got = staged(n, |s, out| walk.range_on::<D2, HALF>(s, 0, hi, repeat, out));
             assert_eq!(got, want, "{label} {}", path.name());
         }
