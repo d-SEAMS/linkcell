@@ -160,7 +160,7 @@ The bindings write their own layout from the same hits: Python and `pairs_within
 `pairs_within_csr` / `lc_pairs_within_csr` groups the same pairs by source, with no shift.
 On a periodic cell each point gathers its own row from the bins around its bin, so no hit is buffered, and no pass counts, places, or fills another thread's hits.
 The bins, the folded positions, and the reach are those of the pair walk, and so is every distance.
-The walk computes a pair from the bin that `keep_dir` picks, as `q - (p - S)` with `p` its source, and a row computes that expression with the same roles: as a source the point subtracts the shift, as a target it adds the shift to the candidate.
+The walk computes a pair from the bin that `keep_dir` picks, as `q - (p - S)` with `p` its source, and a row computes that expression with the same roles: as a source the point subtracts the shift, as a target it subtracts the shift from the candidate.
 That gives the walk's difference or its negation, whose square is the same bits, and with no shift the two roles agree.
 With three bins or more along each axis and a reach of one, the bins around a bin are nine runs of three consecutive bins.
 Their offsets, roles, and shifts are tabulated once for the 27 places a bin can sit (first, inner, or last along each axis).
