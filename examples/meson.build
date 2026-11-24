@@ -5,6 +5,13 @@ two_points_c = executable(
   build_rpath: meson.project_build_root(),
 )
 
+pairs_csr_c = executable(
+  'pairs_csr',
+  'pairs_csr.c',
+  dependencies: [linkcell_dep, cc.find_library('m', required: false)],
+  build_rpath: meson.project_build_root(),
+)
+
 two_points_cpp = executable(
   'two_points_cpp',
   'two_points.cpp',
@@ -21,6 +28,7 @@ endif
 
 test('two-points-c', two_points_c, env: _test_env)
 test('two-points-cpp', two_points_cpp, env: _test_env)
+test('pairs-csr-c', pairs_csr_c, env: _test_env)
 
 if _gpu_on
   gpu_agree = executable(

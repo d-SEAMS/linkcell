@@ -957,6 +957,7 @@ pub unsafe extern "C" fn lc_pairs_within_pbc(
     0
 }
 
+#[derive(PartialEq)]
 struct OpenKey {
     xyz: Vec<u64>,
     periodic: [bool; 3],
@@ -1057,6 +1058,260 @@ fn open_rows(
         });
     }
     Ok(rows)
+}
+
+/// Cutoff neighbours of every point as CSR rows.
+///
+/// Row `i` is `out_cols[out_offsets[i] .. out_offsets[i + 1]]`: every
+/// `j != i` with an image whose squared distance is strictly below
+/// `cutoff` squared, once, ascending. On a periodic axis that is the
+/// minimum-image distance, also past half the box, where one atom meets
+/// another through several images. A periodic image of `i` is not
+/// listed. `half` nonzero keeps `j > i` only. `out_d2`, if non-null,
+/// receives the squared distance of the nearest image of each column.
+///
+/// `pbc` is three ints, nonzero for a periodic axis, or null for a fully
+/// periodic cell; `simbox` may be null when every axis is open. `mask`
+/// and `cell_hint` are those of [`lc_pairs_within_pbc`]. A masked-out
+/// point has an empty row and appears in no row. The rows and distances
+/// are the same bits at every [`lc_set_threads`] width and SIMD path.
+///
+/// Sizing: every call sets `*need_offsets` (`n + 1`) and `*need_cols`.
+/// Null `out_offsets`, `out_cols`, and `out_d2` is a query and returns
+/// 0. Otherwise `out_offsets` holds `cap_offsets` ints and `out_cols`
+/// (and `out_d2` if non-null) `cap_cols` values. A short buffer returns
+/// nonzero without writing. A query or a short buffer keeps its rows on
+/// the calling thread, and the next call there with the same inputs bit
+/// for bit copies them out without searching again. A buffer large
+/// enough on the first call takes the rows straight from the search.
+///
+/// `n == 0` succeeds with one offset, `0`. A cutoff that is not finite
+/// and positive, a coordinate that is not finite, or more columns than
+/// `INT_MAX` returns nonzero with [`lc_last_error`] set.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
+/// periodic, points at one `lc_cell`. `pbc`, if non-null, is three ints.
+/// `mask`, if non-null, is `n` ints. `need_offsets` and `need_cols` are
+/// writable. On a fill, `out_offsets` is writable for `cap_offsets`
+/// ints, `out_cols` for `cap_cols` ints, and `out_d2`, if non-null, for
+/// `cap_cols` doubles.
+#[no_mangle]
+pub unsafe extern "C" fn lc_pairs_within_csr(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    pbc: *const c_int,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    half: c_int,
+    out_offsets: *mut c_int,
+    cap_offsets: usize,
+    out_cols: *mut c_int,
+    out_d2: *mut f64,
+    cap_cols: usize,
+    need_offsets: *mut usize,
+    need_cols: *mut usize,
+) -> c_int {
+    if need_offsets.is_null() || need_cols.is_null() {
+        return fail_msg("null pointer");
+    }
+    let query_only = out_offsets.is_null() && out_cols.is_null() && out_d2.is_null();
+    if !query_only && (out_offsets.is_null() || out_cols.is_null()) {
+        return fail_msg("null pointer");
+    }
+    if !cutoff.is_finite() || cutoff <= 0.0 {
+        return fail(Error::BadCutoff);
+    }
+    let periodic = if pbc.is_null() {
+        [true, true, true]
+    } else {
+        let flags = unsafe { [*pbc, *pbc.add(1), *pbc.add(2)] };
+        [flags[0] != 0, flags[1] != 0, flags[2] != 0]
+    };
+    if n == 0 {
+        unsafe {
+            *need_offsets = 1;
+            *need_cols = 0;
+        }
+        if query_only {
+            clear_error();
+            return 0;
+        }
+        if cap_offsets < 1 {
+            return fail_msg(CSR_SHORT);
+        }
+        unsafe { *out_offsets = 0 };
+        clear_error();
+        return 0;
+    }
+    if xyz.is_null() || (periodic != [false, false, false] && simbox.is_null()) {
+        return fail_msg("null pointer");
+    }
+    if n > c_int::MAX as usize || n > (isize::MAX as usize) / 3 {
+        return fail(Error::Overflow);
+    }
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
+    let pts = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_raw: Option<&[c_int]> = if mask.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(mask, n) })
+    };
+    let mask_vec: Option<Vec<bool>> = mask_raw.map(|m| m.iter().map(|&v| v != 0).collect());
+    let mut query = crate::PbcQuery::new(periodic, cutoff)
+        .cell_hint(hint)
+        .half(half != 0);
+    query.mask = mask_vec.as_deref();
+    if let Err(err) = crate::pairs::csr_check(pts, &query) {
+        return fail(err);
+    }
+    let key = OpenKey {
+        xyz: xyz_bits(pts),
+        periodic,
+        cutoff: cutoff.to_bits(),
+        mask: mask_vec.clone(),
+        cell_hint: hint.map(f64::to_bits),
+        half: half != 0,
+        closed: false,
+        exclude_self: true,
+        box_bits: if periodic == [false, false, false] {
+            [0; 12]
+        } else {
+            box_bits(unsafe { &*simbox })
+        },
+    };
+    let out = CsrOut {
+        offsets: out_offsets,
+        cap_offsets,
+        cols: out_cols,
+        d2: out_d2,
+        cap_cols,
+        query_only,
+    };
+    if let Some(parked) = take_csr(&key) {
+        return unsafe { deliver_csr(key, parked, out, need_offsets, need_cols) };
+    }
+    let cell = if periodic == [false, false, false] {
+        match Cell::ortho(1.0, 1.0, 1.0) {
+            Ok(cell) => cell,
+            Err(err) => return fail(err.into()),
+        }
+    } else {
+        let raw = unsafe { *simbox };
+        match crate::cell_for_pbc(
+            [
+                [raw.ax, raw.ay, raw.az],
+                [raw.bx, raw.by, raw.bz],
+                [raw.cx, raw.cy, raw.cz],
+            ],
+            [raw.ox, raw.oy, raw.oz],
+            periodic,
+        ) {
+            Ok(cell) => cell,
+            Err(err) => return fail(err),
+        }
+    };
+    let dest = crate::pairs::CsrDest {
+        offsets: out_offsets,
+        cols: out_cols,
+        dist2: out_d2,
+    };
+    let room = move |need: usize| {
+        (!out.query_only && out.cap_offsets > n && out.cap_cols >= need).then_some(dest)
+    };
+    let made = with_threads(|| crate::pairs::csr_rows(pts, &cell, &query, room));
+    match made {
+        Ok(crate::pairs::CsrWrite::Direct(need)) => {
+            unsafe {
+                *need_offsets = n + 1;
+                *need_cols = need;
+            }
+            clear_error();
+            0
+        }
+        Ok(crate::pairs::CsrWrite::Owned(rows)) => unsafe {
+            deliver_csr(key, rows, out, need_offsets, need_cols)
+        },
+        Err(err) => fail(err),
+    }
+}
+
+const CSR_SHORT: &str = "CSR buffer is shorter than the row count";
+
+/// Caller buffers of one [`lc_pairs_within_csr`] call.
+#[derive(Clone, Copy)]
+struct CsrOut {
+    offsets: *mut c_int,
+    cap_offsets: usize,
+    cols: *mut c_int,
+    d2: *mut f64,
+    cap_cols: usize,
+    query_only: bool,
+}
+// Safety: only the sizes and the query flag are read off the calling
+// thread; the buffers are written through `CsrDest`.
+unsafe impl Send for CsrOut {}
+unsafe impl Sync for CsrOut {}
+
+/// Rows a query or a short buffer left for the next matching call.
+struct ParkedCsr {
+    key: OpenKey,
+    rows: crate::PairCsr,
+}
+
+thread_local! {
+    static PARKED_CSR: RefCell<Option<ParkedCsr>> = const { RefCell::new(None) };
+}
+
+/// The parked rows when every input matches. Any other call drops them.
+fn take_csr(key: &OpenKey) -> Option<crate::PairCsr> {
+    let parked = PARKED_CSR.with(|slot| slot.borrow_mut().take())?;
+    (parked.key == *key).then_some(parked.rows)
+}
+
+/// Report the sizes of `rows`, then park them (a query or a short
+/// buffer) or copy them out.
+///
+/// # Safety
+///
+/// `need_offsets` and `need_cols` are writable, and `out` follows the
+/// contract of [`lc_pairs_within_csr`].
+unsafe fn deliver_csr(
+    key: OpenKey,
+    rows: crate::PairCsr,
+    out: CsrOut,
+    need_offsets: *mut usize,
+    need_cols: *mut usize,
+) -> c_int {
+    unsafe {
+        *need_offsets = rows.offsets.len();
+        *need_cols = rows.cols.len();
+    }
+    if out.query_only {
+        PARKED_CSR.with(|slot| *slot.borrow_mut() = Some(ParkedCsr { key, rows }));
+        clear_error();
+        return 0;
+    }
+    if out.cap_offsets < rows.offsets.len() || out.cap_cols < rows.cols.len() {
+        PARKED_CSR.with(|slot| *slot.borrow_mut() = Some(ParkedCsr { key, rows }));
+        return fail_msg(CSR_SHORT);
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(rows.offsets.as_ptr(), out.offsets, rows.offsets.len());
+        ptr::copy_nonoverlapping(rows.cols.as_ptr(), out.cols, rows.cols.len());
+        if !out.d2.is_null() {
+            ptr::copy_nonoverlapping(rows.dist2.as_ptr(), out.d2, rows.dist2.len());
+        }
+    }
+    clear_error();
+    0
 }
 
 /// Check the inputs, then take the parked search or run a new one.

@@ -19,6 +19,12 @@ use crate::Error;
 #[path = "pair_wide.rs"]
 mod wide;
 
+#[path = "pair_csr.rs"]
+mod csr;
+#[cfg(feature = "capi")]
+pub(crate) use csr::{check as csr_check, csr_rows, CsrDest, CsrWrite};
+pub use csr::{pairs_within_csr, PairCsr};
+
 const MAX_IMAGES: i64 = 1 << 24;
 
 /// One atom-image pair inside the cutoff.

@@ -526,6 +526,61 @@ int lc_pairs_within(const double *xyz,
                     size_t *out_count);
 
 /**
+ * Cutoff neighbours of every point as CSR rows.
+ *
+ * Row `i` is `out_cols[out_offsets[i] .. out_offsets[i + 1]]`: every
+ * `j != i` with an image whose squared distance is strictly below
+ * `cutoff` squared, once, ascending. On a periodic axis that is the
+ * minimum-image distance, also past half the box, where one atom meets
+ * another through several images. A periodic image of `i` is not
+ * listed. `half` nonzero keeps `j > i` only. `out_d2`, if non-null,
+ * receives the squared distance of the nearest image of each column.
+ *
+ * `pbc` is three ints, nonzero for a periodic axis, or null for a fully
+ * periodic cell; `simbox` may be null when every axis is open. `mask`
+ * and `cell_hint` are those of [`lc_pairs_within_pbc`]. A masked-out
+ * point has an empty row and appears in no row. The rows and distances
+ * are the same bits at every [`lc_set_threads`] width and SIMD path.
+ *
+ * Sizing: every call sets `*need_offsets` (`n + 1`) and `*need_cols`.
+ * Null `out_offsets`, `out_cols`, and `out_d2` is a query and returns
+ * 0. Otherwise `out_offsets` holds `cap_offsets` ints and `out_cols`
+ * (and `out_d2` if non-null) `cap_cols` values. A short buffer returns
+ * nonzero without writing. A query or a short buffer keeps its rows on
+ * the calling thread, and the next call there with the same inputs bit
+ * for bit copies them out without searching again. A buffer large
+ * enough on the first call takes the rows straight from the search.
+ *
+ * `n == 0` succeeds with one offset, `0`. A cutoff that is not finite
+ * and positive, a coordinate that is not finite, or more columns than
+ * `INT_MAX` returns nonzero with [`lc_last_error`] set.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
+ * periodic, points at one `lc_cell`. `pbc`, if non-null, is three ints.
+ * `mask`, if non-null, is `n` ints. `need_offsets` and `need_cols` are
+ * writable. On a fill, `out_offsets` is writable for `cap_offsets`
+ * ints, `out_cols` for `cap_cols` ints, and `out_d2`, if non-null, for
+ * `cap_cols` doubles.
+ */
+int lc_pairs_within_csr(const double *xyz,
+                        size_t n,
+                        const struct lc_cell *simbox,
+                        const int *pbc,
+                        double cutoff,
+                        const int *mask,
+                        double cell_hint,
+                        int half,
+                        int *out_offsets,
+                        size_t cap_offsets,
+                        int *out_cols,
+                        double *out_d2,
+                        size_t cap_cols,
+                        size_t *need_offsets,
+                        size_t *need_cols);
+
+/**
  * [`lc_pairs_within_rows`] with a periodicity mask.
  *
  * `pbc` is three ints. Nonzero means that axis is periodic. A null
