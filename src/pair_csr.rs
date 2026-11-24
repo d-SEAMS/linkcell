@@ -1074,21 +1074,25 @@ mod tests {
     }
 
     /// A box shorter than twice the cutoff stages its rows; with no pair
-    /// they hold no distance, and asking for distances is still fine.
+    /// they hold no distance, and asking for distances is still fine,
+    /// gathered on a periodic cell or written from the walk's hits on a
+    /// cell with an open axis.
     #[test]
     fn empty_staged_rows_with_distances() {
         let cell = Cell::ortho(6.0, 6.0, 6.0).unwrap();
-        let mut out = PairCsr::default();
-        pairs_within_csr(
-            &[[1.0, 2.0, 3.0]],
-            &cell,
-            &PbcQuery::periodic(3.5),
-            true,
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(out.offsets, [0, 0]);
-        assert!(out.cols.is_empty() && out.dist2.is_empty());
+        for periodic in [[true; 3], [true, true, false]] {
+            let mut out = PairCsr::default();
+            pairs_within_csr(
+                &[[1.0, 2.0, 3.0]],
+                &cell,
+                &PbcQuery::new(periodic, 3.5),
+                true,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(out.offsets, [0, 0], "{periodic:?}");
+            assert!(out.cols.is_empty() && out.dist2.is_empty(), "{periodic:?}");
+        }
     }
 
     #[test]
