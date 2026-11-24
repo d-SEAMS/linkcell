@@ -11,6 +11,8 @@ Unused slots are `-1`.
 `lc_knearest_many` is the frame-major batch.
 Returns 0 on success.
 On failure, read `lc_last_error()` on the same thread and keep the pointer.
+A NaN or infinite coordinate (masked or not) or cell origin fails every `lc_knearest*` call with `a coordinate is not finite` before any search.
+The device calls `lc_gpu_knearest*` do not scan their device coordinates for non-finite values; check them before the call.
 
 ## Meson wrap
 

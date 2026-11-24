@@ -254,6 +254,8 @@ Writing the rows is linear in that count.
 The comparison with vesin's ordered 27-cell stencil, for a bin edge equal to the cutoff, is in the paragraph above.
 
 `knearest` takes no cutoff.
+Before the fold it reads every coordinate, masked or not and across all frames of a batch, and the cell origin once, and returns `NonFinite` on a NaN or infinite value.
+The device walk does not make that pass.
 `cell_hint` of `None`, or a value that is not finite and strictly positive, selects a bin edge of 3 in the box length unit, then clamps it to the shortest box width.
 Each source keeps up to `k` pairs `(dist2, index)` and tracks the worst
 entry. For `k <= 16` the storage stays on the stack.
