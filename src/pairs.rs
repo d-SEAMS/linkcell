@@ -19,6 +19,9 @@ use crate::Error;
 #[path = "pair_wide.rs"]
 mod wide;
 
+#[path = "pair_gather.rs"]
+mod gather;
+
 #[path = "pair_csr.rs"]
 mod csr;
 #[cfg(feature = "capi")]
@@ -624,6 +627,7 @@ pub(crate) fn plan(
 
 /// [`plan`] for a caller that never reads a shift. The per-atom images
 /// are one serial pass over every atom, and only shifts read them.
+#[cfg(test)]
 pub(crate) fn plan_unshifted(
     xyz: &[[f64; 3]],
     simbox: &Cell,

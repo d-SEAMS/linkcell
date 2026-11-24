@@ -1,19 +1,23 @@
 //! Cutoff neighbours as CSR rows, built from one search.
 //!
-//! The search leaves each thread's hits in its own buffer, one entry per
-//! atom-image pair. The rows are built from those buffers in place of a
-//! row list and a sort over it. Each lane (one or more search buffers)
-//! counts its entries per row. A prefix sum over the rows gives every
-//! lane its own slots in every row, the lanes write their columns there,
-//! and each row is then sorted. The sorted rows hold no repeated column
-//! and every distance is the same bits at every thread count, so the
-//! rows do not depend on how the search split the hits.
+//! A periodic cell gathers each row whole, source by source, and lays
+//! the rows out in atom order (see `pair_gather.rs`). A cell with an
+//! open axis is searched as half rows. Those land in lanes, one or more
+//! hit buffers each, which count their entries per row. A prefix sum
+//! over the rows gives every lane its own slots in every row, the lanes
+//! write their columns there, and each row is then sorted. The rows
+//! hold no repeated column and every distance is the same bits at
+//! every thread count, so the rows do not depend on how the work was
+//! split.
 //!
 //! An atom meets another through two images only when the cutoff is at
-//! least half the narrowest periodic width. Those rows are written to a
-//! staging buffer first, deduplicated, and then packed.
+//! least half the narrowest periodic width. Those rows keep the nearest
+//! image of each column.
 
-use super::{hit_estimate, in_pool, plan_unshifted, row_guess, Found, Pair, Scratch};
+use super::gather::{gather, Gathered};
+use super::{bin_atoms, hit_estimate, in_pool, row_guess, Pair};
+#[cfg(test)]
+use super::{plan_unshifted, Found, Scratch};
 use crate::cell::Cell;
 use crate::open_cell::{pairs_within_pbc, PbcQuery};
 use crate::Error;
@@ -111,11 +115,60 @@ pub fn pairs_within_csr(
         out.dist2.reserve(guess);
     }
     in_pool(est, || {
-        let source = Source::search(xyz, cell, query)?;
-        let rows = Rows::new(&source, n, query.half, repeats(cell, query), dist2)?;
-        rows.write_vec(out, dist2);
+        if query.periodic != [true, true, true] {
+            let source = Source::search(xyz, cell, query)?;
+            let rows = Rows::new(&source, n, query.half, repeats(cell, query), dist2)?;
+            rows.write_vec(out, dist2);
+            return Ok(());
+        }
+        let Some(mut rows) = gathered(xyz, cell, query, dist2)? else {
+            out.offsets.resize(n + 1, 0);
+            return Ok(());
+        };
+        let need = rows.scan()?;
+        out.cols.reserve(need);
+        if dist2 {
+            out.dist2.reserve(need);
+        }
+        let d2 = if dist2 {
+            out.dist2.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
+        // Safety: the buffers hold `n + 1` offsets and `need` columns and
+        // distances, and `write` sets every one.
+        unsafe {
+            rows.write(out.offsets.as_mut_ptr(), out.cols.as_mut_ptr(), d2);
+            out.offsets.set_len(n + 1);
+            out.cols.set_len(need);
+            if dist2 {
+                out.dist2.set_len(need);
+            }
+        }
         Ok(())
     })
+}
+
+/// The staged rows of a fully periodic search, or `None` when no point
+/// is active.
+fn gathered(
+    xyz: &[[f64; 3]],
+    cell: &Cell,
+    query: &PbcQuery<'_>,
+    dist2: bool,
+) -> Result<Option<Gathered>, Error> {
+    let Some(binned) = bin_atoms(xyz, cell, query.cutoff, query.mask, query.cell_hint)? else {
+        return Ok(None);
+    };
+    let repeat = repeats(cell, query);
+    Ok(Some(gather(
+        &binned,
+        cell,
+        xyz.len(),
+        query.half,
+        repeat,
+        dist2,
+    )))
 }
 
 /// Destination of [`Rows::write`]: `n + 1` offsets, and the columns and
@@ -153,6 +206,56 @@ pub(crate) fn csr_rows(
     let n = xyz.len();
     let est = estimate(n, cell, query);
     in_pool(est, || {
+        if query.periodic == [true, true, true] {
+            let Some(mut rows) = gathered(xyz, cell, query, true)? else {
+                let empty = PairCsr {
+                    offsets: vec![0; n + 1],
+                    ..PairCsr::default()
+                };
+                return Ok(match room(0) {
+                    Some(dest) => {
+                        // Safety: `room` gave `n + 1` offsets.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                empty.offsets.as_ptr(),
+                                dest.offsets,
+                                n + 1,
+                            )
+                        };
+                        CsrWrite::Direct(0)
+                    }
+                    None => CsrWrite::Owned(empty),
+                });
+            };
+            let need = rows.scan()?;
+            return Ok(match room(need) {
+                Some(dest) => {
+                    // Safety: `room` gave `n + 1` offsets and `need` columns
+                    // (and distances when that pointer is non-null).
+                    unsafe { rows.write(dest.offsets, dest.cols, dest.dist2) };
+                    CsrWrite::Direct(need)
+                }
+                None => {
+                    let mut owned = PairCsr {
+                        offsets: Vec::with_capacity(n + 1),
+                        cols: Vec::with_capacity(need),
+                        dist2: Vec::with_capacity(need),
+                    };
+                    // Safety: as in `pairs_within_csr`.
+                    unsafe {
+                        rows.write(
+                            owned.offsets.as_mut_ptr(),
+                            owned.cols.as_mut_ptr(),
+                            owned.dist2.as_mut_ptr(),
+                        );
+                        owned.offsets.set_len(n + 1);
+                        owned.cols.set_len(need);
+                        owned.dist2.set_len(need);
+                    }
+                    CsrWrite::Owned(owned)
+                }
+            });
+        }
         let source = Source::search(xyz, cell, query)?;
         let rows = Rows::new(&source, n, query.half, repeats(cell, query), true)?;
         let need = rows.need();
@@ -226,12 +329,16 @@ const BLOCKS_PER_THREAD: usize = 8;
 /// The hits one search found: the periodic walk's buffers, or an open or
 /// mixed cell's half rows.
 enum Source {
+    /// The pair walk's hit buffers: the v0.6.0 rows of a periodic cell,
+    /// kept as the reference the gathered rows are tested against.
+    #[cfg(test)]
     Found(Found),
     Pairs(Vec<Pair>),
 }
 
 impl Source {
     fn search(xyz: &[[f64; 3]], cell: &Cell, query: &PbcQuery<'_>) -> Result<Self, Error> {
+        #[cfg(test)]
         if query.periodic == [true, true, true] {
             let plan = plan_unshifted(
                 xyz,
@@ -255,6 +362,7 @@ impl Source {
     /// The hits in at most `most` lanes, in search order.
     fn lanes(&self, most: usize) -> Vec<Lane<'_>> {
         match self {
+            #[cfg(test)]
             Source::Found(found) => {
                 let chunks = &found.chunks[..];
                 let count = chunks.len().clamp(1, most);
@@ -281,6 +389,7 @@ impl Source {
 /// One lane's hits. Each is an atom pair and the squared distance of one
 /// of its images, seen once.
 enum Lane<'a> {
+    #[cfg(test)]
     Hits(&'a [Scratch]),
     Pairs(&'a [Pair]),
 }
@@ -288,6 +397,7 @@ enum Lane<'a> {
 impl Lane<'_> {
     fn len(&self) -> usize {
         match self {
+            #[cfg(test)]
             Lane::Hits(chunks) => chunks.iter().map(|c| c.js.len()).sum(),
             Lane::Pairs(rows) => rows.len(),
         }
@@ -296,6 +406,7 @@ impl Lane<'_> {
     #[inline(always)]
     fn each(&self, mut visit: impl FnMut(u32, u32, f64)) {
         match self {
+            #[cfg(test)]
             Lane::Hits(chunks) => {
                 for chunk in chunks.iter() {
                     for ((&a, &b), &d) in chunk.atom.iter().zip(&chunk.js).zip(&chunk.d2) {
