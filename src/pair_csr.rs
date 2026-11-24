@@ -679,7 +679,7 @@ impl<'a> Rows<'a> {
         };
         let raw = &self.start;
         let with_d2 = !dist2.is_null() && !staged.dist2.is_empty();
-        debug_assert!(dist2.is_null() || with_d2);
+        debug_assert!(dist2.is_null() || with_d2 || staged.cols.is_empty());
         each_index(blocks, |b| {
             let (lo, hi) = span(n, blocks, b);
             for i in lo..hi {
@@ -936,6 +936,24 @@ mod tests {
                 assert_eq!(rows(64, half), one);
             }
         }
+    }
+
+    /// A box shorter than twice the cutoff stages its rows; with no pair
+    /// they hold no distance, and asking for distances is still fine.
+    #[test]
+    fn empty_staged_rows_with_distances() {
+        let cell = Cell::ortho(6.0, 6.0, 6.0).unwrap();
+        let mut out = PairCsr::default();
+        pairs_within_csr(
+            &[[1.0, 2.0, 3.0]],
+            &cell,
+            &PbcQuery::periodic(3.5),
+            true,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.offsets, [0, 0]);
+        assert!(out.cols.is_empty() && out.dist2.is_empty());
     }
 
     #[test]
