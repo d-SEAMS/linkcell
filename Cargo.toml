@@ -69,6 +69,10 @@ name = "partition_panel"
 name = "pairs_csr_bench"
 required-features = ["capi"]
 
+[[example]]
+name = "csr_ice_bench"
+required-features = ["capi", "parallel"]
+
 [profile.release]
 lto = true
 codegen-units = 1
