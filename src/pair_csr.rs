@@ -987,4 +987,153 @@ mod tests {
             assert_eq!(got, want, "length {len} after dedup");
         }
     }
+
+    /// The rows of v0.6.0: the pair walk's hit buffers, counted, placed,
+    /// filled, and sorted per row.
+    fn v060(xyz: &[[f64; 3]], cell: &Cell, query: &PbcQuery<'_>) -> PairCsr {
+        let source = Source::search(xyz, cell, query).unwrap();
+        let rows = Rows::new(&source, xyz.len(), query.half, repeats(cell, query), true).unwrap();
+        let mut out = PairCsr::default();
+        rows.write_vec(&mut out, true);
+        out
+    }
+
+    /// Every row against all pairs and images: the columns, but those
+    /// within rounding of the cutoff, and the distances to rounding.
+    fn assert_brute(
+        got: &PairCsr,
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+        query: &PbcQuery<'_>,
+        label: &str,
+    ) {
+        let reach = repeats_of(cell, query.cutoff);
+        let cut2 = query.cutoff * query.cutoff;
+        let tol = 1e-9 * (1.0 + cut2);
+        let active = |i: usize| query.mask.map_or(true, |m| m[i]);
+        for i in 0..xyz.len() {
+            let row = got.offsets[i] as usize..got.offsets[i + 1] as usize;
+            let mut have: std::collections::BTreeMap<i32, f64> = got.cols[row.clone()]
+                .iter()
+                .zip(&got.dist2[row])
+                .map(|(&j, &d)| (j, d))
+                .collect();
+            for j in 0..xyz.len() {
+                if j == i || !active(i) || !active(j) || (query.half && j < i) {
+                    continue;
+                }
+                let mut best = f64::INFINITY;
+                for a in -reach[0]..=reach[0] {
+                    for b in -reach[1]..=reach[1] {
+                        for c in -reach[2]..=reach[2] {
+                            let t = cell.lattice_shift(a, b, c);
+                            let mut d2 = 0.0;
+                            for k in 0..3 {
+                                let d = xyz[j][k] - xyz[i][k] + t[k];
+                                d2 += d * d;
+                            }
+                            best = best.min(d2);
+                        }
+                    }
+                }
+                match have.remove(&(j as i32)) {
+                    Some(d) => {
+                        assert!(best < cut2 + tol, "{label}: {i}-{j} at {best} listed");
+                        assert!(
+                            (d - best).abs() <= tol,
+                            "{label}: {i}-{j} at {d}, brute {best}"
+                        );
+                    }
+                    None => assert!(best >= cut2 - tol, "{label}: {i}-{j} at {best} missing"),
+                }
+            }
+            assert!(
+                have.is_empty(),
+                "{label}: row {i} lists {have:?} beyond the pairs"
+            );
+        }
+    }
+
+    /// Lattice images each way that can hold a pair within `cutoff`, and
+    /// one more for the fold.
+    fn repeats_of(cell: &Cell, cutoff: f64) -> [i32; 3] {
+        cell.widths().map(|w| (cutoff / w).ceil() as i32 + 1)
+    }
+
+    /// CSR rows against v0.6.0's, bit for bit, on every SIMD path at
+    /// one and eight threads, and against brute force: orthorhombic and
+    /// triclinic cells, bins below, at, and above the cutoff, boxes
+    /// shorter than twice the cutoff, atom counts on both sides of the
+    /// parallel thresholds, half and full rows, with and without a mask.
+    #[test]
+    fn csr_rows_match_v060_and_brute_force() {
+        let cutoff = 3.5;
+        let at_threshold = |pairs: usize| {
+            // `hit_estimate` at the bench density: 0.5 n rho 4/3 pi r^3.
+            (pairs as f64 / (0.5 * 0.0334 * 4.1887902047863905 * cutoff * cutoff * cutoff)) as usize
+        };
+        // `PARALLEL_PAIRS`, which builds only with `parallel`.
+        let split = at_threshold(2_000);
+        let grid = super::super::PARALLEL_GRID;
+        let mut sizes: Vec<(usize, Option<f64>)> = vec![(1, None), (2, None), (40, None)];
+        for n in [split - 2, split, split + 2, grid - 1, grid, grid + 1] {
+            sizes.push((n, None));
+        }
+        // Boxes past half the box: one atom meets another through
+        // several images.
+        sizes.push((7, Some(6.0)));
+        sizes.push((24, Some(9.0)));
+        sizes.push((4096, None));
+        let paths = crate::simd::paths_to_compare();
+        for (case, &(n, edge)) in sizes.iter().enumerate() {
+            let edge = edge.unwrap_or((n as f64 / 0.0334).cbrt());
+            for tilt in [0.0, 0.3] {
+                let (xyz, cell) = frame(n, edge, tilt, 0x51ed_270b_27a4_3c11 ^ case as u64);
+                let mask: Vec<bool> = (0..n).map(|i| (i * 7919) % 5 != 0).collect();
+                for hint in [None, Some(0.6 * cutoff), Some(1.7 * cutoff)] {
+                    for (half, masked) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        if n == 4096 && (masked || tilt != 0.0) {
+                            continue;
+                        }
+                        let query = PbcQuery::periodic(cutoff)
+                            .cell_hint(hint)
+                            .half(half)
+                            .mask(masked.then_some(&mask[..]));
+                        let label = format!(
+                            "n {n} edge {edge:.2} tilt {tilt} hint {hint:?} half {half} mask {masked}"
+                        );
+                        let want = on_threads(1, || v060(&xyz, &cell, &query));
+                        // The columns do not depend on the bins; brute force
+                        // is quadratic, so it checks the small systems.
+                        if n <= 64 && hint.is_none() {
+                            assert_brute(&want, &xyz, &cell, &query, &label);
+                        }
+                        for threads in [1, 8] {
+                            for &path in &paths {
+                                let (got, bare) = on_threads(threads, || {
+                                    let _path = crate::simd::force(path);
+                                    let mut got = PairCsr::default();
+                                    pairs_within_csr(&xyz, &cell, &query, true, &mut got).unwrap();
+                                    let mut bare = PairCsr::default();
+                                    pairs_within_csr(&xyz, &cell, &query, false, &mut bare)
+                                        .unwrap();
+                                    (got, bare)
+                                });
+                                let label = format!("{label} threads {threads} {}", path.name());
+                                assert_eq!(bits(&got), bits(&want), "{label}");
+                                assert_eq!(
+                                    (&bare.offsets, &bare.cols),
+                                    (&want.offsets, &want.cols),
+                                    "{label}"
+                                );
+                                assert!(bare.dist2.is_empty(), "{label}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
