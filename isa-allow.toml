@@ -53,6 +53,11 @@ features = ["avx512f", "avx512vl", "avx2", "avx", "popcnt"]
 reason = "AVX-512 CSR row gather. Separate multiply and add."
 
 [[allow]]
+symbol = 'linkcell::.*range_avx2.*'
+features = ["avx2", "avx"]
+reason = "AVX2 CSR row gather. Separate multiply and add."
+
+[[allow]]
 symbol = 'linkcell::.*avx2_scan.*'
 features = ["avx2", "avx", "fma"]
 reason = "AVX2 pair tile. Two vectors cover each 8-wide block. FMA screens only."

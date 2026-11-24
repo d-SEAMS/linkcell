@@ -278,7 +278,7 @@ struct Walker<'a> {
     /// last): flat offsets, roles, and shifts. Otherwise empty.
     steps: Vec<Vec<Step>>,
     /// [`Path`] the search chose on the calling thread.
-    #[cfg_attr(not(all(target_arch = "x86_64", linkcell_avx512)), allow(dead_code))]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     path: Path,
 }
 
@@ -503,6 +503,23 @@ impl<'a> Walker<'a> {
         self.range::<D2, HALF, 8>(stage, lo, hi, repeat, rows);
     }
 
+    /// [`Walker::range`] on the AVX2 path.
+    ///
+    /// # Safety
+    /// The CPU has AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn range_avx2<const D2: bool, const HALF: bool>(
+        &self,
+        stage: &mut Stage,
+        lo: usize,
+        hi: usize,
+        repeat: bool,
+        rows: RowOut,
+    ) {
+        self.range::<D2, HALF, 4>(stage, lo, hi, repeat, rows);
+    }
+
     /// [`Walker::range`] on the path the search chose.
     fn range_on<const D2: bool, const HALF: bool>(
         &self,
@@ -516,6 +533,12 @@ impl<'a> Walker<'a> {
         if self.path == Path::Avx512 {
             // Safety: `select` returned AVX-512, so F, VL, and POPCNT are on.
             unsafe { self.range_avx512::<D2, HALF>(stage, lo, hi, repeat, rows) };
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.path == Path::Avx2 {
+            // Safety: `select` returned AVX2, so the CPU has it.
+            unsafe { self.range_avx2::<D2, HALF>(stage, lo, hi, repeat, rows) };
             return;
         }
         self.range::<D2, HALF, 0>(stage, lo, hi, repeat, rows);
@@ -733,6 +756,170 @@ fn lanes(left: usize) -> u8 {
     }
 }
 
+/// Lanes `0..left` of four, as 64-bit and as 32-bit lanes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn lanes4(left: usize) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m128i) {
+    use std::arch::x86_64::{
+        _mm256_cvtepi32_epi64, _mm_cmpgt_epi32, _mm_set1_epi32, _mm_setr_epi32,
+    };
+    unsafe {
+        let m = _mm_cmpgt_epi32(
+            _mm_set1_epi32(left.min(4) as i32),
+            _mm_setr_epi32(0, 1, 2, 3),
+        );
+        (_mm256_cvtepi32_epi64(m), m)
+    }
+}
+
+/// [`pack`] four slots at a time, the same subtraction lane by lane.
+///
+/// # Safety
+/// As [`pack`], with [`SLACK`] more room in `to`, on a CPU with AVX2.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn pack4(from: Cols, lo: usize, hi: usize, shift: [f64; 3], to: Cols, k: usize) {
+    use std::arch::x86_64::{
+        __m128i, _mm256_maskload_pd, _mm256_set1_pd, _mm256_storeu_pd, _mm256_sub_pd,
+        _mm_maskload_epi32, _mm_storeu_si128,
+    };
+    unsafe {
+        let (sx, sy, sz) = (
+            _mm256_set1_pd(shift[0]),
+            _mm256_set1_pd(shift[1]),
+            _mm256_set1_pd(shift[2]),
+        );
+        let (mut t, mut at) = (lo, k);
+        while t < hi {
+            let (m, m32) = lanes4(hi - t);
+            let x = _mm256_sub_pd(_mm256_maskload_pd(from.x.add(t), m), sx);
+            let y = _mm256_sub_pd(_mm256_maskload_pd(from.y.add(t), m), sy);
+            let z = _mm256_sub_pd(_mm256_maskload_pd(from.z.add(t), m), sz);
+            let id = _mm_maskload_epi32(from.id.add(t) as *const i32, m32);
+            _mm256_storeu_pd((to.x as *mut f64).add(at), x);
+            _mm256_storeu_pd((to.y as *mut f64).add(at), y);
+            _mm256_storeu_pd((to.z as *mut f64).add(at), z);
+            _mm_storeu_si128((to.id as *mut u32).add(at) as *mut __m128i, id);
+            t += 4;
+            at += 4;
+        }
+    }
+}
+
+/// Per mask of four kept lanes: the bytes that bring those 32-bit
+/// lanes, in order, to the front.
+#[cfg(target_arch = "x86_64")]
+const PICK4: [[u8; 16]; 16] = {
+    let mut table = [[0x80u8; 16]; 16];
+    let mut keep = 0;
+    while keep < 16 {
+        let (mut to, mut lane) = (0, 0);
+        while lane < 4 {
+            if keep & (1 << lane) != 0 {
+                let mut b = 0;
+                while b < 4 {
+                    table[keep][4 * to + b] = (4 * lane + b) as u8;
+                    b += 1;
+                }
+                to += 1;
+            }
+            lane += 1;
+        }
+        keep += 1;
+    }
+    table
+};
+
+/// The same for 64-bit lanes, as pairs of 32-bit lane numbers.
+#[cfg(target_arch = "x86_64")]
+const PICK4_WIDE: [[i32; 8]; 16] = {
+    let mut table = [[0i32; 8]; 16];
+    let mut keep = 0;
+    while keep < 16 {
+        let (mut to, mut lane) = (0, 0);
+        while lane < 4 {
+            if keep & (1 << lane) != 0 {
+                table[keep][2 * to] = 2 * lane;
+                table[keep][2 * to + 1] = 2 * lane + 1;
+                to += 1;
+            }
+            lane += 1;
+        }
+        keep += 1;
+    }
+    table
+};
+
+/// [`scan`] four candidates at a time: the same products and sums, lane
+/// by lane, so the same distances. Each step stores four columns and
+/// distances at the row's end; [`SLACK`] covers the lanes past it.
+///
+/// # Safety
+/// As [`scan`], with [`SLACK`] more room, on a CPU with AVX2.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn scan4<const D2: bool, const HALF: bool>(
+    c: Cols,
+    lo: usize,
+    hi: usize,
+    p: [f64; 3],
+    i: u32,
+    cut2: f64,
+    out: Out,
+) -> usize {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm256_add_pd, _mm256_and_pd, _mm256_castpd_ps, _mm256_castps_pd,
+        _mm256_castsi256_pd, _mm256_cmp_pd, _mm256_loadu_si256, _mm256_maskload_pd,
+        _mm256_movemask_pd, _mm256_mul_pd, _mm256_permutevar8x32_ps, _mm256_set1_pd,
+        _mm256_storeu_pd, _mm256_sub_pd, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_cmpgt_epi32,
+        _mm_loadu_si128, _mm_maskload_epi32, _mm_movemask_ps, _mm_set1_epi32, _mm_shuffle_epi8,
+        _mm_storeu_si128, _CMP_LT_OQ,
+    };
+    let Out { cols, d2s, mut len } = out;
+    unsafe {
+        let (px, py, pz) = (
+            _mm256_set1_pd(p[0]),
+            _mm256_set1_pd(p[1]),
+            _mm256_set1_pd(p[2]),
+        );
+        let cut = _mm256_set1_pd(cut2);
+        let me = _mm_set1_epi32(i as i32);
+        let mut t = lo;
+        while t < hi {
+            let (m, m32) = lanes4(hi - t);
+            let dx = _mm256_sub_pd(_mm256_maskload_pd(c.x.add(t), m), px);
+            let dy = _mm256_sub_pd(_mm256_maskload_pd(c.y.add(t), m), py);
+            let dz = _mm256_sub_pd(_mm256_maskload_pd(c.z.add(t), m), pz);
+            let j = _mm_maskload_epi32(c.id.add(t) as *const i32, m32);
+            let d2 = _mm256_add_pd(
+                _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
+                _mm256_mul_pd(dz, dz),
+            );
+            let near = _mm256_and_pd(_mm256_cmp_pd(d2, cut, _CMP_LT_OQ), _mm256_castsi256_pd(m));
+            // Atom numbers fit i32, so the signed compare orders them.
+            let (bits, flip) = if HALF {
+                (_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(j, me))), 0)
+            } else {
+                (
+                    _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(j, me))),
+                    0xf,
+                )
+            };
+            let keep = (_mm256_movemask_pd(near) & (bits ^ flip)) as usize;
+            let pick = _mm_loadu_si128(PICK4[keep].as_ptr() as *const __m128i);
+            _mm_storeu_si128(cols.add(len) as *mut __m128i, _mm_shuffle_epi8(j, pick));
+            if D2 {
+                let pick = _mm256_loadu_si256(PICK4_WIDE[keep].as_ptr() as *const __m256i);
+                let moved = _mm256_permutevar8x32_ps(_mm256_castpd_ps(d2), pick);
+                _mm256_storeu_pd(d2s.add(len), _mm256_castps_pd(moved));
+            }
+            len += keep.count_ones() as usize;
+            t += 4;
+        }
+    }
+    len
+}
+
 /// Test candidates `lo..hi` against the row of atom `i` at `p` (less
 /// the run's shift, for a shifted source run) and append its hits at
 /// `out.cols[out.len..]` (and `out.d2s`) as `q - p`, with `q` less
@@ -792,6 +979,10 @@ unsafe fn pack_w<const W: usize>(
         if W == 8 {
             return pack8(from, lo, hi, shift, to, k);
         }
+        #[cfg(target_arch = "x86_64")]
+        if W == 4 {
+            return pack4(from, lo, hi, shift, to, k);
+        }
         pack(from, lo, hi, shift, to, k)
     }
 }
@@ -816,6 +1007,10 @@ unsafe fn scan_w<const D2: bool, const HALF: bool, const W: usize>(
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
         if W == 8 {
             return scan8::<D2, HALF>(packed, 0, k, p, i, cut2, out);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if W == 4 {
+            return scan4::<D2, HALF>(packed, 0, k, p, i, cut2, out);
         }
     }
     out.len
