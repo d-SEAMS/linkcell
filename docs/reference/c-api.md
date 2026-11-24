@@ -148,8 +148,8 @@ A short buffer with a null `out_d2` keeps no distances, so a next call that asks
 A buffer large enough on the first call takes the rows straight from the search.
 The distances are computed only when `out_d2` is non-null.
 The rows and distances are the same bits at every `lc_set_threads` width and SIMD path.
-A periodic cell is searched, counted, placed, filled, and sorted per row on the pool.
-No step sorts the whole list.
+On a periodic cell each point gathers its row from the bins around it, a bin at a time on the pool, and one copy lays the rows out in point order.
+No hit is buffered and no step sorts the whole list.
 A cell with an open axis is searched on the calling thread, and its rows are then built on the pool.
 `pairs_within_csr` is the Rust entry and fills a `PairCsr`.
 
