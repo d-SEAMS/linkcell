@@ -405,7 +405,7 @@ impl<'a> Walker<'a> {
     }
 
     /// Gather the rows of the atoms in bins `lo..hi` into `stage`, `W`
-    /// candidates at a time (`0`: one at a time).
+    /// packed candidates at a time (`0`: every run read in place).
     #[inline(always)]
     fn range<const D2: bool, const HALF: bool, const W: usize>(
         &self,
@@ -439,6 +439,17 @@ impl<'a> Walker<'a> {
                 // one packed list, a target run as `q - S`: the walk's own
                 // `p - S` of that pair, read here as `q`. A run of fewer
                 // slots than lanes then costs no more than a full one.
+                if W != 0 {
+                    let packed: usize = steps
+                        .iter()
+                        .filter(|step| step.kind != Kind::Source)
+                        .map(|step| {
+                            let first = (c as isize + step.rel) as usize;
+                            off[first + step.bins] - off[first]
+                        })
+                        .sum();
+                    stage.pack.reserve(packed + SLACK);
+                }
                 stage.runs.clear();
                 let mut room = SLACK;
                 let mut k = 0usize;
@@ -458,9 +469,8 @@ impl<'a> Walker<'a> {
                         });
                         continue;
                     }
-                    stage.pack.reserve(k + (b - a) + SLACK);
-                    // Safety: the pack has room for these slots and the wide
-                    // copy's last store.
+                    // Safety: the pack has room for the bin's packed slots
+                    // and the wide copy's last store.
                     unsafe {
                         pack_w::<W>(grid.coords.cols(), a, b, step.shift, stage.pack.cols(), k)
                     };
@@ -671,16 +681,15 @@ struct Pack {
 }
 
 impl Pack {
-    /// Room for `len` candidates. The vectors stay empty; their spare
-    /// capacity is written through [`Pack::cols`].
+    /// Room for `len` candidates in every column. The vectors stay
+    /// empty; their spare capacity is written through [`Pack::cols`],
+    /// which a reallocation need not keep, so a bin reserves before it
+    /// packs anything.
     fn reserve(&mut self, len: usize) {
-        if self.id.capacity() < len {
-            let grow = |v: &mut Vec<f64>| v.reserve(len);
-            grow(&mut self.x);
-            grow(&mut self.y);
-            grow(&mut self.z);
-            self.id.reserve(len);
-        }
+        self.x.reserve(len);
+        self.y.reserve(len);
+        self.z.reserve(len);
+        self.id.reserve(len);
     }
 
     fn cols(&mut self) -> Cols {
@@ -988,7 +997,8 @@ unsafe fn pack_w<const W: usize>(
 }
 
 /// [`scan`] of the first `k` packed candidates with the kernel of `W`
-/// lanes; nothing for `W == 0`, whose rows pack nothing.
+/// lanes, or one at a time for a `W` with no kernel; nothing for
+/// `W == 0`, whose rows pack nothing.
 ///
 /// # Safety
 /// As [`scan`], with [`SLACK`] more room, on a CPU with that kernel's
@@ -1002,7 +1012,6 @@ unsafe fn scan_w<const D2: bool, const HALF: bool, const W: usize>(
     cut2: f64,
     out: Out,
 ) -> usize {
-    let _ = (packed, k, p, i, cut2);
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if W == 8 {
         return unsafe { scan8::<D2, HALF>(packed, 0, k, p, i, cut2, out) };
@@ -1010,6 +1019,9 @@ unsafe fn scan_w<const D2: bool, const HALF: bool, const W: usize>(
     #[cfg(target_arch = "x86_64")]
     if W == 4 {
         return unsafe { scan4::<D2, HALF>(packed, 0, k, p, i, cut2, out) };
+    }
+    if W != 0 {
+        return unsafe { scan::<D2, HALF, false>(packed, 0, k, p, [0.0; 3], i, cut2, out) };
     }
     out.len
 }
@@ -1278,5 +1290,128 @@ impl Gathered {
         unsafe { *op.get().add(n) = bufs.first[n] as i32 };
         drop(stages);
         self.bufs.give();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `n` points in a cell of edge `edge` sheared by `tilt`, the first
+    /// `dense` of them in the middle third of every axis.
+    fn frame(n: usize, dense: usize, edge: f64, tilt: f64) -> (Vec<[f64; 3]>, Cell) {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let a = [edge, 0.0, 0.0];
+        let b = [tilt * edge, edge, 0.0];
+        let c = [0.5 * tilt * edge, -0.5 * tilt * edge, edge];
+        let xyz = (0..n)
+            .map(|k| {
+                let mut f = [next(), next(), next()];
+                if k < dense {
+                    f = f.map(|v| (1.0 + v) / 3.0);
+                }
+                [0, 1, 2].map(|x| f[0] * a[x] + f[1] * b[x] + f[2] * c[x])
+            })
+            .collect();
+        (xyz, Cell::from_vectors(a, b, c, [0.0; 3]).unwrap())
+    }
+
+    /// The rows `walk` stages into one fresh stage: per point, its
+    /// columns and distance bits.
+    fn staged(n: usize, walk: impl FnOnce(&mut Stage, RowOut)) -> Vec<(Vec<i32>, Vec<u64>)> {
+        let mut stage = Stage::default();
+        let mut at = vec![0u64; n];
+        let mut first = vec![0u32; n];
+        walk(
+            &mut stage,
+            RowOut {
+                at: Shared(at.as_mut_ptr()),
+                first: Shared(first.as_mut_ptr()),
+                stage: 0,
+            },
+        );
+        (0..n)
+            .map(|i| {
+                let row = at[i] as usize..at[i] as usize + first[i] as usize;
+                let d2 = stage.d2.get(row.clone()).unwrap_or_default();
+                (
+                    stage.cols[row].to_vec(),
+                    d2.iter().map(|d| d.to_bits()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The packed walks, one candidate at a time and on every path,
+    /// against the walk that packs nothing.
+    fn compare<const D2: bool, const HALF: bool>(
+        walk: &mut Walker,
+        n: usize,
+        repeat: bool,
+        label: &str,
+    ) {
+        let hi = walk.grid.offsets.len() - 1;
+        let want = staged(n, |s, out| walk.range::<D2, HALF, 0>(s, 0, hi, repeat, out));
+        assert!(want.iter().any(|(cols, _)| !cols.is_empty()), "{label}");
+        let got = staged(n, |s, out| walk.range::<D2, HALF, 1>(s, 0, hi, repeat, out));
+        assert_eq!(got, want, "{label} packed one at a time");
+        for path in crate::simd::paths_to_compare() {
+            walk.path = path;
+            let got = staged(n, |s, out| walk.range_on::<D2, HALF>(s, 0, hi, repeat, out));
+            assert_eq!(got, want, "{label} {}", path.name());
+        }
+    }
+
+    /// Bins whose rows pack several runs, one of them the dense bin, so
+    /// a fresh pack needs more than the first run: every packed walk
+    /// stages the rows of the walk that packs nothing, bit for bit.
+    #[test]
+    fn packed_rows_grow_across_steps() {
+        let (cutoff, edge) = (3.5, 10.5);
+        for (tilt, hint) in [(0.0, 3.5), (0.3, 3.5), (0.0, 1.75)] {
+            let label = format!("tilt {tilt} hint {hint}");
+            let (xyz, cell) = frame(160, 100, edge, tilt);
+            let n = xyz.len();
+            let binned = super::super::bin_atoms(&xyz, &cell, cutoff, None, Some(hint), true)
+                .unwrap()
+                .unwrap();
+            let mut walk = Walker::new(&binned, &cell);
+            let off = &walk.grid.offsets;
+            let [nx, ny, _] = walk.grid.n.map(|v| v as usize);
+            let mut stage = Stage::default();
+            let grows = (0..off.len() - 1).any(|c| {
+                let b = [c % nx, c / nx % ny, c / (nx * ny)].map(|v| v as i32);
+                let steps = if walk.steps.is_empty() {
+                    walk.steps_of(c, b, &mut stage);
+                    stage.steps.clone()
+                } else {
+                    walk.steps[walk.class(b)].clone()
+                };
+                let runs: Vec<usize> = steps
+                    .iter()
+                    .filter(|step| step.kind != Kind::Source)
+                    .map(|step| {
+                        let first = (c as isize + step.rel) as usize;
+                        off[first + step.bins] - off[first]
+                    })
+                    .filter(|&len| len > 0)
+                    .collect();
+                let packed: usize = runs.iter().sum();
+                off[c] < off[c + 1] && runs.len() > 1 && packed >= 100 && runs[0] + SLACK < packed
+            });
+            assert!(grows, "{label}: no bin packs past its first run");
+            let w = cell.widths();
+            let repeat = (0..3).any(|a| 2.0 * cutoff >= w[a] * (1.0 - 1.0e-6));
+            assert!(!repeat, "{label}");
+            compare::<true, false>(&mut walk, n, repeat, &label);
+            compare::<true, true>(&mut walk, n, repeat, &label);
+            compare::<false, false>(&mut walk, n, repeat, &label);
+        }
     }
 }
