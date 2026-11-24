@@ -9,7 +9,7 @@ CHECKS=${CHECKS:-$SCRIPT_DIR/prove-published}
 # recipe parser can be checked without creating a work directory.
 ROOT=${PROVE_ROOT:-}
 LOG_DIR=${PROVE_LOG_DIR:-}
-RECIPE_COMMIT=b3b7623eac5e51d645673d4c0da4569a29495e95
+RECIPE_COMMIT=922ae1481b3d983d7814c18bc03085ba67a91704
 RECIPE_URL=https://raw.githubusercontent.com/HaoZeke/staged-recipes/${RECIPE_COMMIT}/recipes/linkcell
 
 log() { printf '%s\n' "$*"; }
