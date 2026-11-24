@@ -13,7 +13,7 @@
 //! least half the narrowest periodic width. Those rows are written to a
 //! staging buffer first, deduplicated, and then packed.
 
-use super::{hit_estimate, in_pool, plan, row_guess, Found, Pair, Scratch};
+use super::{hit_estimate, in_pool, plan_unshifted, row_guess, Found, Pair, Scratch};
 use crate::cell::Cell;
 use crate::open_cell::{pairs_within_pbc, PbcQuery};
 use crate::Error;
@@ -233,7 +233,7 @@ enum Source {
 impl Source {
     fn search(xyz: &[[f64; 3]], cell: &Cell, query: &PbcQuery<'_>) -> Result<Self, Error> {
         if query.periodic == [true, true, true] {
-            let plan = plan(
+            let plan = plan_unshifted(
                 xyz,
                 cell,
                 query.cutoff,
