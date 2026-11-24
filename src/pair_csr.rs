@@ -189,25 +189,29 @@ unsafe impl Sync for CsrDest {}
 pub(crate) enum CsrWrite {
     /// Into the [`CsrDest`] `room` returned; this many columns.
     Direct(usize),
-    /// `room` had no buffer for them: owned rows, with distances.
+    /// `room` had no buffer for them: owned rows, with distances when
+    /// asked for.
     Owned(PairCsr),
 }
 
 /// The C ABI's build: the rows go straight into `room(columns)` when it
-/// returns a destination. Otherwise they are built, with distances, into
-/// an owned [`PairCsr`]. `xyz` is not empty and has passed [`check`].
+/// returns a destination. Otherwise they are built into an owned
+/// [`PairCsr`]. Distances are computed only with `dist2`, and then a
+/// destination's non-null distance pointer receives them. `xyz` is not
+/// empty and has passed [`check`].
 #[cfg(feature = "capi")]
 pub(crate) fn csr_rows(
     xyz: &[[f64; 3]],
     cell: &Cell,
     query: &PbcQuery<'_>,
+    dist2: bool,
     room: impl FnOnce(usize) -> Option<CsrDest> + Send,
 ) -> Result<CsrWrite, Error> {
     let n = xyz.len();
     let est = estimate(n, cell, query);
     in_pool(est, || {
         if query.periodic == [true, true, true] {
-            let Some(mut rows) = gathered(xyz, cell, query, true)? else {
+            let Some(mut rows) = gathered(xyz, cell, query, dist2)? else {
                 let empty = PairCsr {
                     offsets: vec![0; n + 1],
                     ..PairCsr::default()
@@ -232,35 +236,46 @@ pub(crate) fn csr_rows(
                 Some(dest) => {
                     // Safety: `room` gave `n + 1` offsets and `need` columns
                     // (and distances when that pointer is non-null).
-                    unsafe { rows.write(dest.offsets, dest.cols, dest.dist2) };
+                    let d2 = if dist2 {
+                        dest.dist2
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    unsafe { rows.write(dest.offsets, dest.cols, d2) };
                     CsrWrite::Direct(need)
                 }
                 None => {
                     let mut owned = PairCsr {
                         offsets: Vec::with_capacity(n + 1),
                         cols: Vec::with_capacity(need),
-                        dist2: Vec::with_capacity(need),
+                        dist2: Vec::with_capacity(if dist2 { need } else { 0 }),
                     };
                     // Safety: as in `pairs_within_csr`.
                     unsafe {
-                        rows.write(
-                            owned.offsets.as_mut_ptr(),
-                            owned.cols.as_mut_ptr(),
-                            owned.dist2.as_mut_ptr(),
-                        );
+                        let d2 = if dist2 {
+                            owned.dist2.as_mut_ptr()
+                        } else {
+                            std::ptr::null_mut()
+                        };
+                        rows.write(owned.offsets.as_mut_ptr(), owned.cols.as_mut_ptr(), d2);
                         owned.offsets.set_len(n + 1);
                         owned.cols.set_len(need);
-                        owned.dist2.set_len(need);
+                        if dist2 {
+                            owned.dist2.set_len(need);
+                        }
                     }
                     CsrWrite::Owned(owned)
                 }
             });
         }
         let source = Source::search(xyz, cell, query)?;
-        let rows = Rows::new(&source, n, query.half, repeats(cell, query), true)?;
+        let rows = Rows::new(&source, n, query.half, repeats(cell, query), dist2)?;
         let need = rows.need();
         match room(need) {
-            Some(dest) => {
+            Some(mut dest) => {
+                if !dist2 {
+                    dest.dist2 = std::ptr::null_mut();
+                }
                 // Safety: `room` gave `n + 1` offsets and `need` columns
                 // (and distances when that pointer is non-null).
                 unsafe { rows.write(dest) };
@@ -268,7 +283,7 @@ pub(crate) fn csr_rows(
             }
             None => {
                 let mut owned = PairCsr::default();
-                rows.write_vec(&mut owned, true);
+                rows.write_vec(&mut owned, dist2);
                 Ok(CsrWrite::Owned(owned))
             }
         }

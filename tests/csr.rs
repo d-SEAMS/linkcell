@@ -492,6 +492,60 @@ mod capi {
     }
 
     #[test]
+    fn rows_kept_without_distances_are_searched_again_for_them() {
+        let (xyz, h) = frame(20.0, [0.1, 0.0, 0.0], 11);
+        let c = call(&xyz, h, [true; 3], 3.5, false);
+        let want = c.rows();
+        let n = xyz.len();
+        let total = want.cols.len();
+        let mut need = (0, 0);
+        let mut got = PairCsr {
+            offsets: vec![-1; n + 1],
+            cols: vec![-1; total],
+            dist2: vec![-1.0; total],
+        };
+        // A short buffer without distances keeps rows that have none.
+        let rc = unsafe {
+            c.run(
+                got.offsets.as_mut_ptr(),
+                n + 1,
+                got.cols.as_mut_ptr(),
+                null_mut(),
+                total - 1,
+                &mut need,
+            )
+        };
+        assert_ne!(rc, 0);
+        let rc = unsafe {
+            c.run(
+                got.offsets.as_mut_ptr(),
+                n + 1,
+                got.cols.as_mut_ptr(),
+                got.dist2.as_mut_ptr(),
+                total,
+                &mut need,
+            )
+        };
+        assert_eq!(rc, 0, "{}", last_error());
+        assert_eq!(bits(&got), bits(&want));
+        // A fill large enough at once, without distances.
+        let mut offsets = vec![-1 as c_int; n + 1];
+        let mut cols = vec![-1 as c_int; total];
+        let rc = unsafe {
+            c.run(
+                offsets.as_mut_ptr(),
+                n + 1,
+                cols.as_mut_ptr(),
+                null_mut(),
+                total,
+                &mut need,
+            )
+        };
+        assert_eq!(rc, 0, "{}", last_error());
+        assert_eq!((offsets, cols), (want.offsets, want.cols));
+    }
+
+    #[test]
     fn c_edge_cases_fail_with_a_message() {
         let mut need = (9, 9);
         let empty = Call {
