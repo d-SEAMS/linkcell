@@ -241,11 +241,18 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
 ///   `pthread_create` on the same thread counts as one worker. That nesting
 ///   is the counter's rule; it is not a claim that the C library calls the
 ///   symbol again. The abi tests pass on glibc 2.39 with the depth unused.
-/// * macOS. dyld's two-level namespace records `std`'s `pthread_create`
-///   reference against libSystem. A definition of the same symbol in this
-///   binary is not the call `std::thread::spawn` makes. The probe interposes
-///   libSystem's `pthread_create` through `__DATA,__interpose` and forwards
-///   with `dlsym(RTLD_NEXT)`. This interposition has not been run on macOS.
+/// * macOS. dyld binds `std`'s `pthread_create` to libSystem, so a definition
+///   in this binary is not that call, and a `__DATA,__interpose` record in
+///   this binary did not observe it: the self-check's count stayed zero.
+///   libpthread reports `PTHREAD_INTROSPECTION_THREAD_CREATE` on the creating
+///   thread inside `pthread_create`, before the new thread runs, and
+///   `PTHREAD_INTROSPECTION_THREAD_START` on the new thread before its start
+///   routine. The probe installs a hook with
+///   `pthread_introspection_hook_install` and calls the hook that was already
+///   installed. CREATE counts. START for a thread CREATE already counted is
+///   the same thread and does not count again. START with no CREATE counts.
+///   DESTROY with no START rolls that CREATE back: `__bsdthread_create`
+///   failed and no thread ran.
 /// * Windows. The standard library imports `CreateThread` from
 ///   `kernel32.dll`. A `CreateThread` defined in this binary does not
 ///   intercept that import, and a Toolhelp snapshot does not list a thread
@@ -288,7 +295,7 @@ mod nd_spawn {
         SPAWNS.fetch_sub(1, Ordering::SeqCst);
     }
 
-    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     mod unix {
         use std::os::raw::{c_char, c_int, c_void};
         use std::sync::atomic::{AtomicPtr, Ordering};
@@ -331,7 +338,7 @@ mod nd_spawn {
             }
             REAL.store(found, Ordering::Release);
             IN_RESOLVE.with(|flag| flag.set(false));
-            // SAFETY: `dlsym` returned libc's or libSystem's `pthread_create`.
+            // SAFETY: `dlsym` returned libc's `pthread_create`.
             unsafe { std::mem::transmute::<*mut c_void, Create>(found) }
         }
 
@@ -364,10 +371,9 @@ mod nd_spawn {
         }
     }
 
-    /// Glibc binds this executable's definition. macOS uses the interpose
-    /// below instead: a same-named definition is not what libSystem-bound
-    /// references call. Other Linux targets do not define this symbol:
-    /// `dlsym(RTLD_NEXT)` is null when musl is linked statically.
+    /// Glibc binds this executable's definition. Other Linux targets do not
+    /// define this symbol: `dlsym(RTLD_NEXT)` is null when musl is linked
+    /// statically.
     ///
     /// # Safety
     ///
@@ -383,35 +389,109 @@ mod nd_spawn {
         unsafe { unix::counted(thread, attr, start, arg) }
     }
 
+    /// Counts threads libpthread actually creates.
+    ///
+    /// `PTHREAD_INTROSPECTION_THREAD_CREATE` is 1 and
+    /// `PTHREAD_INTROSPECTION_THREAD_START` is 2, from
+    /// `<pthread/introspection.h>`. CREATE runs on the creating thread before
+    /// `pthread_create` returns. START runs on the new thread before its start
+    /// routine. A failed create delivers DESTROY (4) and no START.
     #[cfg(target_os = "macos")]
-    #[repr(C)]
-    struct DyldInterpose {
-        replacement: *const (),
-        replacee: *const (),
+    mod mac {
+        use std::os::raw::{c_uint, c_void};
+        use std::sync::{Mutex, Once};
+
+        use super::{note, unnote};
+
+        const THREAD_CREATE: c_uint = 1;
+        const THREAD_START: c_uint = 2;
+        const THREAD_DESTROY: c_uint = 4;
+
+        type Hook = unsafe extern "C" fn(c_uint, *mut c_void, *mut c_void, usize);
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Phase {
+            Created,
+            Started,
+        }
+
+        /// Addresses, not pointers: a `*mut c_void` is not `Send`, and the
+        /// hook runs on the creating thread and on the new thread.
+        static SEEN: Mutex<Vec<(usize, Phase)>> = Mutex::new(Vec::new());
+        static PREV: Mutex<Option<Hook>> = Mutex::new(None);
+
+        extern "C" {
+            fn pthread_introspection_hook_install(hook: Option<Hook>) -> Option<Hook>;
+        }
+
+        fn seen() -> std::sync::MutexGuard<'static, Vec<(usize, Phase)>> {
+            SEEN.lock().unwrap_or_else(|err| err.into_inner())
+        }
+
+        fn on_create(thread: usize) {
+            let mut seen = seen();
+            if seen.iter().any(|(id, _)| *id == thread) {
+                return;
+            }
+            if note() {
+                seen.push((thread, Phase::Created));
+            }
+        }
+
+        fn on_start(thread: usize) {
+            let mut seen = seen();
+            if let Some((_, phase)) = seen.iter_mut().find(|(id, _)| *id == thread) {
+                *phase = Phase::Started;
+                return;
+            }
+            if note() {
+                seen.push((thread, Phase::Started));
+            }
+        }
+
+        fn on_destroy(thread: usize) {
+            let mut seen = seen();
+            let Some(pos) = seen.iter().position(|(id, _)| *id == thread) else {
+                return;
+            };
+            let started = seen[pos].1 == Phase::Started;
+            seen.swap_remove(pos);
+            if !started {
+                unnote();
+            }
+        }
+
+        unsafe extern "C" fn hook(
+            event: c_uint,
+            thread: *mut c_void,
+            addr: *mut c_void,
+            size: usize,
+        ) {
+            if !thread.is_null() {
+                let id = thread as usize;
+                match event {
+                    THREAD_CREATE => on_create(id),
+                    THREAD_START => on_start(id),
+                    THREAD_DESTROY => on_destroy(id),
+                    _ => {}
+                }
+            }
+            let prev = *PREV.lock().unwrap_or_else(|err| err.into_inner());
+            if let Some(prev) = prev {
+                // SAFETY: `prev` is the hook `pthread_introspection_hook_install` returned.
+                unsafe { prev(event, thread, addr, size) };
+            }
+        }
+
+        pub(super) fn install() {
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                seen().reserve(64);
+                let prev = unsafe { pthread_introspection_hook_install(Some(hook)) };
+                *PREV.lock().unwrap_or_else(|err| err.into_inner()) = prev;
+            });
+        }
     }
-
-    /// Function addresses. dyld reads this record from any thread and the
-    /// slots are never written.
-    #[cfg(target_os = "macos")]
-    unsafe impl Sync for DyldInterpose {}
-
-    #[cfg(target_os = "macos")]
-    extern "C" {
-        fn pthread_create(
-            thread: *mut std::os::raw::c_void,
-            attr: *const std::os::raw::c_void,
-            start: extern "C" fn(*mut std::os::raw::c_void) -> *mut std::os::raw::c_void,
-            arg: *mut std::os::raw::c_void,
-        ) -> std::os::raw::c_int;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[used]
-    #[link_section = "__DATA,__interpose"]
-    static PTHREAD_CREATE_INTERPOSE: DyldInterpose = DyldInterpose {
-        replacement: unix::counted as *const (),
-        replacee: pthread_create as *const (),
-    };
 
     #[cfg(windows)]
     mod win {
@@ -645,8 +725,10 @@ mod nd_spawn {
     }
 
     pub(super) fn arm() -> Result<(), String> {
-        #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         unix::ensure();
+        #[cfg(target_os = "macos")]
+        mac::install();
         #[cfg(windows)]
         win::patch()?;
         ARMED.store(true, Ordering::SeqCst);
