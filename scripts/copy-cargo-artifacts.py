@@ -110,9 +110,13 @@ def main() -> None:
             env["RUSTFLAGS"] = (flags + " " + extra).strip()
     subprocess.check_call(command, env=env)
 
-    built = args.target / args.profile
-    if tsan:
-        built = args.target / "x86_64-unknown-linux-gnu" / args.profile
+    build_target = "x86_64-unknown-linux-gnu" if tsan else env.get("CARGO_BUILD_TARGET")
+    built = args.target
+    if build_target:
+        if build_target.endswith(".json"):
+            build_target = Path(build_target).stem
+        built /= build_target
+    built /= args.profile
     shutil.copy2(built / args.shared, args.out_shared)
     shutil.copy2(built / args.static, args.out_static)
     if args.implib is not None:
