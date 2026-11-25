@@ -21,7 +21,7 @@
 //! on the stack for `k <= 16`.
 
 use crate::bins::{self, axis_gap, for_new_layer, slab_dist2, Mesh};
-use crate::cell::Cell;
+use crate::cell::{periodic_face_collapsed, Cell};
 use crate::team::Stage;
 use crate::Error;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
@@ -373,6 +373,8 @@ pub fn knearest_into_many(
 /// [`Error::NonFinite`] when a coordinate (masked or not) or the cell
 /// origin is not finite. The lattice vectors are finite by
 /// construction: [`Cell`] rejects any other as [`Error::BadBox`].
+/// [`Error::Degenerate`] when the shortest face altitude is at most
+/// `1e-6` of the longest edge.
 fn check(
     xyz: &[[f64; 3]],
     n: usize,
@@ -391,7 +393,11 @@ fn check(
             return Err(Error::MaskLen);
         }
     }
-    finite(xyz, simbox)
+    finite(xyz, simbox)?;
+    if periodic_face_collapsed(simbox, [true, true, true]) {
+        return Err(Error::Degenerate);
+    }
+    Ok(())
 }
 
 /// One pass over the coordinates and the cell origin.
@@ -801,8 +807,10 @@ pub fn knearest_csr(
 /// Returns [`Error::ZeroK`] when `k == 0`, [`Error::Empty`] when `xyz`
 /// is empty, [`Error::Overflow`] when `n * k` does not fit in a slice,
 /// [`Error::NonFinite`] when a coordinate (masked or not) or the cell
-/// origin is NaN or infinite, and [`Error::TooManyCells`] when the mesh
-/// exceeds the bin cap. These inputs return `Err`. [`knearest_into`],
+/// origin is NaN or infinite, [`Error::TooManyCells`] when the mesh
+/// exceeds the bin cap, and [`Error::Degenerate`] when the shortest
+/// face altitude is at most `1e-6` of the longest edge. These inputs
+/// return `Err`. [`knearest_into`],
 /// [`knearest_into_d2`], [`knearest_into_many`], [`knearest_csr`] and
 /// [`knearest_brute`] return the same errors.
 ///
@@ -2209,6 +2217,9 @@ pub fn knearest_brute(
         return Err(Error::Empty);
     }
     finite(xyz, simbox)?;
+    if periodic_face_collapsed(simbox, [true, true, true]) {
+        return Err(Error::Degenerate);
+    }
     let n = xyz.len();
     let active: Vec<usize> = (0..n)
         .filter(|&i| {

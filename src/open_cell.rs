@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bins::certify;
+use crate::cell::periodic_face_collapsed;
 use crate::pairs::{keep_half, Pair};
 use crate::{Cell, Error};
 
@@ -142,8 +143,11 @@ pub fn pairs_open(
 /// `query.periodic[k]` false keeps axis `k` out of the image sum. A
 /// fully periodic mask is [`crate::pairs_within`](crate::pairs_within).
 /// Any open axis uses occupied Cartesian bins and no periodic padding.
-/// `cell` supplies the periodic lattice. It is not read when every axis
-/// is open.
+/// `cell` supplies the periodic rows and the origin. An open row is not
+/// read: [`cell_for_pbc`] replaces it with a unit normal of the periodic
+/// rows before the bins are built. The cell is not read when every axis
+/// is open. A fully periodic cell whose face altitude has collapsed
+/// returns [`Error::Degenerate`].
 pub fn pairs_within_pbc(
     xyz: &[[f64; 3]],
     cell: &Cell,
@@ -166,6 +170,9 @@ pub fn pairs_within_pbc(
         }
     }
     if query.periodic == [true, true, true] {
+        if periodic_face_collapsed(cell, query.periodic) {
+            return Err(Error::Degenerate);
+        }
         let mut rows = crate::pairs::pairs_within(
             xyz,
             cell,
@@ -179,6 +186,8 @@ pub fn pairs_within_pbc(
         }
         return Ok(rows);
     }
+    let binning = cell_for_pbc(cell.h(), cell.origin(), query.periodic)?;
+    let cell = &binning;
     let frame = place(xyz, cell, query)?;
     if frame.n_active == 0 {
         return Ok(Vec::new());
@@ -187,9 +196,36 @@ pub fn pairs_within_pbc(
     walk(&frame, cell, &stencil, query)
 }
 
-/// Lattice for `periodic`. A zero row on an open axis is replaced by a
-/// unit axis so the periodic rows still define a cell. A fully open
-/// mask does not read `rows`.
+/// Lattice used to bin `periodic`.
+///
+/// Each open row is replaced by a unit vector normal to the span of the
+/// periodic rows, whatever length the caller stored. One periodic row
+/// gets the orthonormal complement of that line. Two periodic rows get
+/// the unit normal of their plane. The periodic rows and `origin` are
+/// kept. A fully open mask does not read `rows` and returns a unit cube.
+///
+/// A fully periodic cell is [`Cell::from_vectors`]. When its shortest
+/// face altitude is at most `1e-6` times its longest edge, the lattice
+/// is numerically flat and this returns [`Error::Degenerate`]. minimage
+/// can still form a displacement on that cell. The linked-cell image
+/// stencil cannot.
+///
+/// A periodic row that is non-finite, zero, or collinear with the other
+/// periodic rows returns [`Error::BadBox`]. The same error is returned
+/// when the resulting box is singular.
+///
+/// ```
+/// use linkcell::cell_for_pbc;
+///
+/// # fn main() -> Result<(), linkcell::Error> {
+/// let rows = [[4.0, 0.0, 0.0], [1.0, 3.0, 0.0], [2.0, 1.0, 1.0e-8]];
+/// let cell = cell_for_pbc(rows, [0.0, 0.0, 0.0], [true, true, false])?;
+/// let c = cell.c();
+/// assert!(c[0].abs() + c[1].abs() < 1e-12);
+/// assert!((c[2] - 1.0).abs() < 1e-12);
+/// # Ok(())
+/// # }
+/// ```
 pub fn cell_for_pbc(
     mut rows: [[f64; 3]; 3],
     origin: [f64; 3],
@@ -198,19 +234,123 @@ pub fn cell_for_pbc(
     if periodic == [false, false, false] {
         return Cell::ortho(1.0, 1.0, 1.0).map_err(|_| Error::BadBox);
     }
-    for axis in 0..3 {
-        if periodic[axis] {
-            continue;
+    if periodic != [true, true, true] {
+        replace_open_rows(&mut rows, periodic)?;
+    } else if rows.iter().any(|row| !finite3(*row)) {
+        return Err(Error::BadBox);
+    }
+    let cell = Cell::from_vectors(rows[0], rows[1], rows[2], origin).map_err(|_| Error::BadBox)?;
+    if periodic_face_collapsed(&cell, periodic) {
+        return Err(Error::Degenerate);
+    }
+    Ok(cell)
+}
+
+fn finite3(v: [f64; 3]) -> bool {
+    v[0].is_finite() && v[1].is_finite() && v[2].is_finite()
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn unit(v: [f64; 3]) -> Result<[f64; 3], Error> {
+    let n2 = dot(v, v);
+    if !n2.is_finite() || n2 <= 0.0 {
+        return Err(Error::BadBox);
+    }
+    let n = n2.sqrt();
+    Ok([v[0] / n, v[1] / n, v[2] / n])
+}
+
+/// A unit vector perpendicular to `a`. The seed is the coordinate axis
+/// most orthogonal to `a`, so the cross product is not a cancellation.
+fn unit_perp(a: [f64; 3]) -> Result<[f64; 3], Error> {
+    let ax = a[0].abs();
+    let ay = a[1].abs();
+    let az = a[2].abs();
+    let seed = if ax <= ay && ax <= az {
+        [1.0, 0.0, 0.0]
+    } else if ay <= az {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    unit(cross(a, seed))
+}
+
+/// Write a unit normal of the periodic rows into every open slot.
+///
+/// Two periodic rows use their plane's unit normal. One periodic row
+/// uses an orthonormal frame of the perpendicular plane, assigned to
+/// the open slots in axis order. The periodic rows are left unchanged.
+fn replace_open_rows(rows: &mut [[f64; 3]; 3], periodic: [bool; 3]) -> Result<(), Error> {
+    let count = periodic.iter().filter(|&&flag| flag).count();
+    if count == 2 {
+        let mut kept = [[0.0; 3]; 2];
+        let mut n = 0;
+        let mut open = 0;
+        for axis in 0..3 {
+            if periodic[axis] {
+                kept[n] = rows[axis];
+                n += 1;
+            } else {
+                open = axis;
+            }
         }
-        let len2 = rows[axis][0] * rows[axis][0]
-            + rows[axis][1] * rows[axis][1]
-            + rows[axis][2] * rows[axis][2];
-        if !len2.is_finite() || len2 <= 1.0e-24 {
-            rows[axis] = [0.0, 0.0, 0.0];
-            rows[axis][axis] = 1.0;
+        let (u, v) = (kept[0], kept[1]);
+        if !finite3(u) || !finite3(v) {
+            return Err(Error::BadBox);
+        }
+        let uu = dot(u, u);
+        let vv = dot(v, v);
+        let normal = cross(u, v);
+        let nn = dot(normal, normal);
+        // The same relative gram determinant as minimage `PartialCell`.
+        if !uu.is_finite()
+            || !vv.is_finite()
+            || uu <= 0.0
+            || vv <= 0.0
+            || !nn.is_finite()
+            || nn <= 1.0e-24 * uu * vv
+        {
+            return Err(Error::BadBox);
+        }
+        rows[open] = unit(normal)?;
+        return Ok(());
+    }
+    if count == 1 {
+        let mut axis = 0;
+        for (slot, &is_periodic) in periodic.iter().enumerate() {
+            if is_periodic {
+                axis = slot;
+            }
+        }
+        let a = rows[axis];
+        if !finite3(a) {
+            return Err(Error::BadBox);
+        }
+        let n1 = unit_perp(a)?;
+        let n2 = unit(cross(a, n1))?;
+        let normals = [n1, n2];
+        let mut slot = 0;
+        for open in 0..3 {
+            if periodic[open] {
+                continue;
+            }
+            rows[open] = normals[slot];
+            slot += 1;
         }
     }
-    Cell::from_vectors(rows[0], rows[1], rows[2], origin).map_err(|_| Error::BadBox)
+    Ok(())
 }
 
 struct Frame {
@@ -957,4 +1097,630 @@ fn pair_bins(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use minimage::PartialCell;
+
+    use super::{cell_for_pbc, pairs_within_pbc, PbcQuery};
+    use crate::{pairs_within, pairs_within_csr, Cell, Error, Pair, PairCsr};
+
+    type Key = (usize, usize, [i32; 3]);
+
+    /// Lengths 13, 13, 23.3 Å and angles 86.892, 16.892, 70 degrees.
+    /// The dimensionless residual keeps a positive c height of about 1.2e-7 Å.
+    /// `lz² - cx² - cy²` cancels through zero and is not this height.
+    fn near_flat_rows() -> [[f64; 3]; 3] {
+        let (lx, ly, lz) = (13.0, 13.0, 23.3);
+        let alpha = 86.892_f64.to_radians();
+        let beta = 16.892_f64.to_radians();
+        let gamma = 70.0_f64.to_radians();
+        let (cos_a, cos_b, cos_g) = (alpha.cos(), beta.cos(), gamma.cos());
+        let sin_g = gamma.sin();
+        let factor = (cos_a - cos_b * cos_g) / sin_g;
+        let inside = 1.0 - cos_b * cos_b - factor * factor;
+        assert!(inside > 0.0, "c height {inside}");
+        let cz = lz * inside.sqrt();
+        assert!(cz > 1.0e-7 && cz < 1.5e-7, "c_z {cz}");
+        [
+            [lx, 0.0, 0.0],
+            [ly * cos_g, ly * sin_g, 0.0],
+            [lz * cos_b, lz * factor, cz],
+        ]
+    }
+
+    fn near_flat_cu() -> Vec<[f64; 3]> {
+        vec![
+            [2.7431309316168475, 6.108002035108404, 0.0],
+            [13.232056168881522, 6.352322116512741, 0.2],
+            [4.03338785589701, 0.3664801221065042, 0.0],
+            [7.720397346483967, 10.13928337827995, -0.2],
+            [8.19626621664133, 0.45462981824422477, 0.0412786853694912],
+            [13.762071462898417, 10.626955433611426, -0.03622779513074964],
+            [11.205363013255461, 7.1146751150038385, 0.027634492938765798],
+            [4.492545207753816, 4.035049921555236, -0.19606254358135186],
+            [16.50539159880175, 12.057883571293173, 0.15819319967883666],
+            [4.199134240190456, 10.099861087740562, 0.2068132352186905],
+            [6.126746340992574, 8.464007919000748, -0.11518997428508809],
+            [9.814929593400677, 8.903620103137243, -0.1682723449043315],
+            [2.2857588312509485, 2.9564446590077442, 0.12103716729274078],
+            [
+                5.9510448718450855,
+                0.20132540631560192,
+                -0.08736864655602095,
+            ],
+            [11.368678075155005, 10.008767396697653, -0.05551644303227138],
+            [15.870150122394206, 8.195507208935341, 0.1519522101214148],
+            [10.42169020181862, 1.7934744461922287, 0.10864204430766089],
+            [8.351747146366385, 3.7093332382537727, 0.02911048113793241],
+            [4.732924885010005, 6.6345398008188905, 0.1202865161255377],
+            [11.924591995381464, 4.883493475804255, -0.06332713818033944],
+            [12.308118627317418, 2.485340130933891, -0.24174491728692993],
+            [0.9990718536434593, 0.9081763430908019, 0.09809706259195394],
+            [8.401410062080734, 6.873783879816667, 0.223667971540852],
+            [5.947793909899321, 2.4918353256604986, -0.27449681317456937],
+        ]
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn norm(a: [f64; 3]) -> f64 {
+        dot(a, a).sqrt()
+    }
+
+    fn keep(i: usize, j: usize, shift: [i32; 3]) -> bool {
+        if i != j {
+            return i < j;
+        }
+        for s in shift {
+            if s != 0 {
+                return s < 0;
+            }
+        }
+        true
+    }
+
+    fn raw_cell(rows: [[f64; 3]; 3], origin: [f64; 3]) -> Cell {
+        Cell::from_vectors(rows[0], rows[1], rows[2], origin).unwrap()
+    }
+
+    fn unwrapped(cell: &Cell, point: [f64; 3]) -> [f64; 3] {
+        let origin = cell.origin();
+        let delta = [
+            point[0] - origin[0],
+            point[1] - origin[1],
+            point[2] - origin[2],
+        ];
+        if cell.is_ortho() {
+            let widths = cell.widths();
+            return [
+                delta[0] / widths[0],
+                delta[1] / widths[1],
+                delta[2] / widths[2],
+            ];
+        }
+        let h = cell.hinv();
+        [
+            h[0][0] * delta[0] + h[1][0] * delta[1] + h[2][0] * delta[2],
+            h[0][1] * delta[0] + h[1][1] * delta[1] + h[2][1] * delta[2],
+            h[0][2] * delta[0] + h[1][2] * delta[1] + h[2][2] * delta[2],
+        ]
+    }
+
+    fn shift_window(cell: &Cell, xyz: &[[f64; 3]], periodic: [bool; 3], cutoff: f64) -> i32 {
+        let widths = cell.widths();
+        let mut reach = 1i32;
+        for axis in 0..3 {
+            if !periodic[axis] {
+                continue;
+            }
+            let reps = (cutoff / widths[axis]).ceil();
+            assert!(
+                reps.is_finite() && (0.0..64.0).contains(&reps),
+                "repeats {reps}"
+            );
+            let reps = reps as i32;
+            let mut lo = 0i32;
+            let mut hi = 0i32;
+            for point in xyz {
+                let whole = unwrapped(cell, *point)[axis].floor();
+                assert!(whole.is_finite(), "fraction {whole}");
+                let whole = whole as i32;
+                lo = lo.min(whole);
+                hi = hi.max(whole);
+            }
+            reach = reach.max((hi - lo).abs() + reps + 1);
+        }
+        reach
+    }
+
+    fn brute(
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+        periodic: [bool; 3],
+        cutoff: f64,
+        half: bool,
+        exclude_self: bool,
+        window: i32,
+    ) -> BTreeMap<Key, f64> {
+        let cut2 = cutoff * cutoff;
+        let limit = |axis| {
+            if periodic[axis] {
+                window
+            } else {
+                0
+            }
+        };
+        let mut out = BTreeMap::new();
+        for na in -limit(0)..=limit(0) {
+            for nb in -limit(1)..=limit(1) {
+                for nc in -limit(2)..=limit(2) {
+                    let shift = [na, nb, nc];
+                    for (i, pi) in xyz.iter().enumerate() {
+                        for (j, pj) in xyz.iter().enumerate() {
+                            if exclude_self && i == j {
+                                continue;
+                            }
+                            if i == j && shift == [0, 0, 0] {
+                                continue;
+                            }
+                            if half && !keep(i, j, shift) {
+                                continue;
+                            }
+                            let delta = if shift == [0, 0, 0] {
+                                [0.0; 3]
+                            } else {
+                                cell.lattice_shift(shift[0], shift[1], shift[2])
+                            };
+                            let dx = (pj[0] + delta[0]) - pi[0];
+                            let dy = (pj[1] + delta[1]) - pi[1];
+                            let dz = (pj[2] + delta[2]) - pi[2];
+                            let dist2 = dx * dx + dy * dy + dz * dz;
+                            if dist2 < cut2 {
+                                out.insert((i, j, shift), dist2);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_minimum_image(
+        xyz: &[[f64; 3]],
+        rows: [[f64; 3]; 3],
+        pairs: &[Pair],
+        periodic: [bool; 3],
+        cutoff: f64,
+    ) {
+        let partial = PartialCell::from_ase(rows, periodic).unwrap();
+        let cut2 = cutoff * cutoff;
+        let mut mins: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+        for pair in pairs {
+            if pair.i == pair.j {
+                continue;
+            }
+            let key = if pair.i < pair.j {
+                (pair.i, pair.j)
+            } else {
+                (pair.j, pair.i)
+            };
+            mins.entry(key)
+                .and_modify(|best| {
+                    if pair.dist2 < *best {
+                        *best = pair.dist2;
+                    }
+                })
+                .or_insert(pair.dist2);
+        }
+        for i in 0..xyz.len() {
+            for j in (i + 1)..xyz.len() {
+                let dist2 = partial.dist2_euclidean(xyz[i], xyz[j]);
+                match mins.get(&(i, j)) {
+                    Some(&got) => {
+                        let scale = dist2.abs().max(got.abs()).max(1.0);
+                        assert!(
+                            (got - dist2).abs() <= 1.0e-8 * scale,
+                            "pair {i},{j}: list {got} minimage {dist2}"
+                        );
+                    }
+                    None => assert!(
+                        dist2 >= cut2,
+                        "missing pair {i},{j} at minimage distance {dist2}"
+                    ),
+                }
+            }
+        }
+    }
+
+    fn assert_basis(rows: [[f64; 3]; 3], origin: [f64; 3], periodic: [bool; 3]) -> Cell {
+        let cell = cell_for_pbc(rows, origin, periodic).unwrap();
+        assert_eq!(cell.origin(), origin);
+        if periodic == [false, false, false] {
+            let cube = Cell::ortho(1.0, 1.0, 1.0).unwrap();
+            assert_eq!(cell.h(), cube.h());
+            return cell;
+        }
+        let columns = cell.h();
+        for axis in 0..3 {
+            if periodic[axis] {
+                assert_eq!(columns[axis], rows[axis]);
+                continue;
+            }
+            let row = columns[axis];
+            assert!((norm(row) - 1.0).abs() < 1.0e-12);
+            for other in 0..3 {
+                if periodic[other] {
+                    let scale = norm(rows[other]).max(1.0);
+                    assert!(
+                        dot(row, rows[other]).abs() <= 1.0e-9 * scale,
+                        "open axis {axis} not normal to {other}"
+                    );
+                }
+            }
+        }
+        let open: Vec<[f64; 3]> = (0..3)
+            .filter(|&a| !periodic[a])
+            .map(|a| columns[a])
+            .collect();
+        if open.len() == 2 {
+            assert!(dot(open[0], open[1]).abs() < 1.0e-9);
+        }
+        let again = cell_for_pbc(columns, origin, periodic).unwrap();
+        assert_eq!(again.h(), columns);
+        cell
+    }
+
+    fn expect_pairs(
+        rows: [[f64; 3]; 3],
+        origin: [f64; 3],
+        xyz: &[[f64; 3]],
+        periodic: [bool; 3],
+        cutoff: f64,
+        half: bool,
+    ) -> Vec<Pair> {
+        let binning = assert_basis(rows, origin, periodic);
+        let query = PbcQuery::new(periodic, cutoff)
+            .half(half)
+            .exclude_self_images(true);
+        let found = pairs_within_pbc(xyz, &binning, &query).unwrap();
+        let window = shift_window(&binning, xyz, periodic, cutoff);
+        for pair in &found {
+            for (axis, &component) in pair.shift.iter().enumerate() {
+                if periodic[axis] {
+                    assert!(
+                        component.abs() <= window,
+                        "shift {component} window {window}"
+                    );
+                } else {
+                    assert_eq!(component, 0);
+                }
+            }
+        }
+        let scanned = brute(xyz, &binning, periodic, cutoff, half, true, window);
+        let got: BTreeMap<Key, f64> = found
+            .iter()
+            .map(|pair| ((pair.i, pair.j, pair.shift), pair.dist2))
+            .collect();
+        if periodic == [true, true, true] {
+            let mut direct = pairs_within(xyz, &binning, cutoff, None, None, half).unwrap();
+            direct.retain(|pair| pair.i != pair.j);
+            assert_eq!(found, direct);
+            assert_eq!(
+                got.keys().collect::<Vec<_>>(),
+                scanned.keys().collect::<Vec<_>>()
+            );
+            for (key, dist2) in &scanned {
+                let scale = dist2.abs().max(got[key].abs()).max(1.0);
+                assert!(
+                    (got[key] - dist2).abs() <= 1.0e-9 * scale,
+                    "periodic distance {key:?}"
+                );
+            }
+        } else {
+            assert_eq!(
+                got, scanned,
+                "periodic {periodic:?} half {half} window {window}"
+            );
+        }
+        if periodic != [false, false, false] {
+            let raw = raw_cell(rows, origin);
+            let from_raw = pairs_within_pbc(xyz, &raw, &query).unwrap();
+            assert_eq!(from_raw, found);
+        }
+        assert_minimum_image(xyz, rows, &found, periodic, cutoff);
+        found
+    }
+
+    #[test]
+    fn near_flat_cu_open_patterns_match_minimum_image() {
+        let rows = near_flat_rows();
+        let xyz = near_flat_cu();
+        let patterns = [
+            [true, true, false],
+            [true, false, true],
+            [false, true, true],
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+            [false, false, false],
+        ];
+        let mut saw_wrapped = false;
+        for periodic in patterns {
+            let found = expect_pairs(rows, [0.0; 3], &xyz, periodic, 2.6, true);
+            if periodic == [true, true, false] {
+                assert_eq!(found.len(), 32);
+                saw_wrapped = found.iter().any(|pair| pair.shift != [0, 0, 0]);
+                let mut csr = PairCsr::default();
+                let query = PbcQuery::new(periodic, 2.6)
+                    .half(true)
+                    .exclude_self_images(true);
+                pairs_within_csr(&xyz, &raw_cell(rows, [0.0; 3]), &query, true, &mut csr).unwrap();
+                let mut from_csr = BTreeMap::new();
+                for i in 0..xyz.len() {
+                    let start = usize::try_from(csr.offsets[i]).unwrap();
+                    let end = usize::try_from(csr.offsets[i + 1]).unwrap();
+                    for slot in start..end {
+                        let j = usize::try_from(csr.cols[slot]).unwrap();
+                        from_csr.insert((i, j), csr.dist2[slot]);
+                    }
+                }
+                let mut from_pairs = BTreeMap::new();
+                for pair in &found {
+                    from_pairs
+                        .entry((pair.i, pair.j))
+                        .and_modify(|best: &mut f64| {
+                            if pair.dist2 < *best {
+                                *best = pair.dist2;
+                            }
+                        })
+                        .or_insert(pair.dist2);
+                }
+                assert_eq!(from_csr, from_pairs);
+            }
+        }
+        assert!(
+            saw_wrapped,
+            "the slab has a periodic image inside the cutoff"
+        );
+    }
+
+    #[test]
+    fn near_flat_cu_fully_periodic_is_degenerate() {
+        let rows = near_flat_rows();
+        let xyz = near_flat_cu();
+        let raw = raw_cell(rows, [0.0; 3]);
+        let err = cell_for_pbc(rows, [0.0; 3], [true, true, true]).unwrap_err();
+        assert_eq!(err, Error::Degenerate);
+        assert_eq!(
+            err.to_string(),
+            "periodic cell is degenerate: a face width has collapsed"
+        );
+        assert_eq!(
+            pairs_within(&xyz, &raw, 2.6, None, None, true).unwrap_err(),
+            Error::Degenerate
+        );
+        assert_eq!(
+            pairs_within_pbc(&xyz, &raw, &PbcQuery::periodic(2.6)).unwrap_err(),
+            Error::Degenerate
+        );
+        let mut csr = PairCsr::default();
+        assert_eq!(
+            pairs_within_csr(&xyz, &raw, &PbcQuery::periodic(2.6), true, &mut csr).unwrap_err(),
+            Error::Degenerate
+        );
+        assert_eq!(
+            crate::knearest(&xyz, &raw, 1, None, None).unwrap_err(),
+            Error::Degenerate
+        );
+        assert_eq!(
+            crate::knearest_brute(&xyz, &raw, 1, None).unwrap_err(),
+            Error::Degenerate
+        );
+        let partial = PartialCell::from_ase(rows, [true, true, true]).unwrap();
+        let mut farthest = 0.0f64;
+        for i in 0..xyz.len() {
+            for j in (i + 1)..xyz.len() {
+                farthest = farthest.max(partial.dist2_euclidean(xyz[i], xyz[j]).sqrt());
+            }
+        }
+        assert!(
+            farthest.is_finite() && farthest < 0.1,
+            "fully periodic minimum image on this flat cell is {farthest}"
+        );
+    }
+
+    #[test]
+    fn skewed_open_row_is_replaced_by_the_plane_normal() {
+        let rows = [[4.0, 0.0, 0.0], [1.0, 3.0, 0.0], [2.0, 1.0, 1.0e-8]];
+        let cell = assert_basis(rows, [1.0, 2.0, 3.0], [true, true, false]);
+        let c = cell.c();
+        assert!(c[0].abs() + c[1].abs() < 1.0e-12);
+        assert!((c[2] - 1.0).abs() < 1.0e-12);
+        let wire = [[0.0, 4.0, 0.0], [9.0, 9.0, 9.0], [-3.0, 1.0, 2.0]];
+        let cell = assert_basis(wire, [0.0; 3], [true, false, false]);
+        assert!((cell.widths()[0] - 4.0).abs() < 1.0e-12);
+    }
+
+    fn rnd(state: &mut u64) -> f64 {
+        *state ^= state.wrapping_shl(13);
+        *state ^= state.wrapping_shr(7);
+        *state ^= state.wrapping_shl(17);
+        (*state >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+
+    fn healthy_rows(state: &mut u64) -> [[f64; 3]; 3] {
+        let length = |state: &mut u64| 8.0 + 5.0 * rnd(state);
+        let la = length(state);
+        let lb = length(state);
+        let gamma = std::f64::consts::FRAC_PI_3 + rnd(state) * std::f64::consts::FRAC_PI_3;
+        let a = [la, 0.0, 0.0];
+        let b = [lb * gamma.cos(), lb * gamma.sin(), 0.0];
+        let c = [
+            (rnd(state) - 0.5) * la,
+            (rnd(state) - 0.5) * lb,
+            8.0 + 4.0 * rnd(state),
+        ];
+        [a, b, c]
+    }
+
+    fn points(rows: [[f64; 3]; 3], n: usize, state: &mut u64) -> Vec<[f64; 3]> {
+        (0..n)
+            .map(|_| {
+                let s = [rnd(state), rnd(state), rnd(state)];
+                let mut r = [0.0; 3];
+                for axis in 0..3 {
+                    for k in 0..3 {
+                        r[k] += s[axis] * rows[axis][k];
+                    }
+                }
+                r
+            })
+            .collect()
+    }
+
+    fn flatten(rows: &mut [[f64; 3]; 3], axis: usize, eps: f64) {
+        let (u, v) = match axis {
+            0 => (rows[1], rows[2]),
+            1 => (rows[0], rows[2]),
+            _ => (rows[0], rows[1]),
+        };
+        let n = super::cross(u, v);
+        let n = super::unit(n).unwrap();
+        let height = dot(rows[axis], n);
+        for k in 0..3 {
+            rows[axis][k] += (eps - height) * n[k];
+        }
+    }
+
+    #[test]
+    fn random_near_flat_cells_match_minimum_image() {
+        let mut state = 0xC0FFEE_u64;
+        for trial in 0..6 {
+            let rows = healthy_rows(&mut state);
+            let xyz = points(rows, 8, &mut state);
+            for mask in 0..8 {
+                let periodic = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+                expect_pairs(rows, [0.0; 3], &xyz, periodic, 1.8, trial % 2 == 0);
+            }
+            let mut flat = rows;
+            let axis = trial % 3;
+            flatten(&mut flat, axis, 1.0e-8);
+            assert_eq!(
+                cell_for_pbc(flat, [0.0; 3], [true, true, true]).unwrap_err(),
+                Error::Degenerate
+            );
+            let raw = raw_cell(flat, [0.0; 3]);
+            assert_eq!(
+                pairs_within_pbc(&xyz, &raw, &PbcQuery::periodic(1.8)).unwrap_err(),
+                Error::Degenerate
+            );
+            let mut periodic = [true, true, true];
+            periodic[axis] = false;
+            expect_pairs(flat, [0.0; 3], &xyz, periodic, 1.8, true);
+        }
+    }
+
+    #[cfg(feature = "capi")]
+    #[test]
+    fn near_flat_cu_c_api_matches_rust() {
+        use std::ffi::CStr;
+
+        let rows = near_flat_rows();
+        let xyz = near_flat_cu();
+        let periodic = [true, true, false];
+        let rust = expect_pairs(rows, [0.0; 3], &xyz, periodic, 2.6, true);
+        let raw = crate::lc_cell {
+            ax: rows[0][0],
+            ay: rows[0][1],
+            az: rows[0][2],
+            bx: rows[1][0],
+            by: rows[1][1],
+            bz: rows[1][2],
+            cx: rows[2][0],
+            cy: rows[2][1],
+            cz: rows[2][2],
+            ox: 0.0,
+            oy: 0.0,
+            oz: 0.0,
+        };
+        let flat: Vec<f64> = xyz.iter().copied().flatten().collect();
+        let pbc = [1, 1, 0];
+        let mut count = 0usize;
+        let status = unsafe {
+            crate::lc_pairs_within_pbc(
+                flat.as_ptr(),
+                xyz.len(),
+                &raw,
+                pbc.as_ptr(),
+                2.6,
+                std::ptr::null(),
+                0.0,
+                1,
+                0,
+                1,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(count, rust.len());
+        let mut out = vec![crate::lc_pair::default(); count];
+        let status = unsafe {
+            crate::lc_pairs_within_pbc(
+                flat.as_ptr(),
+                xyz.len(),
+                &raw,
+                pbc.as_ptr(),
+                2.6,
+                std::ptr::null(),
+                0.0,
+                1,
+                0,
+                1,
+                out.as_mut_ptr(),
+                count,
+                &mut count,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(out.len(), rust.len());
+        for (row, pair) in out.iter().zip(&rust) {
+            assert_eq!(row.i, i32::try_from(pair.i).unwrap());
+            assert_eq!(row.j, i32::try_from(pair.j).unwrap());
+            assert_eq!(row.shift, pair.shift);
+            assert_eq!(row.dist2, pair.dist2);
+        }
+        let mut ignored = 0usize;
+        let status = unsafe {
+            crate::lc_pairs_within_pbc(
+                flat.as_ptr(),
+                xyz.len(),
+                &raw,
+                std::ptr::null(),
+                2.6,
+                std::ptr::null(),
+                0.0,
+                1,
+                0,
+                1,
+                std::ptr::null_mut(),
+                0,
+                &mut ignored,
+            )
+        };
+        assert_ne!(status, 0);
+        let message = unsafe { CStr::from_ptr(crate::lc_last_error()) };
+        assert_eq!(
+            message.to_str().unwrap(),
+            "periodic cell is degenerate: a face width has collapsed"
+        );
+    }
 }

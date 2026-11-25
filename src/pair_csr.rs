@@ -18,6 +18,7 @@ use super::gather::{gather, Gathered};
 use super::{bin_atoms, hit_estimate, in_pool, row_guess, Pair};
 #[cfg(test)]
 use super::{plan_unshifted, Found, Scratch};
+use crate::cell::periodic_face_collapsed;
 use crate::cell::Cell;
 use crate::open_cell::{pairs_within_pbc, PbcQuery};
 use crate::Error;
@@ -105,6 +106,9 @@ pub fn pairs_within_csr(
     if n == 0 {
         out.offsets.push(0);
         return Ok(());
+    }
+    if query.periodic == [true, true, true] && periodic_face_collapsed(cell, query.periodic) {
+        return Err(Error::Degenerate);
     }
     let est = estimate(n, cell, query);
     // Reserved on the caller's thread, as in `pairs_within`.

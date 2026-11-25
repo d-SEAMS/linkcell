@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import linkcell
 
@@ -108,3 +109,117 @@ def test_sheared_rows_match_a_shift_scan():
     assert set(got) == set(want)
     for key, dist2 in want.items():
         assert abs(got[key] - dist2) < 1e-8
+
+
+def _near_flat_rows():
+    lx = ly = 13.0
+    lz = 23.3
+    alpha = np.deg2rad(86.892)
+    beta = np.deg2rad(16.892)
+    gamma = np.deg2rad(70.0)
+    cos_a, cos_b, cos_g = np.cos(alpha), np.cos(beta), np.cos(gamma)
+    sin_g = np.sin(gamma)
+    factor = (cos_a - cos_b * cos_g) / sin_g
+    inside = 1.0 - cos_b * cos_b - factor * factor
+    cz = lz * np.sqrt(inside)
+    return np.ascontiguousarray(
+        [
+            [lx, 0.0, 0.0],
+            [ly * cos_g, ly * sin_g, 0.0],
+            [lz * cos_b, lz * factor, cz],
+        ],
+        dtype=np.float64,
+    )
+
+
+_NEAR_FLAT_CU = np.ascontiguousarray(
+    [
+        [2.7431309316168475, 6.108002035108404, 0.0],
+        [13.232056168881522, 6.352322116512741, 0.2],
+        [4.03338785589701, 0.3664801221065042, 0.0],
+        [7.720397346483967, 10.13928337827995, -0.2],
+        [8.19626621664133, 0.45462981824422477, 0.0412786853694912],
+        [13.762071462898417, 10.626955433611426, -0.03622779513074964],
+        [11.205363013255461, 7.1146751150038385, 0.027634492938765798],
+        [4.492545207753816, 4.035049921555236, -0.19606254358135186],
+        [16.50539159880175, 12.057883571293173, 0.15819319967883666],
+        [4.199134240190456, 10.099861087740562, 0.2068132352186905],
+        [6.126746340992574, 8.464007919000748, -0.11518997428508809],
+        [9.814929593400677, 8.903620103137243, -0.1682723449043315],
+        [2.2857588312509485, 2.9564446590077442, 0.12103716729274078],
+        [5.9510448718450855, 0.20132540631560192, -0.08736864655602095],
+        [11.368678075155005, 10.008767396697653, -0.05551644303227138],
+        [15.870150122394206, 8.195507208935341, 0.1519522101214148],
+        [10.42169020181862, 1.7934744461922287, 0.10864204430766089],
+        [8.351747146366385, 3.7093332382537727, 0.02911048113793241],
+        [4.732924885010005, 6.6345398008188905, 0.1202865161255377],
+        [11.924591995381464, 4.883493475804255, -0.06332713818033944],
+        [12.308118627317418, 2.485340130933891, -0.24174491728692993],
+        [0.9990718536434593, 0.9081763430908019, 0.09809706259195394],
+        [8.401410062080734, 6.873783879816667, 0.223667971540852],
+        [5.947793909899321, 2.4918353256604986, -0.27449681317456937],
+    ],
+    dtype=np.float64,
+)
+
+
+def _pbc_pairs(xyz, cell, periodic, cutoff):
+    i, j, shift, d2 = linkcell.pairs_within_pbc(
+        xyz,
+        cell,
+        periodic,
+        cutoff,
+        half=True,
+        exclude_self_images=True,
+    )
+    return (
+        np.from_dlpack(i),
+        np.from_dlpack(j),
+        np.from_dlpack(shift),
+        np.from_dlpack(d2),
+    )
+
+
+def test_near_flat_slab_matches_minimum_image():
+    rows = _near_flat_rows()
+    assert 1.0e-7 < float(rows[2, 2]) < 1.5e-7
+    cutoff = 2.6
+    cut2 = cutoff * cutoff
+    xyz = _NEAR_FLAT_CU
+    for periodic in (
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+        (True, False, False),
+    ):
+        i, j, shift, d2 = _pbc_pairs(xyz, rows, list(periodic), cutoff)
+        got = {
+            (int(i[t]), int(j[t]), tuple(int(s) for s in shift[t])): float(d2[t])
+            for t in range(i.shape[0])
+        }
+        want = {}
+        span = range(-6, 7)
+        for a in range(len(xyz)):
+            for b in range(a + 1, len(xyz)):
+                for na in span:
+                    for nb in span:
+                        for nc in span:
+                            image = (na, nb, nc)
+                            if not periodic[0] and na:
+                                continue
+                            if not periodic[1] and nb:
+                                continue
+                            if not periodic[2] and nc:
+                                continue
+                            delta = xyz[b] - xyz[a] + np.array(image, dtype=np.float64) @ rows
+                            dist2 = float(delta @ delta)
+                            if dist2 < cut2:
+                                want[(a, b, image)] = dist2
+        assert set(got) == set(want)
+        for key, dist2 in want.items():
+            assert abs(got[key] - dist2) < 1.0e-8
+
+
+def test_near_flat_slab_fully_periodic_is_degenerate():
+    with pytest.raises(RuntimeError, match="face width has collapsed"):
+        linkcell.pairs_within_pbc(_NEAR_FLAT_CU, _near_flat_rows(), [True, True, True], 2.6)

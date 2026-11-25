@@ -67,7 +67,9 @@
 //!
 //! [`pairs_within`] keeps the caller's basis. The image count is the
 //! product of `2 * ceil(cutoff / width) + 1` over the three axes, and
-//! a count above 2^24 is [`Error::TooManyImages`]. With the default
+//! a count above 2^24 is [`Error::TooManyImages`]. A fully periodic
+//! cell whose shortest face altitude is at most `1e-6` of its longest
+//! edge is [`Error::Degenerate`]. With the default
 //! bin edge the reach is at most a small constant (the occupancy
 //! integer is clamped to `1..=6`) whenever that edge is shorter than
 //! every box width. One bin that holds every point makes the candidate

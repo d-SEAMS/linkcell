@@ -811,9 +811,12 @@ fn pairs_open_py<'py>(
 /// `cutoff` is a length in the cell's unit. `half` defaults to false.
 /// An empty frame or a mask of the wrong length raises `ValueError`. A
 /// non-positive cutoff or a non-finite coordinate raises `RuntimeError`.
-/// A singular cell raises `ValueError` when any axis is periodic. For a
-/// fully non-periodic search, the cell is ignored and replaced by a unit
-/// orthorhombic cell.
+/// A singular cell raises `ValueError` when any axis is periodic. An
+/// open row is replaced by a unit normal of the periodic rows before
+/// the bins are built. A fully periodic cell whose shortest face
+/// altitude has collapsed raises `RuntimeError` (`face width has
+/// collapsed`). For a fully non-periodic search, the cell is ignored
+/// and replaced by a unit orthorhombic cell.
 #[pyfunction]
 #[pyo3(
     name = "pairs_within_pbc",

@@ -70,6 +70,8 @@ The C, C++, and Python entries are that list (`lc_pairs_within`, `linkcell::pair
 A cutoff neighbour list is this call.
 
 An open axis has no image.
+`cell_for_pbc` replaces each open row with a unit normal to the span of the periodic rows, whatever length the caller stored, and the bins are that periodic sublattice.
+A zero or near-flat open row no longer collapses the periodic face widths.
 `pairs_open` bins the occupied Cartesian cells and returns the half list (`i < j`, shift zero).
 With every axis open the partner stencil is, for each row of bins in y and z, the farthest x offset within reach. It depends on the cutoff and the bin edge alone, so a frame in other bins, such as another image of a band, reuses it, and the walk clips each row to the bins the frame spans.
 A reach past 16 bins stores rows only out to the span a frame needs on y and z and widens them when a later frame spans more.
@@ -286,13 +288,16 @@ The output is `n` rows of length at most `k`.
 Reduction changes which integer offsets are short.
 The bounds and the Cartesian distances stay the same.
 
-`pairs_open`, and a mixed `pairs_within_pbc`, bin the occupied Cartesian extent.
-An open axis stays open.
+`pairs_open`, and a mixed `pairs_within_pbc`, bin the occupied Cartesian extent of the periodic sublattice.
+An open axis is replaced by a unit normal of the periodic rows and stays open.
 The partner stencil stores, for each row of bins, the farthest offset still inside the cutoff.
 That offset depends on the cutoff and the bin edge.
 A fully open stencil is reused by later frames with the same cutoff and edge.
 With a periodic axis the stencil is rebuilt when the bounding bins change.
 The same 2^24 image cap applies.
+A fully periodic cell whose shortest face altitude is at most one millionth of its longest edge is `Error::Degenerate` (`periodic cell is degenerate: a face width has collapsed`).
+The image stencil is not a neighbour list on that lattice.
+minimage can still return a displacement.
 `lc_stencil_builds` counts builds, not reuses.
 
 Threads change the wall time.

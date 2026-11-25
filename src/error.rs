@@ -24,6 +24,15 @@ pub enum Error {
     BadCutoff,
     /// Periodic image stencil exceeds the 2^24 resource cap.
     TooManyImages,
+    /// A periodic face altitude has collapsed.
+    ///
+    /// The shortest perpendicular width of a periodic axis is at most
+    /// `1e-6` times the longest periodic edge. The linked-cell image
+    /// stencil is not a neighbour list on that lattice. minimage can
+    /// still return a displacement. An open axis is not periodic:
+    /// [`crate::cell_for_pbc`] replaces that row with a normal of the
+    /// periodic rows and does not trip this error.
+    Degenerate,
     /// An axis is not periodic and `libvesin.so` is not loaded.
     Partial,
     /// The device is not the CPU and `libvesin.so` is not loaded.
@@ -58,6 +67,9 @@ impl fmt::Display for Error {
             Error::TooManyCells => write!(f, "linked-cell mesh is too fine"),
             Error::BadCutoff => write!(f, "cutoff must be finite and positive"),
             Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
+            Error::Degenerate => {
+                write!(f, "periodic cell is degenerate: a face width has collapsed")
+            }
             Error::Partial => write!(
                 f,
                 "partial periodicity needs libvesin.so on the loader path"

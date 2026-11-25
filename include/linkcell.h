@@ -587,8 +587,12 @@ int lc_pairs_within_csr(const double *xyz,
  * [`lc_pairs_within_rows`] with a periodicity mask.
  *
  * `pbc` is three ints. Nonzero means that axis is periodic. A null
- * `pbc` is fully periodic. An open axis is binned on the occupied
- * Cartesian cells and is not padded into a periodic box. `closed`
+ * `pbc` is fully periodic. An open axis is replaced by a unit normal
+ * of the periodic rows, however long the stored row is, and is binned
+ * on the occupied Cartesian cells of that lattice. A fully periodic
+ * cell whose shortest face altitude is at most one millionth of its
+ * longest edge returns nonzero; `lc_last_error` is
+ * "periodic cell is degenerate: a face width has collapsed". `closed`
  * nonzero keeps `dist2 <= cutoff²` on an open or mixed cell.
  * `exclude_self_images` nonzero drops `i == j`.
  *

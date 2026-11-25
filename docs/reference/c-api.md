@@ -106,8 +106,11 @@ int lc_pairs_within_pbc(const double *xyz, size_t n, const lc_cell *simbox,
 shift zero, squared distance strictly below `cutoff * cutoff`.
 `lc_pairs_within_pbc` is that list with a periodicity mask.
 `pbc[k]` nonzero keeps axis `k` periodic. A null `pbc` is fully
-periodic and is `lc_pairs_within_rows`. An open axis is binned on the
-occupied Cartesian cells. It is not padded into a periodic box.
+periodic and is `lc_pairs_within_rows`. An open axis is replaced by a
+unit normal of the periodic rows, however long the stored row is, and
+is binned on the occupied Cartesian cells of that lattice. It is not
+padded into a periodic box. A fully periodic cell whose shortest face
+altitude is at most one millionth of its longest edge returns nonzero.
 `lc_stencil_builds` counts partner stencils that were built. A stencil
 that is reused does not increment it. A fully open stencil is reused
 by every call with the same cutoff and bin edge, wherever the atoms
@@ -382,6 +385,7 @@ A null function removes the hook, and the device partition then reports that no 
 | `NoDevice` | A device curve split was requested and no device is loaded |
 | `ScotchDisabled` | Scotch support was not compiled in |
 | `TooManyImages` | The periodic image count exceeds 2^24 |
+| `Degenerate` | A periodic face altitude is at most `1e-6` of the longest periodic edge (`periodic cell is degenerate: a face width has collapsed`). An open axis is replaced before this test |
 | `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
 | `Device` | The device is not the CPU and `libvesin.so` is not loaded |
 | `Padded` | A point has more neighbours than the requested pad |
@@ -393,10 +397,10 @@ A null function removes the hook, and the device partition then reports that no 
 `knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`.
 `knearest_csr` returns the same variants.
 `knearest_into`, `knearest_into_d2`, and `knearest_into_many` return them and `BufferSize`.
-`knearest_brute` returns `ZeroK`, `Empty`, and `NonFinite`.
+`knearest_brute` returns `ZeroK`, `Empty`, `NonFinite`, and `Degenerate`.
 A non-finite lattice vector is `BadBox` from the `Cell` constructor, before any search.
 `pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
-`TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
+`TooManyImages`, `TooManyCells`, and `Degenerate`. Its `Overflow` cases include a
 point count above `u32::MAX` and a relative periodic image offset that
 does not fit the stored shift.
 Positions and cell vectors share one length unit.

@@ -12,7 +12,7 @@
 //! wrap on an already shifted delta changes which rows survive.
 
 use crate::bins::{self, axis_gap};
-use crate::cell::Cell;
+use crate::cell::{periodic_face_collapsed, Cell};
 use crate::simd::Path;
 use crate::Error;
 
@@ -73,8 +73,10 @@ pub(crate) fn keep_half(i: usize, j: usize, shift: [i32; 3]) -> bool {
 /// strictly positive, [`Error::Empty`] when `xyz` is empty,
 /// [`Error::MaskLen`] when `mask` has the wrong length,
 /// [`Error::Overflow`] when `n` exceeds `u32::MAX`,
-/// [`Error::TooManyImages`] when the image count exceeds 2^24, and
-/// [`Error::TooManyCells`] on the same bin cap as [`knearest`](crate::knearest).
+/// [`Error::TooManyImages`] when the image count exceeds 2^24,
+/// [`Error::TooManyCells`] on the same bin cap as [`knearest`](crate::knearest),
+/// and [`Error::Degenerate`] when the shortest face altitude is at most
+/// `1e-6` of the longest edge.
 /// These inputs return `Err`.
 ///
 /// ```
@@ -99,6 +101,7 @@ pub fn pairs_within(
     cell_hint: Option<f64>,
     half: bool,
 ) -> Result<Vec<Pair>, Error> {
+    preflight(xyz, simbox, cutoff, mask)?;
     let est = hit_estimate(xyz.len(), simbox, cutoff);
     if walk_threads(est) == 1 {
         let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
@@ -269,6 +272,7 @@ pub fn pairs_within_columns(
     if xyz.len() > i32::MAX as usize {
         return Err(Error::Overflow);
     }
+    preflight(xyz, simbox, cutoff, mask)?;
     let est = hit_estimate(xyz.len(), simbox, cutoff);
     if walk_threads(est) == 1 {
         let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
@@ -708,6 +712,35 @@ pub(crate) struct Binned {
     threads: usize,
 }
 
+/// Cutoff, length, mask, and a collapsed periodic face, before any row
+/// reservation. The order matches the checks that used to live in
+/// [`bin_atoms`].
+fn preflight(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+) -> Result<(), Error> {
+    if !cutoff.is_finite() || cutoff <= 0.0 {
+        return Err(Error::BadCutoff);
+    }
+    if xyz.is_empty() {
+        return Err(Error::Empty);
+    }
+    if xyz.len() > u32::MAX as usize {
+        return Err(Error::Overflow);
+    }
+    if let Some(m) = mask {
+        if m.len() != xyz.len() {
+            return Err(Error::MaskLen);
+        }
+    }
+    if periodic_face_collapsed(simbox, [true, true, true]) {
+        return Err(Error::Degenerate);
+    }
+    Ok(())
+}
+
 /// Check the arguments, then bin the active atoms. `None` when no atom
 /// is active. `lean` builds the grid of [`Grid::build`] for a walk that
 /// reads only the folded positions.
@@ -719,21 +752,8 @@ fn bin_atoms(
     cell_hint: Option<f64>,
     lean: bool,
 ) -> Result<Option<Binned>, Error> {
-    if !cutoff.is_finite() || cutoff <= 0.0 {
-        return Err(Error::BadCutoff);
-    }
-    if xyz.is_empty() {
-        return Err(Error::Empty);
-    }
+    preflight(xyz, simbox, cutoff, mask)?;
     let n = xyz.len();
-    if n > u32::MAX as usize {
-        return Err(Error::Overflow);
-    }
-    if let Some(m) = mask {
-        if m.len() != n {
-            return Err(Error::MaskLen);
-        }
-    }
     let active: Option<Vec<usize>> = mask.map(|m| (0..n).filter(|&i| m[i]).collect());
     let n_act = active.as_ref().map_or(n, |a| a.len());
     if n_act == 0 {
