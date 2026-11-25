@@ -105,7 +105,7 @@ def main() -> None:
     if tsan:
         nightly = rustup_nightly()
         active = active_rustc(cargo, env)
-        if nightly is not None:
+        if nightly is not None and has_std_sources(nightly[1], env):
             nightly_cargo, nightly_rustc = nightly
             command[0] = nightly_cargo
             env["RUSTC"] = nightly_rustc
@@ -119,8 +119,8 @@ def main() -> None:
             env["RUSTC_BOOTSTRAP"] = "1"
         else:
             raise SystemExit(
-                "LINKCELL_SANITIZE=thread needs rustup's nightly toolchain or a "
-                "toolchain whose sysroot has rust-src"
+                "LINKCELL_SANITIZE=thread needs a toolchain whose sysroot has "
+                "rust-src: rustup's nightly or the active one"
             )
         extra = "-Zsanitizer=thread -Zexternal-clangrt -Cforce-frame-pointers=yes"
         flags = env.get("RUSTFLAGS", "")
@@ -145,11 +145,15 @@ def main() -> None:
 
 
 def rustup_nightly() -> tuple[str, str] | None:
-    """rustup's nightly cargo and rustc, or None when rustup has no nightly."""
+    """rustup's installed nightly cargo and rustc, or None without one."""
+    # rustup which installs a missing toolchain by default, and that
+    # minimal nightly has no rust-src for -Zbuild-std.
+    env = dict(os.environ, RUSTUP_AUTO_INSTALL="0")
     try:
         return tuple(
             subprocess.check_output(
                 ["rustup", "which", "--toolchain", "nightly", tool],
+                env=env,
                 text=True,
                 stderr=subprocess.DEVNULL,
             ).strip()

@@ -95,7 +95,7 @@ linkcell_gpu_dep = dependency(
 
 `with_gpulite` controls the device target and defaults to `auto`.
 `sanitize=thread`, like `LINKCELL_SANITIZE=thread`, rebuilds the crate, std and Rayon with `-Zsanitizer=thread` for a host built with `-fsanitize=thread`.
-It uses rustup's nightly toolchain when one is installed, and otherwise the active toolchain if its sysroot has `rust-src`.
+It uses rustup's nightly toolchain when one is installed with `rust-src`, and otherwise the active toolchain if its sysroot has `rust-src`; it never asks rustup to install a toolchain.
 `linkcell_dep` then links the shared library, which keeps the rebuilt std private, even in a subproject.
 
 ### CMake
