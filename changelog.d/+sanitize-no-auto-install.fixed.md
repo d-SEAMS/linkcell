@@ -1,0 +1,1 @@
+The ThreadSanitizer rebuild no longer lets `rustup which` install a nightly toolchain without `rust-src` and then fail in `-Zbuild-std`. It asks rustup only for an installed nightly, uses it only when its sysroot has `rust-src`, and otherwise falls back to the active toolchain.

@@ -30,7 +30,15 @@ else
   cargo_static = 'liblinkcell.a'
 endif
 
-_profile = get_option('buildtype') == 'debug' ? 'debug' : 'release'
+# Meson 1.3 hands a subproject its parent's buildtype and drops the
+# buildtype=debugoptimized above; Meson 1.12 keeps it. So the same wrap
+# consumer got an unoptimized crate on one Meson and an optimized one on
+# another. auto builds the release profile in a subproject on every
+# Meson, and follows the buildtype at the top level.
+_profile = get_option('cargo_profile')
+if _profile == 'auto'
+  _profile = (get_option('buildtype') == 'debug' and not meson.is_subproject()) ? 'debug' : 'release'
+endif
 _omp_supported = host_machine.system() == 'linux' or host_machine.system() == 'darwin'
 _use_openmp = get_option('use_openmp') and _omp_supported
 if get_option('use_openmp') and not _omp_supported
@@ -200,6 +208,9 @@ _cargo_command += ['--cc', ' '.join(cc.cmd_array() + _omp_c_args)]
 foreach _dir : _omp_dirs
   _cargo_command += ['--library-path', _dir]
 endforeach
+if get_option('sanitize') != 'none'
+  _cargo_command += ['--sanitize', get_option('sanitize')]
+endif
 
 # cargo rustc emits both crate types; the target lists both so Meson
 # does not pretend the static archive is the only artifact.
@@ -238,7 +249,25 @@ linkcell_built_h = custom_target(
 # That consumer's default_library does not change this option, so a
 # shared default here would leave the module needing liblinkcell.so
 # at import time. Subprojects always take the static archive.
-_use_static = meson.is_subproject() or get_option('default_library') == 'static'
+#
+# A sanitized build carries its own rebuilt std. Linked static, those std
+# objects clash with the std of any other Rust staticlib in the same link
+# (rust_eh_personality, __rdl_alloc_error_handler); the shared library
+# exports only the C API and keeps its std private.
+#
+# The Rust objects are built with -Zexternal-clangrt, so the library leaves
+# every __tsan_* symbol to the final link; each consumer has to link the
+# sanitizer runtime, whether or not its own sources are instrumented.
+_sanitized = get_option('sanitize') != 'none'
+_use_static = (meson.is_subproject() or get_option('default_library') == 'static') and not _sanitized
+_sanitize_link = []
+if _sanitized
+  _sanitize_flag = '-fsanitize=' + get_option('sanitize')
+  if not cc.has_multi_link_arguments(_sanitize_flag)
+    error('sanitize=@0@ needs a C compiler that links with @1@'.format(get_option('sanitize'), _sanitize_flag))
+  endif
+  _sanitize_link = [_sanitize_flag, '-Wl,-rpath,' + meson.current_build_dir()]
+endif
 if _use_static
   _link_idx = 1
 elif host_machine.system() == 'windows'
@@ -282,7 +311,7 @@ if _gpu_on
   endif
   linkcell_gpu_dep = declare_dependency(
     link_with: linkcell_gpu,
-    link_args: [linkcell_cargo[_link_idx].full_path()],
+    link_args: [linkcell_cargo[_link_idx].full_path()] + _sanitize_link,
     sources: linkcell_built_h,
     include_directories: include_directories('include'),
     compile_args: _gpu_args,
@@ -292,7 +321,7 @@ if _gpu_on
 endif
 
 linkcell_dep = declare_dependency(
-  link_args: [linkcell_cargo[_link_idx].full_path()],
+  link_args: [linkcell_cargo[_link_idx].full_path()] + _sanitize_link,
   sources: linkcell_built_h,
   include_directories: include_directories('include'),
   dependencies: rust_sys + _gpu_deps,
@@ -315,7 +344,7 @@ if _install
     url: 'https://github.com/d-SEAMS/linkcell',
     # Raw `-lfoo` does not get `-L${libdir}`; wrap consumers then fail
     # at link with "cannot find -llinkcell".
-    libraries: ['-L${libdir}', '-llinkcell'],
+    libraries: ['-L${libdir}', '-llinkcell'] + (_sanitized ? [_sanitize_flag] : []),
     libraries_private: rust_sys,
     subdirs: '.',
   )
