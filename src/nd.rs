@@ -362,7 +362,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 let d2 = self.metric.dist2(&anchor, self.point_canon(idx))?;
                 dist.push((idx, d2));
             }
-            dist.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            dist.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             if count == 1 {
                 let threshold2 = dist[0].1;
                 ids[job.start] = dist[0].0;
@@ -650,7 +650,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 dist2: h.dist2,
             })
             .collect();
-        out.sort_by(|a, b| {
+        out.sort_unstable_by(|a, b| {
             a.dist2
                 .total_cmp(&b.dist2)
                 .then_with(|| a.index.cmp(&b.index))
@@ -676,7 +676,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 dist2: h.dist2,
             })
             .collect();
-        out.sort_by(|a, b| {
+        out.sort_unstable_by(|a, b| {
             a.dist2
                 .total_cmp(&b.dist2)
                 .then_with(|| a.index.cmp(&b.index))
@@ -696,7 +696,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         let prepared = self.prepare_query(query)?;
         let mut out = Vec::new();
         self.within_walk(&prepared, radius, skip, &mut out)?;
-        out.sort_by(|a, b| {
+        out.sort_unstable_by(|a, b| {
             a.dist2
                 .total_cmp(&b.dist2)
                 .then_with(|| a.index.cmp(&b.index))
@@ -801,7 +801,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 continue;
             }
             let mut neigh = self.within_index(i, eps)?;
-            neigh.sort_by_key(|h| h.index);
+            neigh.sort_unstable_by_key(|h| h.index);
             if neigh.len() < min_pts {
                 labels[i] = NOISE;
                 continue;
@@ -829,7 +829,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 }
                 labels[p] = cluster;
                 let mut p_neigh = self.within_index(p, eps)?;
-                p_neigh.sort_by_key(|h| h.index);
+                p_neigh.sort_unstable_by_key(|h| h.index);
                 if p_neigh.len() >= min_pts {
                     core[p] = true;
                     for h in p_neigh {
@@ -892,7 +892,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
                         dist2: h.dist2,
                     }));
                 }
-                out.sort_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
+                out.sort_unstable_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
                 Ok(out)
             } else {
                 use rayon::prelude::*;
@@ -912,7 +912,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 let mut out: Vec<_> = nested.into_iter().flatten().collect();
-                out.sort_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
+                out.sort_unstable_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
                 Ok(out)
             }
         }
@@ -927,7 +927,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
                     dist2: h.dist2,
                 }));
             }
-            out.sort_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
+            out.sort_unstable_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
             Ok(out)
         }
     }

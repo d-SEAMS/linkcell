@@ -846,13 +846,13 @@ fn periodic_reduction_matches_bruteforce_across_magnitudes() {
 }
 
 /// 20_000 identical points used to recurse one level per point and overflow
-/// a 2 MiB stack. The build and the queries run on a 256 KiB stack.
+/// a 2 MiB stack. The build and the queries run on a 32 KiB stack.
 #[test]
 fn large_duplicate_set_builds_on_a_small_stack() {
     const N: usize = 20_000;
     let built = std::thread::Builder::new()
         .name("nd-small-stack".into())
-        .stack_size(256 * 1024)
+        .stack_size(32 * 1024)
         .spawn(|| {
             let data = vec![0.125f64; N];
             let periods = vec![Some(1.0)];
