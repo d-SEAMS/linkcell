@@ -1,0 +1,26 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "linkcell",
+  "description": "Periodic linked-cell neighbour lists for molecular simulations: cutoff pair lists and k-nearest neighbour search.",
+  "excludeFolders": [
+    "changelog.d",
+    "subprojects",
+    "third_party",
+    "tests",
+    "scripts",
+    ".github",
+    "lean",
+    "overrides",
+    "assets/rustdoc"
+  ],
+  "excludeFiles": [
+    "CHANGELOG.md",
+    "LICENSE",
+    "summary.md",
+    "REPORT.md",
+    "CMakeLists.txt",
+    "meson_options.txt",
+    "rustdoc-index.html"
+  ],
+  "rules": []
+}
