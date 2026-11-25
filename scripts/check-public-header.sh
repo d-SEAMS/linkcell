@@ -1,5 +1,5 @@
 #!/bin/sh
-# The public headers must be pedantic C99 and C++17.
+# The public headers must be pedantic C99 and C++17 under GCC and Clang.
 # A zero-length array is not a valid object type in either language.
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
@@ -24,8 +24,12 @@ int main() {
 }
 EOF
 # Both languages require sizeof(lc_nd_index) == 1, so the sizes match.
-gcc -std=c99 -Wall -Wextra -pedantic -Werror -I "$root/include" -c "$tmp/pedantic.c" -o "$tmp/pedantic.o"
-g++ -std=c++17 -Wall -Wextra -pedantic -Werror -I "$root/include" -c "$tmp/pedantic.cpp" -o "$tmp/pedantic_cpp.o"
+for cc in gcc clang; do
+    "$cc" -std=c99 -Wall -Wextra -pedantic -Werror -I "$root/include" -c "$tmp/pedantic.c" -o "$tmp/pedantic-$cc.o"
+done
+for cxx in g++ clang++; do
+    "$cxx" -std=c++17 -Wall -Wextra -pedantic -Werror -I "$root/include" -c "$tmp/pedantic.cpp" -o "$tmp/pedantic-$cxx.o"
+done
 
 # docs/reference/c-api.md shows the handle as the generated header defines it.
 handle() {
