@@ -115,12 +115,18 @@ distance.
 
 Exactness guarantee: for finite inputs that do not overflow, returned ND
 results match brute force under the same `dist2`. Each periodic coordinate is
-reduced into `[0, L)` once. On that interval the circular distance errs by at
-most `4 * ulp(L)` per axis. Pruning widens every triangle test by a Higham
-relative factor and by `8 * ||η||_2` (`η_i = 4 * ulp(L_i)` on periodic axes),
-which covers that defect, so a true `dist2 <= r^2` neighbour is not dropped.
-When `x/L` is not finite the representative is `0`, and brute force uses the
-same rule.
+reduced with the IEEE remainder into `[0, L)`; a remainder of `L` is stored
+as `0`. On that interval the circular distance errs by at most `4 * ulp(L)`
+per axis. Pruning widens every triangle test by a Higham relative factor, by
+at least `8 * sqrt(dims) * 2^-537` (squared distances that underflow), and by at least
+`8 * sqrt(n) * max(4 * ulp(L_i))` on the periodic axes. The periodic term is
+not a sum of squares, so a tiny period cannot zero it. A neighbour with
+`dist2 <= r^2` under this metric is not dropped. When every periodic residue
+and every axis minimum-image distance is a binary64 number, `dist2` is the
+sum of the squares of those distances whenever that sum is a binary64 number,
+including `dist2(2^55, 0) = 4` and `dist2(2^55, 8) = 0` for period 10. A
+residue that is not a binary64 number is not claimed to be correctly rounded.
+`±L` are the same point, including `L = 1e308`.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,

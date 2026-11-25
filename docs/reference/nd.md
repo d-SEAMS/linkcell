@@ -48,15 +48,25 @@ is not enabled yet.
 - Each periodic coordinate is reduced into `[0, L)` once: at index build
   for stored points, and at the start of a query. `dist2` reduces its
   arguments the same way, and a value already in `[0, L)` is left unchanged.
-- The reduction is one truncating fused remainder `x - trunc(x/L) * L`,
-  shifted by `L` until it lies in `[0, L)`. When `x/L` is not finite the
-  binary64 value has no unique residue and the representative is `0`.
+- The reduction is the IEEE remainder `x.rem_euclid(L)`. It is the exact
+  mathematical residue whenever that residue is a binary64 number. That
+  includes `2^55 ≡ 8` and `2^62 ≡ 4` (mod 10), `1` and `11` (mod 10),
+  `8.25 ≡ 1.25` (mod 7), and an integer lattice modulo 360 when the
+  coordinate and the period are binary64 integers. It is not claimed for a
+  residue that is not a binary64 number. A remainder of `L` is the seam,
+  where the mathematical residue is closer to `L` than to any smaller
+  binary64 value; the representative in `[0, L)` is `0`, at most half an
+  ulp of `L` from the true residue on the circle. `±L` are that seam, so
+  `dist2(L, -L)` is `0` even when `L` is `1e308` and the raw difference
+  overflows. Overflow is returned only when a reduced axis distance's square,
+  or the sum of those squares, is non-finite.
 - Periodic deltas wrap to `[-L/2, L/2)`, with the tie at `+L/2` mapped to
   `-L/2`.
 - On those representatives the circular distance of one axis is within
-  `4 * ulp(L)` of the real circular distance. The product of those circular
-  distances with open absolute differences is a metric, so the floating-point
-  distance violates the triangle inequality by at most a proved slack.
+  `4 * ulp(L)` of the real circular distance, including the half-ulp seam.
+  The Euclidean norm of the per-axis circular distances and open absolute
+  differences is a metric. The floating-point norm stays within the slack
+  below of that metric, and pruning widens every triangle test by that slack.
 
 Metric trait functions:
 
@@ -73,27 +83,42 @@ metric. Branch pruning widens each triangle test by a relative Higham factor
 on the norm, the square root, and the branch-test addition, plus
 `Metric::vp_absolute_slack`.
 
-That slack is `8 * ||η||_2` with `η_i = 4 * ulp(L_i)` on each periodic axis
-and `0` on an open axis. `4 * ulp(L)` bounds the circular-distance error on
-`[0, L)` (`|fl(a-b) - |a-b|| <= u*L` and one further rounding of `L - w`,
-and `2*u*L <= 4*ulp(L)`). Three distances appear in the test, so the defect
-is at most `3 * ||η||_2`; the factor eight also covers rounding the slack.
-Open axes contribute no absolute term. What remains on those axes is the
-relative factor plus sixteen ulps of each of the three distances in the test.
-At the origin that sum is forty-eight units in the last place of zero. An
-open axis has no further absolute floor.
+That slack is the sum of two absolute terms, each an upper bound.
+
+- Square underflow. `(2^-537)^2` is the subnormal unit in the last place
+  `2^-1074`. A positive binary64 whose square underflows is strictly below
+  `2^-537`, so `sqrt(fl(c*c))` can hide a gap of that size on one axis.
+  Over `d` axes the Euclidean norm of those gaps is at most
+  `sqrt(d) * 2^-537`. The floor stored on the index is at least
+  `8 * sqrt(d) * 2^-537`, with the square root and the products rounded
+  upward: three distances in the triangle test, and room for rounding the
+  floor. It is present for an open axis. It does not underflow to zero.
+- Periodic residue. `η_i = 4 * ulp(L_i)` on each periodic axis. The norm is
+  bounded by `sqrt(n) * max η_i`, not by a sum of squares, so a period below
+  about `1e-146` cannot underflow the slack to zero. Eight times that norm
+  covers a defect of `3 * ||η||_2`.
+
+The relative factor is still added, including sixteen ulps of each of the
+three distances in the test. At the origin that relative piece is forty-eight
+units in the last place of zero. It is not the only absolute guard.
 
 The neighbour set, the k-NN order `(dist2, index)`, the pair list, and the
-DBSCAN labels therefore match brute force under this `dist2`. The distances
-themselves are that `dist2`, including a periodic pair whose raw coordinates
-differ by many periods. This is not a claim that `dist2` is a correctly
-rounded mathematical minimum image for every finite magnitude: when `x/L`
-is not finite the representative is defined to be `0`, and both the index
-and brute force use that rule.
+DBSCAN labels therefore match brute force under this `dist2`, including
+squared distances that underflow and periodic pairs whose raw coordinates
+differ by many periods. When every periodic residue is a binary64 number and
+every axis minimum-image distance is a binary64 number, `dist2` is the sum of
+the squares of those distances whenever that sum is a binary64 number. In
+particular, with period 10, `dist2(2^55, 0) = 4`, `dist2(2^55, 8) = 0`,
+`dist2(2^62, 4) = 0`, `dist2(1, 11) = 0` and `dist2(0, 11) = 1`; with period
+7, `dist2(1.25, 8.25) = 0`; an integer lattice modulo 360 has the integer
+minimum-image square. A squared distance that underflows is `0`. A residue
+that is not a binary64 number is not claimed to be correctly rounded.
 
-The axis and box lower bounds are sound for periodic intervals including
-intervals wider than `L/2` and full-period coverage (`width >= L`), where the
-bound is exactly zero.
+`axis_min_dist2` and `aabb_min_dist2` are lower bounds on the squared
+distance to the interval or box. They are zero when the interval may cover a
+full period (`width >= L`, including a width that rounding could push across
+`L`) and when the gap is inside the rounding budget. They are not claimed to
+be tight.
 
 ## Public Rust API
 

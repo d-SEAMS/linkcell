@@ -266,7 +266,7 @@ fn many_seeds_cover_edge_cases_and_ties() {
                 }
                 let zero = idx.within(q, 0.0).unwrap();
                 for hit in &zero {
-                    assert!(hit.dist2 <= 1e-14);
+                    assert_eq!(hit.dist2, 0.0);
                 }
                 let large = idx.within(q, 1000.0).unwrap();
                 assert_eq!(large.len(), n);
@@ -896,4 +896,467 @@ fn large_duplicate_set_builds_on_a_small_stack() {
         })
         .expect("spawn small stack");
     built.join().expect("small-stack build panicked");
+}
+
+fn from_f64(x: f64) -> (i128, i32) {
+    if x == 0.0 {
+        return (0, 0);
+    }
+    let bits = x.to_bits();
+    let sign: i128 = if bits >> 63 == 1 { -1 } else { 1 };
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let frac = (bits & 0x000f_ffff_ffff_ffff) as i128;
+    if exp_bits == 0 {
+        (sign * frac, -1074)
+    } else {
+        (sign * ((1_i128 << 52) + frac), exp_bits - 1023 - 52)
+    }
+}
+
+fn round_shift(m: u128, shift: i32) -> u128 {
+    if shift >= 0 {
+        return m << shift;
+    }
+    let s = (-shift) as u32;
+    if s >= 128 {
+        return 0;
+    }
+    let half = 1_u128 << (s - 1);
+    let mask = (half << 1) - 1;
+    let rem = m & mask;
+    let quot = m >> s;
+    let up = if rem > half {
+        true
+    } else if rem < half {
+        false
+    } else {
+        (quot & 1) == 1
+    };
+    if up {
+        quot + 1
+    } else {
+        quot
+    }
+}
+
+/// Round `mant * 2^exp` to binary64, ties to even.
+fn to_f64(mant: i128, exp: i32) -> f64 {
+    if mant == 0 {
+        return 0.0;
+    }
+    let sign = mant < 0;
+    let mut m = mant.unsigned_abs();
+    let mut e = exp;
+    while m % 2 == 0 {
+        m /= 2;
+        e += 1;
+    }
+    let bits = 128 - m.leading_zeros();
+    let e_unb = e + bits as i32 - 1;
+    if e_unb > 1023 {
+        return if sign {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if e_unb < -1074 {
+        if e_unb < -1075 || (e_unb == -1075 && m == 1) {
+            return 0.0;
+        }
+        return if sign {
+            -f64::from_bits(1)
+        } else {
+            f64::from_bits(1)
+        };
+    }
+    if e_unb < -1022 {
+        let sh = e + 1074;
+        let k = if sh >= 0 { m << sh } else { round_shift(m, sh) };
+        if k == 0 {
+            return 0.0;
+        }
+        if k >= (1_u128 << 52) {
+            let mut bits_out = 1_u64 << 52;
+            if sign {
+                bits_out |= 1_u64 << 63;
+            }
+            return f64::from_bits(bits_out);
+        }
+        let mut bits_out = k as u64;
+        if sign {
+            bits_out |= 1_u64 << 63;
+        }
+        return f64::from_bits(bits_out);
+    }
+    let shift = 53 - bits as i32;
+    let mut sig = round_shift(m, shift);
+    let mut eu = e_unb;
+    if sig == (1_u128 << 53) {
+        sig = 1_u128 << 52;
+        eu += 1;
+        if eu > 1023 {
+            return if sign {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
+        }
+    }
+    assert!(
+        ((1_u128 << 52)..(1_u128 << 53)).contains(&sig),
+        "sig {sig} bits {bits} shift {shift}"
+    );
+    let frac = (sig - (1_u128 << 52)) as u64;
+    let mut bits_out = ((eu + 1023) as u64) << 52 | frac;
+    if sign {
+        bits_out |= 1_u64 << 63;
+    }
+    f64::from_bits(bits_out)
+}
+
+fn sub_exact(a: (i128, i32), b: (i128, i32)) -> (i128, i32) {
+    if a.0 == 0 {
+        return (-b.0, b.1);
+    }
+    if b.0 == 0 {
+        return a;
+    }
+    let exp = a.1.min(b.1);
+    let sa = a.1 - exp;
+    let sb = b.1 - exp;
+    assert!((0..71).contains(&sa) && (0..71).contains(&sb));
+    let av = a.0.checked_shl(sa as u32).expect("shift");
+    let bv = b.0.checked_shl(sb as u32).expect("shift");
+    (av - bv, exp)
+}
+
+fn rounded_square(mant: i128, exp: i32) -> f64 {
+    if mant == 0 {
+        return 0.0;
+    }
+    let mut m = mant.unsigned_abs();
+    let mut e = exp;
+    while m % 2 == 0 {
+        m /= 2;
+        e += 1;
+    }
+    let sq = m.checked_mul(m).expect("square fits in u128");
+    assert!(sq < (1_u128 << 127));
+    to_f64(sq as i128, e.checked_mul(2).unwrap())
+}
+
+fn open_dist2(a: f64, b: f64) -> f64 {
+    let (m, e) = sub_exact(from_f64(a), from_f64(b));
+    rounded_square(m, e)
+}
+
+fn residue_f64(x: f64, l: f64) -> f64 {
+    let (mx, ex) = from_f64(x);
+    let (ml, el) = from_f64(l);
+    assert!(ml > 0);
+    let exp = ex.min(el);
+    let sx = ex - exp;
+    let sl = el - exp;
+    assert!((0..71).contains(&sx) && (0..71).contains(&sl));
+    let ix = mx.checked_shl(sx as u32).expect("residue shift");
+    let il = ml.checked_shl(sl as u32).expect("period shift");
+    let y = to_f64(ix.rem_euclid(il), exp);
+    if y > 0.0 && y < l {
+        y
+    } else {
+        0.0
+    }
+}
+
+fn periodic_dist2(a: f64, b: f64, l: f64) -> f64 {
+    let left = from_f64(residue_f64(a, l));
+    let right = from_f64(residue_f64(b, l));
+    let diff = sub_exact(left, right);
+    let ad = if diff.0 < 0 { (-diff.0, diff.1) } else { diff };
+    let period = from_f64(l);
+    let twice = (ad.0.checked_mul(2).unwrap(), ad.1);
+    let gap = sub_exact(period, twice);
+    let dist = if gap.0 < 0 { sub_exact(period, ad) } else { ad };
+    rounded_square(dist.0, dist.1)
+}
+
+fn circ_i128(a: i128, b: i128, period: i128) -> i128 {
+    let d = (a - b).rem_euclid(period);
+    let other = period - d;
+    if other < d {
+        other
+    } else {
+        d
+    }
+}
+
+fn assert_same_bits(got: f64, want: f64, what: &str) {
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "{what}: got {got:e} want {want:e}"
+    );
+}
+
+fn assert_search_matches<F>(
+    data: &[f64],
+    d: usize,
+    periods: &[Option<f64>],
+    queries: &[&[f64]],
+    radii: &[f64],
+    exact_dist2: bool,
+    dist: F,
+) where
+    F: Fn(&[f64], &[f64]) -> f64,
+{
+    let n = data.len() / d;
+    let idx = build_index(data, n, d, periods);
+    let metric = PeriodicSpace::new(periods.to_vec()).unwrap();
+    if exact_dist2 {
+        for i in 0..n {
+            for j in 0..n {
+                let pi = &data[i * d..(i + 1) * d];
+                let pj = &data[j * d..(j + 1) * d];
+                assert_same_bits(
+                    metric.dist2(pi, pj).unwrap(),
+                    dist(pi, pj),
+                    &format!("dist2 {i},{j}"),
+                );
+            }
+        }
+    }
+    for q in queries {
+        if exact_dist2 {
+            for i in 0..n {
+                let pi = &data[i * d..(i + 1) * d];
+                assert_same_bits(
+                    metric.dist2(pi, q).unwrap(),
+                    dist(pi, q),
+                    &format!("query {i}"),
+                );
+            }
+        }
+        for &r in radii {
+            let exact_r2 = rounded_square(from_f64(r).0, from_f64(r).1);
+            assert_same_bits(r * r, exact_r2, "radius square");
+            let mut want = Vec::new();
+            for i in 0..n {
+                let d2 = dist(&data[i * d..(i + 1) * d], q);
+                if d2 <= exact_r2 {
+                    want.push((i, d2));
+                }
+            }
+            want.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let got: Vec<_> = idx
+                .within(q, r)
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.index, h.dist2))
+                .collect();
+            if exact_dist2 {
+                assert_eq!(got, want, "within r={r} q={q:?}");
+            } else {
+                let got_i: Vec<_> = got.iter().map(|h| h.0).collect::<Vec<_>>();
+                let want_i: Vec<_> = want.iter().map(|h| h.0).collect::<Vec<_>>();
+                assert_eq!(got_i, want_i, "within r={r} q={q:?}");
+            }
+            for &k in &[1usize, n] {
+                let mut all: Vec<_> = (0..n)
+                    .map(|i| (i, dist(&data[i * d..(i + 1) * d], q)))
+                    .collect();
+                all.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                all.truncate(k.min(n));
+                let got: Vec<_> = idx
+                    .knn(q, k)
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| (h.index, h.dist2))
+                    .collect();
+                if exact_dist2 {
+                    assert_eq!(got, all, "knn k={k}");
+                } else {
+                    let got_i: Vec<_> = got.iter().map(|h| h.0).collect::<Vec<_>>();
+                    let want_i: Vec<_> = all.iter().map(|h| h.0).collect::<Vec<_>>();
+                    assert_eq!(got_i, want_i, "knn k={k}");
+                }
+            }
+        }
+        for &r in radii {
+            let exact_r2 = rounded_square(from_f64(r).0, from_f64(r).1);
+            let mut want = Vec::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let d2 = dist(&data[i * d..(i + 1) * d], &data[j * d..(j + 1) * d]);
+                    if d2 <= exact_r2 {
+                        want.push((i, j, d2));
+                    }
+                }
+            }
+            let got: Vec<_> = idx
+                .pairs_within(r)
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.i, p.j, p.dist2))
+                .collect();
+            if exact_dist2 {
+                assert_eq!(got, want, "pairs r={r}");
+            } else {
+                let got_ij: Vec<_> = got.iter().map(|p| (p.0, p.1)).collect();
+                let want_ij: Vec<_> = want.iter().map(|p| (p.0, p.1)).collect();
+                assert_eq!(got_ij, want_ij, "pairs r={r}");
+            }
+        }
+    }
+}
+
+/// Exact residue arithmetic, independent of `Metric::dist2`.
+#[test]
+fn exact_residue_oracle_matches_neighbour_sets() {
+    let two55 = 2.0f64.powi(55);
+    let two62 = 2.0f64.powi(62);
+    assert_eq!(residue_f64(two55, 10.0), 8.0);
+    assert_eq!(residue_f64(two62, 10.0), 4.0);
+    assert_eq!(residue_f64(11.0, 10.0), 1.0);
+    assert_eq!(residue_f64(-11.0, 10.0), 9.0);
+    assert_eq!(residue_f64(8.25, 7.0), 1.25);
+    assert_eq!(residue_f64(1.25, 7.0), 1.25);
+    assert_eq!(residue_f64(-1.0e-20, 1.0), 0.0);
+    assert_eq!((1_i128 << 55) % 10, 8);
+    assert_eq!((1_i128 << 62) % 10, 4);
+    assert_eq!(circ_i128(1_i128 << 55, 0, 10), 2);
+    assert_eq!(circ_i128(1_i128 << 55, 8, 10), 0);
+    assert_eq!(circ_i128(1, 11, 10), 0);
+    assert_eq!(circ_i128(0, 11, 10), 1);
+    assert_eq!(circ_i128(5, 33, 28), 0);
+
+    let open_periods = [None];
+    let f1 = [2.0e-162, 2.2e-162, 0.0];
+    let f1q = [3.5e-162];
+    assert_eq!(open_dist2(f1q[0], f1[0]), 0.0);
+    assert_eq!(open_dist2(f1q[0], f1[1]), 0.0);
+    assert_ne!(open_dist2(f1q[0], f1[2]), 0.0);
+    assert_eq!(open_dist2(f1[0], f1[1]), 0.0);
+    assert_search_matches(&f1, 1, &open_periods, &[&f1q], &[0.0], true, |a, b| {
+        open_dist2(a[0], b[0])
+    });
+    let f1_idx = build_index(&f1, 3, 1, &open_periods);
+    let f1_hits: Vec<_> = f1_idx
+        .within(&f1q, 0.0)
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.index, h.dist2))
+        .collect();
+    assert_eq!(f1_hits, vec![(0, 0.0), (1, 0.0)]);
+
+    let l_tiny = 1.0e-150;
+    let f2 = [
+        -1.0540256054825181e-153_f64,
+        2.9184493613603147e-153,
+        -6.4388324845298795e-155,
+    ];
+    let f2q = [1.290897940786428e-154_f64];
+    let f2r = 2.789359567281672e-153_f64;
+    let f2_periods = [Some(l_tiny)];
+    assert_search_matches(&f2, 1, &f2_periods, &[&f2q], &[0.0, f2r], false, |a, b| {
+        periodic_dist2(a[0], b[0], l_tiny)
+    });
+    let f2_metric = PeriodicSpace::new(f2_periods.to_vec()).unwrap();
+    let boundary = f2_metric.dist2(&[f2[1]], &f2q).unwrap();
+    assert_same_bits(
+        boundary,
+        periodic_dist2(f2[1], f2q[0], l_tiny),
+        "f2 boundary",
+    );
+    assert_eq!(boundary.to_bits(), (f2r * f2r).to_bits());
+    let f2_idx = build_index(&f2, 3, 1, &f2_periods);
+    let f2_hits: Vec<_> = f2_idx
+        .within(&f2q, f2r)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.index)
+        .collect();
+    assert_eq!(f2_hits, vec![2, 0, 1]);
+
+    let coords = [0_i128, 4, 8, 1, 11, -11, 1 << 55, 1 << 62];
+    let lattice10: Vec<f64> = coords.iter().map(|c| *c as f64).collect();
+    let q0 = [0.0_f64];
+    let q4 = [4.0_f64];
+    assert_search_matches(
+        &lattice10,
+        1,
+        &[Some(10.0)],
+        &[&q0, &q4],
+        &[0.0, 2.0, 4.0],
+        true,
+        |a, b| {
+            let d = circ_i128(a[0] as i128, b[0] as i128, 10);
+            (d * d) as f64
+        },
+    );
+
+    let seventh = [1.25_f64, 8.25, 4.25];
+    let q125 = [1.25_f64];
+    assert_search_matches(
+        &seventh,
+        1,
+        &[Some(7.0)],
+        &[&q125],
+        &[0.0, 3.0],
+        true,
+        |a, b| {
+            let aq = (a[0] * 4.0) as i128;
+            let bq = (b[0] * 4.0) as i128;
+            let d = circ_i128(aq, bq, 28);
+            (d * d) as f64 / 16.0
+        },
+    );
+
+    let mut pts = Vec::new();
+    for i in -4..=4 {
+        for j in 0..6 {
+            pts.push((i as i128, j as i128));
+        }
+    }
+    pts.push((360 * 5 + 7, 10 * 3 + 4));
+    pts.push((-(360 * 3), 0));
+    pts.push((1_i128 << 40, 8));
+    pts.push((997 * 20, 360));
+    let lattice360: Vec<f64> = pts
+        .iter()
+        .flat_map(|(x, y)| [*x as f64, *y as f64])
+        .collect();
+    let origin = [0.0_f64, 0.0];
+    let spot = [7.0_f64, 4.0];
+    assert_search_matches(
+        &lattice360,
+        2,
+        &[Some(360.0), Some(10.0)],
+        &[&origin, &spot],
+        &[0.0, 1.0, 5.0, 25.0],
+        true,
+        |a, b| {
+            let dx = circ_i128(a[0] as i128, b[0] as i128, 360);
+            let dy = circ_i128(a[1] as i128, b[1] as i128, 10);
+            (dx * dx + dy * dy) as f64
+        },
+    );
+
+    let below = f64::from_bits(1.0f64.to_bits() - 1);
+    let seam = [0.0_f64, 0.2, 0.8, 1.0, -0.2, -1.0, -1.0e-20, below];
+    let seam_q = [0.0_f64];
+    assert_eq!(periodic_dist2(0.0, 1.0, 1.0), 0.0);
+    assert_eq!(periodic_dist2(0.0, -1.0, 1.0), 0.0);
+    assert_eq!(periodic_dist2(0.0, -1.0e-20, 1.0), 0.0);
+    assert_eq!(periodic_dist2(0.0, 0.5, 1.0), 0.25);
+    assert_eq!(periodic_dist2(0.0, below, 1.0), 2.0f64.powi(-106));
+    assert_search_matches(
+        &seam,
+        1,
+        &[Some(1.0)],
+        &[&seam_q],
+        &[0.0, 0.25, 2.0f64.powi(-53)],
+        false,
+        |a, b| periodic_dist2(a[0], b[0], 1.0),
+    );
 }

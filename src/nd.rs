@@ -166,8 +166,9 @@ pub struct VpTreeIndex<S, M> {
     root: Option<usize>,
     /// Row-major representatives. Periodic axes lie in `[0, L)`.
     canonical: Vec<f64>,
-    /// Absolute triangle slack for this metric.
-    periodic_slack: f64,
+    /// Absolute triangle slack for this metric. Periodic residue error plus
+    /// the square-underflow floor, both proved upper bounds.
+    absolute_slack: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -206,10 +207,10 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
 
     fn pruning_margin(&self, a: f64, b: f64, c: f64) -> f64 {
         // Relative guard for the norm, the square root, and the branch test.
-        // The absolute term is the periodic reduction's proved slack. It is
-        // zero for an open metric, so tiny open data still prunes. It scales
-        // with ulp(L) on a periodic axis, which is the error left after both
-        // endpoints have been reduced into [0, L).
+        // The absolute term is Metric::vp_absolute_slack: the square-underflow
+        // floor 8 * sqrt(dims) * 2^-537, plus the periodic residue slack when
+        // an axis has a period. The floor stays positive for every non-zero
+        // dimension, including an open axis.
         let d = self.space.dims();
         let n_ops = d.saturating_mul(6).saturating_add(16);
         let g_dist2 = Self::gamma(n_ops);
@@ -221,7 +222,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         let rel = (1.0 + g_dist2) * (1.0 + g_sqrt) * (1.0 + g_add) - 1.0;
         let scale = a.abs() + b.abs() + c.abs();
         let relative = rel * scale + 16.0 * (Self::ulp(a) + Self::ulp(b) + Self::ulp(c));
-        let margin = relative + self.periodic_slack;
+        let margin = relative + self.absolute_slack;
         if margin.is_finite() && margin >= 0.0 {
             margin
         } else {
@@ -276,7 +277,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             }
         }
         let slack = metric.vp_absolute_slack();
-        let periodic_slack = if slack.is_finite() && slack >= 0.0 {
+        let absolute_slack = if slack.is_finite() && slack >= 0.0 {
             slack
         } else {
             f64::INFINITY
@@ -295,7 +296,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             nodes: Vec::new(),
             root: None,
             canonical,
-            periodic_slack,
+            absolute_slack,
         };
         me.root = me.build_iter()?;
         Ok(me)

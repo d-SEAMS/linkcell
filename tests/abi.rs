@@ -1388,12 +1388,23 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
             .env("LC_ND_ONE_THREAD_PROBE", "1")
             .output()
             .unwrap();
-        assert!(
-            out.status.success(),
-            "one-thread probe status {:?}\n{}{}",
-            out.status,
+        let text = format!(
+            "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "one-thread probe status {:?}\n{text}",
+            out.status
+        );
+        assert!(
+            text.contains("LC_ND_ONE_THREAD_PROBE_OK"),
+            "child did not run the probe body\n{text}"
+        );
+        assert!(
+            text.contains("test result: ok. 1 passed;"),
+            "child did not report exactly one passing test\n{text}"
         );
         return;
     }
@@ -1402,6 +1413,36 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
     let q = [0.0, 0.0];
     unsafe { lc_set_threads(1) };
     let before = linux_thread_count();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(before));
+    let stop_c = std::sync::Arc::clone(&stop);
+    let peak_c = std::sync::Arc::clone(&peak);
+    let sampler = std::thread::Builder::new()
+        .name("nd-thread-sampler".into())
+        .spawn(move || {
+            let mut max = linux_thread_count();
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                max = max.max(linux_thread_count());
+            }
+            max = max.max(linux_thread_count());
+            peak_c.store(max, std::sync::atomic::Ordering::Relaxed);
+        })
+        .unwrap();
+    let mut during = linux_thread_count();
+    let mut spins = 0u32;
+    loop {
+        let now = linux_thread_count();
+        if now == during && now == before + 1 {
+            break;
+        }
+        during = now;
+        spins += 1;
+        assert!(
+            spins < 10_000_000,
+            "sampler thread was not the only extra thread: before={before} now={now}"
+        );
+        std::thread::yield_now();
+    }
     for _ in 0..200 {
         let mut nn = [-1; 4];
         assert_eq!(
@@ -1454,8 +1495,14 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
             0
         );
     }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    sampler.join().unwrap();
+    let max_seen = peak.load(std::sync::atomic::Ordering::Relaxed);
     let after = linux_thread_count();
     unsafe { lc_set_threads(0) };
     unsafe { lc_nd_free(idx) };
-    assert_eq!(after, before, "lc_set_threads(1) started a thread");
+    assert_eq!(during, before + 1, "sampler was not the only extra thread");
+    assert_eq!(max_seen, during, "a query started a thread");
+    assert_eq!(after, before, "lc_set_threads(1) left a thread behind");
+    println!("LC_ND_ONE_THREAD_PROBE_OK");
 }

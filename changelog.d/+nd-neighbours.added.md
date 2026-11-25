@@ -13,6 +13,6 @@
   semver-significant API expansion because `Error` is not marked
   `#[non_exhaustive]` in this release line.
 - N-dimensional queries compare equal to brute force under the same `dist2`
-  on finite inputs that do not overflow. Periodic coordinates are reduced
-  into `[0, L)` once, and pruning adds the proved absolute slack of that
-  reduction to a Higham relative factor.
+  on finite inputs that do not overflow. Periodic coordinates use the IEEE
+  remainder into `[0, L)`, and pruning adds a square-underflow floor plus the
+  proved periodic slack to a Higham relative factor.
