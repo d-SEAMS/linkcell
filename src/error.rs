@@ -44,6 +44,10 @@ pub enum Error {
     ScotchDisabled,
     /// The Scotch library rejected the graph.
     ScotchFailed,
+    /// The row-major buffer shape is inconsistent.
+    BadDimensions,
+    /// A periodic length is not finite and strictly positive.
+    BadPeriod,
 }
 
 impl fmt::Display for Error {
@@ -75,6 +79,8 @@ impl fmt::Display for Error {
             }
             Error::ScotchDisabled => write!(f, "Scotch support is compiled out"),
             Error::ScotchFailed => write!(f, "Scotch returned an error"),
+            Error::BadDimensions => write!(f, "row-major buffer shape is inconsistent"),
+            Error::BadPeriod => write!(f, "period length must be finite and positive"),
         }
     }
 }

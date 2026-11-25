@@ -22,6 +22,7 @@ The Rust crate `linkcell` is the implementation. The C ABI (`lc_*`, `include/lin
 - [C ABI](https://linkcell.dseams.info/reference/c-api/): every `lc_*` entry point, ownership, thread width, and error contract
 - [Rust API](https://linkcell.dseams.info/api/linkcell/): rustdoc for the crate
 - [Algorithm](https://linkcell.dseams.info/reference/algorithm/): the linked-cell walk, the k-heap per source, basis reduction, cost, threading and bit identity
+- [N-dimensional index and DBSCAN](https://linkcell.dseams.info/reference/nd/): exact neighbour search and clustering on mixed periodic/open feature dimensions
 - [Features and instruction-set builds](https://linkcell.dseams.info/reference/features/): Cargo features, `LINKCELL_SIMD`, and the AVX2, AVX-512 and NEON kernels
 - [Cell partition](https://linkcell.dseams.info/reference/partition/): domain ids per cell, halos, and the balance bound
 - [Changelog](https://github.com/d-SEAMS/linkcell/blob/main/CHANGELOG.md): release notes per version

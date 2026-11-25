@@ -21,6 +21,7 @@ Python is DLPack (dlpk) over that waist.
 
 - [C API](reference/c-api.md)
 - [Algorithm](reference/algorithm.md)
+- [N-dimensional index and DBSCAN](reference/nd.md)
 - [Features and instruction-set builds](reference/features.md)
 - [Cell partition](reference/partition.md)
 

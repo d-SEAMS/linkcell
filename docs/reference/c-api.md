@@ -56,6 +56,50 @@ A NaN or infinite coordinate, masked or not and in any frame, or a non-finite `s
 A non-finite lattice entry returns nonzero as a singular or non-positive cell.
 The device entries `lc_gpu_knearest*` in `linkcell_gpu.h` do not scan their device coordinates for non-finite values.
 
+## N-dimensional index
+
+```c
+typedef struct lc_nd_index lc_nd_index;
+
+int lc_nd_build(const double *data, size_t n, size_t d,
+                const double *periods, lc_nd_index **out);
+void lc_nd_free(lc_nd_index *index);
+size_t lc_nd_len(const lc_nd_index *index);
+size_t lc_nd_dims(const lc_nd_index *index);
+
+int lc_nd_knn(const lc_nd_index *index, const double *query, size_t k,
+              int *out_idx, double *out_d2);
+
+int lc_nd_within(const lc_nd_index *index, const double *query,
+                 double radius, int *out_idx, double *out_d2,
+                 size_t cap, size_t *out_count);
+
+int lc_nd_pairs_within(const lc_nd_index *index, double radius,
+                       int *out_i, int *out_j, double *out_d2,
+                       size_t cap, size_t *out_count);
+
+int lc_nd_dbscan(const lc_nd_index *index, double eps, size_t min_pts,
+                 int *out_labels, int *out_core, size_t *out_clusters);
+```
+
+`lc_nd_build` takes row-major `data` of shape `n x d`.
+`periods` is optional (`NULL` means every axis open); with a non-null pointer,
+length is `d` and each axis is periodic if `periods[k] > 0`.
+
+`lc_nd_knn` writes exactly `k` slots (`-1` and optional `NaN` for unused
+slots when `k > n`).
+
+`lc_nd_within` and `lc_nd_pairs_within` accept count-query mode:
+
+- for `lc_nd_within`, set `out_idx = NULL` (and `out_d2 = NULL`) to query
+  `*out_count`;
+- for `lc_nd_pairs_within`, set `out_i = out_j = out_d2 = NULL` to query
+  `*out_count`.
+
+`lc_nd_dbscan` writes one label and one core flag per indexed point.
+Noise has label `-1`.
+`min_pts` includes the point itself.
+
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
                     double cutoff, const int *mask, double cell_hint,
