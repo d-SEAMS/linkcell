@@ -548,8 +548,11 @@ int lc_pairs_within(const double *xyz,
  * (and `out_d2` if non-null) `cap_cols` values. A short buffer returns
  * nonzero without writing. A query or a short buffer keeps its rows on
  * the calling thread, and the next call there with the same inputs bit
- * for bit copies them out without searching again. A buffer large
- * enough on the first call takes the rows straight from the search.
+ * for bit copies them out without searching again; a short buffer with
+ * null `out_d2` keeps no distances, so a next call that asks for them
+ * searches again. A buffer large enough on the first call takes the
+ * rows straight from the search, and computes distances only when
+ * `out_d2` is non-null.
  *
  * `n == 0` succeeds with one offset, `0`. A cutoff that is not finite
  * and positive, a coordinate that is not finite, or more columns than

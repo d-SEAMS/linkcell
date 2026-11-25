@@ -1,0 +1,1 @@
+`pairs_within_csr` and `lc_pairs_within_csr` gather each row of a periodic cell from the bins around its point, with an AVX-512 kernel, in place of counting, placing, and sorting the pair walk's hits. The rows are the same bits.

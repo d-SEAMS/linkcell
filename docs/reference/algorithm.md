@@ -157,21 +157,31 @@ Buffers a caller passes in are left alone.
 The bindings write their own layout from the same hits: Python and `pairs_within_columns` get the `ijS` columns without a `Pair` vector, `lc_pairs_within` writes the caller's columns, and a count query keeps its search for the matching fill on the same thread.
 `lc_pairs_within_rows` writes `lc_pair` rows, which the C++ `ShiftedPair` vector uses directly.
 
-`pairs_within_csr` / `lc_pairs_within_csr` groups the same hits by source, with no shift.
-The walk stores each unordered pair once, in per-thread chunks, so a row's entries are spread over every chunk.
-Each worker counts the rows its chunks feed.
-A scan over blocks of rows then gives each chunk its own start in every row, in chunk order.
-Each worker writes its chunks from those starts, and each row is then sorted by column on the pool.
-Those four passes are linear in the hits and need no atomic counter and no sort of the whole list.
-The starts depend on the chunks, and the chunks depend on the thread count, but the sorted row does not, so the output is the same bits at every width.
-When twice the cutoff reaches the narrowest periodic width, one atom can meet another through two images.
-The rows are then staged, sorted, and reduced to the nearest image before they are packed.
-The plan behind a CSR search skips the per-atom image offsets, which only the shift of a row reads.
+`pairs_within_csr` / `lc_pairs_within_csr` groups the same pairs by source, with no shift.
+On a periodic cell each point gathers its own row from the bins around its bin, so no hit is buffered, and no pass counts, places, or fills another thread's hits.
+The bins, the folded positions, and the reach are those of the pair walk, and so is every distance.
+The walk computes a pair from the bin that `keep_dir` picks, as `q - (p - S)` with `p` its source, and a row computes that expression with the same roles: as a source the point subtracts the shift, as a target it subtracts the shift from the candidate.
+That gives the walk's difference or its negation, whose square is the same bits, and with no shift the two roles agree.
+With three bins or more along each axis and a reach of one, the bins around a bin are nine runs of three consecutive bins.
+Their offsets, roles, and shifts are tabulated once for the 27 places a bin can sit (first, inner, or last along each axis).
+The AVX-512 and AVX2 kernels copy every run but the shifted source ones into one packed list per bin, a target run less its shift, and test each point of the bin against that list eight or four candidates at a time, with the same separate multiplies and adds as the scalar path.
+The scalar path and the shifted source runs read the bins in place.
+Columns come out in bin order.
+A row is sorted by insertion, which does nothing when the points are numbered in bin order.
+Without a second image in reach (twice the cutoff short of the narrowest width) no column repeats: an atom sits in one bin, and only one image of each bin around is in reach.
+Otherwise the row is sorted by column and distance and keeps the nearest image.
+Each thread stages its rows in slot order.
+A scan of the row lengths gives the CSR starts, which a caller's buffer is checked against before anything is written, and one copy lays the rows out in point order.
+The threads only split the bins, so the rows and distances do not depend on them.
+The grid behind a gather skips the bin corners, the relative coordinates, and the run boxes, which only the walk reads.
+A cell with an open axis keeps the pair walk.
+Each worker counts the rows its chunks of hits feed, a scan gives each chunk its start in every row, each worker writes its chunks there, and each row is sorted by column on the pool.
 
-At 110,592 random points at water density and cutoff 3.5 on an 8-core AVX-512 host, a full list takes 7 to 10 ms on 8 threads, compared with 33 to 42 ms on one thread.
-In a timed 10.3 ms call on 8 threads, 5.4 ms is the walk, which scales about 5x.
-Another 2.3 ms is the bin build, whose bin scan is serial, and 1.8 ms is the count, place, fill, and row sort.
+At 110,592 random points at water density and cutoff 3.5 on an 8-core AVX-512 host, a full list takes 15 ms on one thread (12.4 ms for a half list) and 4.4 to 5.0 ms on 8 threads, against 31 to 37 ms (27 to 28.5 ms) and 6.8 to 7.6 ms for v0.6.0, medians of 13 calls.
 `examples/pairs_csr_bench.rs` reproduces the totals.
+On cubic ice of the same size (`examples/csr_ice_bench.rs`) a full list without distances takes 9.0 ms on one thread, against 20.0 ms for v0.6.0 and 14.7 ms for the pair walk that only counts (`pairs_within_count`); with the atoms numbered in a random order, 11.9 ms against 23.3 and 16.2 ms.
+The gather is about 77% of that call, the grid build and fold 12%, and the copy into the caller's rows 4%.
+A bin holds 1.4 atoms there, so each bin packs about 38 candidates from its nine runs and tests each of its atoms against them.
 
 With the bin edge equal to the cutoff the search radius is 1, and the gap between any two cells inside that stencil is 0, so the bin test keeps every cell. vesin's cell list then evaluates `27 ρ − 1` ordered distances per atom (`ρ` atoms in the cell).
 This walk evaluates `(ρ − 1) / 2 + 13 ρ`, which is exactly half: `scripts/cutoff_work.py` simplifies the ratio to 2. vesin also forms `S H` with a 3 by 3 product on every candidate.

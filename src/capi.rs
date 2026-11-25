@@ -1082,8 +1082,11 @@ fn open_rows(
 /// (and `out_d2` if non-null) `cap_cols` values. A short buffer returns
 /// nonzero without writing. A query or a short buffer keeps its rows on
 /// the calling thread, and the next call there with the same inputs bit
-/// for bit copies them out without searching again. A buffer large
-/// enough on the first call takes the rows straight from the search.
+/// for bit copies them out without searching again; a short buffer with
+/// null `out_d2` keeps no distances, so a next call that asks for them
+/// searches again. A buffer large enough on the first call takes the
+/// rows straight from the search, and computes distances only when
+/// `out_d2` is non-null.
 ///
 /// `n == 0` succeeds with one offset, `0`. A cutoff that is not finite
 /// and positive, a coordinate that is not finite, or more columns than
@@ -1172,7 +1175,7 @@ pub unsafe extern "C" fn lc_pairs_within_csr(
     if let Err(err) = crate::pairs::csr_check(pts, &query) {
         return fail(err);
     }
-    let key = OpenKey {
+    let key = || OpenKey {
         xyz: xyz_bits(pts),
         periodic,
         cutoff: cutoff.to_bits(),
@@ -1195,7 +1198,7 @@ pub unsafe extern "C" fn lc_pairs_within_csr(
         cap_cols,
         query_only,
     };
-    if let Some(parked) = take_csr(&key) {
+    if let Some(parked) = take_csr(key, out) {
         return unsafe { deliver_csr(key, parked, out, need_offsets, need_cols) };
     }
     let cell = if periodic == [false, false, false] {
@@ -1226,7 +1229,9 @@ pub unsafe extern "C" fn lc_pairs_within_csr(
     let room = move |need: usize| {
         (!out.query_only && out.cap_offsets > n && out.cap_cols >= need).then_some(dest)
     };
-    let made = with_threads(|| crate::pairs::csr_rows(pts, &cell, &query, room));
+    // A query's parked rows carry distances: the next call may ask for them.
+    let dist2 = query_only || !out_d2.is_null();
+    let made = with_threads(|| crate::pairs::csr_rows(pts, &cell, &query, dist2, room));
     match made {
         Ok(crate::pairs::CsrWrite::Direct(need)) => {
             unsafe {
@@ -1270,10 +1275,12 @@ thread_local! {
     static PARKED_CSR: RefCell<Option<ParkedCsr>> = const { RefCell::new(None) };
 }
 
-/// The parked rows when every input matches. Any other call drops them.
-fn take_csr(key: &OpenKey) -> Option<crate::PairCsr> {
+/// The parked rows when every input matches and they hold the
+/// distances `out` asks for. Any other call drops them.
+fn take_csr(key: impl FnOnce() -> OpenKey, out: CsrOut) -> Option<crate::PairCsr> {
     let parked = PARKED_CSR.with(|slot| slot.borrow_mut().take())?;
-    (parked.key == *key).then_some(parked.rows)
+    let d2 = out.d2.is_null() || parked.rows.dist2.len() == parked.rows.cols.len();
+    (d2 && parked.key == key()).then_some(parked.rows)
 }
 
 /// Report the sizes of `rows`, then park them (a query or a short
@@ -1284,7 +1291,7 @@ fn take_csr(key: &OpenKey) -> Option<crate::PairCsr> {
 /// `need_offsets` and `need_cols` are writable, and `out` follows the
 /// contract of [`lc_pairs_within_csr`].
 unsafe fn deliver_csr(
-    key: OpenKey,
+    key: impl FnOnce() -> OpenKey,
     rows: crate::PairCsr,
     out: CsrOut,
     need_offsets: *mut usize,
@@ -1295,12 +1302,12 @@ unsafe fn deliver_csr(
         *need_cols = rows.cols.len();
     }
     if out.query_only {
-        PARKED_CSR.with(|slot| *slot.borrow_mut() = Some(ParkedCsr { key, rows }));
+        PARKED_CSR.with(|slot| *slot.borrow_mut() = Some(ParkedCsr { key: key(), rows }));
         clear_error();
         return 0;
     }
     if out.cap_offsets < rows.offsets.len() || out.cap_cols < rows.cols.len() {
-        PARKED_CSR.with(|slot| *slot.borrow_mut() = Some(ParkedCsr { key, rows }));
+        PARKED_CSR.with(|slot| *slot.borrow_mut() = Some(ParkedCsr { key: key(), rows }));
         return fail_msg(CSR_SHORT);
     }
     unsafe {
