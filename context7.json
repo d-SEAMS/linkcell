@@ -1,7 +1,7 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
   "projectTitle": "linkcell",
-  "description": "Periodic linked-cell k-nearest neighbour search.",
+  "description": "Periodic linked-cell neighbour lists for molecular simulations: cutoff pair lists and k-nearest neighbour search.",
   "folders": [
     "docs",
     "examples",
