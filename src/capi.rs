@@ -370,9 +370,13 @@ struct NdHandle {
 }
 
 /// Opaque N-dimensional neighbour index handle.
+///
+/// Callers only ever hold a pointer returned by `lc_nd_build`. The byte
+/// makes this a complete object type in C99 and C++17. A zero-length array
+/// is not one.
 #[repr(C)]
 pub struct lc_nd_index {
-    _private: [u8; 0],
+    _private: u8,
 }
 
 unsafe fn nd_ref<'a>(ptr: *const lc_nd_index) -> Result<&'a NdHandle, c_int> {

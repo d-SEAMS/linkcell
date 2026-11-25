@@ -141,9 +141,13 @@ typedef struct lc_cell {
 
 /**
  * Opaque N-dimensional neighbour index handle.
+ *
+ * Callers only ever hold a pointer returned by `lc_nd_build`. The byte
+ * makes this a complete object type in C99 and C++17. A zero-length array
+ * is not one.
  */
 typedef struct lc_nd_index {
-    uint8_t _private[0];
+    uint8_t _private;
 } lc_nd_index;
 
 /**

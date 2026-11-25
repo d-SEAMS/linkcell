@@ -16,6 +16,8 @@ pub enum Error {
     /// A size, index, weight, coordinate, or image offset does not fit
     /// its representation.
     Overflow,
+    /// A squared distance or a periodic reduction overflowed binary64.
+    DistanceOverflow,
     /// `mask` is `Some` and its length is not `n`.
     MaskLen,
     /// Linked-cell mesh would overflow or exceed the bin cap.
@@ -26,6 +28,8 @@ pub enum Error {
     BadNdRadius,
     /// DBSCAN epsilon is not finite and strictly positive.
     BadNdEps,
+    /// DBSCAN `min_pts` is zero.
+    BadNdMinPts,
     /// Periodic image stencil exceeds the 2^24 resource cap.
     TooManyImages,
     /// An axis is not periodic and `libvesin.so` is not loaded.
@@ -64,11 +68,13 @@ impl fmt::Display for Error {
             Error::Empty => write!(f, "no points"),
             Error::BufferSize => write!(f, "out buffer length must be n * k"),
             Error::Overflow => write!(f, "n * k overflows"),
+            Error::DistanceOverflow => write!(f, "distance overflowed"),
             Error::MaskLen => write!(f, "mask length must be n"),
             Error::TooManyCells => write!(f, "linked-cell mesh is too fine"),
             Error::BadCutoff => write!(f, "cutoff must be finite and strictly positive"),
             Error::BadNdRadius => write!(f, "radius must be finite and non-negative"),
             Error::BadNdEps => write!(f, "eps must be finite and strictly positive"),
+            Error::BadNdMinPts => write!(f, "min_pts must be at least 1"),
             Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
             Error::Partial => write!(
                 f,

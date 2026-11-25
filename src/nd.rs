@@ -8,6 +8,7 @@ use std::collections::{BinaryHeap, VecDeque};
 
 use crate::Error;
 
+mod dyadic;
 mod metric;
 pub use metric::{Euclidean, Metric, PeriodicEuclidean, PeriodicSpace};
 
@@ -156,18 +157,19 @@ struct Node {
 
 /// Exact VP-tree index.
 ///
-/// Stored points and each query are reduced with [`Metric::write_canonical`]
-/// once. Pruning widens the triangle test by a relative Higham factor and by
-/// [`Metric::vp_absolute_slack`].
+/// Stored points and each query are copied with [`Metric::write_canonical`].
+/// Periodic distance is the residue of the difference, folded into
+/// `[-L/2, L/2]` after that subtraction. Pruning widens the triangle test by
+/// a relative Higham factor and by [`Metric::vp_absolute_slack`].
 pub struct VpTreeIndex<S, M> {
     space: S,
     metric: M,
     nodes: Vec<Node>,
     root: Option<usize>,
-    /// Row-major representatives. Periodic axes lie in `[0, L)`.
+    /// Row-major copies of the original finite coordinates.
     canonical: Vec<f64>,
-    /// Absolute triangle slack for this metric. Periodic residue error plus
-    /// the square-underflow floor, both proved upper bounds.
+    /// Absolute triangle slack for this metric. Periodic rounding plus the
+    /// square-underflow floor, both proved upper bounds.
     absolute_slack: f64,
 }
 
@@ -446,10 +448,17 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         k: usize,
         skip: Option<usize>,
         heap: &mut BinaryHeap<HeapEntry>,
-    ) -> Result<(), Error> {
+    ) -> Result<(usize, usize), Error> {
         let Some(root) = self.root else {
-            return Ok(());
+            return Ok((0, 0));
         };
+        // k = 0 has an empty result. Walking the tree would visit every point,
+        // because the search radius is still infinite while the heap is empty.
+        if k == 0 {
+            return Ok((0, 0));
+        }
+        let mut visited = 0usize;
+        let mut pruned = 0usize;
         struct Frame {
             nid: usize,
             phase: u8,
@@ -490,6 +499,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 }
                 continue;
             }
+            visited += 1;
             let (vp, left, right, threshold2) = {
                 let node = &self.nodes[frame.nid];
                 (node.vp, node.left, node.right, node.threshold2)
@@ -528,6 +538,14 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             } else {
                 Self::visit_left(d, mu, tau, margin)
             };
+            let saw_left = if prefer_left { visit_near } else { visit_far };
+            let saw_right = if prefer_left { visit_far } else { visit_near };
+            if left.is_some() && !saw_left {
+                pruned += 1;
+            }
+            if right.is_some() && !saw_right {
+                pruned += 1;
+            }
             if let Some(near_id) = near {
                 if visit_near {
                     stack.push(Frame {
@@ -562,7 +580,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 }
             }
         }
-        Ok(())
+        Ok((visited, pruned))
     }
 
     fn within_walk(
@@ -624,7 +642,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
     ) -> Result<Vec<NeighborHit>, Error> {
         let prepared = self.prepare_query(query)?;
         let mut heap = BinaryHeap::new();
-        self.knn_walk(&prepared, k, skip, &mut heap)?;
+        let _counted = self.knn_walk(&prepared, k, skip, &mut heap)?;
         let mut out: Vec<_> = heap
             .into_iter()
             .map(|h| NeighborHit {
@@ -638,6 +656,32 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 .then_with(|| a.index.cmp(&b.index))
         });
         Ok(out)
+    }
+
+    /// k-nearest neighbours plus `(nodes visited, children not entered)`.
+    #[cfg(test)]
+    fn knn_with_stats(
+        &self,
+        query: &[f64],
+        k: usize,
+    ) -> Result<(Vec<NeighborHit>, usize, usize), Error> {
+        self.check_query(query)?;
+        let prepared = self.prepare_query(query)?;
+        let mut heap = BinaryHeap::new();
+        let (visited, pruned) = self.knn_walk(&prepared, k, None, &mut heap)?;
+        let mut out: Vec<_> = heap
+            .into_iter()
+            .map(|h| NeighborHit {
+                index: h.index,
+                dist2: h.dist2,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.dist2
+                .total_cmp(&b.dist2)
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        Ok((out, visited, pruned))
     }
 
     fn within_skip(
@@ -738,7 +782,10 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
     /// scanned in ascending index order and each core expansion visits
     /// neighbours in ascending index order.
     pub fn dbscan(&self, eps: f64, min_pts: usize) -> Result<DbscanResult, Error> {
-        if !eps.is_finite() || eps <= 0.0 || min_pts == 0 {
+        if min_pts == 0 {
+            return Err(Error::BadNdMinPts);
+        }
+        if !eps.is_finite() || eps <= 0.0 {
             return Err(Error::BadNdEps);
         }
         let n = self.space.len();
@@ -883,5 +930,46 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
             out.sort_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::metric::{Metric, PeriodicSpace};
+    use super::OwnedContiguousSpace;
+    use super::VpTreeIndex;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    #[test]
+    fn knn_prunes_on_a_large_random_set_and_stays_exact() {
+        let n = 4096usize;
+        let d = 2usize;
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        let data: Vec<f64> = (0..n * d).map(|_| rng.random_range(0.0..1.0)).collect();
+        let space = OwnedContiguousSpace::from_row_major(&data, n, d).unwrap();
+        let metric = PeriodicSpace::new(vec![None, None]).unwrap();
+        let idx = VpTreeIndex::new(space, metric.clone()).unwrap();
+        for _ in 0..8 {
+            let q = [rng.random_range(0.0..1.0), rng.random_range(0.0..1.0)];
+            let (hits, visited, pruned) = idx.knn_with_stats(&q, 1).unwrap();
+            assert!(visited < n / 4, "visited {visited} of {n}, pruned {pruned}");
+            assert!(pruned > 0, "visited both children everywhere");
+            let mut best_i = 0usize;
+            let mut best_d = f64::INFINITY;
+            for i in 0..n {
+                let d2 = metric.dist2(&q, &data[i * d..(i + 1) * d]).unwrap();
+                if d2 < best_d || (d2 == best_d && i < best_i) {
+                    best_d = d2;
+                    best_i = i;
+                }
+            }
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].index, best_i);
+            assert_eq!(hits[0].dist2.to_bits(), best_d.to_bits());
+        }
+        let (hits, visited, _) = idx.knn_with_stats(&[0.5, 0.5], 0).unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(visited, 0, "knn(q, 0) walked the tree");
     }
 }

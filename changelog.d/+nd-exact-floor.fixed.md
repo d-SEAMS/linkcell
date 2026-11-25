@@ -1,3 +1,3 @@
 - Fixed N-dimensional pruning so a squared distance that underflows, or a periodic slack whose square would underflow, still returns the same neighbours as brute force under `dist2`.
-- Periodic reduction is the IEEE remainder into `[0, L)`. The residue is exact when it is a binary64 number, and a remainder of `L` is stored as `0`.
-- `axis_min_dist2` and `aabb_min_dist2` are lower bounds on the squared distance. They are zero when the interval may cover a full period or the gap is inside the rounding budget.
+- Periodic pruning keeps a positive slack when `4 * ulp(L)` squares to zero.
+- `axis_min_dist2` and `aabb_min_dist2` are lower bounds on the squared distance. They are zero when the interval may cover half a period or more.

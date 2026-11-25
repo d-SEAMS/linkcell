@@ -4,6 +4,7 @@
 //! N-dimensional metric traits and bounds, this implementation should be
 //! replaced by the upstream one.
 
+use super::dyadic::{self, DyadicSum};
 use crate::Error;
 
 /// Draft-shaped metric trait for a mechanical future swap to minimage.
@@ -29,8 +30,9 @@ pub trait Metric<T = f64> {
 
     /// Representative of `src` stored by [`crate::VpTreeIndex`].
     ///
-    /// The default copies `src`. A periodic metric folds each periodic axis
-    /// into `[0, L)` so every later distance is taken on that representative.
+    /// The default copies `src`. Periodic distance is applied later from the
+    /// raw coordinates: a value in `[0, L)` cannot hold a negative offset
+    /// smaller than `ulp(L)`.
     fn write_canonical(&self, src: &[f64], dst: &mut [f64]) -> Result<(), Error> {
         if src.len() != self.dims() || dst.len() != src.len() {
             return Err(Error::BadDimensions);
@@ -74,20 +76,6 @@ fn next_up(x: f64) -> f64 {
         f64::from_bits(x.to_bits() + 1)
     } else {
         f64::from_bits(x.to_bits() - 1)
-    }
-}
-
-fn next_down(x: f64) -> f64 {
-    if x.is_nan() || x == f64::NEG_INFINITY {
-        return x;
-    }
-    if x == 0.0 {
-        return -f64::from_bits(1);
-    }
-    if x > 0.0 {
-        f64::from_bits(x.to_bits() - 1)
-    } else {
-        f64::from_bits(x.to_bits() + 1)
     }
 }
 
@@ -165,26 +153,194 @@ fn diff_down(a: f64, b: f64) -> f64 {
     }
 }
 
-/// Lower bound on `d*d`.
+/// Lower bound on `d*d`. Never exceeds the exact square, including when
+/// that square is subnormal.
 fn square_down(d: f64) -> f64 {
-    if !(d.is_finite() && d > 0.0) {
-        return 0.0;
+    dyadic::square_down(d)
+}
+
+/// Exact sum of a few binary64 terms. The terms are not required to be
+/// non-overlapping: each [`two_sum`] keeps both outputs, so the list sums
+/// to the exact real value.
+struct Expansion {
+    v: [f64; 8],
+    n: usize,
+}
+
+impl Expansion {
+    fn new() -> Self {
+        Self { v: [0.0; 8], n: 0 }
     }
-    let s = d * d;
-    if !s.is_finite() || s <= 0.0 {
-        return 0.0;
-    }
-    let resid = d.mul_add(d, -s);
-    if resid < 0.0 {
-        let down = next_down(s);
-        if down > 0.0 {
-            down
-        } else {
-            0.0
+
+    fn push(&mut self, x: f64) -> Result<(), Error> {
+        if x == 0.0 {
+            return Ok(());
         }
-    } else {
-        s
+        if !x.is_finite() || self.n == self.v.len() {
+            return Err(Error::DistanceOverflow);
+        }
+        self.v[self.n] = x;
+        self.n += 1;
+        Ok(())
     }
+
+    fn parts(&self) -> &[f64] {
+        &self.v[..self.n]
+    }
+
+    fn grow(&mut self, x: f64) -> Result<(), Error> {
+        if x == 0.0 {
+            return Ok(());
+        }
+        if !x.is_finite() {
+            return Err(Error::DistanceOverflow);
+        }
+        let mut q = x;
+        let mut out = Expansion::new();
+        for &term in self.parts() {
+            let (s, h) = two_sum(q, term);
+            if !s.is_finite() {
+                return Err(Error::DistanceOverflow);
+            }
+            out.push(h)?;
+            q = s;
+        }
+        out.push(q)?;
+        *self = out;
+        Ok(())
+    }
+}
+
+/// Error-free transformation of `a + b`.
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let bb = s - a;
+    let e = (a - (s - bb)) + (b - bb);
+    (s, e)
+}
+
+fn open_expansion(x: f64, y: f64) -> Result<Expansion, Error> {
+    if !(x - y).is_finite() {
+        return Err(Error::DistanceOverflow);
+    }
+    let (hi, lo) = two_sum(x, -y);
+    let mut exp = Expansion::new();
+    exp.push(lo)?;
+    exp.push(hi)?;
+    Ok(exp)
+}
+
+fn add_expansion_square(acc: &mut DyadicSum, exp: &Expansion) {
+    for (i, &left) in exp.parts().iter().enumerate() {
+        let (mi, ei) = dyadic::decode_f64(left);
+        acc.add_mant(mi * mi, ei * 2);
+        for &right in exp.parts().iter().skip(i + 1) {
+            let (mj, ej) = dyadic::decode_f64(right);
+            acc.add_mant(mi * mj * 2, ei + ej);
+        }
+    }
+}
+
+fn sum_axis_squares(parts: &[Expansion]) -> Result<f64, Error> {
+    let mut acc = DyadicSum::new();
+    for exp in parts {
+        add_expansion_square(&mut acc, exp);
+    }
+    acc.round_nearest()
+}
+
+/// Sign of `2 * sum(exp) - period`: positive means the sum is above `period / 2`.
+fn twice_minus_period(exp: &Expansion, period: f64) -> i8 {
+    let mut acc = DyadicSum::new();
+    for &term in exp.parts() {
+        let (m, e) = dyadic::decode_f64(term);
+        acc.add_mant(m * 2, e);
+    }
+    let (ml, el) = dyadic::decode_f64(period);
+    acc.add_mant(-ml, el);
+    acc.signum()
+}
+
+/// Sign of `2 * sum(exp) + period`: negative means the sum is below `-period / 2`.
+fn twice_plus_period(exp: &Expansion, period: f64) -> i8 {
+    let mut acc = DyadicSum::new();
+    for &term in exp.parts() {
+        let (m, e) = dyadic::decode_f64(term);
+        acc.add_mant(m * 2, e);
+    }
+    let (ml, el) = dyadic::decode_f64(period);
+    acc.add_mant(ml, el);
+    acc.signum()
+}
+
+/// Exact circular distance as a sum of binary64 terms.
+///
+/// Each coordinate is reduced with the IEEE remainder first, and only so the
+/// subtraction stays finite. The remainder of the difference is what is
+/// folded into `[-L/2, L/2]`. A coordinate is never reflected by subtracting
+/// `L` before that difference exists.
+fn periodic_expansion(x: f64, y: f64, l: f64) -> Result<Expansion, Error> {
+    let mut rx = x % l;
+    let mut ry = y % l;
+    if !rx.is_finite() || !ry.is_finite() {
+        return Err(Error::DistanceOverflow);
+    }
+    if !(rx - ry).is_finite() {
+        if rx.abs() >= ry.abs() {
+            rx = shift_toward_zero(rx, l)?;
+        } else {
+            ry = shift_toward_zero(ry, l)?;
+        }
+        if !(rx - ry).is_finite() {
+            return Err(Error::DistanceOverflow);
+        }
+    }
+    let (hi, lo) = two_sum(rx, -ry);
+    let mut exp = Expansion::new();
+    exp.push(lo)?;
+    exp.push(hi)?;
+    for _ in 0..4 {
+        if twice_minus_period(&exp, l) > 0 {
+            exp.grow(-l)?;
+        } else if twice_plus_period(&exp, l) < 0 {
+            exp.grow(l)?;
+        } else {
+            return Ok(exp);
+        }
+    }
+    Err(Error::DistanceOverflow)
+}
+
+fn shift_toward_zero(r: f64, l: f64) -> Result<f64, Error> {
+    let s = if r > 0.0 { r - l } else { r + l };
+    if s.is_finite() {
+        Ok(s)
+    } else {
+        Err(Error::DistanceOverflow)
+    }
+}
+
+/// Greatest binary64 that does not exceed the absolute value of `exp`.
+fn expansion_abs_down(exp: &Expansion) -> f64 {
+    if exp.n == 0 {
+        return 0.0;
+    }
+    let mut probe = DyadicSum::new();
+    for &term in exp.parts() {
+        let (m, e) = dyadic::decode_f64(term);
+        probe.add_mant(m, e);
+    }
+    let sign = probe.signum();
+    if sign == 0 {
+        return 0.0;
+    }
+    let mut acc = DyadicSum::new();
+    for &term in exp.parts() {
+        let (m, e) = dyadic::decode_f64(term);
+        let m = if sign < 0 { -m } else { m };
+        acc.add_mant(m, e);
+    }
+    acc.round_down()
 }
 
 /// Lower bound on `a+b` for non-negative terms.
@@ -284,61 +440,105 @@ impl PeriodicSpace {
         Self::new(out)
     }
 
-    /// Reduce one finite coordinate into `[0, L)`.
+    /// Representative in `[0, L)`.
     ///
-    /// `rem_euclid` is the IEEE remainder. It is the exact mathematical
-    /// residue whenever that residue is a binary64 number, and it lands in
-    /// `[0, L)`. A residue closer to `L` than to any smaller binary64 value
-    /// is returned as `L`; on the circle that seam is the same point as `0`,
-    /// so the representative stored here is `0`. A value already in `[0, L)`
-    /// is unchanged, and `-0` becomes `+0`.
+    /// The absolute value is reduced with the IEEE remainder. A negative
+    /// input then uses `L - r` when that difference lies in `(0, L)`. A
+    /// negative offset smaller than half an ulp of `L` becomes `0` here.
+    /// [`Metric::dist2`] does not read this representative.
     fn canon(x: f64, l: f64) -> Result<f64, Error> {
-        let y = x.rem_euclid(l);
-        if !y.is_finite() {
-            return Err(Error::Overflow);
+        let r = x.abs() % l;
+        if !r.is_finite() {
+            return Err(Error::DistanceOverflow);
         }
-        if y > 0.0 && y < l {
-            Ok(y)
+        if x >= 0.0 || r == 0.0 {
+            if r > 0.0 && r < l {
+                Ok(r)
+            } else {
+                Ok(0.0)
+            }
         } else {
+            let y = l - r;
+            if !y.is_finite() {
+                return Err(Error::DistanceOverflow);
+            }
+            if y > 0.0 && y < l {
+                Ok(y)
+            } else {
+                Ok(0.0)
+            }
+        }
+    }
+
+    /// Minimum-image representative in `[-L/2, L/2]`, with `+L/2` mapped to `-L/2`.
+    ///
+    /// `r` is the IEEE remainder of `|x|`, which is exact. `L - r` is formed
+    /// only when `r >= L/2`, where Sterbenz' lemma makes it exact. A negative
+    /// `x` with `r < L/2` stays negative. It is not passed through
+    /// `rem_euclid`, which would add `L` and round a small gap up to `L`.
+    fn minimum_image(x: f64, l: f64) -> Result<f64, Error> {
+        let ax = x.abs();
+        if !ax.is_finite() {
+            return Err(Error::DistanceOverflow);
+        }
+        let r = ax % l;
+        if !r.is_finite() {
+            return Err(Error::DistanceOverflow);
+        }
+        if r == 0.0 {
+            return Ok(0.0);
+        }
+        let twice = r + r;
+        let image = if twice.is_finite() && twice == l {
+            -r
+        } else if !twice.is_finite() || twice > l {
+            let alt = l - r;
+            if !(alt.is_finite() && alt >= 0.0) {
+                return Err(Error::DistanceOverflow);
+            }
+            if x >= 0.0 {
+                -alt
+            } else {
+                alt
+            }
+        } else if x < 0.0 {
+            -r
+        } else {
+            r
+        };
+        // A full period is the same point as 0. `0.5 * L` underflows for a
+        // subnormal period, and a comparison with that zero used to return `-L`.
+        if !image.is_finite() {
+            return Err(Error::DistanceOverflow);
+        }
+        if image == l || image == -l {
             Ok(0.0)
+        } else {
+            Ok(image)
         }
     }
 
-    /// Circular distance of two representatives in `[0, L)`.
+    /// Lower bound on the absolute circular distance.
     ///
-    /// For `0 <= a < L` and `0 <= b < L`, `|fl(a-b)|` is strictly below `L`
-    /// (the largest difference of such values is `nextDown(L)`, and it does
-    /// not round up to `L`). The real circular distance is 1-Lipschitz in that
-    /// difference, the subtraction errs by at most `u*L`, and `fl(L - w)`
-    /// adds another `u*L`. The seam representative `0` stands for a true
-    /// residue within half an ulp of `L`, which adds at most one ulp. The
-    /// computed result therefore lies within `4*ulp(L)` of the real circular
-    /// distance of the original coordinates.
-    fn circular(a: f64, b: f64, l: f64) -> Result<f64, Error> {
-        let mut w = (a - b).abs();
-        if !w.is_finite() {
-            return Err(Error::Overflow);
-        }
-        if w >= l {
-            w = 0.0;
-        }
-        let alt = l - w;
-        if !alt.is_finite() {
-            return Err(Error::Overflow);
-        }
-        Ok(if alt < w { alt } else { w })
+    /// The value is the greatest binary64 that does not exceed the exact
+    /// short image of `x - y`. It is not a difference of coordinates that
+    /// were reflected before the subtraction.
+    fn circular_abs(x: f64, y: f64, l: f64) -> Result<f64, Error> {
+        Ok(expansion_abs_down(&periodic_expansion(x, y, l)?))
     }
 
-    /// Absolute prune slack: periodic residue error plus square underflow.
+    /// Absolute prune slack: a periodic term plus the square-underflow floor.
     ///
-    /// `η_i = 4 * ulp(L_i)` and `||η||_2 <= sqrt(n) * max η_i`. The product
-    /// of squares is never formed, so a tiny period cannot underflow the
-    /// slack to zero. Eight times that norm covers a three-distance defect
-    /// of `3 * ||η||_2` and rounding of the slack. The square-underflow
-    /// floor is added on top.
+    /// The floor is an upper bound. A positive binary64 whose square
+    /// underflows is strictly below `2^-537`. The periodic term is
+    /// `8 * sqrt(p) * max(4 * ulp(L_i))`, where `p` is the number of
+    /// periodic axes (not the point count). The products are rounded
+    /// upward and no product of squares is formed, so a tiny period cannot
+    /// zero the term. It is a prune guard, not a claim that `dist2` errs by
+    /// `4 * ulp(L)`.
     fn proven_slack(periods: &[Option<f64>]) -> f64 {
         let mut max_eta = 0.0_f64;
-        let mut n_periodic = 0.0_f64;
+        let mut periodic_axes = 0.0_f64;
         for period in periods {
             let Some(l) = *period else {
                 continue;
@@ -350,13 +550,13 @@ impl PeriodicSpace {
             if eta > max_eta {
                 max_eta = eta;
             }
-            n_periodic += 1.0;
+            periodic_axes += 1.0;
         }
         let under = square_underflow_floor(periods.len());
-        if n_periodic == 0.0 || max_eta == 0.0 {
+        if periodic_axes == 0.0 || max_eta == 0.0 {
             return under;
         }
-        let norm = mul_up(next_up(n_periodic.sqrt()), max_eta);
+        let norm = mul_up(next_up(periodic_axes.sqrt()), max_eta);
         let periodic = mul_up(8.0, norm);
         add_up(periodic, under)
     }
@@ -378,22 +578,7 @@ impl PeriodicSpace {
             return Err(Error::BadDimensions);
         }
         Ok(match self.periods[axis] {
-            Some(l) => {
-                let y = Self::canon(delta, l)?;
-                let half = 0.5 * l;
-                if !half.is_finite() {
-                    return Err(Error::Overflow);
-                }
-                if y >= half {
-                    let z = y - l;
-                    if !z.is_finite() {
-                        return Err(Error::Overflow);
-                    }
-                    z
-                } else {
-                    y
-                }
-            }
+            Some(l) => Self::minimum_image(delta, l)?,
             None => delta,
         })
     }
@@ -438,55 +623,45 @@ impl PeriodicSpace {
 
     /// Lower bound on the absolute circular distance from `x` to `[lo, hi]`.
     ///
-    /// The bound is zero when the interval may cover a full period, when `x`
-    /// may lie on the arc, or when the gap is inside `4 * ulp(L)`. Otherwise
-    /// it is that gap rounded down. It is a lower bound, not a tight one.
+    /// A degenerate interval uses [`Self::circular_abs`], the same remainder
+    /// as `dist2`, so a small gap on a huge period stays positive. A wider
+    /// interval is zero when its width may reach half a period. Otherwise the
+    /// bound is the distance to the nearer endpoint when `x` is off the short
+    /// arc between the endpoints, and zero when it may lie on that arc.
     fn periodic_axis_lower_abs(&self, x: f64, lo: f64, hi: f64, l: f64) -> f64 {
         let w = hi - lo;
         if !w.is_finite() || w < 0.0 || !l.is_finite() || l <= 0.0 {
             return 0.0;
         }
-        let w_up = if w == 0.0 {
-            0.0
-        } else {
-            let up = w + ulp_at(w);
-            if !up.is_finite() {
-                return 0.0;
-            }
-            up
-        };
-        if w_up >= l {
-            return 0.0;
-        }
-        let (Ok(base), Ok(xw)) = (Self::canon(lo, l), Self::canon(x, l)) else {
+        let Ok(d_lo) = Self::circular_abs(x, lo, l) else {
             return 0.0;
         };
-        let mut rel = xw - base;
-        if rel < 0.0 {
-            rel += l;
+        if w == 0.0 {
+            return diff_down(d_lo, 0.0);
         }
-        if !rel.is_finite() {
+        let w_up = w + ulp_at(w);
+        if !w_up.is_finite() || w_up >= l {
             return 0.0;
         }
-        // Residue representatives and `rel` each miss the true forward
-        // distance by at most two ulps of `L`, and the gap subtraction adds
-        // half an ulp. Four ulps cover that. The threshold and the returned
-        // gap are rounded so this function cannot land above the true gap.
-        let budget = mul_up(4.0, ulp_at(l));
-        if !budget.is_finite() || rel <= add_up(w_up, budget) {
+        let half = l * 0.5;
+        if !half.is_finite() || w_up > half {
             return 0.0;
         }
-        let gap_fwd = rel - w_up;
-        let gap_back = l - rel;
-        let gap = if gap_fwd < gap_back {
-            gap_fwd
-        } else {
-            gap_back
+        let (Ok(d_hi), Ok(span)) = (Self::circular_abs(x, hi, l), Self::circular_abs(lo, hi, l))
+        else {
+            return 0.0;
         };
-        if !gap.is_finite() || gap <= 0.0 {
+        let sum = d_lo + d_hi;
+        if !sum.is_finite() {
             return 0.0;
         }
-        diff_down(gap, budget)
+        let near = if d_lo < d_hi { d_lo } else { d_hi };
+        let scale = sum.max(span).max(near);
+        let tol = mul_up(8.0, ulp_at(scale));
+        if !tol.is_finite() || sum <= add_up(span, tol) {
+            return 0.0;
+        }
+        diff_down(near, 0.0)
     }
 
     fn check_point_shape(&self, p: &[f64]) -> Result<(), Error> {
@@ -512,22 +687,11 @@ impl Metric<f64> for Euclidean {
         if !a.iter().all(|x| x.is_finite()) || !b.iter().all(|x| x.is_finite()) {
             return Err(Error::NonFinite);
         }
-        let mut s = 0.0;
+        let mut parts = Vec::with_capacity(self.dims);
         for (x, y) in a.iter().zip(b.iter()) {
-            let d = *x - *y;
-            if !d.is_finite() {
-                return Err(Error::Overflow);
-            }
-            let term = d * d;
-            if !term.is_finite() {
-                return Err(Error::Overflow);
-            }
-            s += term;
-            if !s.is_finite() {
-                return Err(Error::Overflow);
-            }
+            parts.push(open_expansion(*x, *y)?);
         }
-        Ok(s)
+        sum_axis_squares(&parts)
     }
 
     fn distance(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {
@@ -599,31 +763,16 @@ impl Metric<f64> for PeriodicSpace {
     fn dist2(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {
         self.check_point_shape(a)?;
         self.check_point_shape(b)?;
-        let mut s = 0.0;
+        let mut parts = Vec::with_capacity(self.periods.len());
         for i in 0..self.periods.len() {
-            let d = if let Some(l) = self.periods[i] {
-                // IEEE residue in [0, L). Exact when that residue is a
-                // binary64 number; the seam `L` is stored as `0`.
-                let aw = Self::canon(a[i], l)?;
-                let bw = Self::canon(b[i], l)?;
-                Self::circular(aw, bw, l)?
+            let exp = if let Some(l) = self.periods[i] {
+                periodic_expansion(a[i], b[i], l)?
             } else {
-                let w = (a[i] - b[i]).abs();
-                if !w.is_finite() {
-                    return Err(Error::Overflow);
-                }
-                w
+                open_expansion(a[i], b[i])?
             };
-            let term = d * d;
-            if !term.is_finite() {
-                return Err(Error::Overflow);
-            }
-            s += term;
-            if !s.is_finite() {
-                return Err(Error::Overflow);
-            }
+            parts.push(exp);
         }
-        Ok(s)
+        sum_axis_squares(&parts)
     }
 
     fn distance(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {
@@ -693,20 +842,6 @@ impl Metric<f64> for PeriodicSpace {
         Ok(())
     }
 
-    fn write_canonical(&self, src: &[f64], dst: &mut [f64]) -> Result<(), Error> {
-        self.check_point_shape(src)?;
-        if dst.len() != src.len() {
-            return Err(Error::BadDimensions);
-        }
-        for i in 0..src.len() {
-            dst[i] = match self.periods[i] {
-                Some(l) => Self::canon(src[i], l)?,
-                None => src[i],
-            };
-        }
-        Ok(())
-    }
-
     fn vp_absolute_slack(&self) -> f64 {
         Self::proven_slack(&self.periods)
     }
@@ -716,27 +851,6 @@ impl Metric<f64> for PeriodicSpace {
 mod tests {
     use super::{Euclidean, Metric, PeriodicSpace};
     use crate::Error;
-
-    fn brute_axis_min_dist2(x: f64, lo: f64, hi: f64, l: f64) -> f64 {
-        if hi - lo >= l {
-            return 0.0;
-        }
-        let mut best = f64::INFINITY;
-        let steps = 20_000usize;
-        for t in 0..=steps {
-            let y = lo + (hi - lo) * (t as f64 / steps as f64);
-            let mut d = x - y;
-            d = d - l * (d / l).trunc();
-            if d < 0.0 {
-                d += l;
-            }
-            if d >= 0.5 * l {
-                d -= l;
-            }
-            best = best.min(d * d);
-        }
-        best
-    }
 
     #[test]
     fn delta_tie_maps_plus_half_to_minus_half() {
@@ -763,53 +877,6 @@ mod tests {
         assert_eq!(metric.dist2(&a, &a).unwrap(), 0.0);
         assert_eq!(metric.dist2(&b, &b).unwrap(), 0.0);
         assert_eq!(metric.dist2(&a, &b).unwrap(), metric.dist2(&b, &a).unwrap());
-    }
-
-    #[test]
-    fn axis_bound_is_sound_for_wide_periodic_intervals() {
-        let metric = PeriodicSpace::new(vec![Some(7.0)]).unwrap();
-        for i in 0..512 {
-            let x = -40.0 + 80.0 * (i as f64 / 511.0);
-            let lo = -30.0 + 0.13 * i as f64;
-            let width = 3.6 + (i % 17) as f64 * 0.22;
-            let hi = lo + width;
-            let got = metric.axis_min_dist2(x, lo, hi, 0).unwrap();
-            let want = brute_axis_min_dist2(x, lo, hi, 7.0);
-            assert!(got <= want + 1.0e-9);
-            if hi - lo >= 7.0 {
-                assert_eq!(got, 0.0);
-            }
-        }
-    }
-
-    #[test]
-    fn aabb_bound_is_sound_for_periodic_boxes() {
-        let metric = PeriodicSpace::new(vec![Some(5.0), Some(9.0), None]).unwrap();
-        for i in 0..256 {
-            let p = [
-                -12.0 + i as f64 * 0.17,
-                7.0 - i as f64 * 0.09,
-                -2.0 + i as f64 * 0.03,
-            ];
-            let lo = [-8.0 + i as f64 * 0.01, -5.0, -1.0];
-            let hi = [lo[0] + 3.2 + (i % 11) as f64 * 0.35, 8.0, 2.0];
-            let lb = metric.aabb_min_dist2(&p, &lo, &hi).unwrap();
-            let mut worst_violation = 0.0f64;
-            for a in 0..20 {
-                for b in 0..20 {
-                    for c in 0..20 {
-                        let q = [
-                            lo[0] + (hi[0] - lo[0]) * a as f64 / 19.0,
-                            lo[1] + (hi[1] - lo[1]) * b as f64 / 19.0,
-                            lo[2] + (hi[2] - lo[2]) * c as f64 / 19.0,
-                        ];
-                        let d2 = metric.dist2(&p, &q).unwrap();
-                        worst_violation = worst_violation.max(lb - d2);
-                    }
-                }
-            }
-            assert!(worst_violation <= 1.0e-9);
-        }
     }
 
     fn periodic_ref_axis(a: i64, b: i64, period: Option<i64>) -> i64 {
@@ -850,15 +917,26 @@ mod tests {
     fn finite_overflow_in_dist2_is_error() {
         // Half a huge period is finite, and its square is not.
         let periodic = PeriodicSpace::new(vec![Some(1.0e200)]).unwrap();
-        assert_eq!(periodic.dist2(&[0.0], &[6.0e199]), Err(Error::Overflow));
+        assert_eq!(
+            periodic.dist2(&[0.0], &[6.0e199]),
+            Err(Error::DistanceOverflow)
+        );
 
         // ±L are the same point on the circle. The raw difference overflows,
         // and the exact remainder does not: both residues are 0.
         let images = PeriodicSpace::new(vec![Some(1.0e308)]).unwrap();
         assert_eq!(images.dist2(&[1.0e308], &[-1.0e308]).unwrap(), 0.0);
 
+        // The raw difference overflows. Each coordinate is reduced modulo 10
+        // first: both remainders are 2, and the squared gap is 16.
+        let reduced = PeriodicSpace::new(vec![Some(10.0)]).unwrap();
+        assert_eq!(reduced.dist2(&[1.7e308], &[-1.7e308]).unwrap(), 16.0);
+
         let euclid = Euclidean::new(1).unwrap();
-        assert_eq!(euclid.dist2(&[1.0e308], &[-1.0e308]), Err(Error::Overflow));
+        assert_eq!(
+            euclid.dist2(&[1.0e308], &[-1.0e308]),
+            Err(Error::DistanceOverflow)
+        );
     }
 
     #[test]
@@ -914,10 +992,39 @@ mod tests {
         assert_eq!(m1.dist2(&[0.0], &[0.5]).unwrap(), 0.25);
         let below = f64::from_bits(1.0f64.to_bits() - 1);
         assert_eq!(m1.dist2(&[0.0], &[below]).unwrap(), 2.0f64.powi(-106));
-        // -1e-20 is closer to 0 than half an ulp of L=1, so the seam stores 0.
-        let half_ulp = 0.5 * (1.0 - below);
-        assert!(1.0e-20 < half_ulp);
-        assert_eq!(m1.dist2(&[0.0], &[-1.0e-20]).unwrap(), 0.0);
+        // -1e-20 is below half an ulp of L=1, so the `[0, L)` wrap snaps to 0.
+        // The distance keeps the representable gap.
+        let tiny = -1.0e-20_f64;
+        assert!(tiny.abs() < 0.5 * (1.0 - below));
+        assert_eq!(m1.wrap_point_axis(tiny, 0).unwrap(), 0.0);
+        assert_eq!(m1.dist2(&[0.0], &[tiny]).unwrap(), tiny.abs() * tiny.abs());
+        assert_ne!(m1.dist2(&[0.0], &[tiny]).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn huge_period_keeps_small_negative_delta() {
+        let cases = [
+            (2.0f64.powi(53), -0.5, 0.25),
+            (1.0e16, -1.0, 1.0),
+            (1.0e300, -1.0, 1.0),
+            (0.1 * 2.0f64.powi(60), -0.125, 0.015625),
+        ];
+        for (l, x, want) in cases {
+            let metric = PeriodicSpace::new(vec![Some(l)]).unwrap();
+            assert_eq!(metric.dist2(&[x], &[0.0]).unwrap(), want, "L={l:e}");
+            assert_eq!(metric.dist2(&[0.0], &[x]).unwrap(), want, "L={l:e}");
+            let bound = metric.axis_min_dist2(x, 0.0, 0.0, 0).unwrap();
+            assert!(bound > 0.0 && bound <= want, "bound {bound} want {want}");
+        }
+        let wide = PeriodicSpace::new(vec![Some(1.0e16), Some(1.0e16)]).unwrap();
+        let axis = wide.axis_min_dist2(-1.0, 0.0, 0.0, 0).unwrap();
+        assert!(axis > 0.0 && axis <= 1.0, "{axis}");
+        let lb = wide
+            .aabb_min_dist2(&[-1.0, -0.5], &[0.0, 0.0], &[0.0, 0.0])
+            .unwrap();
+        assert!(lb > 0.0 && lb <= 1.25, "{lb}");
+        let image = PeriodicSpace::new(vec![Some(2.0f64.powi(53))]).unwrap();
+        assert_eq!(image.wrap_delta_axis(-0.5, 0).unwrap(), -0.5);
     }
 
     #[test]
@@ -968,19 +1075,67 @@ mod tests {
             .aabb_min_dist2(&[x, 0.0], &[3.0, 3.0], &[5.0, 5.0])
             .unwrap();
         assert!(lb > 0.0 && lb <= 18.0, "{lb}");
+    }
 
-        let lo = 0.3;
-        let hi = 1.7;
-        let bound = seven.axis_min_dist2(x, lo, hi, 0).unwrap();
-        let mut nearest = f64::INFINITY;
-        for i in 0..=4_000 {
-            let y = lo + (hi - lo) * (i as f64 / 4_000.0);
-            nearest = nearest.min(seven.dist2(&[x], &[y]).unwrap());
+    #[test]
+    fn sum_of_squares_matches_a_binary64_total() {
+        let u = 2.0_f64.powi(-27);
+        let p = [1.0 + u, u, u, u];
+        let z = [0.0; 4];
+        let exact = 1.0 + 2.0_f64.powi(-26) + 2.0_f64.powi(-52);
+        let got = Euclidean::new(4).unwrap().dist2(&p, &z).unwrap();
+        assert_eq!(got.to_bits(), exact.to_bits());
+    }
+
+    #[test]
+    fn difference_residue_keeps_gaps_that_straddle_half_period() {
+        // ulp(2^52) is 1, so a half-unit gap at L/2 is not a binary64 coordinate.
+        // The adjacent representable point is one unit away and must stay one unit.
+        let l = 2.0_f64.powi(53);
+        let half = 2.0_f64.powi(52);
+        let m = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        assert_eq!(m.dist2(&[half - 1.0], &[half]).unwrap(), 1.0);
+        assert_eq!(m.dist2(&[half + 1.0], &[half]).unwrap(), 1.0);
+        // Two periods of length 4 keep the integer gap representable.
+        let l4 = 4.0_f64;
+        let m4 = PeriodicSpace::new(vec![Some(l4)]).unwrap();
+        assert_eq!(m4.dist2(&[1.0 + 2.0 * l4], &[2.0]).unwrap(), 1.0);
+        // A 1.5 gap is representable one binade lower.
+        let l52 = 2.0_f64.powi(52);
+        let half52 = 2.0_f64.powi(51);
+        let m52 = PeriodicSpace::new(vec![Some(l52)]).unwrap();
+        assert_ne!(half52 - 1.5, half52);
+        assert_eq!(m52.dist2(&[half52 - 1.5], &[half52]).unwrap(), 2.25);
+
+        let wide = PeriodicSpace::new(vec![Some(1.0e16)]).unwrap();
+        assert_eq!(
+            wide.dist2(&[-5.0e15], &[4_999_999_999_999_999.0]).unwrap(),
+            1.0
+        );
+        assert_eq!(wide.wrap_delta_axis(-1.0, 0).unwrap(), -1.0);
+
+        let huge = PeriodicSpace::new(vec![Some(1.0e300)]).unwrap();
+        assert_eq!(
+            huge.dist2(&[-5.0e299], &[4.999_999_999_999_999_5e299])
+                .unwrap_err(),
+            Error::DistanceOverflow
+        );
+        let finite = PeriodicSpace::new(vec![Some(1.0e308)]).unwrap();
+        assert_eq!(finite.dist2(&[1.0], &[0.0]).unwrap(), 1.0);
+        assert_eq!(finite.dist2(&[1.0e308], &[-1.0e308]).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn wrap_delta_does_not_return_a_full_subnormal_period() {
+        let l = 5.0e-324_f64;
+        let m = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        for &x in &[0.0_f64, l, -l, 1.0, -1.0, f64::MIN_POSITIVE, 1.0e300] {
+            let got = m.wrap_delta_axis(x, 0).unwrap();
+            assert!(got.is_finite(), "{x:e} -> {got}");
+            assert_ne!(got, -l, "{x:e} returned -L");
+            assert_ne!(got, l, "{x:e} returned L");
         }
-        assert!(bound <= nearest, "{bound} > {nearest}");
-
-        let open_edge = open.axis_min_dist2(x, x + 0.3, x + 0.7, 0).unwrap();
-        let endpoint = open.dist2(&[x], &[x + 0.3]).unwrap();
-        assert!(open_edge <= endpoint, "{open_edge} > {endpoint}");
+        let tiny = PeriodicSpace::new(vec![Some(1.0e-10)]).unwrap();
+        assert!(tiny.wrap_delta_axis(1.0e300, 0).unwrap().is_finite());
     }
 }

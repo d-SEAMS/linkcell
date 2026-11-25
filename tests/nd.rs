@@ -1,4 +1,7 @@
-use linkcell::{ContiguousSpace, Metric, NeighbourIndex, PeriodicSpace, VpTreeIndex};
+use linkcell::{ContiguousSpace, Error, Metric, NeighbourIndex, PeriodicSpace, VpTreeIndex};
+
+#[path = "common/rational.rs"]
+mod rational;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -11,33 +14,6 @@ fn build_index<'a>(
     let space = ContiguousSpace::from_row_major(data, n, d).unwrap();
     let metric = PeriodicSpace::new(periods.to_vec()).unwrap();
     VpTreeIndex::new(space, metric).unwrap()
-}
-
-fn brute_axis_min_dist2(x: f64, lo: f64, hi: f64, period: Option<f64>) -> f64 {
-    if let Some(l) = period {
-        if hi - lo >= l {
-            return 0.0;
-        }
-        let mut best = f64::INFINITY;
-        let steps = 8_000usize;
-        for t in 0..=steps {
-            let y = lo + (hi - lo) * (t as f64 / steps as f64);
-            let mut d = x - y;
-            d = d - l * (d / l).trunc();
-            if d < 0.0 {
-                d += l;
-            }
-            d = d.min(l - d);
-            best = best.min(d * d);
-        }
-        best
-    } else if x < lo {
-        (lo - x) * (lo - x)
-    } else if x > hi {
-        (x - hi) * (x - hi)
-    } else {
-        0.0
-    }
 }
 
 fn brute_knn(
@@ -206,7 +182,7 @@ fn random_knn_and_within_match_bruteforce() {
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want.iter()) {
             assert_eq!(g.index, w.0);
-            assert!((g.dist2 - w.1).abs() < 1e-12);
+            assert_eq!(g.dist2.to_bits(), w.1.to_bits());
         }
 
         let r = rng.random_range(0.1..4.0);
@@ -215,7 +191,7 @@ fn random_knn_and_within_match_bruteforce() {
         assert_eq!(got_w.len(), want_w.len());
         for (g, w) in got_w.iter().zip(want_w.iter()) {
             assert_eq!(g.index, w.0);
-            assert!((g.dist2 - w.1).abs() < 1e-12);
+            assert_eq!(g.dist2.to_bits(), w.1.to_bits());
         }
     }
 }
@@ -261,7 +237,7 @@ fn many_seeds_cover_edge_cases_and_ties() {
                     assert_eq!(got.len(), want.len());
                     for (g, w) in got.iter().zip(&want) {
                         assert_eq!(g.index, w.0);
-                        assert!((g.dist2 - w.1).abs() < 1e-12);
+                        assert_eq!(g.dist2.to_bits(), w.1.to_bits());
                     }
                 }
                 let zero = idx.within(q, 0.0).unwrap();
@@ -440,9 +416,9 @@ fn exact_boundary_queries_match_oracle_on_open_integer_lattice() {
 }
 
 #[test]
-fn metric_bounds_are_sound_for_unwrapped_and_wide_intervals() {
+fn axis_and_aabb_bounds_do_not_exceed_the_rational_distance() {
     let mut rng = StdRng::seed_from_u64(999);
-    for _ in 0..600 {
+    for _ in 0..400 {
         let l = rng.random_range(2.0..13.0);
         let metric = PeriodicSpace::new(vec![Some(l), None]).unwrap();
         let x = rng.random_range(-90.0..90.0);
@@ -450,27 +426,44 @@ fn metric_bounds_are_sound_for_unwrapped_and_wide_intervals() {
         let width = rng.random_range(0.0..(2.5 * l));
         let hi = lo + width;
         let got = metric.axis_min_dist2(x, lo, hi, 0).unwrap();
-        let want = brute_axis_min_dist2(x, lo, hi, Some(l));
-        assert!(got <= want + 1.0e-9);
+        let exact = rational::periodic_interval_sq(x, lo, hi, l);
+        assert!(
+            rational::rat_from_f64(got) <= exact,
+            "axis bound {got} above the rational distance"
+        );
         if width >= l {
             assert_eq!(got, 0.0);
         }
 
-        let p = [x, rng.random_range(-8.0..8.0)];
-        let lo2 = [lo, -2.0];
-        let hi2 = [hi, 4.0];
-        let lb = metric.aabb_min_dist2(&p, &lo2, &hi2).unwrap();
-        let mut min_seen = f64::INFINITY;
-        for a in 0..80 {
-            for b in 0..40 {
-                let q = [
-                    lo2[0] + (hi2[0] - lo2[0]) * a as f64 / 79.0,
-                    lo2[1] + (hi2[1] - lo2[1]) * b as f64 / 39.0,
-                ];
-                min_seen = min_seen.min(metric.dist2(&p, &q).unwrap());
-            }
+        let y = rng.random_range(-8.0..8.0);
+        let y_lo = -2.0;
+        let y_hi = 4.0;
+        let lb = metric
+            .aabb_min_dist2(&[x, y], &[lo, y_lo], &[hi, y_hi])
+            .unwrap();
+        let exact_box = rational::periodic_interval_sq(x, lo, hi, l)
+            + rational::open_interval_sq(y, y_lo, y_hi);
+        assert!(
+            rational::rat_from_f64(lb) <= exact_box,
+            "box bound {lb} above the rational distance"
+        );
+    }
+
+    let witnesses = [
+        (10.0, 1.0e13, 3.0, 5.0),
+        (10.0, 2.0f64.powi(62), 0.0, 2.0),
+        (7.0, 1.0e13, 0.0, 1.0),
+        (1.0e16, -1.0, 0.0, 0.0),
+        (2.0f64.powi(53), -0.5, 0.0, 0.0),
+    ];
+    for (l, x, lo, hi) in witnesses {
+        let metric = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        let got = metric.axis_min_dist2(x, lo, hi, 0).unwrap();
+        let exact = rational::periodic_interval_sq(x, lo, hi, l);
+        assert!(rational::rat_from_f64(got) <= exact, "L={l:e} bound {got}");
+        if lo == hi {
+            assert!(got > 0.0, "degenerate bound collapsed");
         }
-        assert!(lb <= min_seen + 1.0e-9);
     }
 }
 
@@ -1069,16 +1062,11 @@ fn residue_f64(x: f64, l: f64) -> f64 {
     }
 }
 
+/// Circular square of two binary64 values, as a binary64 when that square is one.
+///
+/// The square is [`rational::periodic_sq`]. It does not call [`Metric::dist2`].
 fn periodic_dist2(a: f64, b: f64, l: f64) -> f64 {
-    let left = from_f64(residue_f64(a, l));
-    let right = from_f64(residue_f64(b, l));
-    let diff = sub_exact(left, right);
-    let ad = if diff.0 < 0 { (-diff.0, diff.1) } else { diff };
-    let period = from_f64(l);
-    let twice = (ad.0.checked_mul(2).unwrap(), ad.1);
-    let gap = sub_exact(period, twice);
-    let dist = if gap.0 < 0 { sub_exact(period, ad) } else { ad };
-    rounded_square(dist.0, dist.1)
+    rational::approx_f64(&rational::periodic_sq(a, b, l))
 }
 
 fn circ_i128(a: i128, b: i128, period: i128) -> i128 {
@@ -1258,6 +1246,9 @@ fn exact_residue_oracle_matches_neighbour_sets() {
     let f2q = [1.290897940786428e-154_f64];
     let f2r = 2.789359567281672e-153_f64;
     let f2_periods = [Some(l_tiny)];
+    // exact_dist2 is false: `periodic_dist2` falls back to `BigRational::to_f64`
+    // when the square is not a binary64 number, and that conversion is not a
+    // bit-identical promise. The check is the neighbour index set.
     assert_search_matches(&f2, 1, &f2_periods, &[&f2q], &[0.0, f2r], false, |a, b| {
         periodic_dist2(a[0], b[0], l_tiny)
     });
@@ -1347,9 +1338,14 @@ fn exact_residue_oracle_matches_neighbour_sets() {
     let seam_q = [0.0_f64];
     assert_eq!(periodic_dist2(0.0, 1.0, 1.0), 0.0);
     assert_eq!(periodic_dist2(0.0, -1.0, 1.0), 0.0);
-    assert_eq!(periodic_dist2(0.0, -1.0e-20, 1.0), 0.0);
+    let tiny_sq = periodic_dist2(0.0, -1.0e-20, 1.0);
+    assert_eq!(tiny_sq, open_dist2(0.0, -1.0e-20));
+    assert_ne!(tiny_sq, 0.0);
     assert_eq!(periodic_dist2(0.0, 0.5, 1.0), 0.25);
     assert_eq!(periodic_dist2(0.0, below, 1.0), 2.0f64.powi(-106));
+    // exact_dist2 is false for the same reason as the tiny-period set above:
+    // the rational fallback is not required to match `dist2` bit for bit, so
+    // only the neighbour indices are compared.
     assert_search_matches(
         &seam,
         1,
@@ -1359,4 +1355,394 @@ fn exact_residue_oracle_matches_neighbour_sets() {
         false,
         |a, b| periodic_dist2(a[0], b[0], 1.0),
     );
+}
+
+#[test]
+fn huge_period_negative_delta_repros() {
+    let specs = [
+        (2.0f64.powi(53), [-0.5, 0.0], 0.25),
+        (1.0e16, [-1.0, 0.0], 1.0),
+        (1.0e300, [-1.0, 0.0], 1.0),
+        (0.1 * 2.0f64.powi(60), [-0.125, 0.0], 0.015625),
+    ];
+    for (l, pair, want) in specs {
+        let metric = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        assert_eq!(metric.dist2(&pair[..1], &pair[1..]).unwrap(), want);
+        let bound = metric.axis_min_dist2(pair[0], pair[1], pair[1], 0).unwrap();
+        assert!(bound > 0.0 && bound <= want, "L={l:e} bound {bound}");
+    }
+
+    let period = 1.0e16;
+    let points = [-0.5_f64, 0.25];
+    let idx = build_index(&points, 2, 1, &[Some(period)]);
+    let nearest = idx.knn(&[0.0], 1).unwrap();
+    assert_eq!(nearest.len(), 1);
+    assert_eq!(nearest[0].index, 1);
+    assert_eq!(nearest[0].dist2, 0.0625);
+    let both = idx.knn(&[0.0], 2).unwrap();
+    assert_eq!(both[0].index, 1);
+    assert_eq!(both[0].dist2, 0.0625);
+    assert!(idx.within(&[0.0], 0.1).unwrap().is_empty());
+
+    let cluster = [-0.5_f64, 0.0, 0.5];
+    let db = build_index(&cluster, 3, 1, &[Some(period)])
+        .dbscan(0.4, 2)
+        .unwrap();
+    assert_eq!(db.labels, vec![-1, -1, -1]);
+    assert!(db.core.iter().all(|flag| !flag));
+    assert_eq!(db.clusters, 0);
+
+    let metric = PeriodicSpace::new(vec![Some(period)]).unwrap();
+    let axis = metric.axis_min_dist2(-1.0, 0.0, 0.0, 0).unwrap();
+    assert!(axis > 0.0 && axis <= 1.0, "{axis}");
+}
+
+#[test]
+fn huge_period_matches_exact_rational_reference() {
+    let coords = [
+        -4.0, -2.0, -1.0, -0.5, -0.25, -0.125, 0.0, 0.125, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0,
+    ];
+    let periods = [
+        2.0f64.powi(53),
+        2.0f64.powi(60),
+        2.0f64.powi(100),
+        2.0f64.powi(500),
+        2.0f64.powi(1023),
+        1.0e16,
+        1.0e300,
+        0.1 * 2.0f64.powi(60),
+        f64::MAX,
+    ];
+    for &l in &periods {
+        assert!(l >= 64.0 && l.is_finite());
+        let metric = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        let boxed = PeriodicSpace::new(vec![Some(l), Some(l)]).unwrap();
+        for &a in &coords {
+            for &b in &coords {
+                // |a - b| <= 8 and L/2 >= 32, so the circular distance is the
+                // open difference. The reference is that rational, not `dist2`.
+                let want = rational::periodic_sq(a, b, l);
+                let got = metric.dist2(&[a], &[b]).unwrap();
+                assert!(
+                    rational::eq_f64(&want, got),
+                    "L={l:e} a={a} b={b}: got {got:e}"
+                );
+                let bound = metric.axis_min_dist2(a, b, b, 0).unwrap();
+                assert!(
+                    rational::rat_from_f64(bound) <= want,
+                    "axis {bound} above the rational distance"
+                );
+                if !rational::eq_f64(&want, 0.0) {
+                    assert!(bound > 0.0, "collapsed axis L={l:e} a={a} b={b}");
+                }
+                let want_box = rational::periodic_sq(a, 0.0, l) + rational::periodic_sq(b, 0.0, l);
+                let lb = boxed
+                    .aabb_min_dist2(&[a, b], &[0.0, 0.0], &[0.0, 0.0])
+                    .unwrap();
+                assert!(
+                    rational::rat_from_f64(lb) <= want_box,
+                    "box {lb} above the rational distance"
+                );
+                if !rational::eq_f64(&want_box, 0.0) {
+                    assert!(lb > 0.0, "collapsed box L={l:e} a={a} b={b}");
+                }
+            }
+        }
+        assert_eq!(metric.dist2(&[l], &[0.0]).unwrap(), 0.0);
+        assert_eq!(metric.dist2(&[-l], &[0.0]).unwrap(), 0.0);
+    }
+
+    // One ulp below a power-of-two period. The rational reference is the
+    // integer circular distance, not `Metric::dist2`.
+    for exp in [53_u32, 60, 100] {
+        let l_i = 1_i128 << exp;
+        let ulp = 1_i128 << (exp - 52);
+        let x_i = l_i - ulp;
+        let gap = circ_i128(x_i, 0, l_i);
+        assert_eq!(gap, ulp);
+        let want = (gap * gap) as f64;
+        let metric = PeriodicSpace::new(vec![Some(l_i as f64)]).unwrap();
+        assert_eq!(metric.dist2(&[x_i as f64], &[0.0]).unwrap(), want);
+        let bound = metric.axis_min_dist2(x_i as f64, 0.0, 0.0, 0).unwrap();
+        assert!(bound > 0.0 && bound <= want, "{bound} {want}");
+        let exact = rational::periodic_interval_sq(x_i as f64, 0.0, 0.0, l_i as f64);
+        assert!(rational::rat_from_f64(bound) <= exact);
+    }
+}
+
+#[test]
+fn fmod_before_difference_keeps_seam_and_huge_magnitudes() {
+    let ten = PeriodicSpace::new(vec![Some(10.0)]).unwrap();
+    let huge = ten.dist2(&[1.7e308], &[-1.7e308]).unwrap();
+    assert_eq!(huge, 16.0);
+    assert!(rational::eq_f64(
+        &rational::periodic_sq(1.7e308, -1.7e308, 10.0),
+        huge
+    ));
+
+    let data = [-1.0e-20_f64, 0.0];
+    let idx = build_index(&data, 2, 1, &[Some(10.0)]);
+    let hit = idx.knn(&[0.0], 1).unwrap();
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].index, 1);
+    assert_eq!(hit[0].dist2, 0.0);
+
+    let r: f64 = 2.000000000000001e-3;
+    let near = PeriodicSpace::new(vec![Some(1.0)]).unwrap();
+    let d = near.dist2(&[0.999], &[0.001]).unwrap();
+    // The circular square is not a binary64 number. The computed square is
+    // the binary64 rounding of that rational, and it is the squared radius.
+    let exact = rational::periodic_sq(0.999, 0.001, 1.0);
+    assert_eq!(d.to_bits(), rational::approx_f64(&exact).to_bits());
+    assert_eq!(d.to_bits(), (r * r).to_bits());
+    let idx = build_index(&[0.999], 1, 1, &[Some(1.0)]);
+    let hits = idx.within(&[0.001], r).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].index, 0);
+    assert_eq!(hits[0].dist2.to_bits(), d.to_bits());
+}
+
+#[test]
+fn wrap_helpers_match_huge_multiples_modulo_the_period() {
+    let multiples = [
+        (2.0f64.powi(62), 10.0),
+        (-2.0f64.powi(62), 10.0),
+        (1.0e16, 10.0),
+        (-1.0e16, 10.0),
+        (1.7e308, 10.0),
+        (-1.7e308, 10.0),
+        (30.0, 10.0),
+        (-30.0, 10.0),
+        (1.0e16, 1.0e16),
+        (-1.0e16, 1.0e16),
+        (2.0f64.powi(53), 2.0f64.powi(53)),
+        (-2.0f64.powi(53), 2.0f64.powi(53)),
+        (2.0f64.powi(50) * 10.0, 10.0),
+        (-(2.0f64.powi(50) * 10.0), 10.0),
+    ];
+    for (x, l) in multiples {
+        let metric = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        let wrapped = metric.wrap_point_axis(x, 0).unwrap();
+        assert!(
+            rational::congruent(x, wrapped, l),
+            "wrap_point {x:e} -> {wrapped:e} mod {l:e}"
+        );
+        let delta = metric.wrap_delta_axis(x, 0).unwrap();
+        assert!(
+            rational::congruent(x, delta, l),
+            "wrap_delta {x:e} -> {delta:e} mod {l:e}"
+        );
+    }
+}
+
+#[test]
+fn min_pts_zero_and_distance_overflow_have_their_own_messages() {
+    let idx = build_index(&[0.0, 1.0], 2, 1, &[Some(1.0)]);
+    let min_pts = idx.dbscan(0.5, 0).unwrap_err();
+    assert_eq!(min_pts.to_string(), "min_pts must be at least 1");
+    let eps = idx.dbscan(0.0, 2).unwrap_err();
+    assert_eq!(eps.to_string(), "eps must be finite and strictly positive");
+    assert_ne!(min_pts.to_string(), eps.to_string());
+    assert_eq!(Error::Overflow.to_string(), "n * k overflows");
+    assert_eq!(Error::DistanceOverflow.to_string(), "distance overflowed");
+    assert_ne!(
+        Error::Overflow.to_string(),
+        Error::DistanceOverflow.to_string()
+    );
+    let wide = PeriodicSpace::new(vec![Some(1.0e200)]).unwrap();
+    assert_eq!(
+        wide.dist2(&[0.0], &[6.0e199]).unwrap_err(),
+        Error::DistanceOverflow
+    );
+}
+
+#[test]
+fn gaps_that_straddle_the_cut_keep_their_square() {
+    let l53 = 2.0f64.powi(53);
+    let half = 2.0f64.powi(52);
+    let m = PeriodicSpace::new(vec![Some(l53)]).unwrap();
+    assert_eq!(m.dist2(&[half - 1.0], &[half]).unwrap(), 1.0);
+    assert_eq!(m.dist2(&[half + 1.0], &[half]).unwrap(), 1.0);
+    let pair = [half - 1.0, half];
+    let shifted = build_index(&pair, 2, 1, &[Some(l53)]);
+    let hits = shifted.within(&[half], 1.0).unwrap();
+    assert_eq!(hits.len(), 2);
+    let triple = [half - 1.0, half, half + 1.0];
+    let db = build_index(&triple, 3, 1, &[Some(l53)])
+        .dbscan(1.5, 2)
+        .unwrap();
+    assert!(db.clusters >= 1);
+    let axis = m.axis_min_dist2(half - 1.0, half, half, 0).unwrap();
+    assert!(axis > 0.0 && axis <= 1.0, "{axis}");
+
+    let l16 = 1.0e16_f64;
+    let wide = PeriodicSpace::new(vec![Some(l16)]).unwrap();
+    let a = -5.0e15_f64;
+    let b = 4999999999999999.0_f64;
+    assert_eq!(wide.dist2(&[a], &[b]).unwrap(), 1.0);
+    let points = [a, b];
+    let idx = build_index(&points, 2, 1, &[Some(l16)]);
+    assert_eq!(idx.within(&[a], 0.5).unwrap().len(), 1);
+    assert_eq!(idx.knn(&[a], 2).unwrap()[1].dist2, 1.0);
+    assert!(idx.pairs_within(0.5).unwrap().is_empty());
+    assert_eq!(idx.dbscan(0.5, 2).unwrap().clusters, 0);
+    let bound = wide
+        .axis_min_dist2(
+            5.000000000000002e15,
+            4.999999999999999e15,
+            4.999999999999999e15,
+            0,
+        )
+        .unwrap();
+    assert!(bound <= 9.0, "{bound}");
+    assert_eq!(wide.wrap_delta_axis(-1.0, 0).unwrap(), -1.0);
+
+    let tiny_period = PeriodicSpace::new(vec![Some(1.0e-10)]).unwrap();
+    assert!(tiny_period.wrap_delta_axis(1.0e300, 0).unwrap().is_finite());
+    let sub = PeriodicSpace::new(vec![Some(5.0e-324)]).unwrap();
+    assert_ne!(sub.wrap_delta_axis(0.0, 0).unwrap(), -5.0e-324);
+
+    let huge = PeriodicSpace::new(vec![Some(1.0e300)]).unwrap();
+    assert_eq!(
+        huge.dist2(&[-5.0e299], &[4.9999999999999995e299])
+            .unwrap_err(),
+        Error::DistanceOverflow
+    );
+    let biggest = PeriodicSpace::new(vec![Some(1.0e308)]).unwrap();
+    assert_eq!(biggest.dist2(&[1.0], &[0.0]).unwrap(), 1.0);
+    assert!(biggest.dist2(&[0.0], &[1.0e308 * 0.5]).is_err());
+
+    let unit = PeriodicSpace::new(vec![Some(1.0)]).unwrap();
+    let near_half = unit
+        .dist2(&[4.999999999999974e-1], &[5.000000000000074e-1])
+        .unwrap();
+    let scale = 1.0095262545291237e-28_f64;
+    assert!((near_half / scale - 1.0).abs() < 1e-12, "{near_half:e}");
+
+    let near_cut = [-0.5_f64, 0.49999999999999994];
+    let dup = build_index(&near_cut, 2, 1, &[Some(1.0)]);
+    assert_eq!(dup.within(&[-0.5], 0.0).unwrap().len(), 1);
+
+    let open = linkcell::Euclidean::new(4).unwrap();
+    let u = 2.0f64.powi(-27);
+    let exact = 1.0 + 2.0f64.powi(-26) + 2.0f64.powi(-52);
+    assert_eq!(
+        open.dist2(&[1.0 + u, u, u, u], &[0.0; 4])
+            .unwrap()
+            .to_bits(),
+        exact.to_bits()
+    );
+}
+
+#[test]
+fn straddling_fold_matches_the_rational_square() {
+    let periods = [
+        1.0,
+        7.0,
+        0.1,
+        3.0,
+        1.0e16,
+        2.0f64.powi(53),
+        0.1 * 2.0f64.powi(60),
+        1.0e300,
+        1.0e308,
+    ];
+    let mut straddling = 0_u64;
+    let mut outside = 0_u64;
+    let mut false_zeros = 0_u64;
+    let mut worst = 0.0_f64;
+    let max_sq = rational::rat_from_f64(f64::MAX);
+    for &l in &periods {
+        let metric = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        let samples = fold_samples(l);
+        for &a in &samples {
+            for &b in &samples {
+                if !rational::straddles_fold(a, b, l) {
+                    continue;
+                }
+                straddling += 1;
+                let exact = rational::periodic_sq(a, b, l);
+                let got = metric.dist2(&[a], &[b]);
+                if exact > max_sq {
+                    assert!(
+                        got.is_err(),
+                        "L={l:e} a={a:e} b={b:e} fitted but overflowed"
+                    );
+                    continue;
+                }
+                let got =
+                    got.unwrap_or_else(|_| panic!("spurious overflow L={l:e} a={a:e} b={b:e}"));
+                if got == 0.0
+                    && exact > rational::rat_from_f64(0.0)
+                    && !rational::is_nearest(0.0, &exact)
+                {
+                    false_zeros += 1;
+                }
+                if !rational::is_nearest(got, &exact) {
+                    outside += 1;
+                }
+                worst = worst.max(rational::error_ulps(got, &exact));
+            }
+        }
+    }
+    assert!(straddling > 0, "the sweep produced no straddling pairs");
+    assert_eq!(
+        outside, 0,
+        "straddling {straddling} outside {outside} worst {worst}"
+    );
+    assert_eq!(
+        false_zeros, 0,
+        "false zeros in {straddling} straddling pairs"
+    );
+    assert!(
+        worst <= 0.5,
+        "worst ulp {worst} over {straddling} straddling pairs"
+    );
+    eprintln!(
+        "straddling {straddling} outside {outside} false_zeros {false_zeros} worst_ulp {worst}"
+    );
+}
+
+fn fold_samples(l: f64) -> Vec<f64> {
+    let mut v = vec![0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 8.0, -8.0];
+    for k in -2..=2 {
+        for n in [0.0, 1.0, 7.0, 8.0, 15.0] {
+            let x = (k as f64) * l + n * l / 16.0;
+            if x.is_finite() {
+                v.push(x);
+            }
+        }
+    }
+    let half = l * 0.5;
+    if half.is_finite() && half != 0.0 {
+        v.push(half);
+        v.push(-half);
+        let up = f64::from_bits(half.to_bits() + 1);
+        let down = f64::from_bits(half.to_bits() - 1);
+        v.push(up);
+        v.push(down);
+        for d in [1.0, 0.5, 8.0] {
+            let a = half - d;
+            let b = -half + d;
+            if a.is_finite() {
+                v.push(a);
+            }
+            if b.is_finite() {
+                v.push(b);
+            }
+        }
+    }
+    let base = v.clone();
+    for x in base {
+        for shift in [l + l, -(l + l)] {
+            let y = x + shift;
+            if y.is_finite() {
+                v.push(y);
+            }
+        }
+    }
+    v.retain(|x| x.is_finite());
+    v.sort_by(f64::total_cmp);
+    v.dedup();
+    v
 }

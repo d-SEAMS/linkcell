@@ -23,7 +23,7 @@ struct LcCell {
 
 #[repr(C)]
 struct LcNdIndex {
-    _private: [u8; 0],
+    _private: u8,
 }
 
 extern "C" {
@@ -1091,7 +1091,7 @@ fn lc_nd_build_and_queries_work() {
     let rc = unsafe { lc_nd_knn(idx, q.as_ptr(), 5, nn.as_mut_ptr(), d2.as_mut_ptr()) };
     assert_eq!(rc, 0);
     assert_eq!(nn[0], 0);
-    assert!(d2[0].abs() <= 1.0e-14);
+    assert_eq!(d2[0], 0.0);
 
     let mut need = 0usize;
     let rc = unsafe {
@@ -1384,7 +1384,7 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
         let exe = std::env::current_exe().unwrap();
         let out = std::process::Command::new(exe)
             .arg("lc_nd_respects_set_threads_one_without_growing_threads")
-            .args(["--exact", "--test-threads", "1", "--nocapture"])
+            .args(["--exact", "--test-threads", "1", "--show-output"])
             .env("LC_ND_ONE_THREAD_PROBE", "1")
             .output()
             .unwrap();
@@ -1405,6 +1405,10 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
         assert!(
             text.contains("test result: ok. 1 passed;"),
             "child did not report exactly one passing test\n{text}"
+        );
+        assert!(
+            text.contains("test lc_nd_respects_set_threads_one_without_growing_threads ... ok"),
+            "child did not pass this test\n{text}"
         );
         return;
     }

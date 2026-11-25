@@ -108,25 +108,33 @@ Noise has label `-1`.
 `min_pts` includes the point itself.
 Index outputs are `int` to match existing `lc_*` neighbour and pair ABI
 conventions; if an index would not fit in `int`, the call returns nonzero.
-For finite input coordinates, if a distance operation overflows binary64
-intermediates (for example a finite subtraction or squared accumulation becomes
-`inf`/`NaN`), the call fails with overflow instead of returning a non-finite
-distance.
+For finite input coordinates, `dist2` is the binary64 nearest to the exact
+sum of the squares of the per-axis distances, ties to even. When that exact
+sum is a binary64 number, the result is that number, including
+`(1 + 2^-27, 2^-27, 2^-27, 2^-27)` against the origin
+(`1 + 2^-26 + 2^-52`) and, for period 10, `dist2(2^55, 0) = 4`,
+`dist2(2^55, 8) = 0`, and `dist2(2^62, 4) = 0`. The call fails with
+`distance overflowed` when that nearest value is not finite. That string is
+not `n * k overflows`. A half-period gap whose square is outside the finite
+range is that error, not a zero distance. `dist2(1, 0)` at period `1e308`
+is `1`. The nearest value is `0` only when zero is a nearest binary64 to the
+exact sum. `min_pts == 0` fails with `min_pts must be at least 1`.
 
-Exactness guarantee: for finite inputs that do not overflow, returned ND
-results match brute force under the same `dist2`. Each periodic coordinate is
-reduced with the IEEE remainder into `[0, L)`; a remainder of `L` is stored
-as `0`. On that interval the circular distance errs by at most `4 * ulp(L)`
-per axis. Pruning widens every triangle test by a Higham relative factor, by
-at least `8 * sqrt(dims) * 2^-537` (squared distances that underflow), and by at least
-`8 * sqrt(n) * max(4 * ulp(L_i))` on the periodic axes. The periodic term is
-not a sum of squares, so a tiny period cannot zero it. A neighbour with
-`dist2 <= r^2` under this metric is not dropped. When every periodic residue
-and every axis minimum-image distance is a binary64 number, `dist2` is the
-sum of the squares of those distances whenever that sum is a binary64 number,
-including `dist2(2^55, 0) = 4` and `dist2(2^55, 8) = 0` for period 10. A
-residue that is not a binary64 number is not claimed to be correctly rounded.
-`±L` are the same point, including `L = 1e308`.
+Returned ND results are checked against a full scan under the same `dist2`.
+Each periodic coordinate is reduced with the IEEE remainder, the remainders
+are subtracted, and that difference is folded into `[-L/2, L/2]`. A
+coordinate is not reflected before the subtraction. A signed `rem_euclid` is
+not used, so a small negative delta on a huge period is kept: with period
+`2^53`, `dist2(-0.5, 0)` is `0.25` and `dist2(2^52 - 1, 2^52)` is `1`; with
+period `1e16` or `1e300`, `dist2(-1, 0)` is `1`; with period `1e16`,
+`dist2(-5e15, 4999999999999999)` is `1`. With period 10,
+`dist2(1.7e308, -1.7e308)` is `16`. Pruning widens every triangle test by a
+Higham relative factor, by at least `8 * sqrt(dims) * 2^-537`, and by
+`8 * sqrt(p) * max(4 * ulp(L_i))` where `p` is the number of periodic axes,
+not the point count. The periodic term is not a sum of squares, so a tiny
+period cannot zero it. It is a prune guard, not an error bound on `dist2`.
+`±L` are the same point, including `L = 1e308`. `knn` with `k = 0` does not
+walk the tree.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
@@ -450,7 +458,9 @@ A null function removes the hook, and the device partition then reports that no 
 | `BadCutoff` | `cutoff` is not finite and strictly positive |
 | `BadNdRadius` | ND query radius is not finite or is negative |
 | `BadNdEps` | ND DBSCAN epsilon is not finite and strictly positive |
-| `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation |
+| `BadNdMinPts` | ND DBSCAN `min_pts` is zero |
+| `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation (`n * k overflows`) |
+| `DistanceOverflow` | An N-dimensional distance overflowed binary64 (`distance overflowed`) |
 | `BadPartition` | The part count is zero, or the balance bound is below 1 |
 | `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |
 | `NoDevice` | A device curve split was requested and no device is loaded |

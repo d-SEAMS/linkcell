@@ -1,6 +1,6 @@
 # N-dimensional neighbour index and DBSCAN
 
-`linkcell::VpTreeIndex` provides exact N-dimensional neighbour search over
+`linkcell::VpTreeIndex` provides N-dimensional neighbour search over
 row-major `f64` feature buffers (`n x d`) with optional per-axis periodicity.
 The API is generic over a metric trait (`linkcell::Metric`) implemented
 currently by `linkcell::PeriodicSpace` (with `PeriodicEuclidean` as a
@@ -19,8 +19,8 @@ awkward on toroidal axes.
 
 A metric tree keeps pruning in metric space and directly supports periodic
 minimum-image distance through one metric implementation.
-The current choice is a vantage-point tree (Yianilos, SODA 1993): exact search
-with branch-and-bound from the triangle inequality.
+The current choice is a vantage-point tree (Yianilos, SODA 1993):
+branch-and-bound from the triangle inequality.
 
 For `d` in the tens, distance concentration weakens all exact tree pruning,
 including VP-trees. The exact worst case remains linear scan per query.
@@ -36,8 +36,8 @@ Related work considered:
 - Beygelzimer, Kakade, Langford (ICML 2006): cover trees.
 - Arya, Mount et al. (SODA 1994; JACM 1998): ANN via balanced box-decomposition.
 
-The present API is exact by default; approximate search with explicit epsilon
-is not enabled yet.
+Approximate search with an explicit epsilon is not enabled. Queries are
+checked against a full scan under this `dist2`.
 
 ## Space and metric
 
@@ -45,28 +45,44 @@ is not enabled yet.
 - `PeriodicSpace` supports per-axis `Option<f64>` periods:
   - `Some(L)`: periodic axis with period `L`.
   - `None`: open axis.
-- Each periodic coordinate is reduced into `[0, L)` once: at index build
-  for stored points, and at the start of a query. `dist2` reduces its
-  arguments the same way, and a value already in `[0, L)` is left unchanged.
-- The reduction is the IEEE remainder `x.rem_euclid(L)`. It is the exact
-  mathematical residue whenever that residue is a binary64 number. That
-  includes `2^55 ≡ 8` and `2^62 ≡ 4` (mod 10), `1` and `11` (mod 10),
-  `8.25 ≡ 1.25` (mod 7), and an integer lattice modulo 360 when the
-  coordinate and the period are binary64 integers. It is not claimed for a
-  residue that is not a binary64 number. A remainder of `L` is the seam,
-  where the mathematical residue is closer to `L` than to any smaller
-  binary64 value; the representative in `[0, L)` is `0`, at most half an
-  ulp of `L` from the true residue on the circle. `±L` are that seam, so
-  `dist2(L, -L)` is `0` even when `L` is `1e308` and the raw difference
-  overflows. Overflow is returned only when a reduced axis distance's square,
-  or the sum of those squares, is non-finite.
-- Periodic deltas wrap to `[-L/2, L/2)`, with the tie at `+L/2` mapped to
-  `-L/2`.
-- On those representatives the circular distance of one axis is within
-  `4 * ulp(L)` of the real circular distance, including the half-ulp seam.
-  The Euclidean norm of the per-axis circular distances and open absolute
-  differences is a metric. The floating-point norm stays within the slack
-  below of that metric, and pruning widens every triangle test by that slack.
+- The index stores the original finite coordinates. A query is copied the
+  same way. On a periodic axis, `dist2` takes the IEEE remainder of each
+  coordinate, subtracts those remainders, and folds that difference into
+  `[-L/2, L/2]` (the tie `+L/2` has the same square as `-L/2`). A coordinate
+  is not reflected by subtracting `L` before that difference exists. A stored
+  `[0, L)` representative cannot hold a negative offset smaller than `ulp(L)`.
+  With period `2^53`, `dist2(-0.5, 0)` is `0.25` and `dist2(2^52 - 1, 2^52)`
+  is `1`. With period `1e16`, `dist2(-1, 0)` is `1` and
+  `dist2(-5e15, 4999999999999999)` is `1`. With period `1e300`,
+  `dist2(-1, 0)` is `1`. With period `0.1 * 2^60`, `dist2(-0.125, 0)` is
+  `0.015625`.
+- `dist2` is the binary64 nearest to the exact sum of the squares of those
+  per-axis distances, with ties rounded to even. An open axis uses the exact
+  difference of its two coordinates. When that exact sum is itself a binary64
+  number, `dist2` is that number. The point
+  `(1 + 2^-27, 2^-27, 2^-27, 2^-27)` against the origin has exact sum of
+  squares `1 + 2^-26 + 2^-52`, and `dist2` returns that value. The same holds
+  for the integer residues with period 10: `dist2(2^55, 0) = 4`,
+  `dist2(2^55, 8) = 0`, `dist2(2^62, 4) = 0`, `dist2(1, 11) = 0`,
+  `dist2(0, 11) = 1`, and `dist2(1.7e308, -1.7e308) = 16`; with period 7,
+  `dist2(1.25, 8.25) = 0`. `±L` are the same point, so `dist2(L, -L)` is `0`
+  even when `L` is `1e308`.
+- `DistanceOverflow` (`distance overflowed`) is returned when that nearest
+  value is not finite. The message is not `Overflow` (`n * k overflows`).
+  A half-period gap whose square is outside the finite range (`0` and
+  `6e199` with period `1e200`, and the same class at `1e300` and `1e308`)
+  is `DistanceOverflow`, not `Ok(0)`. A gap whose exact square is finite is
+  that finite value: `dist2(1, 0)` at period `1e308` is `1`.
+- The nearest binary64 is `0` when the exact sum is closer to zero than to
+  the smallest positive binary64, and on the tie at exactly half of that
+  value. A nonzero exact sum that is a binary64 number is not replaced by
+  `0`. `2^-106`, the square of `2^-53`, is returned unchanged.
+- `wrap_point` returns a representative in `[0, L)`. That representative is
+  `0` when `L - (|x| % L)` is not a binary64 number in `(0, L)`. `dist2`
+  does not use it. `wrap_delta` is a minimum image in `[-L/2, L/2]`; a
+  result of `±L` is returned as `0`. With period `5e-324`, `0.5 * L`
+  underflows and `wrap_delta(0)` is `0`, not `-L`. `wrap_delta(-1)` at
+  period `1e16` is `-1`. `wrap_delta(1e300)` at period `1e-10` is finite.
 
 Metric trait functions:
 
@@ -74,16 +90,16 @@ Metric trait functions:
 - `axis_min_dist2(x, lo, hi, axis)`
 - `aabb_min_dist2(point, lo, hi)`
 
-The point metric is exactly symmetric (`dist2(a, b) == dist2(b, a)`) and
+The point metric is symmetric (`dist2(a, b) == dist2(b, a)`) and
 `dist2(a, a) == 0`.
 
-For finite inputs whose squared axis distances do not overflow (otherwise the
-API returns `Overflow`), acceptance is exactly `dist2 <= r^2` using this
-metric. Branch pruning widens each triangle test by a relative Higham factor
+Acceptance is `dist2 <= r^2` using this metric. When the nearest value
+described above is not finite, the call returns `DistanceOverflow` instead of
+a neighbour. Branch pruning widens each triangle test by a relative Higham factor
 on the norm, the square root, and the branch-test addition, plus
 `Metric::vp_absolute_slack`.
 
-That slack is the sum of two absolute terms, each an upper bound.
+That slack is the sum of two absolute terms.
 
 - Square underflow. `(2^-537)^2` is the subnormal unit in the last place
   `2^-1074`. A positive binary64 whose square underflows is strictly below
@@ -93,32 +109,28 @@ That slack is the sum of two absolute terms, each an upper bound.
   `8 * sqrt(d) * 2^-537`, with the square root and the products rounded
   upward: three distances in the triangle test, and room for rounding the
   floor. It is present for an open axis. It does not underflow to zero.
-- Periodic residue. `η_i = 4 * ulp(L_i)` on each periodic axis. The norm is
-  bounded by `sqrt(n) * max η_i`, not by a sum of squares, so a period below
-  about `1e-146` cannot underflow the slack to zero. Eight times that norm
-  covers a defect of `3 * ||η||_2`.
+- Periodic term. `η_i = 4 * ulp(L_i)` on each periodic axis. `p` is the
+  number of periodic axes, not the number of points. The norm is
+  `sqrt(p) * max η_i`, not a sum of squares, so a period below about
+  `1e-146` cannot underflow the slack to zero. Eight times that norm is
+  added. It is a prune guard. It is not an error bound on `dist2`.
 
 The relative factor is still added, including sixteen ulps of each of the
 three distances in the test. At the origin that relative piece is forty-eight
 units in the last place of zero. It is not the only absolute guard.
 
 The neighbour set, the k-NN order `(dist2, index)`, the pair list, and the
-DBSCAN labels therefore match brute force under this `dist2`, including
-squared distances that underflow and periodic pairs whose raw coordinates
-differ by many periods. When every periodic residue is a binary64 number and
-every axis minimum-image distance is a binary64 number, `dist2` is the sum of
-the squares of those distances whenever that sum is a binary64 number. In
-particular, with period 10, `dist2(2^55, 0) = 4`, `dist2(2^55, 8) = 0`,
-`dist2(2^62, 4) = 0`, `dist2(1, 11) = 0` and `dist2(0, 11) = 1`; with period
-7, `dist2(1.25, 8.25) = 0`; an integer lattice modulo 360 has the integer
-minimum-image square. A squared distance that underflows is `0`. A residue
-that is not a binary64 number is not claimed to be correctly rounded.
+DBSCAN labels are checked against a full scan under this `dist2`. `knn` with
+`k = 0` returns an empty list without walking the tree.
 
 `axis_min_dist2` and `aabb_min_dist2` are lower bounds on the squared
-distance to the interval or box. They are zero when the interval may cover a
-full period (`width >= L`, including a width that rounding could push across
-`L`) and when the gap is inside the rounding budget. They are not claimed to
-be tight.
+distance to the interval or box. A degenerate interval rounds the same
+circular distance downward before squaring, so the bound does not exceed the
+exact square. With period `1e16`, `axis_min_dist2(-1, 0, 0)` is positive and
+at most `1`. The bounds are zero when the width may reach half a period or a
+full period, and when the point may lie on the short arc between the
+endpoints. They are not claimed to be tight. `square_down` never exceeds the
+exact square, including a square in the subnormal range.
 
 ## Public Rust API
 
