@@ -54,9 +54,9 @@ is not enabled yet.
 - Periodic deltas wrap to `[-L/2, L/2)`, with the tie at `+L/2` mapped to
   `-L/2`.
 - On those representatives the circular distance of one axis is within
-  `4 * ulp(L)` of the real circular distance, and the real product of
-  circular and open axes is a metric. The floating-point distance therefore
-  violates the triangle inequality by at most a proved slack.
+  `4 * ulp(L)` of the real circular distance. The product of those circular
+  distances with open absolute differences is a metric, so the floating-point
+  distance violates the triangle inequality by at most a proved slack.
 
 Metric trait functions:
 
@@ -78,8 +78,10 @@ and `0` on an open axis. `4 * ulp(L)` bounds the circular-distance error on
 `[0, L)` (`|fl(a-b) - |a-b|| <= u*L` and one further rounding of `L - w`,
 and `2*u*L <= 4*ulp(L)`). Three distances appear in the test, so the defect
 is at most `3 * ||η||_2`; the factor eight also covers rounding the slack.
-Open axes contribute no absolute term. Their error stays in the relative
-factor, which is zero at distance zero, so a tiny open data set still prunes.
+Open axes contribute no absolute term. What remains on those axes is the
+relative factor plus sixteen ulps of each of the three distances in the test.
+At the origin that sum is forty-eight units in the last place of zero. An
+open axis has no further absolute floor.
 
 The neighbour set, the k-NN order `(dist2, index)`, the pair list, and the
 DBSCAN labels therefore match brute force under this `dist2`. The distances
