@@ -26,4 +26,3 @@
   `8 * sqrt(p) * max(4 * ulp(L_i))`, where `p` is the periodic-axis count,
   which stays positive when `4 * ulp(L)` squares to zero, plus a Higham
   relative factor.
-
