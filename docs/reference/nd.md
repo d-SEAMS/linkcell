@@ -207,5 +207,6 @@ whose table would not fit in `isize::MAX` bytes fails with `the period table
 does not fit in isize::MAX bytes` before allocation. A dimensionality the
 size check accepts can still fail with `the period table could not be
 allocated`. `n * d` that does not fit in `usize` fails with `n * d overflows`
-before the coordinates are read. `VpTreeIndex::new` returns `Overflow` for
-that product, and that error's message remains `n * k overflows`.
+before the coordinates are read. `VpTreeIndex::new` returns `NdProduct`
+(`n * d overflows`) for that product before it reads a point.
+`Error::Overflow` still displays `n * k overflows`.

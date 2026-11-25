@@ -428,7 +428,7 @@ pub unsafe extern "C" fn lc_nd_build(
         return fail_msg("the period table does not fit in isize::MAX bytes");
     }
     let Some(len) = n.checked_mul(d) else {
-        return fail_msg("n * d overflows");
+        return fail(Error::NdProduct);
     };
     let raw = unsafe { std::slice::from_raw_parts(data, len) };
     if !raw.iter().all(|v| v.is_finite()) {

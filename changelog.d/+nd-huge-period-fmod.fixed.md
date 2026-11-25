@@ -2,4 +2,4 @@
 - `knn` of `[-1e-20, 0]` at query `0` and period 10 returns index 1. `within` of `0.999` from query `0.001` at period 1 and radius `2.000000000000001e-3` includes that point.
 - `axis_min_dist2` and `aabb_min_dist2` stay at or below the squared circular distance of the real values of their binary64 inputs. A degenerate interval on period `1e16` keeps `axis_min_dist2(-1, 0, 0)` in `(0, 1]`.
 - DBSCAN `min_pts == 0` returns `BadNdMinPts` (`min_pts must be at least 1`), not `BadNdEps`. A distance that overflows binary64 returns `DistanceOverflow` (`distance overflowed`), not `Overflow` (`n * k overflows`).
-- The N-dimensional `linkcell::Error` variants are `BadDimensions`, `BadPeriod`, `IndexOutOfRange`, `BadNdRadius`, `BadNdEps`, `BadNdMinPts`, and `DistanceOverflow`.
+- The N-dimensional `linkcell::Error` variants are `BadDimensions`, `BadPeriod`, `IndexOutOfRange`, `BadNdRadius`, `BadNdEps`, `BadNdMinPts`, `DistanceOverflow`, and `NdProduct`.

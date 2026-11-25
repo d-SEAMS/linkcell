@@ -1824,8 +1824,9 @@ fn min_pts_zero_and_distance_overflow_have_their_own_messages() {
     let Err(err) = built else {
         panic!("n * d overflow built an index");
     };
-    assert_eq!(err, Error::Overflow);
-    assert_eq!(err.to_string(), "n * k overflows");
+    assert_eq!(err, Error::NdProduct);
+    assert_eq!(err.to_string(), "n * d overflows");
+    assert_ne!(err.to_string(), Error::Overflow.to_string());
     assert_eq!(Error::DistanceOverflow.to_string(), "distance overflowed");
     assert_ne!(
         Error::Overflow.to_string(),

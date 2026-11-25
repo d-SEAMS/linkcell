@@ -58,6 +58,8 @@ pub enum Error {
     BadPeriod,
     /// Point index is outside the indexed range.
     IndexOutOfRange,
+    /// `n * d` does not fit in `usize`.
+    NdProduct,
 }
 
 impl fmt::Display for Error {
@@ -96,6 +98,7 @@ impl fmt::Display for Error {
             Error::BadDimensions => write!(f, "row-major buffer shape is inconsistent"),
             Error::BadPeriod => write!(f, "period length must be finite and positive"),
             Error::IndexOutOfRange => write!(f, "point index is out of range"),
+            Error::NdProduct => write!(f, "n * d overflows"),
         }
     }
 }

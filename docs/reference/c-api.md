@@ -99,9 +99,9 @@ does not fit in isize::MAX bytes` before any allocation. A `d` that passes
 that check can still fail with `the period table could not be allocated`
 when the allocator refuses the table. `n * d` that does not fit in `usize`
 fails with `n * d overflows` before the coordinates are read. Those three
-strings are the C messages for these refusals. `Error::Overflow` still
-displays `n * k overflows`, and `VpTreeIndex::new` returns that error for
-the same `n * d` product before it reads a point.
+strings are the C messages for these refusals. `VpTreeIndex::new` returns
+`NdProduct` (`n * d overflows`) for the same product before it reads a
+point. `Error::Overflow` still displays `n * k overflows`.
 
 `lc_nd_knn` writes exactly `k` slots (`-1` and optional `NaN` for unused
 slots when `k > n`).
@@ -497,6 +497,7 @@ A null function removes the hook, and the device partition then reports that no 
 | `BadNdEps` | ND DBSCAN epsilon is not finite and strictly positive |
 | `BadNdMinPts` | ND DBSCAN `min_pts` is zero |
 | `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation (`n * k overflows`) |
+| `NdProduct` | `n * d` does not fit in `usize` (`n * d overflows`) |
 | `DistanceOverflow` | An N-dimensional distance overflowed binary64 (`distance overflowed`) |
 | `BadPartition` | The part count is zero, or the balance bound is below 1 |
 | `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |

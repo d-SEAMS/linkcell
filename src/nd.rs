@@ -294,9 +294,9 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
 
     /// Build an index over `space` with `metric`.
     ///
-    /// Returns [`Error::Overflow`] when `space.len() * space.dims()` does
+    /// Returns [`Error::NdProduct`] when `space.len() * space.dims()` does
     /// not fit in `usize`, before any point is read. That error's message
-    /// remains `n * k overflows`.
+    /// is `n * d overflows`.
     pub fn new(space: S, metric: M) -> Result<Self, Error> {
         if space.dims() == 0 || space.dims() != metric.dims() {
             return Err(Error::BadDimensions);
@@ -304,7 +304,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         let n = space.len();
         let d = space.dims();
         let Some(canonical_len) = n.checked_mul(d) else {
-            return Err(Error::Overflow);
+            return Err(Error::NdProduct);
         };
         for i in 0..n {
             let p = space.point(i);
