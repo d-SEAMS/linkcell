@@ -1377,6 +1377,26 @@ fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
 #[cfg(target_os = "linux")]
 #[test]
 fn lc_nd_respects_set_threads_one_without_growing_threads() {
+    // The suite shares this process, so `/proc/self/task` also counts threads
+    // other tests start. The strict count runs in a child whose only work is
+    // this search.
+    if std::env::var_os("LC_ND_ONE_THREAD_PROBE").is_none() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("lc_nd_respects_set_threads_one_without_growing_threads")
+            .args(["--exact", "--test-threads", "1", "--nocapture"])
+            .env("LC_ND_ONE_THREAD_PROBE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "one-thread probe status {:?}\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
     let data = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     let idx = build_nd_index(&data, 4, 2, None);
     let q = [0.0, 0.0];
@@ -1437,7 +1457,5 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
     let after = linux_thread_count();
     unsafe { lc_set_threads(0) };
     unsafe { lc_nd_free(idx) };
-    // The Rust test harness can run tests in parallel; allow tiny ambient
-    // fluctuations from unrelated tests while still catching pool growth.
-    assert!(after <= before + 2);
+    assert_eq!(after, before, "lc_set_threads(1) started a thread");
 }
