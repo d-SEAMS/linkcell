@@ -807,12 +807,13 @@ pub fn knearest_csr(
 /// is empty, [`Error::Overflow`] when `n * k` does not fit in a slice,
 /// [`Error::NonFinite`] when a coordinate (masked or not) or the cell
 /// origin is NaN or infinite, [`Error::TooManyCells`] when the mesh
-/// exceeds the bin cap, and [`Error::Degenerate`] when a face width is
-/// zero or non-finite. A positive finite width is not rejected by its
-/// aspect ratio. These inputs
-/// return `Err`. [`knearest_into`],
-/// [`knearest_into_d2`], [`knearest_into_many`], [`knearest_csr`] and
-/// [`knearest_brute`] return the same errors.
+/// exceeds the bin cap or the box is at least 10^7 bin edges across,
+/// and [`Error::Degenerate`] when a face width is zero or non-finite.
+/// A positive finite width is not rejected by its aspect ratio. These
+/// inputs return `Err`. [`knearest_into`], [`knearest_into_d2`],
+/// [`knearest_into_many`] and [`knearest_csr`] return the same errors.
+/// [`knearest_brute`] has no mesh, so it does not return
+/// [`Error::TooManyCells`].
 ///
 /// Fold, bin, then grow a rectangular index box. An orthorhombic cell
 /// is used as stored. A restricted triclinic cell is tilt-reduced
@@ -1081,7 +1082,7 @@ fn execute(
             let mesh = timed_mesh(|| Mesh::build(xyz, &walk, active_owned.as_deref(), edge))?;
             let nbin = [mesh.nx, mesh.ny, mesh.nz];
             let geom = geom_of(&walk, nbin, mesh.widths);
-            let max_reach = reach_of(&walk, &geom, mesh.image_reach());
+            let max_reach = reach_of(&walk, &geom, mesh.image_reach())?;
             let side = block_side(mesh.occupants.len(), nbin);
             let (units, _) = scan_units(nbin, side);
             let mut scratch = Scratch::default();
@@ -1131,7 +1132,7 @@ fn execute(
             &walk,
             &geom,
             nbin.iter().copied().max().unwrap_or(1) / 2 + 2,
-        );
+        )?;
         let side = block_side(stages.n_active(), nbin);
         let (units, _) = scan_units(nbin, side);
         let per = scan_chunk(units, width);
@@ -1261,7 +1262,7 @@ fn walk_cells<const MODE: u8>(
     }
 }
 
-fn reach_of(walk: &Cell, geom: &Geom, image_reach: i32) -> i32 {
+fn reach_of(walk: &Cell, geom: &Geom, image_reach: i32) -> Result<i32, Error> {
     let [nx, ny, nz] = geom.nbin;
     let widths = geom.widths;
     let cell_min = (widths[0] / f64::from(nx))
@@ -1269,9 +1270,10 @@ fn reach_of(walk: &Cell, geom: &Geom, image_reach: i32) -> i32 {
         .min(widths[2] / f64::from(nz));
     let need = (box_diameter(walk) / cell_min).ceil();
     if need.is_finite() && need < 1.0e7 {
-        (need as i32).saturating_add(3).max(image_reach)
+        Ok((need as i32).saturating_add(3).max(image_reach))
     } else {
-        image_reach
+        // A shorter image box would not certify the neighbours.
+        Err(Error::TooManyCells)
     }
 }
 

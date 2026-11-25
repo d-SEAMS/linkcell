@@ -403,7 +403,7 @@ A null function removes the hook, and the device partition then reports that no 
 | `ScotchFailed` | The Scotch library rejected the graph |
 
 `Error::Empty` is not a wrong-length buffer.
-`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`.
+`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`. `TooManyCells` is also a box at least 10^7 bin edges across: the walk would not certify the neighbours.
 `knearest_csr` returns the same variants.
 `knearest_into`, `knearest_into_d2`, and `knearest_into_many` return them and `BufferSize`.
 `knearest_brute` returns `ZeroK`, `Empty`, `NonFinite`, and `Degenerate`.

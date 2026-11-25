@@ -1517,13 +1517,13 @@ mod tests {
             pairs_within_csr(&xyz, &raw, &PbcQuery::periodic(2.6), true, &mut csr).unwrap_err(),
             Error::TooManyImages
         );
-        let nearest = crate::knearest(&xyz, &raw, 1, None, None);
-        assert!(
-            nearest.is_ok()
-                || matches!(
-                    nearest,
-                    Err(Error::TooManyCells | Error::TooManyImages | Error::Degenerate)
-                )
+        // Tilt reduction leaves perpendicular widths near 1e-7 and a mesh
+        // of 10 x 2 x 1 bins, inside the bin cap. The box is far more
+        // than 1e7 of those bin edges across, so the walk cannot certify
+        // a neighbour and returns TooManyCells. Brute force has no mesh.
+        assert_eq!(
+            crate::knearest(&xyz, &raw, 1, None, None).unwrap_err(),
+            Error::TooManyCells
         );
         let brute = crate::knearest_brute(&xyz, &raw, 1, None).unwrap();
         assert!(brute

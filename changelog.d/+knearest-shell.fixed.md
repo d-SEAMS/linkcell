@@ -1,0 +1,1 @@
+A k-nearest search whose box is at least 10^7 bin edges across returns `TooManyCells` instead of an uncertified neighbour list. The fully periodic near-flat copper cell is that case: the tilt-reduced mesh stays inside the bin cap, and the shell does not.
