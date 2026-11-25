@@ -254,11 +254,19 @@ linkcell_built_h = custom_target(
 # objects clash with the std of any other Rust staticlib in the same link
 # (rust_eh_personality, __rdl_alloc_error_handler); the shared library
 # exports only the C API and keeps its std private.
+#
+# The Rust objects are built with -Zexternal-clangrt, so the library leaves
+# every __tsan_* symbol to the final link; each consumer has to link the
+# sanitizer runtime, whether or not its own sources are instrumented.
 _sanitized = get_option('sanitize') != 'none'
 _use_static = (meson.is_subproject() or get_option('default_library') == 'static') and not _sanitized
-_link_rpath = []
+_sanitize_link = []
 if _sanitized
-  _link_rpath = ['-Wl,-rpath,' + meson.current_build_dir()]
+  _sanitize_flag = '-fsanitize=' + get_option('sanitize')
+  if not cc.has_multi_link_arguments(_sanitize_flag)
+    error('sanitize=@0@ needs a C compiler that links with @1@'.format(get_option('sanitize'), _sanitize_flag))
+  endif
+  _sanitize_link = [_sanitize_flag, '-Wl,-rpath,' + meson.current_build_dir()]
 endif
 if _use_static
   _link_idx = 1
@@ -303,7 +311,7 @@ if _gpu_on
   endif
   linkcell_gpu_dep = declare_dependency(
     link_with: linkcell_gpu,
-    link_args: [linkcell_cargo[_link_idx].full_path()] + _link_rpath,
+    link_args: [linkcell_cargo[_link_idx].full_path()] + _sanitize_link,
     sources: linkcell_built_h,
     include_directories: include_directories('include'),
     compile_args: _gpu_args,
@@ -313,7 +321,7 @@ if _gpu_on
 endif
 
 linkcell_dep = declare_dependency(
-  link_args: [linkcell_cargo[_link_idx].full_path()] + _link_rpath,
+  link_args: [linkcell_cargo[_link_idx].full_path()] + _sanitize_link,
   sources: linkcell_built_h,
   include_directories: include_directories('include'),
   dependencies: rust_sys + _gpu_deps,
@@ -336,7 +344,7 @@ if _install
     url: 'https://github.com/d-SEAMS/linkcell',
     # Raw `-lfoo` does not get `-L${libdir}`; wrap consumers then fail
     # at link with "cannot find -llinkcell".
-    libraries: ['-L${libdir}', '-llinkcell'],
+    libraries: ['-L${libdir}', '-llinkcell'] + (_sanitized ? [_sanitize_flag] : []),
     libraries_private: rust_sys,
     subdirs: '.',
   )
