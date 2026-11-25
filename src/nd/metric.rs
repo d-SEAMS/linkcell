@@ -98,6 +98,10 @@ fn ulp_at(x: f64) -> f64 {
 }
 
 /// Upper bound on `a*b` for non-negative finite factors.
+///
+/// The rounding residue comes from the exact significand product. A fused
+/// multiply-add would link a runtime-dispatched FMA routine into the
+/// library, outside `simd::select()` and the ISA allowlist.
 fn mul_up(a: f64, b: f64) -> f64 {
     if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
         return f64::INFINITY;
@@ -109,8 +113,13 @@ fn mul_up(a: f64, b: f64) -> f64 {
     if !p.is_finite() {
         return f64::INFINITY;
     }
-    let resid = a.mul_add(b, -p);
-    if resid > 0.0 {
+    let (ma, ea) = dyadic::decode_f64(a);
+    let (mb, eb) = dyadic::decode_f64(b);
+    let (mp, ep) = dyadic::decode_f64(p);
+    let mut resid = DyadicSum::new();
+    resid.add_mant(ma * mb, ea + eb);
+    resid.add_mant(-mp, ep);
+    if resid.signum() > 0 {
         let up = next_up(p);
         if up.is_finite() {
             up
