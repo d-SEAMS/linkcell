@@ -59,7 +59,9 @@ The device entries `lc_gpu_knearest*` in `linkcell_gpu.h` do not scan their devi
 ## N-dimensional index
 
 ```c
-typedef struct lc_nd_index lc_nd_index;
+typedef struct lc_nd_index {
+  uint8_t _private;
+} lc_nd_index;
 
 int lc_nd_build(const double *data, size_t n, size_t d,
                 const double *periods, lc_nd_index **out);
@@ -81,6 +83,9 @@ int lc_nd_pairs_within(const lc_nd_index *index, double radius,
 int lc_nd_dbscan(const lc_nd_index *index, double eps, size_t min_pts,
                  int *out_labels, int *out_core, size_t *out_clusters);
 ```
+
+The handle is opaque. Callers only hold a pointer returned by `lc_nd_build`.
+The one byte makes it a complete object type in C99 and C++17.
 
 `lc_nd_build` takes row-major `data` of shape `n x d`.
 `periods` is optional (`NULL` means every axis open); with a non-null pointer,

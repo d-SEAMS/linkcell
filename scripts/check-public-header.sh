@@ -26,3 +26,15 @@ EOF
 # Both languages require sizeof(lc_nd_index) == 1, so the sizes match.
 gcc -std=c99 -Wall -Wextra -pedantic -Werror -I "$root/include" -c "$tmp/pedantic.c" -o "$tmp/pedantic.o"
 g++ -std=c++17 -Wall -Wextra -pedantic -Werror -I "$root/include" -c "$tmp/pedantic.cpp" -o "$tmp/pedantic_cpp.o"
+
+# docs/reference/c-api.md shows the handle as the generated header defines it.
+handle() {
+    awk '/^typedef struct lc_nd_index/ { on = 1 } on { print } on && /} lc_nd_index;/ { exit }' "$1" |
+        tr -s ' \t\n' ' '
+}
+header=$(handle "$root/include/linkcell.h")
+docs=$(handle "$root/docs/reference/c-api.md")
+if [ -z "$header" ] || [ "$header" != "$docs" ]; then
+    echo "docs/reference/c-api.md: lc_nd_index is '$docs'; include/linkcell.h has '$header'" >&2
+    exit 1
+fi
