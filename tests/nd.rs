@@ -474,6 +474,65 @@ fn metric_bounds_are_sound_for_unwrapped_and_wide_intervals() {
     }
 }
 
+fn next_up(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
+    if x == -0.0 {
+        return f64::from_bits(1);
+    }
+    if x >= 0.0 {
+        f64::from_bits(x.to_bits() + 1)
+    } else {
+        f64::from_bits(x.to_bits() - 1)
+    }
+}
+
+#[test]
+fn high_dimensional_boundary_radii_match_oracle_on_collinear_rays() {
+    let dims = [2usize, 8, 64, 72, 96, 128, 1024, 4096];
+    let n = 6usize;
+    for &d in &dims {
+        let periods = vec![None; d];
+        let metric = PeriodicSpace::new(periods.clone()).unwrap();
+        let mut data = vec![0.0f64; n * d];
+        for i in 0..n {
+            let t = i as f64 * 0.1;
+            for k in 0..d {
+                data[i * d + k] = t;
+            }
+        }
+        let idx = build_index(&data, n, d, &periods);
+        let q = &data[2 * d..3 * d];
+        let p3 = &data[3 * d..4 * d];
+        let r0 = metric.distance(q, p3).unwrap();
+        let r1 = next_up(r0);
+        for &radius in &[r0, r1] {
+            let got = idx.within(q, radius).unwrap();
+            let want = brute_within(&metric, &data, n, d, q, radius);
+            let got_pairs: Vec<_> = got.into_iter().map(|h| (h.index, h.dist2)).collect();
+            assert_eq!(got_pairs, want, "within mismatch at d={d}, radius={radius}");
+
+            let got_pairs = idx.pairs_within(radius).unwrap();
+            let got: Vec<_> = got_pairs.into_iter().map(|p| (p.i, p.j, p.dist2)).collect();
+            let want = brute_pairs_within(&metric, &data, n, d, radius);
+            assert_eq!(got, want, "pairs mismatch at d={d}, radius={radius}");
+
+            let got_db = idx.dbscan(radius, 2).unwrap();
+            let want_db = brute_dbscan(&metric, &data, n, d, radius, 2);
+            assert_eq!(
+                got_db.labels, want_db,
+                "dbscan mismatch at d={d}, radius={radius}"
+            );
+        }
+
+        let got_knn = idx.knn(q, n).unwrap();
+        let want_knn = brute_knn(&metric, &data, n, d, q, n);
+        let got_pairs: Vec<_> = got_knn.into_iter().map(|h| (h.index, h.dist2)).collect();
+        assert_eq!(got_pairs, want_knn, "knn mismatch at d={d}");
+    }
+}
+
 #[cfg(feature = "parallel")]
 #[test]
 fn parallel_and_serial_paths_match_exactly() {

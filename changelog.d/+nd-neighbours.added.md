@@ -8,5 +8,11 @@
   distance and lower-bound logic behind one trait for future replacement by
   upstream minimage N-dimensional metrics.
 - Notable API surface change: public `linkcell::Error` gained
-  `BadDimensions` and `BadPeriod` variants for N-dimensional shape/period
-  validation failures.
+  `BadDimensions`, `BadPeriod`, and `IndexOutOfRange` variants for
+  N-dimensional shape/period/index validation failures. This is recorded as a
+  semver-significant API expansion because `Error` is not marked
+  `#[non_exhaustive]` in this release line.
+- N-dimensional VP-tree branch pruning now uses a dimension-scaled conservative
+  floating-point widening margin derived from Higham `gamma_n` error bounds,
+  so ND query/dbscan outputs are bitwise-equal to brute force under the same
+  metric on finite, non-overflowing inputs.

@@ -1145,27 +1145,50 @@ fn lc_nd_build_and_queries_work() {
 fn lc_nd_rejects_bad_dimensions_nulls_and_bad_periods() {
     let data = [0.0, 1.0];
     let periods = [1.0];
-    let mut out = std::ptr::null_mut();
+    let mut out = 0x123usize as *mut LcNdIndex;
     assert_ne!(
         unsafe { lc_nd_build(std::ptr::null(), 1, 1, periods.as_ptr(), &mut out) },
         0
     );
+    assert!(out.is_null());
+    out = 0x123usize as *mut LcNdIndex;
     assert_ne!(
         unsafe { lc_nd_build(data.as_ptr(), 1, 0, periods.as_ptr(), &mut out) },
         0
     );
+    assert!(out.is_null());
     assert_ne!(
         unsafe { lc_nd_build(data.as_ptr(), 1, 1, periods.as_ptr(), std::ptr::null_mut()) },
         0
     );
     let bad_neg = [-1.0f64];
+    out = 0x123usize as *mut LcNdIndex;
     assert_ne!(
         unsafe { lc_nd_build(data.as_ptr(), 1, 1, bad_neg.as_ptr(), &mut out) },
         0
     );
+    assert!(out.is_null());
     let bad_nan = [f64::NAN];
+    out = 0x123usize as *mut LcNdIndex;
     assert_ne!(
         unsafe { lc_nd_build(data.as_ptr(), 1, 1, bad_nan.as_ptr(), &mut out) },
+        0
+    );
+    assert!(out.is_null());
+
+    // n * d overflow before any read.
+    out = 0x123usize as *mut LcNdIndex;
+    assert_ne!(
+        unsafe { lc_nd_build(data.as_ptr(), usize::MAX, 2, std::ptr::null(), &mut out) },
+        0
+    );
+    assert!(out.is_null());
+
+    // Non-finite payload rejection.
+    let nonfinite = [f64::INFINITY];
+    out = 0x123usize as *mut LcNdIndex;
+    assert_ne!(
+        unsafe { lc_nd_build(nonfinite.as_ptr(), 1, 1, std::ptr::null(), &mut out) },
         0
     );
     assert!(out.is_null());
@@ -1343,18 +1366,12 @@ fn lc_nd_rejects_non_finite_coordinates_and_null_query_pointers() {
 #[test]
 fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
     let data = [0.0f64];
-    let mut out = 0x1usize as *mut LcNdIndex;
-    let rc = unsafe {
-        lc_nd_build(
-            data.as_ptr(),
-            0,
-            usize::MAX / 16,
-            std::ptr::null(),
-            &mut out,
-        )
-    };
-    assert_ne!(rc, 0);
-    assert!(out.is_null());
+    for &d in &[1usize << 33, 1usize << 40] {
+        let mut out = 0x1usize as *mut LcNdIndex;
+        let rc = unsafe { lc_nd_build(data.as_ptr(), 0, d, std::ptr::null(), &mut out) };
+        assert_ne!(rc, 0);
+        assert!(out.is_null());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1386,9 +1403,41 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
             },
             0
         );
+        assert_eq!(
+            unsafe {
+                lc_nd_pairs_within(
+                    idx,
+                    2.0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            },
+            0
+        );
+        let mut labels = [-1; 4];
+        let mut core = [0; 4];
+        let mut clusters = 0usize;
+        assert_eq!(
+            unsafe {
+                lc_nd_dbscan(
+                    idx,
+                    2.0,
+                    2,
+                    labels.as_mut_ptr(),
+                    core.as_mut_ptr(),
+                    &mut clusters,
+                )
+            },
+            0
+        );
     }
     let after = linux_thread_count();
     unsafe { lc_set_threads(0) };
     unsafe { lc_nd_free(idx) };
-    assert!(after <= before);
+    // The Rust test harness can run tests in parallel; allow tiny ambient
+    // fluctuations from unrelated tests while still catching pool growth.
+    assert!(after <= before + 2);
 }

@@ -22,6 +22,10 @@ pub enum Error {
     TooManyCells,
     /// `cutoff` is not finite and strictly positive.
     BadCutoff,
+    /// N-dimensional query radius is not finite and non-negative.
+    BadNdRadius,
+    /// DBSCAN epsilon is not finite and strictly positive.
+    BadNdEps,
     /// Periodic image stencil exceeds the 2^24 resource cap.
     TooManyImages,
     /// An axis is not periodic and `libvesin.so` is not loaded.
@@ -62,7 +66,9 @@ impl fmt::Display for Error {
             Error::Overflow => write!(f, "n * k overflows"),
             Error::MaskLen => write!(f, "mask length must be n"),
             Error::TooManyCells => write!(f, "linked-cell mesh is too fine"),
-            Error::BadCutoff => write!(f, "cutoff must be finite and non-negative"),
+            Error::BadCutoff => write!(f, "cutoff must be finite and strictly positive"),
+            Error::BadNdRadius => write!(f, "radius must be finite and non-negative"),
+            Error::BadNdEps => write!(f, "eps must be finite and strictly positive"),
             Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
             Error::Partial => write!(
                 f,

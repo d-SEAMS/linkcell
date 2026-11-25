@@ -186,10 +186,48 @@ impl PartialOrd for HeapEntry {
 }
 
 impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
-    fn pruning_margin(a: f64, b: f64, c: f64) -> f64 {
-        // Outward rounding guard for sums/differences in branch tests.
-        let scale = a.abs().max(b.abs()).max(c.abs()).max(1.0);
-        8.0 * f64::EPSILON * scale
+    fn gamma(n: usize) -> f64 {
+        // Higham: gamma_n = n*u / (1 - n*u), where u is unit roundoff.
+        let u = 0.5 * f64::EPSILON;
+        let nu = (n as f64) * u;
+        if nu >= 1.0 {
+            return f64::INFINITY;
+        }
+        nu / (1.0 - nu)
+    }
+
+    fn pruning_margin(&self, a: f64, b: f64, c: f64) -> f64 {
+        // Conservative outward guard for VP triangle tests:
+        //
+        // - Each axis contributes several rounded steps (delta, wrap/reduce,
+        //   square, and accumulation), so we bound distance evaluation by
+        //   gamma_{6d+16}.
+        // - sqrt contributes one extra rounding stage.
+        // - each branch test adds/subtracts up to two values.
+        //
+        // We bound those by one relative factor and convert to an absolute
+        // widening term on |a|+|b|+|c|. No absolute floor is used so tiny-scale
+        // data still prunes.
+        let d = self.space.dims();
+        let n_ops = d.saturating_mul(6).saturating_add(16);
+        let g_dist2 = Self::gamma(n_ops);
+        let g_sqrt = Self::gamma(2);
+        let g_add = Self::gamma(3);
+        let rel = (1.0 + g_dist2) * (1.0 + g_sqrt) * (1.0 + g_add) - 1.0;
+        let scale = a.abs() + b.abs() + c.abs();
+        rel * scale + 16.0 * (Self::ulp(a) + Self::ulp(b) + Self::ulp(c))
+    }
+
+    fn ulp(x: f64) -> f64 {
+        if !x.is_finite() {
+            return 0.0;
+        }
+        let next = if x >= 0.0 {
+            f64::from_bits(x.to_bits().saturating_add(1))
+        } else {
+            f64::from_bits(x.to_bits().saturating_sub(1))
+        };
+        (next - x).abs()
     }
 
     /// Build an index over `space` with `metric`.
@@ -244,10 +282,14 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         dist.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         let mid = dist.len() / 2;
         let threshold2 = dist[mid].1;
-        let mut left_ids = Vec::with_capacity(mid);
-        let mut right_ids = Vec::with_capacity(dist.len() - mid);
-        for (pos, (idx, _)) in dist.into_iter().enumerate() {
-            if pos < mid {
+        let mut left_ids = Vec::new();
+        let mut right_ids = Vec::new();
+        left_ids.reserve(dist.len());
+        right_ids.reserve(dist.len());
+        for (idx, d2) in dist {
+            // Keep pruning invariants sound across exact ties:
+            // left has dist < threshold, right has dist >= threshold.
+            if d2 < threshold2 {
                 left_ids.push(idx);
             } else {
                 right_ids.push(idx);
@@ -326,7 +368,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         };
         let d = d2.sqrt();
         let mu = node.threshold2.sqrt();
-        let margin = Self::pruning_margin(d, tau, mu);
+        let margin = self.pruning_margin(d, tau, mu);
         if d < mu {
             self.knn_rec(node.left, query, k, skip, heap)?;
             if d + tau + margin >= mu {
@@ -366,7 +408,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         }
         let d = d2.sqrt();
         let mu = node.threshold2.sqrt();
-        let margin = Self::pruning_margin(d, radius, mu);
+        let margin = self.pruning_margin(d, radius, mu);
         if d <= mu + radius + margin {
             self.within_rec(node.left, query, radius, skip, out)?;
         }
@@ -406,7 +448,28 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         skip: Option<usize>,
     ) -> Result<Vec<NeighborHit>, Error> {
         if !radius.is_finite() || radius < 0.0 {
-            return Err(Error::BadCutoff);
+            return Err(Error::BadNdRadius);
+        }
+        if radius == 0.0 {
+            let mut out = Vec::new();
+            for i in 0..self.space.len() {
+                if skip == Some(i) {
+                    continue;
+                }
+                let d2 = self.metric.dist2(query, self.space.point(i))?;
+                if d2 == 0.0 {
+                    out.push(NeighborHit {
+                        index: i,
+                        dist2: d2,
+                    });
+                }
+            }
+            out.sort_by(|a, b| {
+                a.dist2
+                    .total_cmp(&b.dist2)
+                    .then_with(|| a.index.cmp(&b.index))
+            });
+            return Ok(out);
         }
         let mut out = Vec::new();
         self.within_rec(self.root, query, radius, skip, &mut out)?;
@@ -497,7 +560,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
     /// neighbours in ascending index order.
     pub fn dbscan(&self, eps: f64, min_pts: usize) -> Result<DbscanResult, Error> {
         if !eps.is_finite() || eps <= 0.0 || min_pts == 0 {
-            return Err(Error::BadCutoff);
+            return Err(Error::BadNdEps);
         }
         let n = self.space.len();
         let mut labels = vec![-2; n];
@@ -589,7 +652,20 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
 
     fn pairs_within(&self, radius: f64) -> Result<Vec<PairHit>, Error> {
         if !radius.is_finite() || radius < 0.0 {
-            return Err(Error::BadCutoff);
+            return Err(Error::BadNdRadius);
+        }
+        if radius == 0.0 {
+            let mut out = Vec::new();
+            for i in 0..self.space.len() {
+                let pi = self.space.point(i);
+                for j in (i + 1)..self.space.len() {
+                    let d2 = self.metric.dist2(pi, self.space.point(j))?;
+                    if d2 == 0.0 {
+                        out.push(PairHit { i, j, dist2: d2 });
+                    }
+                }
+            }
+            return Ok(out);
         }
         #[cfg(feature = "parallel")]
         {

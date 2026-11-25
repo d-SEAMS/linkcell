@@ -90,6 +90,8 @@ On any `lc_nd_build` failure, `*out` is set to `NULL`.
 
 `lc_nd_knn` writes exactly `k` slots (`-1` and optional `NaN` for unused
 slots when `k > n`).
+`radius` for `lc_nd_within` / `lc_nd_pairs_within` must be finite and
+non-negative. `eps` for `lc_nd_dbscan` must be finite and strictly positive.
 
 `lc_nd_within` and `lc_nd_pairs_within` accept count-query mode:
 
@@ -106,6 +108,15 @@ Noise has label `-1`.
 `min_pts` includes the point itself.
 Index outputs are `int` to match existing `lc_*` neighbour and pair ABI
 conventions; if an index would not fit in `int`, the call returns nonzero.
+For finite input coordinates, if a distance operation overflows binary64
+intermediates (for example a finite subtraction or squared accumulation becomes
+`inf`/`NaN`), the call fails with overflow instead of returning a non-finite
+distance.
+
+Exactness guarantee: returned ND results are bitwise-equal to brute force under
+the same `dist2` function. VP-tree pruning uses a conservative widening margin
+derived from `gamma_n = n*u/(1-n*u)` forward-error bounds (distance sum, sqrt,
+and branch-test additions), so pruning never drops a true in-radius point.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
@@ -427,6 +438,8 @@ A null function removes the hook, and the device partition then reports that no 
 | `MaskLen` | `mask` is `Some` and `mask.len() != n` |
 | `TooManyCells` | linked-cell mesh overflows the bin cap |
 | `BadCutoff` | `cutoff` is not finite and strictly positive |
+| `BadNdRadius` | ND query radius is not finite or is negative |
+| `BadNdEps` | ND DBSCAN epsilon is not finite and strictly positive |
 | `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation |
 | `BadPartition` | The part count is zero, or the balance bound is below 1 |
 | `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |
@@ -439,6 +452,12 @@ A null function removes the hook, and the device partition then reports that no 
 | `NonFinite` | A coordinate is not finite. `knearest`, `knearest_into`, `knearest_into_d2`, `knearest_into_many`, `knearest_csr`, `knearest_brute` (and through them `lc_knearest`, `lc_knearest_d2`, `lc_knearest_many`, `lc_knearest_csr`), `pairs_within_pbc`, `pairs_within_csr`, `pairs_open`, and the partition entry points return this variant. The k-nearest entries also return it for a non-finite cell origin |
 | `DeviceMismatch` | The device curve split disagreed with the host weights |
 | `ScotchFailed` | The Scotch library rejected the graph |
+| `BadDimensions` | N-dimensional row-major shape is inconsistent |
+| `BadPeriod` | N-dimensional period value is not finite and strictly positive |
+| `IndexOutOfRange` | N-dimensional point index is outside the indexed range |
+
+All status-returning C ABI calls currently return `0` on success and `1` on
+failure; error detail is carried by `lc_last_error()`.
 
 `Error::Empty` is not a wrong-length buffer.
 `knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`.

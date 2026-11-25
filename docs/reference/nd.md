@@ -60,9 +60,26 @@ Metric trait functions:
 - `aabb_min_dist2(point, lo, hi)`
 
 The point metric is exactly symmetric (`dist2(a, b) == dist2(b, a)`) and
-`dist2(a, a) == 0`. Query acceptance uses the exact predicate `dist2 <= r^2`
-with the same metric function as brute-force checks, so neighbour and clustering
-results are identical to brute force under this metric.
+`dist2(a, a) == 0`.
+
+For finite inputs where each per-axis delta, square, and accumulated sum stays
+finite (otherwise the API returns `Overflow`), the search acceptance predicate
+is exactly `dist2 <= r^2`, and branch pruning is widened by a conservative
+floating-point guard. Therefore the returned neighbour sets, k-NN ordering
+(`dist2`, then index), pair lists, and DBSCAN labels are bitwise identical to
+the same-metric brute-force oracle for all dimensions.
+
+Pruning margin derivation (Higham-style forward error):
+
+- Let `u = 2^-53` (unit roundoff for binary64).
+- For a distance-squared sum of `d` terms, use `gamma_n = n*u/(1 - n*u)` with
+  `n = d + c` (`c` is a small constant for subtraction/multiplication rounds).
+- Add one rounding for `sqrt` and one for the final two-term branch-test add.
+- Convert that relative bound to an absolute widening on `|a| + |b| + |c|`
+  for each triangle-inequality comparison.
+
+This widening never overestimates pruning safety (it only widens), so it can
+reduce pruning efficiency but does not lose exact neighbours.
 
 The axis and box lower bounds are sound for periodic intervals including
 intervals wider than `L/2` and full-period coverage (`width >= L`), where the

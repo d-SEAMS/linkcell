@@ -224,7 +224,22 @@ impl Metric<f64> for Euclidean {
         if !a.iter().all(|x| x.is_finite()) || !b.iter().all(|x| x.is_finite()) {
             return Err(Error::NonFinite);
         }
-        Ok(a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum())
+        let mut s = 0.0;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = *x - *y;
+            if !d.is_finite() {
+                return Err(Error::Overflow);
+            }
+            let term = d * d;
+            if !term.is_finite() {
+                return Err(Error::Overflow);
+            }
+            s += term;
+            if !s.is_finite() {
+                return Err(Error::Overflow);
+            }
+        }
+        Ok(s)
     }
 
     fn distance(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {
@@ -297,7 +312,13 @@ impl Metric<f64> for PeriodicSpace {
             let d = if let Some(l) = self.periods[i] {
                 // Keep point distance exactly symmetric and self-zero.
                 let mut w = (a[i] - b[i]).abs();
+                if !w.is_finite() {
+                    return Err(Error::Overflow);
+                }
                 let q = (w / l).trunc();
+                if !q.is_finite() {
+                    return Err(Error::Overflow);
+                }
                 w -= l * q;
                 if w < 0.0 {
                     w = 0.0;
@@ -307,9 +328,20 @@ impl Metric<f64> for PeriodicSpace {
                 }
                 w.min(l - w)
             } else {
-                (a[i] - b[i]).abs()
+                let w = (a[i] - b[i]).abs();
+                if !w.is_finite() {
+                    return Err(Error::Overflow);
+                }
+                w
             };
-            s += d * d;
+            let term = d * d;
+            if !term.is_finite() {
+                return Err(Error::Overflow);
+            }
+            s += term;
+            if !s.is_finite() {
+                return Err(Error::Overflow);
+            }
         }
         Ok(s)
     }
@@ -384,7 +416,8 @@ impl Metric<f64> for PeriodicSpace {
 
 #[cfg(test)]
 mod tests {
-    use super::{Metric, PeriodicSpace};
+    use super::{Euclidean, Metric, PeriodicSpace};
+    use crate::Error;
 
     fn brute_axis_min_dist2(x: f64, lo: f64, hi: f64, l: f64) -> f64 {
         if hi - lo >= l {
@@ -479,5 +512,50 @@ mod tests {
             }
             assert!(worst_violation <= 1.0e-9);
         }
+    }
+
+    fn periodic_ref_axis(a: i64, b: i64, period: Option<i64>) -> i64 {
+        if let Some(l) = period {
+            let mut d = (a - b).abs() % l;
+            if d > l - d {
+                d = l - d;
+            }
+            d
+        } else {
+            (a - b).abs()
+        }
+    }
+
+    #[test]
+    fn metric_dist2_matches_independent_integer_reference() {
+        let periods = vec![Some(11.0), None, Some(7.0), None];
+        let metric = PeriodicSpace::new(periods.clone()).unwrap();
+        for i in -10i64..=10 {
+            for j in -10i64..=10 {
+                let a_i = [i, 2 * i, -3 * i, i - 4];
+                let b_i = [j, 2 * j, -3 * j, j - 4];
+                let a = [a_i[0] as f64, a_i[1] as f64, a_i[2] as f64, a_i[3] as f64];
+                let b = [b_i[0] as f64, b_i[1] as f64, b_i[2] as f64, b_i[3] as f64];
+                let got = metric.dist2(&a, &b).unwrap();
+                let mut ref_i2 = 0i128;
+                for axis in 0..4 {
+                    let p = periods[axis].map(|v| v as i64);
+                    let d = periodic_ref_axis(a_i[axis], b_i[axis], p) as i128;
+                    ref_i2 += d * d;
+                }
+                assert_eq!(got, ref_i2 as f64);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_overflow_in_dist2_is_error() {
+        let periodic = PeriodicSpace::new(vec![Some(1.0e308)]).unwrap();
+        let a = [1.0e308];
+        let b = [-1.0e308];
+        assert_eq!(periodic.dist2(&a, &b), Err(Error::Overflow));
+
+        let euclid = Euclidean::new(1).unwrap();
+        assert_eq!(euclid.dist2(&a, &b), Err(Error::Overflow));
     }
 }

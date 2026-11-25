@@ -402,11 +402,14 @@ pub unsafe extern "C" fn lc_nd_build(
     periods: *const f64,
     out: *mut *mut lc_nd_index,
 ) -> c_int {
-    if out.is_null() || data.is_null() || d == 0 {
+    if out.is_null() {
         return fail_msg("null pointer");
     }
     unsafe {
         *out = ptr::null_mut();
+    }
+    if data.is_null() || d == 0 {
+        return fail_msg("null pointer");
     }
     let max_d = (isize::MAX as usize) / std::mem::size_of::<Option<f64>>();
     if d > max_d {
@@ -419,17 +422,21 @@ pub unsafe extern "C" fn lc_nd_build(
     if !raw.iter().all(|v| v.is_finite()) {
         return fail(Error::NonFinite);
     }
-    let period_vec = if periods.is_null() {
-        vec![None; d]
+    let mut period_vec = Vec::new();
+    if period_vec.try_reserve_exact(d).is_err() {
+        return fail(Error::Overflow);
+    }
+    if periods.is_null() {
+        period_vec.resize(d, None);
     } else {
         let p = unsafe { std::slice::from_raw_parts(periods, d) };
         if p.iter().any(|&v| v.is_nan() || v < 0.0) {
             return fail(Error::BadPeriod);
         }
-        p.iter()
-            .map(|&v| if v > 0.0 { Some(v) } else { None })
-            .collect()
-    };
+        for &v in p {
+            period_vec.push(if v > 0.0 { Some(v) } else { None });
+        }
+    }
     let space = match crate::OwnedContiguousSpace::from_row_major(raw, n, d) {
         Ok(space) => space,
         Err(err) => return fail(err),
