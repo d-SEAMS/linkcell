@@ -380,6 +380,11 @@ mod nd_spawn {
         replacee: *const (),
     }
 
+    /// Function addresses. dyld reads this record from any thread and the
+    /// slots are never written.
+    #[cfg(target_os = "macos")]
+    unsafe impl Sync for DyldInterpose {}
+
     #[cfg(target_os = "macos")]
     extern "C" {
         fn pthread_create(
@@ -520,7 +525,7 @@ mod nd_spawn {
                 return Err("executable has no import directory".to_string());
             }
             let ordinal = 1usize << (usize::BITS - 1);
-            let hook = counted_create_thread as usize;
+            let hook = counted_create_thread as *const () as usize;
             let mut patched = 0usize;
             for desc in 0..512usize {
                 let at = import_rva + desc * 20;
