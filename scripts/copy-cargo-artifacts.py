@@ -103,16 +103,25 @@ def main() -> None:
             paths.append(inherited)
         env["LIBRARY_PATH"] = os.pathsep.join(paths)
     if tsan:
-        nightly_cargo = subprocess.check_output(
-            ["rustup", "which", "--toolchain", "nightly", "cargo"], text=True
-        ).strip()
-        nightly_rustc = subprocess.check_output(
-            ["rustup", "which", "--toolchain", "nightly", "rustc"], text=True
-        ).strip()
-        command[0] = nightly_cargo
-        env["RUSTC"] = nightly_rustc
-        nightly_bin = str(Path(nightly_rustc).parent)
-        env["PATH"] = nightly_bin + os.pathsep + env.get("PATH", "")
+        nightly = rustup_nightly()
+        active = active_rustc(cargo, env)
+        if nightly is not None:
+            nightly_cargo, nightly_rustc = nightly
+            command[0] = nightly_cargo
+            env["RUSTC"] = nightly_rustc
+            nightly_bin = str(Path(nightly_rustc).parent)
+            env["PATH"] = nightly_bin + os.pathsep + env.get("PATH", "")
+        elif active is not None and has_std_sources(active, env):
+            # -Zbuild-std only needs the toolchain's rust-src (conda-forge
+            # ships it as a package); RUSTC_BOOTSTRAP lets a stable
+            # toolchain take the -Z flags.
+            env["RUSTC"] = active
+            env["RUSTC_BOOTSTRAP"] = "1"
+        else:
+            raise SystemExit(
+                "LINKCELL_SANITIZE=thread needs rustup's nightly toolchain or a "
+                "toolchain whose sysroot has rust-src"
+            )
         extra = "-Zsanitizer=thread -Zexternal-clangrt -Cforce-frame-pointers=yes"
         flags = env.get("RUSTFLAGS", "")
         if "-Zsanitizer=thread" not in flags:
@@ -133,6 +142,42 @@ def main() -> None:
         shutil.copy2(built / args.implib, args.out_implib)
     if args.depfile is not None:
         write_depfile(built / (Path(args.static).stem + ".d"), args.out_shared, args.depfile)
+
+
+def rustup_nightly() -> tuple[str, str] | None:
+    """rustup's nightly cargo and rustc, or None when rustup has no nightly."""
+    try:
+        return tuple(
+            subprocess.check_output(
+                ["rustup", "which", "--toolchain", "nightly", tool],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            for tool in ("cargo", "rustc")
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def active_rustc(cargo: str, env: dict[str, str]) -> str | None:
+    """The rustc Cargo would run: RUSTC, else the one beside cargo or on PATH."""
+    if env.get("RUSTC"):
+        return env["RUSTC"]
+    beside = Path(cargo).parent / "rustc"
+    if beside.is_file():
+        return str(beside)
+    return shutil.which("rustc", path=env.get("PATH"))
+
+
+def has_std_sources(rustc: str, env: dict[str, str]) -> bool:
+    """Whether rustc's sysroot holds the std sources -Zbuild-std compiles."""
+    try:
+        sysroot = subprocess.check_output(
+            [rustc, "--print", "sysroot"], env=env, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return (Path(sysroot) / "lib" / "rustlib" / "src" / "rust" / "library" / "Cargo.lock").is_file()
 
 
 def write_depfile(cargo_dep: Path, target: Path, depfile: Path) -> None:
