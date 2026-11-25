@@ -1,0 +1,38 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "linkcell",
+  "description": "Periodic linked-cell k-nearest neighbour search.",
+  "folders": [
+    "docs",
+    "examples",
+    "include",
+    "python"
+  ],
+  "excludeFolders": [
+    "docs/source",
+    "docs/build",
+    "docs/newsfragments",
+    "newsfragments",
+    "changelog.d",
+    "benches",
+    "benchmarks",
+    "bench",
+    "benchflow",
+    "subprojects",
+    "third_party",
+    "tests",
+    "scripts",
+    "ci",
+    ".github",
+    "branding",
+    ".pixi",
+    "lean",
+    "overrides"
+  ],
+  "excludeFiles": [
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "LICENSE"
+  ],
+  "rules": []
+}
