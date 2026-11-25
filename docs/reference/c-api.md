@@ -52,6 +52,9 @@ int lc_knearest_many(const double *xyz, size_t n, size_t n_frames,
 
 `lc_knearest` is the one-frame, indices-only entry.
 Returns 0 on success, nonzero on failure.
+A NaN or infinite coordinate, masked or not and in any frame, or a non-finite `simbox` origin returns nonzero with `lc_last_error()` set to `a coordinate is not finite`, before any search; `out_nn` is filled with `-1` and `out_d2` with `NaN`.
+A non-finite lattice entry returns nonzero as a singular or non-positive cell.
+The device entries `lc_gpu_knearest*` in `linkcell_gpu.h` do not scan their device coordinates for non-finite values.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
@@ -141,10 +144,12 @@ A masked-out point has an empty row and appears in no row.
 
 A query or a short buffer keeps its rows on the calling thread, like the other count queries.
 The next call there with the same inputs bit for bit copies them out without searching again.
+A short buffer with a null `out_d2` keeps no distances, so a next call that asks for them searches again.
 A buffer large enough on the first call takes the rows straight from the search.
+The distances are computed only when `out_d2` is non-null.
 The rows and distances are the same bits at every `lc_set_threads` width and SIMD path.
-A periodic cell is searched, counted, placed, filled, and sorted per row on the pool.
-No step sorts the whole list.
+On a periodic cell each point gathers its row from the bins around it, a bin at a time on the pool, and one copy lays the rows out in point order.
+No hit is buffered and no step sorts the whole list.
 A cell with an open axis is searched on the calling thread, and its rows are then built on the pool.
 `pairs_within_csr` is the Rust entry and fills a `PairCsr`.
 
@@ -307,7 +312,7 @@ int lc_knearest_csr(const double *xyz, size_t n, const lc_cell *simbox,
                     int *(*alloc)(void *, size_t), void *ctx);
 ```
 
-Inputs match `lc_knearest`.
+Inputs and argument errors match `lc_knearest`, including the non-finite coordinate and origin check.
 `out_offsets` has length `n + 1`.
 `alloc(ctx, total)` is called once, from any thread of the search, and returns `total` writable ints for the columns.
 A null return fails the call.
@@ -380,12 +385,16 @@ A null function removes the hook, and the device partition then reports that no 
 | `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
 | `Device` | The device is not the CPU and `libvesin.so` is not loaded |
 | `Padded` | A point has more neighbours than the requested pad |
-| `NonFinite` | A coordinate is not finite. `pairs_within_pbc`, `pairs_within_csr`, `pairs_open`, and the partition entry points return this variant |
+| `NonFinite` | A coordinate is not finite. `knearest`, `knearest_into`, `knearest_into_d2`, `knearest_into_many`, `knearest_csr`, `knearest_brute` (and through them `lc_knearest`, `lc_knearest_d2`, `lc_knearest_many`, `lc_knearest_csr`), `pairs_within_pbc`, `pairs_within_csr`, `pairs_open`, and the partition entry points return this variant. The k-nearest entries also return it for a non-finite cell origin |
 | `DeviceMismatch` | The device curve split disagreed with the host weights |
 | `ScotchFailed` | The Scotch library rejected the graph |
 
 `Error::Empty` is not a wrong-length buffer.
-`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, and `TooManyCells`.
+`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`.
+`knearest_csr` returns the same variants.
+`knearest_into`, `knearest_into_d2`, and `knearest_into_many` return them and `BufferSize`.
+`knearest_brute` returns `ZeroK`, `Empty`, and `NonFinite`.
+A non-finite lattice vector is `BadBox` from the `Cell` constructor, before any search.
 `pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
 `TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
 point count above `u32::MAX` and a relative periodic image offset that

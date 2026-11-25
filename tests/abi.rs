@@ -797,3 +797,214 @@ fn continuation_runs_only_on_the_thread_that_set_it() {
         );
     }
 }
+
+fn last_error() -> String {
+    let msg = linkcell::lc_last_error();
+    assert!(!msg.is_null());
+    unsafe { std::ffi::CStr::from_ptr(msg) }
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// Three points with `bad` at axis `axis` of point 1, packed.
+fn poisoned_c(bad: f64, axis: usize) -> [f64; 9] {
+    let mut packed = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0];
+    packed[3 + axis] = bad;
+    packed
+}
+
+const NON_FINITE: [f64; 3] = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+
+#[test]
+fn lc_knearest_entries_reject_non_finite_coordinates() {
+    let box_c = ortho_c(10.0, 10.0, 10.0);
+    let want = Error::NonFinite.to_string();
+    for bad in NON_FINITE {
+        for axis in 0..3 {
+            let packed = poisoned_c(bad, axis);
+            let mut nn = [7i32; 6];
+            let rc = unsafe {
+                lc_knearest(
+                    packed.as_ptr(),
+                    3,
+                    &box_c,
+                    2,
+                    std::ptr::null(),
+                    0.0,
+                    nn.as_mut_ptr(),
+                )
+            };
+            assert_ne!(rc, 0);
+            assert_eq!(last_error(), want);
+            assert_eq!(nn, [-1; 6]);
+
+            let mut nn = [7i32; 6];
+            let mut d2 = [1.0f64; 6];
+            let rc = unsafe {
+                lc_knearest_d2(
+                    packed.as_ptr(),
+                    3,
+                    &box_c,
+                    2,
+                    std::ptr::null(),
+                    0.0,
+                    nn.as_mut_ptr(),
+                    d2.as_mut_ptr(),
+                )
+            };
+            assert_ne!(rc, 0);
+            assert_eq!(last_error(), want);
+            assert_eq!(nn, [-1; 6]);
+            assert!(d2.iter().all(|v| v.is_nan()));
+        }
+    }
+}
+
+#[test]
+fn lc_knearest_many_rejects_a_non_finite_later_frame() {
+    let box_c = ortho_c(10.0, 10.0, 10.0);
+    for bad in NON_FINITE {
+        let mut packed = [0.0f64; 18];
+        packed[..9].copy_from_slice(&poisoned_c(0.0, 0));
+        packed[9..].copy_from_slice(&poisoned_c(bad, 2));
+        let mut nn = [7i32; 12];
+        let mut d2 = [1.0f64; 12];
+        let rc = unsafe {
+            lc_knearest_many(
+                packed.as_ptr(),
+                3,
+                2,
+                &box_c,
+                2,
+                std::ptr::null(),
+                0.0,
+                nn.as_mut_ptr(),
+                d2.as_mut_ptr(),
+            )
+        };
+        assert_ne!(rc, 0);
+        assert_eq!(last_error(), Error::NonFinite.to_string());
+        assert_eq!(nn, [-1; 12]);
+        assert!(d2.iter().all(|v| v.is_nan()));
+    }
+}
+
+extern "C" fn csr_alloc(ctx: *mut std::ffi::c_void, total: usize) -> *mut c_int {
+    let cols = unsafe { &mut *(ctx as *mut Vec<c_int>) };
+    cols.resize(total, 0);
+    cols.as_mut_ptr()
+}
+
+fn c_csr(packed: &[f64], n: usize, box_c: &linkcell::lc_cell, mutual: c_int) -> c_int {
+    let mut offsets = vec![0 as c_int; n + 1];
+    let mut cols: Vec<c_int> = Vec::new();
+    unsafe {
+        linkcell::lc_knearest_csr(
+            packed.as_ptr(),
+            n,
+            box_c,
+            2,
+            std::ptr::null(),
+            0.0,
+            mutual,
+            offsets.as_mut_ptr(),
+            Some(csr_alloc),
+            (&mut cols as *mut Vec<c_int>).cast(),
+        )
+    }
+}
+
+fn ortho_lc(l: f64) -> linkcell::lc_cell {
+    linkcell::lc_cell {
+        ax: l,
+        ay: 0.0,
+        az: 0.0,
+        bx: 0.0,
+        by: l,
+        bz: 0.0,
+        cx: 0.0,
+        cy: 0.0,
+        cz: l,
+        ox: 0.0,
+        oy: 0.0,
+        oz: 0.0,
+    }
+}
+
+#[test]
+fn lc_knearest_csr_rejects_non_finite_coordinates() {
+    let box_c = ortho_lc(10.0);
+    assert_eq!(c_csr(&poisoned_c(0.0, 0), 3, &box_c, 0), 0);
+    for bad in NON_FINITE {
+        for axis in 0..3 {
+            for mutual in [0, 1] {
+                assert_ne!(c_csr(&poisoned_c(bad, axis), 3, &box_c, mutual), 0);
+                assert_eq!(last_error(), Error::NonFinite.to_string());
+            }
+        }
+    }
+}
+
+#[test]
+fn lc_knearest_entries_reject_a_non_finite_origin() {
+    let packed = poisoned_c(0.0, 0);
+    for bad in NON_FINITE {
+        let mut box_c = ortho_lc(10.0);
+        box_c.oy = bad;
+        let mut nn = [7i32; 6];
+        let rc = unsafe {
+            linkcell::lc_knearest(
+                packed.as_ptr(),
+                3,
+                &box_c,
+                2,
+                std::ptr::null(),
+                0.0,
+                nn.as_mut_ptr(),
+            )
+        };
+        assert_ne!(rc, 0);
+        assert_eq!(last_error(), Error::NonFinite.to_string());
+        assert_ne!(c_csr(&packed, 3, &box_c, 0), 0);
+        assert_eq!(last_error(), Error::NonFinite.to_string());
+    }
+}
+
+#[test]
+fn lc_knearest_entries_reject_non_finite_box_lengths() {
+    let packed = poisoned_c(0.0, 0);
+    let want = Error::BadBox.to_string();
+    for bad in NON_FINITE {
+        for slot in 0..9 {
+            let mut box_c = ortho_lc(10.0);
+            match slot {
+                0 => box_c.ax = bad,
+                1 => box_c.ay = bad,
+                2 => box_c.az = bad,
+                3 => box_c.bx = bad,
+                4 => box_c.by = bad,
+                5 => box_c.bz = bad,
+                6 => box_c.cx = bad,
+                7 => box_c.cy = bad,
+                _ => box_c.cz = bad,
+            }
+            let mut nn = [7i32; 6];
+            let rc = unsafe {
+                linkcell::lc_knearest(
+                    packed.as_ptr(),
+                    3,
+                    &box_c,
+                    2,
+                    std::ptr::null(),
+                    0.0,
+                    nn.as_mut_ptr(),
+                )
+            };
+            assert_ne!(rc, 0);
+            assert_eq!(last_error(), want);
+            assert_ne!(c_csr(&packed, 3, &box_c, 0), 0);
+            assert_eq!(last_error(), want);
+        }
+    }
+}

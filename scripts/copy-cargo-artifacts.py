@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -38,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         default="true",
         help="Compile the fused k-nearest OpenMP region (LINKCELL_OPENMP).",
     )
+    parser.add_argument(
+        "--sanitize",
+        choices=("none", "thread"),
+        default="none",
+        help="Rebuild the crate and std with this sanitizer (LINKCELL_SANITIZE).",
+    )
     args = parser.parse_args()
     if (args.implib is None) != (args.out_implib is None):
         parser.error("--implib and --out-implib must be supplied together")
@@ -49,20 +54,21 @@ def main() -> None:
     # ThreadSanitizer does not see Rayon's futex join unless std and rayon
     # are rebuilt with the sanitizer. The final C++ link supplies one
     # compiler-rt via -Zexternal-clangrt, so the pool stays multithreaded.
-    tsan = os.environ.get("LINKCELL_SANITIZE") == "thread"
+    tsan = args.sanitize == "thread" or os.environ.get("LINKCELL_SANITIZE") == "thread"
     # Pixi's cargo is a real binary, not the rustup proxy, and it is ahead
     # of rustup on PATH. rustup run nightly still leaves that rustc first,
     # so the nightly compiler has to be named by its own path.
-    command = [args.cargo]
+    cargo = os.path.abspath(args.cargo) if os.path.dirname(args.cargo) else args.cargo
+    command = [cargo]
     if os.environ.get("LINKCELL_CARGO_VERBOSE") == "1":
         command.append("-vv")
     command += [
         "rustc",
         "--lib",
         "--manifest-path",
-        str(args.source / "Cargo.toml"),
+        str(args.source.absolute() / "Cargo.toml"),
         "--target-dir",
-        str(args.target),
+        str(args.target.absolute()),
         "--features",
         "capi",
     ]
@@ -74,12 +80,15 @@ def main() -> None:
         command.append("--release")
 
     rustc = ["--crate-type=cdylib", "--crate-type=staticlib"]
-    if sys.platform.startswith("linux"):
+    if args.shared.endswith(".so"):
         rustc.append(f"-Clink-arg=-Wl,-soname,{args.shared}")
-    elif sys.platform == "darwin":
+    elif args.shared.endswith(".dylib"):
         rustc.append(f"-Clink-arg=-Wl,-install_name,@rpath/{args.shared}")
     command.extend(["--", *rustc])
     env = os.environ.copy()
+    build_target = env.get("CARGO_BUILD_TARGET")
+    if build_target and build_target.endswith(".json"):
+        env["CARGO_BUILD_TARGET"] = os.path.abspath(build_target)
     # Unset keeps the historical default inside build.rs. Meson always
     # passes the flag so a use_openmp=false build does not emit the region.
     env["LINKCELL_OPENMP"] = "1" if args.openmp == "true" else "0"
@@ -94,31 +103,85 @@ def main() -> None:
             paths.append(inherited)
         env["LIBRARY_PATH"] = os.pathsep.join(paths)
     if tsan:
-        nightly_cargo = subprocess.check_output(
-            ["rustup", "which", "--toolchain", "nightly", "cargo"], text=True
-        ).strip()
-        nightly_rustc = subprocess.check_output(
-            ["rustup", "which", "--toolchain", "nightly", "rustc"], text=True
-        ).strip()
-        command[0] = nightly_cargo
-        env["RUSTC"] = nightly_rustc
-        nightly_bin = str(Path(nightly_rustc).parent)
-        env["PATH"] = nightly_bin + os.pathsep + env.get("PATH", "")
+        nightly = rustup_nightly()
+        active = active_rustc(cargo, env)
+        if nightly is not None and has_std_sources(nightly[1], env):
+            nightly_cargo, nightly_rustc = nightly
+            command[0] = nightly_cargo
+            env["RUSTC"] = nightly_rustc
+            nightly_bin = str(Path(nightly_rustc).parent)
+            env["PATH"] = nightly_bin + os.pathsep + env.get("PATH", "")
+        elif active is not None and has_std_sources(active, env):
+            # -Zbuild-std only needs the toolchain's rust-src (conda-forge
+            # ships it as a package); RUSTC_BOOTSTRAP lets a stable
+            # toolchain take the -Z flags.
+            env["RUSTC"] = active
+            env["RUSTC_BOOTSTRAP"] = "1"
+        else:
+            raise SystemExit(
+                "LINKCELL_SANITIZE=thread needs a toolchain whose sysroot has "
+                "rust-src: rustup's nightly or the active one"
+            )
         extra = "-Zsanitizer=thread -Zexternal-clangrt -Cforce-frame-pointers=yes"
         flags = env.get("RUSTFLAGS", "")
         if "-Zsanitizer=thread" not in flags:
             env["RUSTFLAGS"] = (flags + " " + extra).strip()
-    subprocess.check_call(command, env=env)
+    subprocess.check_call(command, cwd=args.source, env=env)
 
-    built = args.target / args.profile
     if tsan:
-        built = args.target / "x86_64-unknown-linux-gnu" / args.profile
+        build_target = "x86_64-unknown-linux-gnu"
+    built = args.target
+    if build_target:
+        if build_target.endswith(".json"):
+            build_target = Path(build_target).stem
+        built /= build_target
+    built /= args.profile
     shutil.copy2(built / args.shared, args.out_shared)
     shutil.copy2(built / args.static, args.out_static)
     if args.implib is not None:
         shutil.copy2(built / args.implib, args.out_implib)
     if args.depfile is not None:
         write_depfile(built / (Path(args.static).stem + ".d"), args.out_shared, args.depfile)
+
+
+def rustup_nightly() -> tuple[str, str] | None:
+    """rustup's installed nightly cargo and rustc, or None without one."""
+    # rustup which installs a missing toolchain by default, and that
+    # minimal nightly has no rust-src for -Zbuild-std.
+    env = dict(os.environ, RUSTUP_AUTO_INSTALL="0")
+    try:
+        return tuple(
+            subprocess.check_output(
+                ["rustup", "which", "--toolchain", "nightly", tool],
+                env=env,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            for tool in ("cargo", "rustc")
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def active_rustc(cargo: str, env: dict[str, str]) -> str | None:
+    """The rustc Cargo would run: RUSTC, else the one beside cargo or on PATH."""
+    if env.get("RUSTC"):
+        return env["RUSTC"]
+    beside = Path(cargo).parent / "rustc"
+    if beside.is_file():
+        return str(beside)
+    return shutil.which("rustc", path=env.get("PATH"))
+
+
+def has_std_sources(rustc: str, env: dict[str, str]) -> bool:
+    """Whether rustc's sysroot holds the std sources -Zbuild-std compiles."""
+    try:
+        sysroot = subprocess.check_output(
+            [rustc, "--print", "sysroot"], env=env, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return (Path(sysroot) / "lib" / "rustlib" / "src" / "rust" / "library" / "Cargo.lock").is_file()
 
 
 def write_depfile(cargo_dep: Path, target: Path, depfile: Path) -> None:

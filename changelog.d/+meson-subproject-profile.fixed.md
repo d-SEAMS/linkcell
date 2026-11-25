@@ -1,0 +1,1 @@
+A Meson subproject build of linkcell compiles the crate with Cargo's release profile on every Meson version. Meson 1.3 handed the subproject its parent's `debug` buildtype, so a wrap consumer's debug build got an unoptimized crate there and an optimized one on newer Meson. The new `cargo_profile` option (`auto`, `debug`, `release`) overrides the choice.

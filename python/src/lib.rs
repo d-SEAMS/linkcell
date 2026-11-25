@@ -340,9 +340,11 @@ where
 ///
 /// `k == 0`, a cell of the wrong shape, and a singular cell raise
 /// `ValueError`. An empty frame and a mask whose length is not `n` also
-/// raise `ValueError`. A mesh past the bin cap raises `RuntimeError`
-/// with the crate's error text. Lengths are the cell's unit. `dist2` is
-/// that unit squared.
+/// raise `ValueError`, as does a NaN or infinite lattice entry. A NaN or
+/// infinite host coordinate (masked or not) or cell origin, and a mesh
+/// past the bin cap, raise `RuntimeError` with the crate's error text.
+/// CUDA `xyz` is not scanned for non-finite values. Lengths are the
+/// cell's unit. `dist2` is that unit squared.
 /// `cell_hint` defaults to `None`, which selects a bin edge of 3 in
 /// that unit.
 #[pyfunction]

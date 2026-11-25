@@ -1,0 +1,1 @@
+The ThreadSanitizer rebuild uses the active toolchain when rustup has no nightly and that toolchain's sysroot has `rust-src`, such as conda-forge's `rust` with `rust-src`, and exits with a message when neither is available.

@@ -1,0 +1,1 @@
+A Meson build with `sanitize=thread` links consumers against the shared library, even as a subproject, so its rebuilt std no longer collides with the std of another Rust static library in the same link (`rust_eh_personality`, `__rdl_alloc_error_handler`).

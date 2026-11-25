@@ -1,19 +1,23 @@
 //! Cutoff neighbours as CSR rows, built from one search.
 //!
-//! The search leaves each thread's hits in its own buffer, one entry per
-//! atom-image pair. The rows are built from those buffers in place of a
-//! row list and a sort over it. Each lane (one or more search buffers)
-//! counts its entries per row. A prefix sum over the rows gives every
-//! lane its own slots in every row, the lanes write their columns there,
-//! and each row is then sorted. The sorted rows hold no repeated column
-//! and every distance is the same bits at every thread count, so the
-//! rows do not depend on how the search split the hits.
+//! A periodic cell gathers each row whole, source by source, and lays
+//! the rows out in atom order (see `pair_gather.rs`). A cell with an
+//! open axis is searched as half rows. Those land in lanes, one or more
+//! hit buffers each, which count their entries per row. A prefix sum
+//! over the rows gives every lane its own slots in every row, the lanes
+//! write their columns there, and each row is then sorted. The rows
+//! hold no repeated column and every distance is the same bits at
+//! every thread count, so the rows do not depend on how the work was
+//! split.
 //!
 //! An atom meets another through two images only when the cutoff is at
-//! least half the narrowest periodic width. Those rows are written to a
-//! staging buffer first, deduplicated, and then packed.
+//! least half the narrowest periodic width. Those rows keep the nearest
+//! image of each column.
 
-use super::{hit_estimate, in_pool, plan_unshifted, row_guess, Found, Pair, Scratch};
+use super::gather::{gather, Gathered};
+use super::{bin_atoms, hit_estimate, in_pool, row_guess, Pair};
+#[cfg(test)]
+use super::{plan_unshifted, Found, Scratch};
 use crate::cell::Cell;
 use crate::open_cell::{pairs_within_pbc, PbcQuery};
 use crate::Error;
@@ -111,11 +115,61 @@ pub fn pairs_within_csr(
         out.dist2.reserve(guess);
     }
     in_pool(est, || {
-        let source = Source::search(xyz, cell, query)?;
-        let rows = Rows::new(&source, n, query.half, repeats(cell, query), dist2)?;
-        rows.write_vec(out, dist2);
+        if query.periodic != [true, true, true] {
+            let source = Source::search(xyz, cell, query)?;
+            let rows = Rows::new(&source, n, query.half, repeats(cell, query), dist2)?;
+            rows.write_vec(out, dist2);
+            return Ok(());
+        }
+        let Some(mut rows) = gathered(xyz, cell, query, dist2)? else {
+            out.offsets.resize(n + 1, 0);
+            return Ok(());
+        };
+        let need = rows.scan()?;
+        out.cols.reserve(need);
+        if dist2 {
+            out.dist2.reserve(need);
+        }
+        let d2 = if dist2 {
+            out.dist2.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
+        // Safety: the buffers hold `n + 1` offsets and `need` columns and
+        // distances, and `write` sets every one.
+        unsafe {
+            rows.write(out.offsets.as_mut_ptr(), out.cols.as_mut_ptr(), d2);
+            out.offsets.set_len(n + 1);
+            out.cols.set_len(need);
+            if dist2 {
+                out.dist2.set_len(need);
+            }
+        }
         Ok(())
     })
+}
+
+/// The staged rows of a fully periodic search, or `None` when no point
+/// is active.
+fn gathered(
+    xyz: &[[f64; 3]],
+    cell: &Cell,
+    query: &PbcQuery<'_>,
+    dist2: bool,
+) -> Result<Option<Gathered>, Error> {
+    let Some(binned) = bin_atoms(xyz, cell, query.cutoff, query.mask, query.cell_hint, true)?
+    else {
+        return Ok(None);
+    };
+    let repeat = repeats(cell, query);
+    Ok(Some(gather(
+        &binned,
+        cell,
+        xyz.len(),
+        query.half,
+        repeat,
+        dist2,
+    )))
 }
 
 /// Destination of [`Rows::write`]: `n + 1` offsets, and the columns and
@@ -136,28 +190,93 @@ unsafe impl Sync for CsrDest {}
 pub(crate) enum CsrWrite {
     /// Into the [`CsrDest`] `room` returned; this many columns.
     Direct(usize),
-    /// `room` had no buffer for them: owned rows, with distances.
+    /// `room` had no buffer for them: owned rows, with distances when
+    /// asked for.
     Owned(PairCsr),
 }
 
 /// The C ABI's build: the rows go straight into `room(columns)` when it
-/// returns a destination. Otherwise they are built, with distances, into
-/// an owned [`PairCsr`]. `xyz` is not empty and has passed [`check`].
+/// returns a destination. Otherwise they are built into an owned
+/// [`PairCsr`]. Distances are computed only with `dist2`, and then a
+/// destination's non-null distance pointer receives them. `xyz` is not
+/// empty and has passed [`check`].
 #[cfg(feature = "capi")]
 pub(crate) fn csr_rows(
     xyz: &[[f64; 3]],
     cell: &Cell,
     query: &PbcQuery<'_>,
+    dist2: bool,
     room: impl FnOnce(usize) -> Option<CsrDest> + Send,
 ) -> Result<CsrWrite, Error> {
     let n = xyz.len();
     let est = estimate(n, cell, query);
     in_pool(est, || {
+        if query.periodic == [true, true, true] {
+            let Some(mut rows) = gathered(xyz, cell, query, dist2)? else {
+                let empty = PairCsr {
+                    offsets: vec![0; n + 1],
+                    ..PairCsr::default()
+                };
+                return Ok(match room(0) {
+                    Some(dest) => {
+                        // Safety: `room` gave `n + 1` offsets.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                empty.offsets.as_ptr(),
+                                dest.offsets,
+                                n + 1,
+                            )
+                        };
+                        CsrWrite::Direct(0)
+                    }
+                    None => CsrWrite::Owned(empty),
+                });
+            };
+            let need = rows.scan()?;
+            return Ok(match room(need) {
+                Some(dest) => {
+                    // Safety: `room` gave `n + 1` offsets and `need` columns
+                    // (and distances when that pointer is non-null).
+                    let d2 = if dist2 {
+                        dest.dist2
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    unsafe { rows.write(dest.offsets, dest.cols, d2) };
+                    CsrWrite::Direct(need)
+                }
+                None => {
+                    let mut owned = PairCsr {
+                        offsets: Vec::with_capacity(n + 1),
+                        cols: Vec::with_capacity(need),
+                        dist2: Vec::with_capacity(if dist2 { need } else { 0 }),
+                    };
+                    // Safety: as in `pairs_within_csr`.
+                    unsafe {
+                        let d2 = if dist2 {
+                            owned.dist2.as_mut_ptr()
+                        } else {
+                            std::ptr::null_mut()
+                        };
+                        rows.write(owned.offsets.as_mut_ptr(), owned.cols.as_mut_ptr(), d2);
+                        owned.offsets.set_len(n + 1);
+                        owned.cols.set_len(need);
+                        if dist2 {
+                            owned.dist2.set_len(need);
+                        }
+                    }
+                    CsrWrite::Owned(owned)
+                }
+            });
+        }
         let source = Source::search(xyz, cell, query)?;
-        let rows = Rows::new(&source, n, query.half, repeats(cell, query), true)?;
+        let rows = Rows::new(&source, n, query.half, repeats(cell, query), dist2)?;
         let need = rows.need();
         match room(need) {
-            Some(dest) => {
+            Some(mut dest) => {
+                if !dist2 {
+                    dest.dist2 = std::ptr::null_mut();
+                }
                 // Safety: `room` gave `n + 1` offsets and `need` columns
                 // (and distances when that pointer is non-null).
                 unsafe { rows.write(dest) };
@@ -165,7 +284,7 @@ pub(crate) fn csr_rows(
             }
             None => {
                 let mut owned = PairCsr::default();
-                rows.write_vec(&mut owned, true);
+                rows.write_vec(&mut owned, dist2);
                 Ok(CsrWrite::Owned(owned))
             }
         }
@@ -185,7 +304,12 @@ pub(crate) fn check(xyz: &[[f64; 3]], query: &PbcQuery<'_>) -> Result<(), Error>
     if xyz.len() > i32::MAX as usize {
         return Err(Error::Overflow);
     }
-    if xyz.iter().flatten().any(|v| !v.is_finite()) {
+    // A fold rather than `any`: no early exit, so it vectorizes.
+    if !xyz
+        .as_flattened()
+        .iter()
+        .fold(true, |ok, v| ok & v.is_finite())
+    {
         return Err(Error::NonFinite);
     }
     Ok(())
@@ -226,12 +350,16 @@ const BLOCKS_PER_THREAD: usize = 8;
 /// The hits one search found: the periodic walk's buffers, or an open or
 /// mixed cell's half rows.
 enum Source {
+    /// The pair walk's hit buffers: the v0.6.0 rows of a periodic cell,
+    /// kept as the reference the gathered rows are tested against.
+    #[cfg(test)]
     Found(Found),
     Pairs(Vec<Pair>),
 }
 
 impl Source {
     fn search(xyz: &[[f64; 3]], cell: &Cell, query: &PbcQuery<'_>) -> Result<Self, Error> {
+        #[cfg(test)]
         if query.periodic == [true, true, true] {
             let plan = plan_unshifted(
                 xyz,
@@ -255,6 +383,7 @@ impl Source {
     /// The hits in at most `most` lanes, in search order.
     fn lanes(&self, most: usize) -> Vec<Lane<'_>> {
         match self {
+            #[cfg(test)]
             Source::Found(found) => {
                 let chunks = &found.chunks[..];
                 let count = chunks.len().clamp(1, most);
@@ -281,6 +410,7 @@ impl Source {
 /// One lane's hits. Each is an atom pair and the squared distance of one
 /// of its images, seen once.
 enum Lane<'a> {
+    #[cfg(test)]
     Hits(&'a [Scratch]),
     Pairs(&'a [Pair]),
 }
@@ -288,6 +418,7 @@ enum Lane<'a> {
 impl Lane<'_> {
     fn len(&self) -> usize {
         match self {
+            #[cfg(test)]
             Lane::Hits(chunks) => chunks.iter().map(|c| c.js.len()).sum(),
             Lane::Pairs(rows) => rows.len(),
         }
@@ -296,6 +427,7 @@ impl Lane<'_> {
     #[inline(always)]
     fn each(&self, mut visit: impl FnMut(u32, u32, f64)) {
         match self {
+            #[cfg(test)]
             Lane::Hits(chunks) => {
                 for chunk in chunks.iter() {
                     for ((&a, &b), &d) in chunk.atom.iter().zip(&chunk.js).zip(&chunk.d2) {
@@ -400,8 +532,8 @@ struct Rows<'a> {
     n: usize,
     half: bool,
     blocks: usize,
-    /// `next[l][i]`: lane `l`'s next slot in row `i`.
-    next: Vec<Vec<u32>>,
+    /// `next[l * n + i]`: lane `l`'s next slot in row `i`.
+    next: Vec<u32>,
     /// Row starts before repeated columns are dropped, `n + 1` values.
     start: Vec<usize>,
     /// The rows of a search that can repeat a column, already sorted
@@ -483,8 +615,12 @@ impl<'a> Rows<'a> {
         let n = self.n;
         let half = self.half;
         let lanes = &self.lanes;
-        self.next = map_index(lanes.len(), |l| {
-            let mut count = vec![0u32; n];
+        self.next.clear();
+        self.next.resize(lanes.len() * n, 0);
+        let next = Shared(self.next.as_mut_ptr());
+        each_index(lanes.len(), |l| {
+            // Safety: lane `l` counts into its own `n` entries alone.
+            let count = unsafe { std::slice::from_raw_parts_mut(next.at(l * n), n) };
             lanes[l].each(|a, b, _| {
                 if a == b {
                     return;
@@ -496,7 +632,6 @@ impl<'a> Rows<'a> {
                     count[b as usize] += 1;
                 }
             });
-            count
         });
     }
 
@@ -507,14 +642,14 @@ impl<'a> Rows<'a> {
         let next = &self.next;
         let sums = map_index(blocks, |b| {
             let (lo, hi) = span(n, blocks, b);
-            next.iter()
+            next.chunks(n)
                 .map(|count| count[lo..hi].iter().map(|&c| c as usize).sum::<usize>())
                 .sum()
         });
         let (base, total) = bases(&sums);
         let lanes: Vec<Shared<u32>> = self
             .next
-            .iter_mut()
+            .chunks_mut(n)
             .map(|c| Shared(c.as_mut_ptr()))
             .collect();
         let start = Shared(self.start.as_mut_ptr());
@@ -549,10 +684,10 @@ impl<'a> Rows<'a> {
         let lanes = &self.lanes;
         let next: Vec<Shared<u32>> = self
             .next
-            .iter_mut()
+            .chunks_mut(self.n)
             .map(|c| Shared(c.as_mut_ptr()))
             .collect();
-        // Lane `l` owns `next[l]`, and its slots in `cols` are its own.
+        // Lane `l` owns its row of `next`, and its slots in `cols` are its own.
         each_index(lanes.len(), |l| {
             let next = next[l];
             let put = |row: u32, col: u32, d: f64| unsafe {
@@ -679,7 +814,7 @@ impl<'a> Rows<'a> {
         };
         let raw = &self.start;
         let with_d2 = !dist2.is_null() && !staged.dist2.is_empty();
-        debug_assert!(dist2.is_null() || with_d2);
+        debug_assert!(dist2.is_null() || with_d2 || staged.cols.is_empty());
         each_index(blocks, |b| {
             let (lo, hi) = span(n, blocks, b);
             for i in lo..hi {
@@ -938,6 +1073,28 @@ mod tests {
         }
     }
 
+    /// A box shorter than twice the cutoff stages its rows; with no pair
+    /// they hold no distance, and asking for distances is still fine,
+    /// gathered on a periodic cell or written from the walk's hits on a
+    /// cell with an open axis.
+    #[test]
+    fn empty_staged_rows_with_distances() {
+        let cell = Cell::ortho(6.0, 6.0, 6.0).unwrap();
+        for periodic in [[true; 3], [true, true, false]] {
+            let mut out = PairCsr::default();
+            pairs_within_csr(
+                &[[1.0, 2.0, 3.0]],
+                &cell,
+                &PbcQuery::new(periodic, 3.5),
+                true,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(out.offsets, [0, 0], "{periodic:?}");
+            assert!(out.cols.is_empty() && out.dist2.is_empty(), "{periodic:?}");
+        }
+    }
+
     #[test]
     fn sort_row_orders_by_column_then_distance() {
         let mut scratch = Vec::new();
@@ -967,6 +1124,155 @@ mod tests {
                 .map(|(&c, d)| (c, d.to_bits()))
                 .collect();
             assert_eq!(got, want, "length {len} after dedup");
+        }
+    }
+
+    /// The rows of v0.6.0: the pair walk's hit buffers, counted, placed,
+    /// filled, and sorted per row.
+    fn v060(xyz: &[[f64; 3]], cell: &Cell, query: &PbcQuery<'_>) -> PairCsr {
+        let source = Source::search(xyz, cell, query).unwrap();
+        let rows = Rows::new(&source, xyz.len(), query.half, repeats(cell, query), true).unwrap();
+        let mut out = PairCsr::default();
+        rows.write_vec(&mut out, true);
+        out
+    }
+
+    /// Every row against all pairs and images: the columns, but those
+    /// within rounding of the cutoff, and the distances to rounding.
+    fn assert_brute(
+        got: &PairCsr,
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+        query: &PbcQuery<'_>,
+        label: &str,
+    ) {
+        let reach = repeats_of(cell, query.cutoff);
+        let cut2 = query.cutoff * query.cutoff;
+        let tol = 1e-9 * (1.0 + cut2);
+        let active = |i: usize| query.mask.map_or(true, |m| m[i]);
+        for i in 0..xyz.len() {
+            let row = got.offsets[i] as usize..got.offsets[i + 1] as usize;
+            let mut have: std::collections::BTreeMap<i32, f64> = got.cols[row.clone()]
+                .iter()
+                .zip(&got.dist2[row])
+                .map(|(&j, &d)| (j, d))
+                .collect();
+            for j in 0..xyz.len() {
+                if j == i || !active(i) || !active(j) || (query.half && j < i) {
+                    continue;
+                }
+                let mut best = f64::INFINITY;
+                for a in -reach[0]..=reach[0] {
+                    for b in -reach[1]..=reach[1] {
+                        for c in -reach[2]..=reach[2] {
+                            let t = cell.lattice_shift(a, b, c);
+                            let mut d2 = 0.0;
+                            for k in 0..3 {
+                                let d = xyz[j][k] - xyz[i][k] + t[k];
+                                d2 += d * d;
+                            }
+                            best = best.min(d2);
+                        }
+                    }
+                }
+                match have.remove(&(j as i32)) {
+                    Some(d) => {
+                        assert!(best < cut2 + tol, "{label}: {i}-{j} at {best} listed");
+                        assert!(
+                            (d - best).abs() <= tol,
+                            "{label}: {i}-{j} at {d}, brute {best}"
+                        );
+                    }
+                    None => assert!(best >= cut2 - tol, "{label}: {i}-{j} at {best} missing"),
+                }
+            }
+            assert!(
+                have.is_empty(),
+                "{label}: row {i} lists {have:?} beyond the pairs"
+            );
+        }
+    }
+
+    /// Lattice images each way that can hold a pair within `cutoff`, and
+    /// one more for the fold.
+    fn repeats_of(cell: &Cell, cutoff: f64) -> [i32; 3] {
+        cell.widths().map(|w| (cutoff / w).ceil() as i32 + 1)
+    }
+
+    /// CSR rows against v0.6.0's, bit for bit, on every SIMD path at
+    /// one and eight threads, and against brute force: orthorhombic and
+    /// triclinic cells, bins below, at, and above the cutoff, boxes
+    /// shorter than twice the cutoff, atom counts on both sides of the
+    /// parallel thresholds, half and full rows, with and without a mask.
+    #[test]
+    fn csr_rows_match_v060_and_brute_force() {
+        let cutoff = 3.5;
+        let at_threshold = |pairs: usize| {
+            // `hit_estimate` at the bench density: 0.5 n rho 4/3 pi r^3.
+            (pairs as f64 / (0.5 * 0.0334 * 4.1887902047863905 * cutoff * cutoff * cutoff)) as usize
+        };
+        // `PARALLEL_PAIRS`, which builds only with `parallel`.
+        let split = at_threshold(2_000);
+        let grid = super::super::PARALLEL_GRID;
+        let mut sizes: Vec<(usize, Option<f64>)> = vec![(1, None), (2, None), (40, None)];
+        for n in [split - 2, split, split + 2, grid - 1, grid, grid + 1] {
+            sizes.push((n, None));
+        }
+        // Boxes past half the box: one atom meets another through
+        // several images.
+        sizes.push((7, Some(6.0)));
+        sizes.push((24, Some(9.0)));
+        sizes.push((4096, None));
+        let paths = crate::simd::paths_to_compare();
+        for (case, &(n, edge)) in sizes.iter().enumerate() {
+            let edge = edge.unwrap_or((n as f64 / 0.0334).cbrt());
+            for tilt in [0.0, 0.3] {
+                let (xyz, cell) = frame(n, edge, tilt, 0x51ed_270b_27a4_3c11 ^ case as u64);
+                let mask: Vec<bool> = (0..n).map(|i| (i * 7919) % 5 != 0).collect();
+                for hint in [None, Some(0.6 * cutoff), Some(1.7 * cutoff)] {
+                    for (half, masked) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        if n == 4096 && (masked || tilt != 0.0) {
+                            continue;
+                        }
+                        let query = PbcQuery::periodic(cutoff)
+                            .cell_hint(hint)
+                            .half(half)
+                            .mask(masked.then_some(&mask[..]));
+                        let label = format!(
+                            "n {n} edge {edge:.2} tilt {tilt} hint {hint:?} half {half} mask {masked}"
+                        );
+                        let want = on_threads(1, || v060(&xyz, &cell, &query));
+                        // The columns do not depend on the bins; brute force
+                        // is quadratic, so it checks the small systems.
+                        if n <= 64 && hint.is_none() {
+                            assert_brute(&want, &xyz, &cell, &query, &label);
+                        }
+                        for threads in [1, 8] {
+                            for &path in &paths {
+                                let (got, bare) = on_threads(threads, || {
+                                    let _path = crate::simd::force(path);
+                                    let mut got = PairCsr::default();
+                                    pairs_within_csr(&xyz, &cell, &query, true, &mut got).unwrap();
+                                    let mut bare = PairCsr::default();
+                                    pairs_within_csr(&xyz, &cell, &query, false, &mut bare)
+                                        .unwrap();
+                                    (got, bare)
+                                });
+                                let label = format!("{label} threads {threads} {}", path.name());
+                                assert_eq!(bits(&got), bits(&want), "{label}");
+                                assert_eq!(
+                                    (&bare.offsets, &bare.cols),
+                                    (&want.offsets, &want.cols),
+                                    "{label}"
+                                );
+                                assert!(bare.dist2.is_empty(), "{label}");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

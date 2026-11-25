@@ -127,6 +127,10 @@ fn compile_knn_region() -> bool {
         Some(dir) => {
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib={runtime}");
+            if macos {
+                // The runtime can have an @rpath install name, including in conda.
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+            }
             true
         }
         None if required => panic!("OpenMP k-nearest region: finding lib{runtime} failed"),
@@ -137,14 +141,16 @@ fn compile_knn_region() -> bool {
 /// The prefix holding `include/omp.h` and `lib/libomp.dylib`. A caller that
 /// builds its own runtime names it with `LIBOMP_PREFIX`; wheels do, because
 /// a runtime they bundle must not need a newer macOS than the wheel claims.
-/// Otherwise ask Homebrew's keg-only libomp, through `brew` and then the
-/// standard Apple Silicon and Intel prefixes.
+/// Otherwise check the active conda environment and Homebrew's keg-only
+/// libomp through `brew` and the standard Apple Silicon and Intel prefixes.
 fn libomp_prefix() -> Option<std::path::PathBuf> {
     println!("cargo:rerun-if-env-changed=PATH");
-    println!("cargo:rerun-if-env-changed=LIBOMP_PREFIX");
     let mut prefixes = Vec::new();
-    if let Some(prefix) = std::env::var_os("LIBOMP_PREFIX").filter(|prefix| !prefix.is_empty()) {
-        prefixes.push(std::path::PathBuf::from(prefix));
+    for variable in ["LIBOMP_PREFIX", "CONDA_PREFIX"] {
+        println!("cargo:rerun-if-env-changed={variable}");
+        if let Some(prefix) = std::env::var_os(variable).filter(|prefix| !prefix.is_empty()) {
+            prefixes.push(std::path::PathBuf::from(prefix));
+        }
     }
     if let Ok(output) = std::process::Command::new("brew")
         .args(["--prefix", "libomp"])
