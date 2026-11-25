@@ -146,8 +146,9 @@ and subnormal squares are checked against a full scan.
 
 The neighbour set, the k-NN order, the pair list, and the DBSCAN labels are
 checked against a full scan under this `dist2`. `knn` with `k = 0` returns
-an empty list without reading a distance, and `within` with radius `0` reads
-about one root-to-leaf path.
+an empty list without reading a distance. `within` with radius `0` reads a
+few distances per tree level, not one per point: at most `4 * levels` in the
+tests, where `levels` is the bit length of the point count.
 
 `axis_min_dist2` and `aabb_min_dist2` are lower bounds on the squared
 distance to the interval or box. A degenerate interval rounds the same

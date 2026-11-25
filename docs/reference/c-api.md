@@ -160,8 +160,8 @@ test is within a relative `2^-52` and an absolute `2^-537` of its exact
 value at every dimension. The relative factor grows with the dimension and
 the absolute floor with its square root; neither is a fixed number of ulps.
 `±L` are the same point, including `L = 1e308`. `knn` with `k = 0` does not
-walk the tree, and `lc_nd_within` with radius `0` reads about one
-root-to-leaf path.
+walk the tree. `lc_nd_within` with radius `0` reads a few distances per tree
+level, not one per point.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
