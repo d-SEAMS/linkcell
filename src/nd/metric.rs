@@ -4,7 +4,7 @@
 //! N-dimensional metric traits and bounds, this implementation should be
 //! replaced by the upstream one.
 
-use super::dyadic::{self, DyadicSum};
+use super::dyadic::{self, DyadicSum, ExactDist2};
 use crate::Error;
 
 /// Draft-shaped metric trait for a mechanical future swap to minimage.
@@ -12,7 +12,26 @@ pub trait Metric<T = f64> {
     /// Dimensionality.
     fn dims(&self) -> usize;
     /// Squared distance between two points.
+    ///
+    /// [`crate::VpTreeIndex`] never prunes a subtree that may hold a point
+    /// `2^510` or farther from the query. A `dist2` that fails only for
+    /// such pairs makes every query fail exactly when a full scan fails.
     fn dist2(&self, a: &[T], b: &[T]) -> Result<T, Error>;
+    /// Exact squared distance between two points.
+    ///
+    /// [`crate::VpTreeIndex`] orders neighbours whose `dist2` ties by this
+    /// value. When `fl(r * r)` is 0 it accepts only a point where this
+    /// value is zero, not one whose square underflowed. The default is the
+    /// exact value of
+    /// [`Metric::dist2`]; a `dist2` that is negative or not finite is
+    /// `DistanceOverflow`. [`Euclidean`] and [`PeriodicSpace`] return the
+    /// sum of squares before its rounding.
+    fn dist2_exact(&self, a: &[T], b: &[T]) -> Result<ExactDist2, Error>
+    where
+        T: Into<f64>,
+    {
+        ExactDist2::from_f64(self.dist2(a, b)?.into()).ok_or(Error::DistanceOverflow)
+    }
     /// Distance between two points.
     fn distance(&self, a: &[T], b: &[T]) -> Result<T, Error>;
     /// Lower bound from a scalar coordinate to one interval.
@@ -250,12 +269,20 @@ fn add_expansion_square(acc: &mut DyadicSum, exp: &Expansion) {
     }
 }
 
-fn sum_axis_squares(parts: &[Expansion]) -> Result<f64, Error> {
+fn axis_square_sum(parts: &[Expansion]) -> DyadicSum {
     let mut acc = DyadicSum::new();
     for exp in parts {
         add_expansion_square(&mut acc, exp);
     }
-    acc.round_nearest()
+    acc
+}
+
+fn sum_axis_squares(parts: &[Expansion]) -> Result<f64, Error> {
+    axis_square_sum(parts).round_nearest()
+}
+
+fn exact_axis_squares(parts: &[Expansion]) -> Result<ExactDist2, Error> {
+    axis_square_sum(parts).exact()
 }
 
 /// Sign of `2 * sum(exp) - period`: positive means the sum is above `period / 2`.
@@ -396,6 +423,20 @@ impl Euclidean {
             return Err(Error::BadDimensions);
         }
         Ok(Self { dims })
+    }
+
+    fn axis_parts(&self, a: &[f64], b: &[f64]) -> Result<Vec<Expansion>, Error> {
+        if a.len() != self.dims || b.len() != self.dims {
+            return Err(Error::BadDimensions);
+        }
+        if !a.iter().all(|x| x.is_finite()) || !b.iter().all(|x| x.is_finite()) {
+            return Err(Error::NonFinite);
+        }
+        let mut parts = Vec::with_capacity(self.dims);
+        for (x, y) in a.iter().zip(b.iter()) {
+            parts.push(open_expansion(*x, *y)?);
+        }
+        Ok(parts)
     }
 }
 
@@ -682,6 +723,21 @@ impl PeriodicSpace {
         }
         Ok(())
     }
+
+    fn axis_parts(&self, a: &[f64], b: &[f64]) -> Result<Vec<Expansion>, Error> {
+        self.check_point_shape(a)?;
+        self.check_point_shape(b)?;
+        let mut parts = Vec::with_capacity(self.periods.len());
+        for i in 0..self.periods.len() {
+            let exp = if let Some(l) = self.periods[i] {
+                periodic_expansion(a[i], b[i], l)?
+            } else {
+                open_expansion(a[i], b[i])?
+            };
+            parts.push(exp);
+        }
+        Ok(parts)
+    }
 }
 
 impl Metric<f64> for Euclidean {
@@ -690,17 +746,11 @@ impl Metric<f64> for Euclidean {
     }
 
     fn dist2(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {
-        if a.len() != self.dims || b.len() != self.dims {
-            return Err(Error::BadDimensions);
-        }
-        if !a.iter().all(|x| x.is_finite()) || !b.iter().all(|x| x.is_finite()) {
-            return Err(Error::NonFinite);
-        }
-        let mut parts = Vec::with_capacity(self.dims);
-        for (x, y) in a.iter().zip(b.iter()) {
-            parts.push(open_expansion(*x, *y)?);
-        }
-        sum_axis_squares(&parts)
+        sum_axis_squares(&self.axis_parts(a, b)?)
+    }
+
+    fn dist2_exact(&self, a: &[f64], b: &[f64]) -> Result<ExactDist2, Error> {
+        exact_axis_squares(&self.axis_parts(a, b)?)
     }
 
     fn distance(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {
@@ -770,18 +820,11 @@ impl Metric<f64> for PeriodicSpace {
     }
 
     fn dist2(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {
-        self.check_point_shape(a)?;
-        self.check_point_shape(b)?;
-        let mut parts = Vec::with_capacity(self.periods.len());
-        for i in 0..self.periods.len() {
-            let exp = if let Some(l) = self.periods[i] {
-                periodic_expansion(a[i], b[i], l)?
-            } else {
-                open_expansion(a[i], b[i])?
-            };
-            parts.push(exp);
-        }
-        sum_axis_squares(&parts)
+        sum_axis_squares(&self.axis_parts(a, b)?)
+    }
+
+    fn dist2_exact(&self, a: &[f64], b: &[f64]) -> Result<ExactDist2, Error> {
+        exact_axis_squares(&self.axis_parts(a, b)?)
     }
 
     fn distance(&self, a: &[f64], b: &[f64]) -> Result<f64, Error> {

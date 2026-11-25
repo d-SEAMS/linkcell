@@ -1,0 +1,2 @@
+- N-dimensional radius queries accept a point when `dist2 <= fl(r * r)`. When `fl(r * r)` is 0, only points that coincide with the query are accepted, not points whose square underflowed to 0. With points `i * 1e-163`, radius `27e-163` from the origin returns the 28 points `i <= 27`.
+- `knn` and `within` order hits by exact squared distance, then index, so two `dist2` values that tie keep the order of their unrounded squares: `knn(0, 1)` on `[1e-170, 0]` returns index 1. `Metric::dist2_exact` returns that square as an `ExactDist2`.

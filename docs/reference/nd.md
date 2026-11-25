@@ -77,25 +77,43 @@ checked against a full scan under this `dist2`.
   the smallest positive binary64, and on the tie at exactly half of that
   value. A nonzero exact sum that is a binary64 number is not replaced by
   `0`. `2^-106`, the square of `2^-53`, is returned unchanged.
-- `wrap_point` returns a representative in `[0, L)`. That representative is
-  `0` when `L - (|x| % L)` is not a binary64 number in `(0, L)`. `dist2`
-  does not use it. `wrap_delta` is a minimum image in `[-L/2, L/2]`; a
-  result of `±L` is returned as `0`. With period `5e-324`, `0.5 * L`
-  underflows and `wrap_delta(0)` is `0`, not `-L`. `wrap_delta(-1)` at
-  period `1e16` is `-1`. `wrap_delta(1e300)` at period `1e-10` is finite.
+- `wrap_point` returns a representative in `[0, L)`. For a negative `x` it
+  is `fl(L - (|x| % L))`, and `0` when that is not in `(0, L)`. `dist2`
+  does not use it. `wrap_delta` is a minimum image in `[-L/2, L/2)`, with
+  `+L/2` returned as `-L/2`; a result of `±L` is returned as `0`. It
+  forms `L - r` only when Sterbenz' lemma makes it exact, so it differs
+  from its input by a whole number of periods. With period `5e-324`,
+  `0.5 * L` underflows and `wrap_delta(0)` is `0`, not `-L`; the tie is
+  found from `r + r`, not from `0.5 * L`. On a subnormal period every value
+  is a multiple of `2^-1074`, so `wrap_point` is exact too.
+  `wrap_delta(-1)` at period `1e16` is `-1`. `wrap_delta(1e300)` at period
+  `1e-10` is finite.
 
 Metric trait functions:
 
 - `dist2(a, b)`
+- `dist2_exact(a, b)`: the unrounded sum as an `ExactDist2`, which orders
+  squares that `dist2` rounds to the same value
 - `axis_min_dist2(x, lo, hi, axis)`
 - `aabb_min_dist2(point, lo, hi)`
 
 The point metric is symmetric (`dist2(a, b) == dist2(b, a)`) and
 `dist2(a, a) == 0`.
 
-Acceptance is `dist2 <= r^2` using this metric. When the nearest value
-described above is not finite, the call returns `DistanceOverflow` instead of
-a neighbour. Branch pruning widens each triangle test by a relative Higham factor
+Acceptance is `dist2 <= fl(r * r)`, with `r * r` rounded to binary64. When
+`fl(r * r)` is `0`, only points that coincide with the query are accepted,
+not points whose square underflowed to `0`. With points `i * 1e-163` and the
+query `0`, `within(0, 27e-163)` returns the 28 points `i <= 27`:
+`fl(r * r)` is `2^-1074`, and each of their squares rounds to at most that.
+
+A query returns `DistanceOverflow` exactly when a full scan of the distances
+it reads would. `knn` with `k > 0` and `within` read the distance from the
+query to every point, and `pairs_within` and `dbscan` read every pair. A
+subtree that may hold a point `2^510` or farther from the query is never
+pruned, so the result does not depend on the build order. The build stores
+such a distance as infinite instead of failing.
+
+Branch pruning widens each triangle test by a relative Higham factor
 on the norm, the square root, and the branch-test addition, plus
 `Metric::vp_absolute_slack`.
 
@@ -119,9 +137,17 @@ The relative factor is still added, including sixteen ulps of each of the
 three distances in the test. At the origin that relative piece is forty-eight
 units in the last place of zero. It is not the only absolute guard.
 
-The neighbour set, the k-NN order `(dist2, index)`, the pair list, and the
-DBSCAN labels are checked against a full scan under this `dist2`. `knn` with
-`k = 0` returns an empty list without walking the tree.
+`dist2` is the nearest binary64 to the exact sum at every dimension, so each
+distance in a triangle test is within a relative `2^-52` and an absolute
+`2^-537` of its exact value. The relative factor counts `6d + 16` roundings
+and the floor grows with `sqrt(d)`, so neither is a fixed number of ulps.
+Collinear sets in up to 256 dimensions, where every triangle test is tight,
+and subnormal squares are checked against a full scan.
+
+The neighbour set, the k-NN order, the pair list, and the DBSCAN labels are
+checked against a full scan under this `dist2`. `knn` with `k = 0` returns
+an empty list without reading a distance, and `within` with radius `0` reads
+about one root-to-leaf path.
 
 `axis_min_dist2` and `aabb_min_dist2` are lower bounds on the squared
 distance to the interval or box. A degenerate interval rounds the same
@@ -147,8 +173,10 @@ pub trait NeighbourIndex {
 
 Results are deterministic:
 
-- `knn` and `within` sort by `(dist2, index)`.
-- Ties resolve by index.
+- `knn` and `within` sort by exact squared distance, then index. Two
+  `dist2` values that tie keep the order of their unrounded squares:
+  `knn(0, 1)` on `[1e-170, 0]` returns index 1.
+- Equal exact squares resolve by index.
 - Pair output uses `i < j`.
 
 ## DBSCAN

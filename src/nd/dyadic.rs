@@ -4,6 +4,8 @@
 //! terms of those integers fit in `i128`. The accumulator below is that
 //! integer, so a later rounding is the only place a value stops being exact.
 
+use std::cmp::Ordering;
+
 use crate::Error;
 
 const LIMB_BITS: i32 = 60;
@@ -109,6 +111,20 @@ impl DyadicSum {
 
     pub(super) fn round_nearest(&mut self) -> Result<f64, Error> {
         self.round(false)
+    }
+
+    /// The exact sum, or `DistanceOverflow` when its nearest binary64 is not
+    /// finite or the sum is negative.
+    pub(super) fn exact(&mut self) -> Result<ExactDist2, Error> {
+        self.round_nearest()?;
+        let len = self
+            .limbs
+            .iter()
+            .rposition(|&limb| limb != 0)
+            .map_or(0, |top| top + 1);
+        Ok(ExactDist2 {
+            digits: self.limbs[..len].iter().map(|&limb| limb as u64).collect(),
+        })
     }
 
     pub(super) fn round_down(&mut self) -> f64 {
@@ -239,6 +255,51 @@ impl DyadicSum {
     }
 }
 
+/// Exact squared distance, compared without rounding.
+///
+/// Two values whose nearest binary64 is the same can still be unequal here:
+/// `(1e-170)^2` and `0` both round to `0`. The value is a non-negative
+/// multiple of `2^-2400`, below every square and cross term of two binary64
+/// numbers, so nothing is dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactDist2 {
+    /// Base-`2^60` digits from `2^-2400` upward, without high zero digits.
+    digits: Vec<u64>,
+}
+
+impl ExactDist2 {
+    /// The exact value of `x`, or `None` when `x` is negative or not finite.
+    pub fn from_f64(x: f64) -> Option<Self> {
+        if !x.is_finite() || x < 0.0 {
+            return None;
+        }
+        let (mant, exp) = decode_f64(x);
+        let mut acc = DyadicSum::new();
+        acc.add_mant(mant, exp);
+        acc.exact().ok()
+    }
+
+    /// `true` only when the two points coincide.
+    pub fn is_zero(&self) -> bool {
+        self.digits.is_empty()
+    }
+}
+
+impl Ord for ExactDist2 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.digits
+            .len()
+            .cmp(&other.digits.len())
+            .then_with(|| self.digits.iter().rev().cmp(other.digits.iter().rev()))
+    }
+}
+
+impl PartialOrd for ExactDist2 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub(super) fn decode_f64(x: f64) -> (i128, i32) {
     if x == 0.0 {
         return (0, 0);
@@ -305,6 +366,34 @@ mod tests {
         assert_eq!(nearest(1, -1075), 0.0);
         assert_eq!(nearest(3, -1076).to_bits(), 1);
         assert_eq!(nearest(1, 10), 1024.0);
+    }
+
+    #[test]
+    fn exact_values_order_below_the_rounding() {
+        let zero = ExactDist2::from_f64(0.0).unwrap();
+        assert_eq!(ExactDist2::from_f64(-0.0).unwrap(), zero);
+        let mut tiny = DyadicSum::new();
+        let (m, e) = decode_f64(1.0e-170);
+        tiny.add_mant(m * m, e * 2);
+        let tiny = tiny.exact().unwrap();
+        assert!(zero < tiny);
+        assert!(tiny < ExactDist2::from_f64(f64::from_bits(1)).unwrap());
+
+        let mut above_one = DyadicSum::new();
+        above_one.add_mant(1, 0);
+        above_one.add_mant(1, -60);
+        assert_eq!(above_one.round_nearest().unwrap(), 1.0);
+        let one = ExactDist2::from_f64(1.0).unwrap();
+        assert!(one < above_one.exact().unwrap());
+        assert!(one < ExactDist2::from_f64(f64::MAX).unwrap());
+
+        assert_eq!(ExactDist2::from_f64(-1.0), None);
+        assert_eq!(ExactDist2::from_f64(f64::INFINITY), None);
+        assert_eq!(ExactDist2::from_f64(f64::NAN), None);
+        let mut huge = DyadicSum::new();
+        let (m, e) = decode_f64(f64::MAX);
+        huge.add_mant(m * m, e * 2);
+        assert_eq!(huge.exact(), Err(Error::DistanceOverflow));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::Error;
 
 mod dyadic;
 mod metric;
+pub use dyadic::ExactDist2;
 pub use metric::{Euclidean, Metric, PeriodicEuclidean, PeriodicSpace};
 
 /// One neighbour hit.
@@ -67,9 +68,12 @@ pub trait NeighbourIndex {
     }
     /// Point dimensionality.
     fn dims(&self) -> usize;
-    /// k-nearest neighbours, sorted by `(dist2, index)`.
+    /// k-nearest neighbours, sorted by exact squared distance, then index.
     fn knn(&self, query: &[f64], k: usize) -> Result<Vec<NeighborHit>, Error>;
-    /// Radius neighbours, sorted by `(dist2, index)`.
+    /// Points with `dist2 <= fl(radius * radius)`, sorted by exact squared
+    /// distance, then index. When `fl(radius * radius)` is 0, only points
+    /// that coincide with `query` are returned, not points whose square
+    /// underflowed to 0.
     fn within(&self, query: &[f64], radius: f64) -> Result<Vec<NeighborHit>, Error>;
     /// Radius neighbours of one indexed point, including itself at zero distance.
     fn within_index(&self, index: usize, radius: f64) -> Result<Vec<NeighborHit>, Error>;
@@ -151,6 +155,9 @@ impl Space for OwnedContiguousSpace {
 struct Node {
     vp: usize,
     threshold2: f64,
+    /// Largest `dist2` from `vp` to a point of the right subtree. Infinite
+    /// when one of those distances overflows.
+    far2: f64,
     left: Option<usize>,
     right: Option<usize>,
 }
@@ -160,7 +167,17 @@ struct Node {
 /// Stored points and each query are copied with [`Metric::write_canonical`].
 /// Periodic distance is the residue of the difference, folded into
 /// `[-L/2, L/2]` after that subtraction. Pruning widens the triangle test by
-/// a relative Higham factor and by [`Metric::vp_absolute_slack`].
+/// a relative Higham factor and by [`Metric::vp_absolute_slack`]. For
+/// [`Euclidean`] and [`PeriodicSpace`], `dist2` is the nearest binary64 to
+/// the exact sum at every dimension, so each distance in the test is within
+/// a relative `2^-52` and an absolute `2^-537` of its exact value. The
+/// relative factor grows with the dimension and the absolute slack with its
+/// square root, so neither is a fixed number of ulps.
+///
+/// Every query returns `DistanceOverflow` exactly when a full scan of the
+/// distances it reads would: a subtree that may hold a point `2^510` or
+/// farther from the query is never pruned. `knn` with `k = 0` reads no
+/// distance.
 pub struct VpTreeIndex<S, M> {
     space: S,
     metric: M,
@@ -244,6 +261,19 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         d + tau + margin >= mu
     }
 
+    /// `true` when every point within `reach` of a vantage point at
+    /// distance `d` from the query has a finite squared distance to it.
+    ///
+    /// `d` and `reach` are square roots of rounded squares. Each is within a
+    /// relative `2^-52` and an absolute `2^-537` of its exact distance, so
+    /// `fl(d + reach) <= 2^510` puts every such point below `2^511` from
+    /// the query and its square below `2^1022`. A subtree that fails this
+    /// test is entered even when the radius test would prune it, so a
+    /// query sees every distance that a full scan would overflow on.
+    fn overflow_free(d: f64, reach: f64) -> bool {
+        d + reach <= f64::from_bits((1023 + 510) << 52)
+    }
+
     fn point_canon(&self, index: usize) -> &[f64] {
         let d = self.space.dims();
         let off = index * d;
@@ -309,6 +339,10 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
     /// left half has `dist <= threshold` and the right half has
     /// `dist >= threshold`, and both halves are non-empty whenever more than
     /// one point remains beside the vantage point.
+    ///
+    /// A distance that overflows is stored as infinite instead of failing,
+    /// so whether the build succeeds does not depend on the point order.
+    /// Queries report the overflow.
     fn build_iter(&mut self) -> Result<Option<usize>, Error> {
         let n = self.space.len();
         if n == 0 {
@@ -349,6 +383,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 self.nodes.push(Node {
                     vp: ids[job.start],
                     threshold2: 0.0,
+                    far2: 0.0,
                     left: None,
                     right: None,
                 });
@@ -359,16 +394,21 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             let count = len - 1;
             let mut dist = Vec::with_capacity(count);
             for &idx in &ids[job.start..job.end - 1] {
-                let d2 = self.metric.dist2(&anchor, self.point_canon(idx))?;
+                let d2 = match self.metric.dist2(&anchor, self.point_canon(idx)) {
+                    Err(Error::DistanceOverflow) => f64::INFINITY,
+                    other => other?,
+                };
                 dist.push((idx, d2));
             }
             dist.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let far2 = dist[count - 1].1;
             if count == 1 {
                 let threshold2 = dist[0].1;
                 ids[job.start] = dist[0].0;
                 self.nodes.push(Node {
                     vp,
                     threshold2,
+                    far2,
                     left: None,
                     right: None,
                 });
@@ -390,6 +430,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             self.nodes.push(Node {
                 vp,
                 threshold2,
+                far2,
                 left: None,
                 right: None,
             });
@@ -419,7 +460,16 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         Ok(())
     }
 
-    fn maybe_push(heap: &mut BinaryHeap<HeapEntry>, k: usize, hit: HeapEntry) {
+    /// Keeps the `k` smallest hits by `(dist2, index)` in `heap`, and in
+    /// `ties` every other hit whose `dist2` equals the largest kept value.
+    /// [`Self::sort_hits`] settles the exact order of that tie after the
+    /// walk.
+    fn maybe_push(
+        heap: &mut BinaryHeap<HeapEntry>,
+        ties: &mut Vec<HeapEntry>,
+        k: usize,
+        hit: HeapEntry,
+    ) {
         if k == 0 {
             return;
         }
@@ -427,10 +477,20 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             heap.push(hit);
             return;
         }
-        let worst = *heap.peek().expect("non-empty");
-        if hit.dist2 < worst.dist2 || (hit.dist2 == worst.dist2 && hit.index < worst.index) {
-            let _ = heap.pop();
-            heap.push(hit);
+        let worst = heap.peek().expect("non-empty").dist2;
+        if hit.dist2 > worst {
+            return;
+        }
+        if hit.dist2 == worst {
+            ties.push(hit);
+            return;
+        }
+        heap.push(hit);
+        let evicted = heap.pop().expect("non-empty");
+        if heap.peek().is_some_and(|h| h.dist2 == evicted.dist2) {
+            ties.push(evicted);
+        } else {
+            ties.clear();
         }
     }
 
@@ -442,12 +502,83 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         }
     }
 
+    /// Sort by exact squared distance, then index.
+    ///
+    /// Rounding is monotone, so the order by rounded `dist2` only changes
+    /// inside a run of equal rounded values.
+    fn sort_hits(&self, query: &[f64], hits: &mut [NeighborHit]) -> Result<(), Error> {
+        hits.sort_unstable_by(|a, b| {
+            a.dist2
+                .total_cmp(&b.dist2)
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        let mut start = 0;
+        while start < hits.len() {
+            let tied = hits[start..]
+                .iter()
+                .take_while(|h| h.dist2 == hits[start].dist2)
+                .count();
+            let run = &mut hits[start..start + tied];
+            if tied > 1 {
+                let mut keyed = Vec::with_capacity(tied);
+                for hit in run.iter() {
+                    let exact = self
+                        .metric
+                        .dist2_exact(query, self.point_canon(hit.index))?;
+                    keyed.push((exact, *hit));
+                }
+                keyed
+                    .sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.index.cmp(&b.1.index)));
+                for (slot, (_, hit)) in run.iter_mut().zip(keyed) {
+                    *slot = hit;
+                }
+            }
+            start += tied;
+        }
+        Ok(())
+    }
+
+    /// The `k` nearest of the candidates kept by [`Self::maybe_push`].
+    fn knn_result(
+        &self,
+        query: &[f64],
+        heap: BinaryHeap<HeapEntry>,
+        ties: Vec<HeapEntry>,
+        k: usize,
+    ) -> Result<Vec<NeighborHit>, Error> {
+        let mut out: Vec<_> = heap
+            .into_iter()
+            .chain(ties)
+            .map(|h| NeighborHit {
+                index: h.index,
+                dist2: h.dist2,
+            })
+            .collect();
+        self.sort_hits(query, &mut out)?;
+        out.truncate(k);
+        Ok(out)
+    }
+
+    /// `d2 <= r2`, where `r2 = fl(r * r)`. A `d2` of 0 from a point that
+    /// does not coincide with the query is a positive square that
+    /// underflowed, so it is outside when `r2` is 0.
+    fn inside(&self, query: &[f64], index: usize, d2: f64, r2: f64) -> Result<bool, Error> {
+        if d2 != r2 || r2 > 0.0 {
+            return Ok(d2 <= r2);
+        }
+        Ok(self
+            .metric
+            .dist2_exact(query, self.point_canon(index))?
+            .is_zero())
+    }
+
     fn knn_walk(
         &self,
         query: &[f64],
         k: usize,
         skip: Option<usize>,
         heap: &mut BinaryHeap<HeapEntry>,
+        ties: &mut Vec<HeapEntry>,
     ) -> Result<(usize, usize), Error> {
         let Some(root) = self.root else {
             return Ok((0, 0));
@@ -466,48 +597,44 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             mu: f64,
             far: Option<usize>,
             far_is_right: bool,
+            far_reach: f64,
         }
-        let mut stack = Vec::new();
-        stack.push(Frame {
-            nid: root,
+        let enter = |nid: usize| Frame {
+            nid,
             phase: 0,
             d: 0.0,
             mu: 0.0,
             far: None,
             far_is_right: false,
-        });
+            far_reach: 0.0,
+        };
+        let mut stack = vec![enter(root)];
         while let Some(frame) = stack.pop() {
             if frame.phase == 1 {
                 let tau = Self::tau_of(heap, k);
                 let margin = self.pruning_margin(frame.d, tau, frame.mu);
-                let go = if frame.far_is_right {
+                let in_range = if frame.far_is_right {
                     Self::visit_right(frame.d, frame.mu, tau, margin)
                 } else {
                     Self::visit_left(frame.d, frame.mu, tau, margin)
                 };
-                if go {
+                if in_range || !Self::overflow_free(frame.d, frame.far_reach) {
                     if let Some(fid) = frame.far {
-                        stack.push(Frame {
-                            nid: fid,
-                            phase: 0,
-                            d: 0.0,
-                            mu: 0.0,
-                            far: None,
-                            far_is_right: false,
-                        });
+                        stack.push(enter(fid));
                     }
                 }
                 continue;
             }
             visited += 1;
-            let (vp, left, right, threshold2) = {
+            let (vp, left, right, threshold2, far2) = {
                 let node = &self.nodes[frame.nid];
-                (node.vp, node.left, node.right, node.threshold2)
+                (node.vp, node.left, node.right, node.threshold2, node.far2)
             };
             let d2 = self.metric.dist2(query, self.point_canon(vp))?;
             if skip != Some(vp) {
                 Self::maybe_push(
                     heap,
+                    ties,
                     k,
                     HeapEntry {
                         dist2: d2,
@@ -520,30 +647,27 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             }
             let d = d2.sqrt();
             let mu = threshold2.sqrt();
+            let right_reach = far2.sqrt();
             let tau = Self::tau_of(heap, k);
             let margin = self.pruning_margin(d, tau, mu);
+            let need_left = Self::visit_left(d, mu, tau, margin) || !Self::overflow_free(d, mu);
+            let need_right =
+                Self::visit_right(d, mu, tau, margin) || !Self::overflow_free(d, right_reach);
             let prefer_left = d < mu;
-            let (near, far, far_is_right) = if prefer_left {
-                (left, right, true)
+            let (near, far, far_is_right, far_reach) = if prefer_left {
+                (left, right, true, right_reach)
             } else {
-                (right, left, false)
+                (right, left, false, mu)
             };
-            let visit_near = if prefer_left {
-                Self::visit_left(d, mu, tau, margin)
+            let (visit_near, visit_far) = if prefer_left {
+                (need_left, need_right)
             } else {
-                Self::visit_right(d, mu, tau, margin)
+                (need_right, need_left)
             };
-            let visit_far = if far_is_right {
-                Self::visit_right(d, mu, tau, margin)
-            } else {
-                Self::visit_left(d, mu, tau, margin)
-            };
-            let saw_left = if prefer_left { visit_near } else { visit_far };
-            let saw_right = if prefer_left { visit_far } else { visit_near };
-            if left.is_some() && !saw_left {
+            if left.is_some() && !need_left {
                 pruned += 1;
             }
-            if right.is_some() && !saw_right {
+            if right.is_some() && !need_right {
                 pruned += 1;
             }
             if let Some(near_id) = near {
@@ -555,28 +679,15 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                         mu,
                         far,
                         far_is_right,
+                        far_reach,
                     });
-                    stack.push(Frame {
-                        nid: near_id,
-                        phase: 0,
-                        d: 0.0,
-                        mu: 0.0,
-                        far: None,
-                        far_is_right: false,
-                    });
+                    stack.push(enter(near_id));
                     continue;
                 }
             }
             if visit_far {
                 if let Some(far_id) = far {
-                    stack.push(Frame {
-                        nid: far_id,
-                        phase: 0,
-                        d: 0.0,
-                        mu: 0.0,
-                        far: None,
-                        far_is_right: false,
-                    });
+                    stack.push(enter(far_id));
                 }
             }
         }
@@ -597,12 +708,12 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         stack.push(root);
         let r2 = radius * radius;
         while let Some(nid) = stack.pop() {
-            let (vp, left, right, threshold2) = {
+            let (vp, left, right, threshold2, far2) = {
                 let node = &self.nodes[nid];
-                (node.vp, node.left, node.right, node.threshold2)
+                (node.vp, node.left, node.right, node.threshold2, node.far2)
             };
             let d2 = self.metric.dist2(query, self.point_canon(vp))?;
-            if d2 <= r2 && skip != Some(vp) {
+            if skip != Some(vp) && self.inside(query, vp, d2, r2)? {
                 out.push(NeighborHit {
                     index: vp,
                     dist2: d2,
@@ -615,12 +726,13 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             let mu = threshold2.sqrt();
             let margin = self.pruning_margin(d, radius, mu);
             if let Some(id) = left {
-                if Self::visit_left(d, mu, radius, margin) {
+                if Self::visit_left(d, mu, radius, margin) || !Self::overflow_free(d, mu) {
                     stack.push(id);
                 }
             }
             if let Some(id) = right {
-                if Self::visit_right(d, mu, radius, margin) {
+                if Self::visit_right(d, mu, radius, margin) || !Self::overflow_free(d, far2.sqrt())
+                {
                     stack.push(id);
                 }
             }
@@ -642,20 +754,9 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
     ) -> Result<Vec<NeighborHit>, Error> {
         let prepared = self.prepare_query(query)?;
         let mut heap = BinaryHeap::new();
-        let _counted = self.knn_walk(&prepared, k, skip, &mut heap)?;
-        let mut out: Vec<_> = heap
-            .into_iter()
-            .map(|h| NeighborHit {
-                index: h.index,
-                dist2: h.dist2,
-            })
-            .collect();
-        out.sort_unstable_by(|a, b| {
-            a.dist2
-                .total_cmp(&b.dist2)
-                .then_with(|| a.index.cmp(&b.index))
-        });
-        Ok(out)
+        let mut ties = Vec::new();
+        let _counted = self.knn_walk(&prepared, k, skip, &mut heap, &mut ties)?;
+        self.knn_result(&prepared, heap, ties, k)
     }
 
     /// k-nearest neighbours plus `(nodes visited, children not entered)`.
@@ -668,20 +769,25 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         self.check_query(query)?;
         let prepared = self.prepare_query(query)?;
         let mut heap = BinaryHeap::new();
-        let (visited, pruned) = self.knn_walk(&prepared, k, None, &mut heap)?;
-        let mut out: Vec<_> = heap
-            .into_iter()
-            .map(|h| NeighborHit {
-                index: h.index,
-                dist2: h.dist2,
-            })
-            .collect();
-        out.sort_unstable_by(|a, b| {
-            a.dist2
-                .total_cmp(&b.dist2)
-                .then_with(|| a.index.cmp(&b.index))
-        });
-        Ok((out, visited, pruned))
+        let mut ties = Vec::new();
+        let (visited, pruned) = self.knn_walk(&prepared, k, None, &mut heap, &mut ties)?;
+        Ok((self.knn_result(&prepared, heap, ties, k)?, visited, pruned))
+    }
+
+    /// Radius neighbours in walk order. Pairs and DBSCAN reorder them.
+    fn within_hits(
+        &self,
+        query: &[f64],
+        radius: f64,
+        skip: Option<usize>,
+    ) -> Result<Vec<NeighborHit>, Error> {
+        if !radius.is_finite() || radius < 0.0 {
+            return Err(Error::BadNdRadius);
+        }
+        let prepared = self.prepare_query(query)?;
+        let mut out = Vec::new();
+        self.within_walk(&prepared, radius, skip, &mut out)?;
+        Ok(out)
     }
 
     fn within_skip(
@@ -696,11 +802,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         let prepared = self.prepare_query(query)?;
         let mut out = Vec::new();
         self.within_walk(&prepared, radius, skip, &mut out)?;
-        out.sort_unstable_by(|a, b| {
-            a.dist2
-                .total_cmp(&b.dist2)
-                .then_with(|| a.index.cmp(&b.index))
-        });
+        self.sort_hits(&prepared, &mut out)?;
         Ok(out)
     }
 
@@ -800,7 +902,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             if labels[i] != UNASSIGNED {
                 continue;
             }
-            let mut neigh = self.within_index(i, eps)?;
+            let mut neigh = self.within_hits(self.space.point(i), eps, None)?;
             neigh.sort_unstable_by_key(|h| h.index);
             if neigh.len() < min_pts {
                 labels[i] = NOISE;
@@ -828,7 +930,7 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                     continue;
                 }
                 labels[p] = cluster;
-                let mut p_neigh = self.within_index(p, eps)?;
+                let mut p_neigh = self.within_hits(self.space.point(p), eps, None)?;
                 p_neigh.sort_unstable_by_key(|h| h.index);
                 if p_neigh.len() >= min_pts {
                     core[p] = true;
@@ -885,7 +987,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
             if crate::on_caller() {
                 let mut out = Vec::new();
                 for i in 0..self.space.len() {
-                    let hits = self.within_skip(self.space.point(i), radius, Some(i))?;
+                    let hits = self.within_hits(self.space.point(i), radius, Some(i))?;
                     out.extend(hits.into_iter().filter(|h| i < h.index).map(|h| PairHit {
                         i,
                         j: h.index,
@@ -899,7 +1001,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
                 let nested: Vec<Vec<PairHit>> = (0..self.space.len())
                     .into_par_iter()
                     .map(|i| -> Result<Vec<PairHit>, Error> {
-                        let hits = self.within_skip(self.space.point(i), radius, Some(i))?;
+                        let hits = self.within_hits(self.space.point(i), radius, Some(i))?;
                         Ok(hits
                             .into_iter()
                             .filter(|h| i < h.index)
@@ -920,7 +1022,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
         {
             let mut out = Vec::new();
             for i in 0..self.space.len() {
-                let hits = self.within_skip(self.space.point(i), radius, Some(i))?;
+                let hits = self.within_hits(self.space.point(i), radius, Some(i))?;
                 out.extend(hits.into_iter().filter(|h| i < h.index).map(|h| PairHit {
                     i,
                     j: h.index,
@@ -941,20 +1043,34 @@ mod prune_tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
+    /// A 1-NN query reads a few root-to-leaf paths: at most four nodes per
+    /// tree level, and two per level on average.
     #[test]
     fn knn_prunes_on_a_large_random_set_and_stays_exact() {
-        let n = 4096usize;
+        for n in [4096usize, 64_000] {
+            knn_prunes_on(n);
+        }
+    }
+
+    fn knn_prunes_on(n: usize) {
         let d = 2usize;
+        let levels = (usize::BITS - n.leading_zeros()) as usize;
         let mut rng = StdRng::seed_from_u64(0x5eed);
         let data: Vec<f64> = (0..n * d).map(|_| rng.random_range(0.0..1.0)).collect();
         let space = OwnedContiguousSpace::from_row_major(&data, n, d).unwrap();
         let metric = PeriodicSpace::new(vec![None, None]).unwrap();
         let idx = VpTreeIndex::new(space, metric.clone()).unwrap();
-        for _ in 0..8 {
+        let queries = 8;
+        let mut total = 0;
+        for _ in 0..queries {
             let q = [rng.random_range(0.0..1.0), rng.random_range(0.0..1.0)];
             let (hits, visited, pruned) = idx.knn_with_stats(&q, 1).unwrap();
-            assert!(visited < n / 4, "visited {visited} of {n}, pruned {pruned}");
+            assert!(
+                visited <= 4 * levels,
+                "visited {visited} of {n}, pruned {pruned}"
+            );
             assert!(pruned > 0, "visited both children everywhere");
+            total += visited;
             let mut best_i = 0usize;
             let mut best_d = f64::INFINITY;
             for i in 0..n {
@@ -968,6 +1084,10 @@ mod prune_tests {
             assert_eq!(hits[0].index, best_i);
             assert_eq!(hits[0].dist2.to_bits(), best_d.to_bits());
         }
+        assert!(
+            total <= 2 * levels * queries,
+            "visited {total} in {queries} queries of {n}"
+        );
         let (hits, visited, _) = idx.knn_with_stats(&[0.5, 0.5], 0).unwrap();
         assert!(hits.is_empty());
         assert_eq!(visited, 0, "knn(q, 0) walked the tree");

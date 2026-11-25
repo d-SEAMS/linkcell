@@ -120,6 +120,23 @@ range is that error, not a zero distance. `dist2(1, 0)` at period `1e308`
 is `1`. The nearest value is `0` only when zero is a nearest binary64 to the
 exact sum. `min_pts == 0` fails with `min_pts must be at least 1`.
 
+A query fails with `distance overflowed` exactly when a full scan would.
+`lc_nd_knn` with `k > 0` and `lc_nd_within` read the distance from the
+query to every point, and `lc_nd_pairs_within` and `lc_nd_dbscan` read every
+pair. The tree never prunes a subtree that may hold a point `2^510` or
+farther from the query, so the result does not depend on the point order.
+`lc_nd_build` does not fail on such a distance.
+
+`lc_nd_within`, `lc_nd_pairs_within` and `lc_nd_dbscan` accept a point when
+`dist2 <= fl(radius * radius)`, the product rounded to binary64. When that
+product is `0`, only a point that coincides with the query is accepted, not
+one whose square underflowed to `0`. With points `i * 1e-163` and the query
+`0`, radius `27e-163` returns the 28 points `i <= 27`: `fl(radius * radius)`
+is `2^-1074`, and each of their squares rounds to at most that. Hits are
+ordered by exact squared distance, then index. Two `dist2` values that tie
+keep the order of their unrounded squares: for points `1e-170` and `0`,
+`lc_nd_knn` from `0` with `k = 1` returns index 1.
+
 Returned ND results are checked against a full scan under the same `dist2`.
 Each periodic coordinate is reduced with the IEEE remainder, the remainders
 are subtracted, and that difference is folded into `[-L/2, L/2]`. A
@@ -133,8 +150,13 @@ Higham relative factor, by at least `8 * sqrt(dims) * 2^-537`, and by
 `8 * sqrt(p) * max(4 * ulp(L_i))` where `p` is the number of periodic axes,
 not the point count. The periodic term is not a sum of squares, so a tiny
 period cannot zero it. It is a prune guard, not an error bound on `dist2`.
+`dist2` is rounded once from the exact sum, so each distance in a triangle
+test is within a relative `2^-52` and an absolute `2^-537` of its exact
+value at every dimension. The relative factor grows with the dimension and
+the absolute floor with its square root; neither is a fixed number of ulps.
 `±L` are the same point, including `L = 1e308`. `knn` with `k = 0` does not
-walk the tree.
+walk the tree, and `lc_nd_within` with radius `0` reads about one
+root-to-leaf path.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
