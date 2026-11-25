@@ -30,7 +30,15 @@ else
   cargo_static = 'liblinkcell.a'
 endif
 
-_profile = get_option('buildtype') == 'debug' ? 'debug' : 'release'
+# Meson 1.3 hands a subproject its parent's buildtype and drops the
+# buildtype=debugoptimized above; Meson 1.12 keeps it. So the same wrap
+# consumer got an unoptimized crate on one Meson and an optimized one on
+# another. auto builds the release profile in a subproject on every
+# Meson, and follows the buildtype at the top level.
+_profile = get_option('cargo_profile')
+if _profile == 'auto'
+  _profile = (get_option('buildtype') == 'debug' and not meson.is_subproject()) ? 'debug' : 'release'
+endif
 _omp_supported = host_machine.system() == 'linux' or host_machine.system() == 'darwin'
 _use_openmp = get_option('use_openmp') and _omp_supported
 if get_option('use_openmp') and not _omp_supported

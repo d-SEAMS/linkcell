@@ -94,6 +94,7 @@ linkcell_gpu_dep = dependency(
 ```
 
 `with_gpulite` controls the device target and defaults to `auto`.
+`cargo_profile` picks the Cargo profile; its default, `auto`, builds the release profile in a subproject whatever buildtype the parent passes, and follows `buildtype` in a top-level build.
 `sanitize=thread`, like `LINKCELL_SANITIZE=thread`, rebuilds the crate, std and Rayon with `-Zsanitizer=thread` for a host built with `-fsanitize=thread`.
 It uses rustup's nightly toolchain when one is installed with `rust-src`, and otherwise the active toolchain if its sysroot has `rust-src`; it never asks rustup to install a toolchain.
 `linkcell_dep` then links the shared library, which keeps the rebuilt std private, even in a subproject.
