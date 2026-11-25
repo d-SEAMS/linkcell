@@ -3,7 +3,7 @@
 
 use std::os::raw::c_int;
 
-use linkcell::{knearest_into, Cell, Error};
+use linkcell::{knearest_into, Cell, Error, Metric, PeriodicSpace};
 
 #[repr(C)]
 struct LcCell {
@@ -1459,6 +1459,498 @@ fn lc_nd_rejects_non_finite_coordinates_and_null_query_pointers() {
     assert_eq!(unsafe { lc_nd_len(std::ptr::null()) }, 0);
     assert_eq!(unsafe { lc_nd_dims(std::ptr::null()) }, 0);
     unsafe { lc_nd_free(idx) };
+}
+
+type NdHits = Result<Vec<(usize, u64)>, String>;
+type NdRows = Result<Vec<(usize, usize, u64)>, String>;
+type NdLabels = Result<(Vec<c_int>, Vec<c_int>, usize), String>;
+
+/// A full scan under the crate's own `dist2`, which every `lc_nd_*` query
+/// must match. A point is inside radius `r` when `dist2 <= fl(r * r)`; when
+/// that product is 0, only a point that coincides with the query is. Hits
+/// are ordered by exact square, then index. A query fails when any distance
+/// it reads overflows, and `k = 0` reads none.
+struct NdScan<'a> {
+    space: PeriodicSpace,
+    data: &'a [f64],
+    d: usize,
+}
+
+impl<'a> NdScan<'a> {
+    /// `periods` is dense, as `lc_nd_build` takes it: 0 is an open axis.
+    fn new(data: &'a [f64], d: usize, periods: &[f64]) -> Self {
+        let periods = periods.iter().map(|&l| (l > 0.0).then_some(l)).collect();
+        Self {
+            space: PeriodicSpace::new(periods).unwrap(),
+            data,
+            d,
+        }
+    }
+
+    fn n(&self) -> usize {
+        self.data.len() / self.d
+    }
+
+    fn point(&self, i: usize) -> &[f64] {
+        &self.data[i * self.d..(i + 1) * self.d]
+    }
+
+    fn dist2(&self, a: &[f64], b: &[f64]) -> Result<f64, String> {
+        self.space.dist2(a, b).map_err(|err| {
+            assert_eq!(err, Error::DistanceOverflow);
+            err.to_string()
+        })
+    }
+
+    fn inside(&self, a: &[f64], b: &[f64], d2: f64, r2: f64) -> bool {
+        d2 < r2 || (d2 == r2 && (r2 > 0.0 || self.space.dist2_exact(a, b).unwrap().is_zero()))
+    }
+
+    fn ranked(&self, q: &[f64], mut hits: Vec<(usize, f64)>) -> Vec<(usize, u64)> {
+        hits.sort_by_cached_key(|&(i, _)| (self.space.dist2_exact(self.point(i), q).unwrap(), i));
+        hits.into_iter().map(|(i, d2)| (i, d2.to_bits())).collect()
+    }
+
+    fn knn(&self, q: &[f64], k: usize) -> NdHits {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let hits = (0..self.n())
+            .map(|i| Ok((i, self.dist2(self.point(i), q)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut ranked = self.ranked(q, hits);
+        ranked.truncate(k);
+        Ok(ranked)
+    }
+
+    fn within(&self, q: &[f64], r: f64) -> NdHits {
+        let r2 = r * r;
+        let mut hits = Vec::new();
+        for i in 0..self.n() {
+            let d2 = self.dist2(self.point(i), q)?;
+            if self.inside(self.point(i), q, d2, r2) {
+                hits.push((i, d2));
+            }
+        }
+        Ok(self.ranked(q, hits))
+    }
+
+    fn pairs(&self, r: f64) -> NdRows {
+        let r2 = r * r;
+        let mut rows = Vec::new();
+        for i in 0..self.n() {
+            for j in i + 1..self.n() {
+                let (a, b) = (self.point(i), self.point(j));
+                let d2 = self.dist2(a, b)?;
+                if self.inside(a, b, d2, r2) {
+                    rows.push((i, j, d2.to_bits()));
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Labels, core flags and the cluster count. Seeds are taken in index
+    /// order, and each expansion visits neighbours in index order.
+    fn dbscan(&self, eps: f64, min_pts: usize) -> NdLabels {
+        let n = self.n();
+        let mut near: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+        for (i, j, _) in self.pairs(eps)? {
+            near[i].push(j);
+            near[j].push(i);
+        }
+        for list in &mut near {
+            list.sort_unstable();
+        }
+        let core: Vec<c_int> = near
+            .iter()
+            .map(|list| c_int::from(list.len() >= min_pts))
+            .collect();
+        let mut labels: Vec<c_int> = vec![-2; n];
+        let mut clusters = 0;
+        for seed in 0..n {
+            if labels[seed] != -2 {
+                continue;
+            }
+            if core[seed] == 0 {
+                labels[seed] = -1;
+                continue;
+            }
+            labels[seed] = clusters;
+            let mut queued = vec![false; n];
+            let mut queue = std::collections::VecDeque::new();
+            for &j in &near[seed] {
+                if j != seed {
+                    queued[j] = true;
+                    queue.push_back(j);
+                }
+            }
+            while let Some(p) = queue.pop_front() {
+                if labels[p] == -1 {
+                    labels[p] = clusters;
+                }
+                if labels[p] != -2 {
+                    continue;
+                }
+                labels[p] = clusters;
+                if core[p] == 1 {
+                    for &j in &near[p] {
+                        if !queued[j] {
+                            queued[j] = true;
+                            queue.push_back(j);
+                        }
+                    }
+                }
+            }
+            clusters += 1;
+        }
+        Ok((labels, core, clusters as usize))
+    }
+}
+
+/// `lc_nd_knn`, which writes `k` slots: the hits, then `-1` / `NaN`.
+fn c_nd_knn(idx: *const LcNdIndex, q: &[f64], k: usize) -> NdHits {
+    let mut ids: Vec<c_int> = vec![-7; k];
+    let mut d2 = vec![-7.0; k];
+    if unsafe { lc_nd_knn(idx, q.as_ptr(), k, ids.as_mut_ptr(), d2.as_mut_ptr()) } != 0 {
+        return Err(last_error());
+    }
+    let found = ids.iter().take_while(|&&j| j >= 0).count();
+    assert!(
+        ids[found..].iter().all(|&j| j == -1) && d2[found..].iter().all(|v| v.is_nan()),
+        "lc_nd_knn tail {ids:?} {d2:?}"
+    );
+    Ok(ids[..found]
+        .iter()
+        .zip(&d2)
+        .map(|(&j, v)| (j as usize, v.to_bits()))
+        .collect())
+}
+
+/// `lc_nd_within`: a count with null outputs, then a fill of that size.
+fn c_nd_within(idx: *const LcNdIndex, q: &[f64], r: f64) -> NdHits {
+    let null = std::ptr::null_mut();
+    let mut need = usize::MAX;
+    if unsafe { lc_nd_within(idx, q.as_ptr(), r, null, null.cast(), 0, &mut need) } != 0 {
+        return Err(last_error());
+    }
+    let mut ids: Vec<c_int> = vec![-7; need];
+    let mut d2 = vec![-7.0; need];
+    let mut count = usize::MAX;
+    let rc = unsafe {
+        lc_nd_within(
+            idx,
+            q.as_ptr(),
+            r,
+            ids.as_mut_ptr(),
+            d2.as_mut_ptr(),
+            need,
+            &mut count,
+        )
+    };
+    assert_eq!(
+        (rc, count),
+        (0, need),
+        "lc_nd_within fill: {}",
+        last_error()
+    );
+    Ok(ids
+        .iter()
+        .zip(&d2)
+        .map(|(&j, v)| (j as usize, v.to_bits()))
+        .collect())
+}
+
+/// `lc_nd_pairs_within`: a count with null outputs, then a fill.
+fn c_nd_pairs(idx: *const LcNdIndex, r: f64) -> NdRows {
+    let null = std::ptr::null_mut();
+    let mut need = usize::MAX;
+    if unsafe { lc_nd_pairs_within(idx, r, null, null, null.cast(), 0, &mut need) } != 0 {
+        return Err(last_error());
+    }
+    let mut i: Vec<c_int> = vec![-7; need];
+    let mut j: Vec<c_int> = vec![-7; need];
+    let mut d2 = vec![-7.0; need];
+    let mut count = usize::MAX;
+    let rc = unsafe {
+        lc_nd_pairs_within(
+            idx,
+            r,
+            i.as_mut_ptr(),
+            j.as_mut_ptr(),
+            d2.as_mut_ptr(),
+            need,
+            &mut count,
+        )
+    };
+    assert_eq!(
+        (rc, count),
+        (0, need),
+        "lc_nd_pairs_within fill: {}",
+        last_error()
+    );
+    Ok((0..need)
+        .map(|row| (i[row] as usize, j[row] as usize, d2[row].to_bits()))
+        .collect())
+}
+
+fn c_nd_dbscan(idx: *const LcNdIndex, n: usize, eps: f64, min_pts: usize) -> NdLabels {
+    let mut labels: Vec<c_int> = vec![-7; n];
+    let mut core: Vec<c_int> = vec![-7; n];
+    let mut clusters = usize::MAX;
+    let rc = unsafe {
+        lc_nd_dbscan(
+            idx,
+            eps,
+            min_pts,
+            labels.as_mut_ptr(),
+            core.as_mut_ptr(),
+            &mut clusters,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok((labels, core, clusters))
+}
+
+/// Builds `data` through the C ABI and compares every query with a full
+/// scan, errors included. Returns how many queries failed and how many
+/// succeeded.
+fn assert_c_full_scan(
+    data: &[f64],
+    d: usize,
+    periods: &[f64],
+    queries: &[Vec<f64>],
+    radii: &[f64],
+    what: &str,
+) -> [usize; 2] {
+    let scan = NdScan::new(data, d, periods);
+    let n = scan.n();
+    let idx = build_nd_index(data, n, d, Some(periods));
+    let mut seen = [0usize; 2];
+    let mut tally = |ok: bool| seen[usize::from(ok)] += 1;
+    for q in queries {
+        for k in [0, 1, 2, n + 1] {
+            let want = scan.knn(q, k);
+            tally(want.is_ok());
+            assert_eq!(c_nd_knn(idx, q, k), want, "{what}: lc_nd_knn({q:?}, {k})");
+        }
+        for &r in radii {
+            let want = scan.within(q, r);
+            tally(want.is_ok());
+            assert_eq!(
+                c_nd_within(idx, q, r),
+                want,
+                "{what}: lc_nd_within({q:?}, {r:e})"
+            );
+        }
+    }
+    for &r in radii {
+        let want = scan.pairs(r);
+        tally(want.is_ok());
+        assert_eq!(
+            c_nd_pairs(idx, r),
+            want,
+            "{what}: lc_nd_pairs_within({r:e})"
+        );
+    }
+    for &eps in radii.iter().filter(|&&r| r > 0.0) {
+        for min_pts in [1, 2] {
+            let want = scan.dbscan(eps, min_pts);
+            tally(want.is_ok());
+            assert_eq!(
+                c_nd_dbscan(idx, n, eps, min_pts),
+                want,
+                "{what}: lc_nd_dbscan({eps:e}, {min_pts})"
+            );
+        }
+    }
+    unsafe { lc_nd_free(idx) };
+    seen
+}
+
+/// Largest value whose square is finite. A gap of `1.01` times it overflows.
+fn nd_huge() -> f64 {
+    f64::from_bits(0x5fef_ffff_ffff_ffff)
+}
+
+/// Every ordering of `0..n`.
+fn nd_orderings(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in nd_orderings(n - 1) {
+        for slot in 0..n {
+            let mut order = rest.clone();
+            order.insert(slot, n - 1);
+            out.push(order);
+        }
+    }
+    out
+}
+
+/// Small sets of huge, tiny, duplicate and signed coordinates on 1 to 3
+/// axes, open and periodic, in every build order: each `lc_nd_*` result or
+/// error equals a full scan.
+#[test]
+fn lc_nd_queries_match_a_full_scan_in_every_order() {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let x = nd_huge();
+    let palette = [
+        x,
+        -x,
+        0.5 * x,
+        -0.5 * x,
+        -0.1 * x,
+        0.3 * x,
+        1.0e153,
+        -1.0e153,
+        1.0,
+        -1.0,
+        0.0,
+        1.0e-170,
+        -1.0e-170,
+        2.0f64.powi(-600),
+    ];
+    let axes = [0.0, 8.0 * x, 4.0 * x, 3.5 * x, 4.0];
+    let radii = [0.0, 1.0e-300, 1.0e-170, 1.0, 1.0e100, 1.0e153, 1.0e300];
+    let mut rng = StdRng::seed_from_u64(0x0cab_1a11);
+    let mut seen = [0usize; 2];
+    for case in 0..90 {
+        let d = 1 + case % 3;
+        let n = 2 + (case / 3) % 3;
+        let periods: Vec<f64> = (0..d)
+            .map(|_| axes[rng.random_range(0..axes.len())])
+            .collect();
+        let mut row = || -> Vec<f64> {
+            (0..d)
+                .map(|_| palette[rng.random_range(0..palette.len())])
+                .collect()
+        };
+        let rows: Vec<Vec<f64>> = (0..n).map(|_| row()).collect();
+        let mut queries = rows.clone();
+        queries.push(row());
+        for order in nd_orderings(n) {
+            let data: Vec<f64> = order
+                .iter()
+                .flat_map(|&i| rows[i].iter().copied())
+                .collect();
+            let got = assert_c_full_scan(
+                &data,
+                d,
+                &periods,
+                &queries,
+                &radii,
+                &format!("{periods:?} {data:?}"),
+            );
+            seen[0] += got[0];
+            seen[1] += got[1];
+        }
+    }
+    assert!(seen[0] > 0 && seen[1] > 0, "{seen:?}");
+}
+
+/// The overflow repros through the C ABI. `x`, `-x/2`, `0` and
+/// `x`, `-x/10`, `3x/10`, `-1` hold a pair whose square overflows, on the
+/// last of 1 to 3 axes. Every build order fails every query that reads it.
+#[test]
+fn lc_nd_overflow_repros_fail_in_every_order() {
+    let x = nd_huge();
+    let overflow = Error::DistanceOverflow.to_string();
+    let radii = [0.0, 1.0e-300, 1.0, 1.0e100, 1.0e153];
+    for axis in [0.0, 8.0 * x, 4.0 * x, 3.5 * x] {
+        for d in 1..=3 {
+            let mut periods = vec![0.0; d];
+            periods[d - 1] = axis;
+            let lift = |v: f64, i: usize| -> Vec<f64> {
+                let mut row: Vec<f64> = (0..d).map(|k| (i + k) as f64 * 0.125).collect();
+                row[d - 1] = v;
+                row
+            };
+            let q = lift(-0.5 * x, 1);
+            for values in [&[x, -0.5 * x, 0.0][..], &[x, -0.1 * x, 0.3 * x, -1.0][..]] {
+                let n = values.len();
+                for order in nd_orderings(n) {
+                    let data: Vec<f64> = order.iter().flat_map(|&i| lift(values[i], i)).collect();
+                    let what = format!("{periods:?} {order:?} {values:?}");
+                    let idx = build_nd_index(&data, n, d, Some(&periods));
+                    if n == 3 {
+                        for k in [1, 2] {
+                            assert_eq!(c_nd_knn(idx, &q, k).unwrap_err(), overflow, "{what}");
+                        }
+                        for r in radii {
+                            let got = c_nd_within(idx, &q, r).unwrap_err();
+                            assert_eq!(got, overflow, "{what} {r:e}");
+                        }
+                        assert!(c_nd_within(idx, &lift(0.0, 2), 1.0).is_ok(), "{what}");
+                    }
+                    assert_eq!(c_nd_pairs(idx, 1.0).unwrap_err(), overflow, "{what}");
+                    let got = c_nd_dbscan(idx, n, 1.0, 1).unwrap_err();
+                    assert_eq!(got, overflow, "{what}");
+                    unsafe { lc_nd_free(idx) };
+                    let queries = [q.clone(), lift(0.0, 2), lift(x, 0)];
+                    assert_c_full_scan(&data, d, &periods, &queries, &radii, &what);
+                }
+            }
+        }
+    }
+}
+
+/// Rounded squares that tie keep the order of their exact squares, and a
+/// radius whose square is 0 admits only points that coincide with the query.
+#[test]
+fn lc_nd_orders_rounded_ties_by_the_exact_square() {
+    let idx = build_nd_index(&[1.0e-170, 0.0], 2, 1, None);
+    assert_eq!(c_nd_knn(idx, &[0.0], 1), Ok(vec![(1, 0)]));
+    assert_eq!(c_nd_knn(idx, &[0.0], 2), Ok(vec![(1, 0), (0, 0)]));
+    for r in [0.0, 1.0e-300, 1.0e-170] {
+        assert_eq!(c_nd_within(idx, &[0.0], r), Ok(vec![(1, 0)]), "{r:e}");
+    }
+    assert_eq!(c_nd_pairs(idx, 1.0e-170), Ok(Vec::new()));
+    assert_eq!(c_nd_pairs(idx, 1.0), Ok(vec![(0, 1, 0)]));
+    unsafe { lc_nd_free(idx) };
+
+    let tiny = 2.0f64.powi(-600);
+    let idx = build_nd_index(&[tiny, 0.0], 2, 1, None);
+    assert_eq!(c_nd_within(idx, &[0.0], 0.0), Ok(vec![(1, 0)]));
+    assert_eq!(c_nd_within(idx, &[tiny], 0.0), Ok(vec![(0, 0)]));
+    unsafe { lc_nd_free(idx) };
+}
+
+/// Points `i * 1e-163` have subnormal squares. `fl(27e-163 * 27e-163)` is
+/// `2^-1074`, and the first 28 squares round to at most that, so radius
+/// `27e-163` from the origin returns those 28 points.
+#[test]
+fn lc_nd_subnormal_squares_match_a_full_scan() {
+    let n = 64;
+    let r = 27.0e-163;
+    assert_eq!(r * r, f64::from_bits(1));
+    let radii = [0.0, 1.0e-163, 16.0e-163, 27.0e-163, 28.0e-163, 1.0e-161];
+    for (d, period) in [(1, 0.0), (1, 1.0), (2, 0.0), (2, 1.0), (48, 0.0)] {
+        let data: Vec<f64> = (0..n)
+            .flat_map(|i| std::iter::repeat(i as f64 * 1.0e-163).take(d))
+            .collect();
+        let periods = vec![period; d];
+        let idx = build_nd_index(&data, n, d, Some(&periods));
+        let origin = vec![0.0; d];
+        let got = c_nd_within(idx, &origin, r).unwrap();
+        let want = NdScan::new(&data, d, &periods).within(&origin, r).unwrap();
+        assert_eq!(got, want, "d={d} period={period}");
+        if d == 1 {
+            let ids: Vec<usize> = got.iter().map(|h| h.0).collect();
+            assert_eq!(ids, (0..28).collect::<Vec<_>>());
+        }
+        unsafe { lc_nd_free(idx) };
+        let queries: Vec<Vec<f64>> = [0usize, 5, 27, 63]
+            .iter()
+            .map(|&i| data[i * d..(i + 1) * d].to_vec())
+            .collect();
+        let what = format!("subnormal d={d} period={period}");
+        assert_c_full_scan(&data, d, &periods, &queries, &radii, &what);
+    }
 }
 
 /// The period table holds one `Option<f64>` per axis. At the largest `d` the
