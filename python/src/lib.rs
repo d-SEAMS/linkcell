@@ -813,10 +813,19 @@ fn pairs_open_py<'py>(
 /// non-positive cutoff or a non-finite coordinate raises `RuntimeError`.
 /// A singular cell raises `ValueError` when any axis is periodic. An
 /// open row is replaced by a unit normal of the periodic rows before
-/// the bins are built. A fully periodic cell whose shortest face
-/// altitude has collapsed raises `RuntimeError` (`face width has
-/// collapsed`). For a fully non-periodic search, the cell is ignored
-/// and replaced by a unit orthorhombic cell.
+/// the bins are built. A fully periodic cell with a positive finite
+/// width raises `RuntimeError` when the image count exceeds 2^24, the
+/// partner stencil's reach box exceeds 2^31 slots, or the mesh is too
+/// fine (`periodic image count exceeds 2^24`,
+/// `linked-cell mesh is too fine`). A zero or non-finite width raises
+/// `RuntimeError` (`face width is zero or non-finite`). A positive
+/// finite width is not rejected by its ratio to the longest edge. The
+/// mesh edge is clamped to the shortest width, so a face much shorter
+/// than the other edges can exceed the bin cap at every cutoff. A
+/// short face no shorter than the cutoff still returns pairs when
+/// both caps hold. For
+/// a fully non-periodic search, the cell is ignored and replaced by a
+/// unit orthorhombic cell.
 #[pyfunction]
 #[pyo3(
     name = "pairs_within_pbc",

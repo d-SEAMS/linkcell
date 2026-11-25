@@ -30,6 +30,14 @@ pub use csr::{pairs_within_csr, PairCsr};
 
 const MAX_IMAGES: i64 = 1 << 24;
 
+/// Partner slots in one stencil, one per bin per direction in the reach
+/// box. A box larger than this is [`Error::TooManyImages`] and is not
+/// allocated. 2^31 admits a reach of two bins on every axis of a mesh
+/// at the bin cap, which is the stencil a cubic cell of a few hundred
+/// bins on a side builds and searches. The needle (widths 0.001, 0.001,
+/// 10 at cutoff 0.1) is about 8e10 slots and is refused before the loop.
+const MAX_PARTNERS: usize = 1 << 31;
+
 /// One atom-image pair inside the cutoff.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pair {
@@ -73,11 +81,14 @@ pub(crate) fn keep_half(i: usize, j: usize, shift: [i32; 3]) -> bool {
 /// strictly positive, [`Error::Empty`] when `xyz` is empty,
 /// [`Error::MaskLen`] when `mask` has the wrong length,
 /// [`Error::Overflow`] when `n` exceeds `u32::MAX`,
-/// [`Error::TooManyImages`] when the image count exceeds 2^24,
-/// [`Error::TooManyCells`] on the same bin cap as [`knearest`](crate::knearest),
-/// and [`Error::Degenerate`] when the shortest face altitude is at most
-/// `1e-6` of the longest edge.
-/// These inputs return `Err`.
+/// [`Error::TooManyImages`] when the image count exceeds 2^24, the
+/// partner stencil's reach box exceeds 2^31 slots, or the
+/// estimated row buffer does not fit, [`Error::TooManyCells`] on the
+/// same bin cap as [`knearest`](crate::knearest), and
+/// [`Error::Degenerate`] when a face width is zero or non-finite.
+/// A positive finite width is not rejected by its ratio to the longest
+/// edge. The image count and the bin cap run before any row buffer is
+/// reserved. These inputs return `Err`.
 ///
 /// ```
 /// use linkcell::{pairs_within, Cell};
@@ -101,20 +112,29 @@ pub fn pairs_within(
     cell_hint: Option<f64>,
     half: bool,
 ) -> Result<Vec<Pair>, Error> {
-    preflight(xyz, simbox, cutoff, mask)?;
+    let n_act = prepare_pairs(xyz, simbox, cutoff, mask, cell_hint)?;
+    if n_act == 0 {
+        return Ok(Vec::new());
+    }
     let est = hit_estimate(xyz.len(), simbox, cutoff);
+    let rows_guess = row_guess(est, half);
+    // Image and bin caps have already run. A guess that does not fit,
+    // or that the allocator refuses, is TooManyImages and does not search.
+    if !reservation_fits::<Pair>(rows_guess) {
+        return Err(Error::TooManyImages);
+    }
     if walk_threads(est) == 1 {
         let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
         if let Some(words) = plan.fused().filter(|_| knobs::fused()) {
-            return Ok(plan.fused_rows(&words));
+            return plan.fused_rows(&words);
         }
-        return Ok(plan.search().into_pairs());
+        return plan.search().into_pairs();
     }
     // The buffer is reserved here, on the caller's thread, from the
     // ideal-gas estimate; search and write then run in one pool entry.
-    let rows_guess = row_guess(est, half);
-    let mut out: Vec<Pair> = Vec::with_capacity(rows_guess);
+    let mut out: Vec<Pair> = Vec::new();
+    try_hold(&mut out, rows_guess)?;
     advise_huge(&mut out);
     let base = RowPtr(out.as_mut_ptr() as *mut std::mem::MaybeUninit<Pair>);
     let (rows, rest) = in_pool(est, || -> Result<(usize, Option<Found>), Error> {
@@ -152,7 +172,7 @@ pub fn pairs_within(
         Ok((rows, None))
     })?;
     if let Some(found) = rest {
-        out.reserve(rows);
+        try_hold(&mut out, rows)?;
         // Safety: `out` now holds `rows` rows.
         unsafe { found.write_pairs(out.as_mut_ptr()) };
     }
@@ -197,13 +217,21 @@ pub fn pairs_within_into(
     half: bool,
     out: &mut Vec<Pair>,
 ) -> Result<(), Error> {
+    let n_act = prepare_pairs(xyz, simbox, cutoff, mask, cell_hint)?;
+    if n_act == 0 {
+        out.clear();
+        return Ok(());
+    }
+    let rows_guess = row_guess(hit_estimate(xyz.len(), simbox, cutoff), half);
+    if !reservation_fits::<Pair>(rows_guess) {
+        return Err(Error::TooManyImages);
+    }
     let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
     #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
     if let Some(words) = plan.fused().filter(|_| knobs::fused()) {
-        plan.fused_into_vec(&words, out);
-        return Ok(());
+        return plan.fused_into_vec(&words, out);
     }
-    *out = plan.search().into_pairs();
+    *out = plan.search().into_pairs()?;
     Ok(())
 }
 
@@ -253,6 +281,34 @@ fn row_guess(hits: usize, half: bool) -> usize {
     rows.saturating_add(rows / 4).saturating_add(64)
 }
 
+/// `true` when `count` elements of `T` fit in `isize::MAX` bytes.
+fn reservation_fits<T>(count: usize) -> bool {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .is_some_and(|bytes| bytes <= isize::MAX as usize)
+}
+
+/// The four column vectors of one row guess fit in `isize::MAX` bytes.
+fn columns_fit(rows: usize) -> bool {
+    reservation_fits::<i32>(rows)
+        && reservation_fits::<[i32; 3]>(rows)
+        && reservation_fits::<f64>(rows)
+}
+
+/// Reserve `additional` slots, or [`Error::TooManyImages`] when the
+/// product overflows or the allocator refuses the block.
+fn try_hold<T>(buf: &mut Vec<T>, additional: usize) -> Result<(), Error> {
+    let need = buf
+        .len()
+        .checked_add(additional)
+        .ok_or(Error::TooManyImages)?;
+    if !reservation_fits::<T>(need) {
+        return Err(Error::TooManyImages);
+    }
+    buf.try_reserve(additional)
+        .map_err(|_| Error::TooManyImages)
+}
+
 /// The same rows as [`pairs_within`], as four columns.
 ///
 /// `i`, `j`, and `shift` are the vesin / tonari `ijS` layout and
@@ -272,29 +328,38 @@ pub fn pairs_within_columns(
     if xyz.len() > i32::MAX as usize {
         return Err(Error::Overflow);
     }
-    preflight(xyz, simbox, cutoff, mask)?;
+    let n_act = prepare_pairs(xyz, simbox, cutoff, mask, cell_hint)?;
+    if n_act == 0 {
+        out.i.clear();
+        out.j.clear();
+        out.shift.clear();
+        out.dist2.clear();
+        return Ok(());
+    }
     let est = hit_estimate(xyz.len(), simbox, cutoff);
+    let rows_guess = row_guess(est, half);
+    if !columns_fit(rows_guess) {
+        return Err(Error::TooManyImages);
+    }
     if walk_threads(est) == 1 {
         let plan = plan(xyz, simbox, cutoff, mask, cell_hint, half)?;
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
         if plan.fused().is_some() && knobs::fused() {
-            plan.fused_columns(out);
-            return Ok(());
+            return plan.fused_columns(out);
         }
-        plan.search().fill_columns(out);
+        plan.search().fill_columns(out)?;
         return Ok(());
     }
     // Columns are reserved on the caller's thread; search and write run
     // in one pool entry.
-    let rows_guess = row_guess(est, half);
     out.i.clear();
     out.j.clear();
     out.shift.clear();
     out.dist2.clear();
-    out.i.reserve(rows_guess);
-    out.j.reserve(rows_guess);
-    out.shift.reserve(rows_guess);
-    out.dist2.reserve(rows_guess);
+    try_hold(&mut out.i, rows_guess)?;
+    try_hold(&mut out.j, rows_guess)?;
+    try_hold(&mut out.shift, rows_guess)?;
+    try_hold(&mut out.dist2, rows_guess)?;
     out.advise_huge();
     let ptrs = ColumnPtrs {
         i: RowPtr(out.i.as_mut_ptr() as *mut std::mem::MaybeUninit<i32>),
@@ -339,7 +404,7 @@ pub fn pairs_within_columns(
         Ok((rows, None))
     })?;
     match rest {
-        Some(found) => found.fill_columns(out),
+        Some(found) => found.fill_columns(out)?,
         // Safety: every row below `rows` is written in every column.
         None => unsafe {
             out.i.set_len(rows);
@@ -679,7 +744,7 @@ fn plan_with(
         path,
         threads,
     } = binned;
-    let partners = partners_for(&grid, simbox, reach, cut2);
+    let partners = partners_for(&grid, simbox, reach, cut2)?;
     let margin = expanded_margin(&grid, &partners, cutoff);
     Ok(Plan {
         images: if shifts {
@@ -712,9 +777,8 @@ pub(crate) struct Binned {
     threads: usize,
 }
 
-/// Cutoff, length, mask, and a collapsed periodic face, before any row
-/// reservation. The order matches the checks that used to live in
-/// [`bin_atoms`].
+/// Cutoff, length, mask, and a zero or non-finite periodic width, before
+/// any row reservation.
 fn preflight(
     xyz: &[[f64; 3]],
     simbox: &Cell,
@@ -741,6 +805,92 @@ fn preflight(
     Ok(())
 }
 
+/// Active points. A mask has already been checked for length.
+fn active_len(n: usize, mask: Option<&[bool]>) -> usize {
+    match mask {
+        Some(m) => m.iter().filter(|&&on| on).count(),
+        None => n,
+    }
+}
+
+/// Images per axis, the product of `2 * repeats + 1` capped at
+/// [`MAX_IMAGES`]. Checked multiplication: a product that overflows is
+/// [`Error::TooManyImages`], the same as a product past the cap.
+fn image_repeats(simbox: &Cell, cutoff: f64) -> Result<[i32; 3], Error> {
+    let w = simbox.widths();
+    let mut image_count: i64 = 1;
+    let mut repeats = [0i32; 3];
+    for a in 0..3 {
+        let r = (cutoff / w[a]).ceil();
+        if !r.is_finite() || r > i32::MAX as f64 {
+            return Err(Error::TooManyImages);
+        }
+        let repeats_a = r as i32;
+        let factor = i64::from(repeats_a)
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(Error::TooManyImages)?;
+        if factor <= 0 || image_count > MAX_IMAGES / factor {
+            return Err(Error::TooManyImages);
+        }
+        image_count = image_count
+            .checked_mul(factor)
+            .ok_or(Error::TooManyImages)?;
+        repeats[a] = repeats_a;
+    }
+    Ok(repeats)
+}
+
+/// Image count, bin cap, and the reach those bins imply.
+fn stencil_limits(
+    simbox: &Cell,
+    cutoff: f64,
+    cell_hint: Option<f64>,
+    n_act: usize,
+) -> Result<([i32; 3], [i32; 3], i32), Error> {
+    let repeats = image_repeats(simbox, cutoff)?;
+    let edge = bins::target_edge(simbox, cell_hint, default_edge(simbox, n_act, cutoff));
+    let dims = bins::grid_dims(simbox, edge)?;
+    let w = simbox.widths();
+    let cell_min = (w[0] / f64::from(dims[0]))
+        .min(w[1] / f64::from(dims[1]))
+        .min(w[2] / f64::from(dims[2]));
+    let reach_cut = (cutoff / cell_min).ceil();
+    if !reach_cut.is_finite() || reach_cut > i32::MAX as f64 {
+        return Err(Error::TooManyImages);
+    }
+    let mut max_reach = reach_cut as i32;
+    for a in 0..3 {
+        let span = repeats[a]
+            .checked_mul(dims[a])
+            .ok_or(Error::TooManyImages)?;
+        max_reach = max_reach.max(span);
+    }
+    Ok((repeats, dims, max_reach.max(1)))
+}
+
+/// Argument checks, then the image and bin caps. `Ok(0)` when no atom
+/// is active: that search has no stencil and no row buffer.
+///
+/// Called before any capacity estimate is reserved. [`bin_atoms`] repeats
+/// the same caps, so a cell that fails here never reaches a reservation
+/// and a cell that passes is the cell the walk accepts.
+pub(crate) fn prepare_pairs(
+    xyz: &[[f64; 3]],
+    simbox: &Cell,
+    cutoff: f64,
+    mask: Option<&[bool]>,
+    cell_hint: Option<f64>,
+) -> Result<usize, Error> {
+    preflight(xyz, simbox, cutoff, mask)?;
+    let n_act = active_len(xyz.len(), mask);
+    if n_act == 0 {
+        return Ok(0);
+    }
+    let _ = stencil_limits(simbox, cutoff, cell_hint, n_act)?;
+    Ok(n_act)
+}
+
 /// Check the arguments, then bin the active atoms. `None` when no atom
 /// is active. `lean` builds the grid of [`Grid::build`] for a walk that
 /// reads only the folded positions.
@@ -761,36 +911,8 @@ fn bin_atoms(
     }
     retain_pair_pages();
 
+    let (repeats, dims, max_reach) = stencil_limits(simbox, cutoff, cell_hint, n_act)?;
     let w = simbox.widths();
-    let mut image_count: i64 = 1;
-    let mut repeats = [0i32; 3];
-    for a in 0..3 {
-        let r = (cutoff / w[a]).ceil();
-        if !r.is_finite() || r > i32::MAX as f64 {
-            return Err(Error::TooManyImages);
-        }
-        repeats[a] = r as i32;
-        let factor = 2 * i64::from(repeats[a]) + 1;
-        if image_count > MAX_IMAGES / factor {
-            return Err(Error::TooManyImages);
-        }
-        image_count *= factor;
-    }
-
-    let edge = bins::target_edge(simbox, cell_hint, default_edge(simbox, n_act, cutoff));
-    let dims = bins::grid_dims(simbox, edge)?;
-    let cell_min = (w[0] / f64::from(dims[0]))
-        .min(w[1] / f64::from(dims[1]))
-        .min(w[2] / f64::from(dims[2]));
-    let reach_cut = (cutoff / cell_min).ceil();
-    if !reach_cut.is_finite() || reach_cut > i32::MAX as f64 {
-        return Err(Error::TooManyImages);
-    }
-    let max_reach = (reach_cut as i32)
-        .max(repeats[0] * dims[0])
-        .max(repeats[1] * dims[1])
-        .max(repeats[2] * dims[2])
-        .max(1);
     let cut2 = cutoff * cutoff;
     // One reach for every atom: the shorter gap at either edge of a bin.
     // The box is symmetric, so each unordered pair is visited from one
@@ -901,7 +1023,7 @@ fn partners_for(
     simbox: &Cell,
     reach: [i32; 3],
     cut2: f64,
-) -> std::sync::Arc<PartnerList> {
+) -> Result<std::sync::Arc<PartnerList>, Error> {
     let h = simbox.h();
     let o = simbox.origin();
     let mut boxbits = [0u64; 12];
@@ -915,15 +1037,15 @@ fn partners_for(
     if let Ok(slot) = PARTNERS.lock() {
         if let Some(list) = slot.as_ref() {
             if list.key == key {
-                return std::sync::Arc::clone(list);
+                return Ok(std::sync::Arc::clone(list));
             }
         }
     }
-    let built = std::sync::Arc::new(build_partners(grid, simbox, reach, cut2, key));
+    let built = std::sync::Arc::new(build_partners(grid, simbox, reach, cut2, key)?);
     if let Ok(mut slot) = PARTNERS.lock() {
         *slot = Some(std::sync::Arc::clone(&built));
     }
-    built
+    Ok(built)
 }
 
 fn bin_gap(src: i32, dst: i32, width: f64) -> f64 {
@@ -963,9 +1085,27 @@ fn build_partners(
     reach: [i32; 3],
     cut2: f64,
     key: PartnerKey,
-) -> PartnerList {
+) -> Result<PartnerList, Error> {
     let [nx, ny, nz] = grid.n;
-    let ncell = (nx as usize) * (ny as usize) * (nz as usize);
+    let ncell = (nx as usize)
+        .checked_mul(ny as usize)
+        .and_then(|v| v.checked_mul(nz as usize))
+        .ok_or(Error::TooManyCells)?;
+    let mut slots = ncell;
+    for r in reach {
+        let span = i64::from(r)
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(Error::TooManyImages)?;
+        let span = usize::try_from(span).map_err(|_| Error::TooManyImages)?;
+        slots = slots.checked_mul(span).ok_or(Error::TooManyImages)?;
+    }
+    // The list stores one entry per kept direction. The full reach box is
+    // the most it can hold. A box past the image-count cap, or that does
+    // not fit in `isize::MAX` bytes, is not reserved.
+    if slots > MAX_PARTNERS || !reservation_fits::<Partner>(slots) {
+        return Err(Error::TooManyImages);
+    }
     let width = [
         grid.widths[0] / f64::from(nx),
         grid.widths[1] / f64::from(ny),
@@ -973,7 +1113,9 @@ fn build_partners(
     ];
     let ortho = simbox.is_ortho();
     let [rx, ry, rz] = reach;
-    let mut off = vec![0usize; ncell + 1];
+    let mut off = Vec::new();
+    try_hold(&mut off, ncell + 1)?;
+    off.resize(ncell + 1, 0);
     let mut items = Vec::new();
     let (mut s_max, mut d_max) = (0.0f64, 0.0f64);
     for iz in 0..nz {
@@ -1008,6 +1150,14 @@ fn build_partners(
                                 s_max = s_max.max(shift[k].abs());
                                 d_max = d_max.max(delta[k].abs());
                             }
+                            if items.len() == MAX_PARTNERS {
+                                return Err(Error::TooManyImages);
+                            }
+                            if items.len() == items.capacity() {
+                                let room = MAX_PARTNERS - items.len();
+                                let extra = items.capacity().max(64).min(room);
+                                try_hold(&mut items, extra)?;
+                            }
                             items.push(Partner {
                                 jc,
                                 shift_s,
@@ -1029,7 +1179,7 @@ fn build_partners(
         d_max,
     };
     crate::open_cell::note_stencil_build();
-    list
+    Ok(list)
 }
 
 #[derive(Default)]
@@ -2167,15 +2317,16 @@ impl Found {
         off
     }
 
-    fn into_pairs(self) -> Vec<Pair> {
+    fn into_pairs(self) -> Result<Vec<Pair>, Error> {
         let total = self.rows();
-        let mut found: Vec<Pair> = Vec::with_capacity(total);
+        let mut found: Vec<Pair> = Vec::new();
+        try_hold(&mut found, total)?;
         // Safety: `total` slots are allocated.
         unsafe {
             self.write_pairs(found.as_mut_ptr());
             found.set_len(total);
         }
-        found
+        Ok(found)
     }
 
     /// Every row, written at `out`.
@@ -2251,16 +2402,16 @@ impl Found {
     }
 
     /// Clear `out`, then write every row into its four columns.
-    pub(crate) fn fill_columns(&self, out: &mut PairColumns) {
+    pub(crate) fn fill_columns(&self, out: &mut PairColumns) -> Result<(), Error> {
         let total = self.rows();
         out.i.clear();
         out.j.clear();
         out.shift.clear();
         out.dist2.clear();
-        out.i.reserve(total);
-        out.j.reserve(total);
-        out.shift.reserve(total);
-        out.dist2.reserve(total);
+        try_hold(&mut out.i, total)?;
+        try_hold(&mut out.j, total)?;
+        try_hold(&mut out.shift, total)?;
+        try_hold(&mut out.dist2, total)?;
         // Safety: each column has room for `total` rows.
         unsafe {
             self.write_columns(
@@ -2274,6 +2425,7 @@ impl Found {
             out.shift.set_len(total);
             out.dist2.set_len(total);
         }
+        Ok(())
     }
 
     /// # Safety
@@ -4093,31 +4245,36 @@ impl Plan {
     }
 
     /// [`Plan::fused`]: every row appended from the tile kernel.
-    fn fused_rows(&self, words: &RowWords) -> Vec<Pair> {
+    fn fused_rows(&self, words: &RowWords) -> Result<Vec<Pair>, Error> {
         let _timer = crate::pop::JobTimer::new();
         let guess = self.fused_guess();
-        let mut out: Vec<Pair> = Vec::with_capacity(guess);
+        let mut out: Vec<Pair> = Vec::new();
+        try_hold(&mut out, guess)?;
         advise_huge(&mut out);
         let ahead = ahead(guess, std::mem::size_of::<Pair>());
         let n = self.fused_sink::<false, _>(words, &mut out, ahead);
         // Safety: every row below `n` is written.
         unsafe { out.set_len(n) };
-        out
+        Ok(out)
     }
 
     /// [`pairs_within_into`]: fill `out`, growing it only when it is short.
-    fn fused_into_vec(&self, words: &RowWords, out: &mut Vec<Pair>) {
+    fn fused_into_vec(&self, words: &RowWords, out: &mut Vec<Pair>) -> Result<(), Error> {
         let _timer = crate::pop::JobTimer::new();
         let guess = self.fused_guess();
+        if !reservation_fits::<Pair>(guess) {
+            return Err(Error::TooManyImages);
+        }
         out.clear();
         if out.capacity() < guess {
-            out.reserve(guess - out.len());
+            try_hold(out, guess - out.len())?;
         }
         advise_huge(out);
         let ahead = ahead(out.capacity(), std::mem::size_of::<Pair>());
         let n = self.fused_sink::<false, _>(words, out, ahead);
         // Safety: every row below `n` is written.
         unsafe { out.set_len(n) };
+        Ok(())
     }
 
     /// [`pairs_within_count`]: the tile's row count, with no row stored.
@@ -4427,21 +4584,24 @@ impl Plan {
     }
 
     /// [`Plan::fused`] into four columns.
-    fn fused_columns(&self, out: &mut PairColumns) {
+    fn fused_columns(&self, out: &mut PairColumns) -> Result<(), Error> {
         let _timer = crate::pop::JobTimer::new();
         let words = match RowWords::of_pair() {
             Some(w) => w,
             None => return self.search().fill_columns(out),
         };
+        let guess = self.fused_guess();
+        if !columns_fit(guess) {
+            return self.search().fill_columns(out);
+        }
         out.i.clear();
         out.j.clear();
         out.shift.clear();
         out.dist2.clear();
-        let guess = self.fused_guess();
-        out.i.reserve(guess);
-        out.j.reserve(guess);
-        out.shift.reserve(guess);
-        out.dist2.reserve(guess);
+        try_hold(&mut out.i, guess)?;
+        try_hold(&mut out.j, guess)?;
+        try_hold(&mut out.shift, guess)?;
+        try_hold(&mut out.dist2, guess)?;
         out.advise_huge();
         let n = self.fused_sink::<true, _>(&words, out, ahead(guess, COLUMN_BYTES));
         // Safety: every row below `n` is written in every column.
@@ -4451,6 +4611,7 @@ impl Plan {
             out.shift.set_len(n);
             out.dist2.set_len(n);
         }
+        Ok(())
     }
 }
 

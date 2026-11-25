@@ -109,8 +109,17 @@ shift zero, squared distance strictly below `cutoff * cutoff`.
 periodic and is `lc_pairs_within_rows`. An open axis is replaced by a
 unit normal of the periodic rows, however long the stored row is, and
 is binned on the occupied Cartesian cells of that lattice. It is not
-padded into a periodic box. A fully periodic cell whose shortest face
-altitude is at most one millionth of its longest edge returns nonzero.
+padded into a periodic box. A fully periodic cell whose face width
+is zero or non-finite returns nonzero. A positive finite width is not
+rejected by its ratio to the longest edge. A width that needs more
+than 2^24 images, or whose estimated row buffer does not fit, returns
+nonzero with the image-count error. The mesh edge is clamped to the
+shortest width, so a face much shorter than the other edges can exceed
+the bin cap at every cutoff and returns the mesh error. When both caps
+hold, including a short face no shorter than the cutoff, the call
+returns the pairs. The partner stencil is capped at 2^31 slots,
+enough for a reach of two bins on every axis of a mesh at the bin cap.
+A larger reach box returns the image-count error and is not stored.
 `lc_stencil_builds` counts partner stencils that were built. A stencil
 that is reused does not increment it. A fully open stencil is reused
 by every call with the same cutoff and bin edge, wherever the atoms
@@ -385,7 +394,7 @@ A null function removes the hook, and the device partition then reports that no 
 | `NoDevice` | A device curve split was requested and no device is loaded |
 | `ScotchDisabled` | Scotch support was not compiled in |
 | `TooManyImages` | The periodic image count exceeds 2^24 |
-| `Degenerate` | A periodic face altitude is at most `1e-6` of the longest periodic edge (`periodic cell is degenerate: a face width has collapsed`). An open axis is replaced before this test |
+| `Degenerate` | A periodic face width is zero or non-finite (`periodic cell is degenerate: a face width is zero or non-finite`). A positive finite width is cutoff-aware and uses the image and bin caps. An open axis is replaced before this test |
 | `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
 | `Device` | The device is not the CPU and `libvesin.so` is not loaded |
 | `Padded` | A point has more neighbours than the requested pad |

@@ -193,7 +193,7 @@ pub(super) fn gather(
     half: bool,
     repeat: bool,
     dist2: bool,
-) -> Gathered {
+) -> Result<Gathered, Error> {
     let grid = &binned.grid;
     let threads = binned.threads;
     let ncell = grid.offsets.len() - 1;
@@ -218,7 +218,8 @@ pub(super) fn gather(
     bufs.at.resize(n, 0);
     bufs.first.clear();
     bufs.first.resize(n + 1, 0);
-    let walk = Walker::new(binned, cell);
+    let walk = Walker::new(binned, cell)?;
+    let failed = std::sync::atomic::AtomicBool::new(false);
     let stages = Shared(bufs.stages.as_mut_ptr());
     let at = Shared(bufs.at.as_mut_ptr());
     let first = Shared(bufs.first.as_mut_ptr());
@@ -235,14 +236,20 @@ pub(super) fn gather(
             first,
             stage: (t as u64) << STAGE_BITS,
         };
-        match (staged_d2, half) {
+        let result = match (staged_d2, half) {
             (false, false) => walk.range_on::<false, false>(stage, lo, hi, repeat, rows),
             (false, true) => walk.range_on::<false, true>(stage, lo, hi, repeat, rows),
             (true, false) => walk.range_on::<true, false>(stage, lo, hi, repeat, rows),
             (true, true) => walk.range_on::<true, true>(stage, lo, hi, repeat, rows),
+        };
+        if result.is_err() {
+            failed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
-    Gathered {
+    if failed.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Error::TooManyImages);
+    }
+    Ok(Gathered {
         bufs,
         n,
         blocks: if threads > 1 {
@@ -251,7 +258,7 @@ pub(super) fn gather(
             1
         },
         dist2,
-    }
+    })
 }
 
 /// Row blocks per thread in the layout passes.
@@ -284,7 +291,7 @@ struct Walker<'a> {
 }
 
 impl<'a> Walker<'a> {
-    fn new(binned: &'a Binned, cell: &'a Cell) -> Self {
+    fn new(binned: &'a Binned, cell: &'a Cell) -> Result<Self, Error> {
         let grid = &binned.grid;
         let [nx, ny, nz] = grid.n;
         let width = [
@@ -310,11 +317,11 @@ impl<'a> Walker<'a> {
                 let at = |k: i32, n: i32| [0, 1, n - 1][k as usize];
                 let b = [at(class % 3, nx), at(class / 3 % 3, ny), at(class / 9, nz)];
                 let c = bins::flat_cell(b, grid.n);
-                walk.steps_of(c, b, &mut stage);
+                walk.steps_of(c, b, &mut stage)?;
                 walk.steps.push(stage.steps.clone());
             }
         }
-        walk
+        Ok(walk)
     }
 
     /// Where bin `b` sits on each axis, as an index into `steps`.
@@ -336,7 +343,7 @@ impl<'a> Walker<'a> {
     /// Runs of bin `c` at `b`, as flat offsets: every bin offset in
     /// reach, the walk's roles and shifts, less the bins the stencil
     /// drops. Runs of neighbouring bins read the same way merge.
-    fn steps_of(&self, c: usize, b: [i32; 3], stage: &mut Stage) {
+    fn steps_of(&self, c: usize, b: [i32; 3], stage: &mut Stage) -> Result<(), Error> {
         let n = self.grid.n;
         let r = self.reach;
         // Per axis and offset `d`: the bin `b + d` folds into and its
@@ -390,6 +397,10 @@ impl<'a> Walker<'a> {
                             continue;
                         }
                     }
+                    if steps.len() == steps.capacity() {
+                        let extra = steps.capacity().max(64);
+                        super::try_hold(steps, extra)?;
+                    }
                     steps.push(Step {
                         rel,
                         bins: 1,
@@ -404,6 +415,7 @@ impl<'a> Walker<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     /// Gather the rows of the atoms in bins `lo..hi` into `stage`, `W`
@@ -416,9 +428,9 @@ impl<'a> Walker<'a> {
         hi: usize,
         repeat: bool,
         rows: RowOut,
-    ) {
+    ) -> Result<(), Error> {
         if lo >= hi {
-            return;
+            return Ok(());
         }
         let grid = self.grid;
         let off = &grid.offsets;
@@ -432,7 +444,7 @@ impl<'a> Walker<'a> {
             let (s_lo, s_hi) = (off[c], off[c + 1]);
             if s_lo < s_hi {
                 let steps = if self.steps.is_empty() {
-                    self.steps_of(c, [bx, by, bz], stage);
+                    self.steps_of(c, [bx, by, bz], stage)?;
                     &stage.steps[..]
                 } else {
                     &self.steps[self.class([bx, by, bz])][..]
@@ -501,6 +513,7 @@ impl<'a> Walker<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     /// [`Walker::range`] on the AVX-512 path.
@@ -516,8 +529,8 @@ impl<'a> Walker<'a> {
         hi: usize,
         repeat: bool,
         rows: RowOut,
-    ) {
-        self.range::<D2, HALF, 8>(stage, lo, hi, repeat, rows);
+    ) -> Result<(), Error> {
+        self.range::<D2, HALF, 8>(stage, lo, hi, repeat, rows)
     }
 
     /// [`Walker::range`] on the AVX2 path.
@@ -533,8 +546,8 @@ impl<'a> Walker<'a> {
         hi: usize,
         repeat: bool,
         rows: RowOut,
-    ) {
-        self.range::<D2, HALF, 4>(stage, lo, hi, repeat, rows);
+    ) -> Result<(), Error> {
+        self.range::<D2, HALF, 4>(stage, lo, hi, repeat, rows)
     }
 
     /// [`Walker::range`] on the path the search chose.
@@ -545,20 +558,18 @@ impl<'a> Walker<'a> {
         hi: usize,
         repeat: bool,
         rows: RowOut,
-    ) {
+    ) -> Result<(), Error> {
         #[cfg(all(target_arch = "x86_64", linkcell_avx512))]
         if self.path == Path::Avx512 {
             // Safety: `select` returned AVX-512, so F, VL, and POPCNT are on.
-            unsafe { self.range_avx512::<D2, HALF>(stage, lo, hi, repeat, rows) };
-            return;
+            return unsafe { self.range_avx512::<D2, HALF>(stage, lo, hi, repeat, rows) };
         }
         #[cfg(target_arch = "x86_64")]
         if self.path == Path::Avx2 {
             // Safety: `select` returned AVX2, so the CPU has it.
-            unsafe { self.range_avx2::<D2, HALF>(stage, lo, hi, repeat, rows) };
-            return;
+            return unsafe { self.range_avx2::<D2, HALF>(stage, lo, hi, repeat, rows) };
         }
-        self.range::<D2, HALF, 0>(stage, lo, hi, repeat, rows);
+        self.range::<D2, HALF, 0>(stage, lo, hi, repeat, rows)
     }
 
     /// Stage the row of slot `s` from `bin`.
@@ -1380,16 +1391,22 @@ mod tests {
         label: &str,
     ) {
         let hi = walk.grid.offsets.len() - 1;
-        let want = staged(n, |s, out| walk.range::<D2, HALF, 0>(s, 0, hi, repeat, out));
+        let want = staged(n, |s, out| {
+            walk.range::<D2, HALF, 0>(s, 0, hi, repeat, out).unwrap()
+        });
         assert!(want.iter().any(|(cols, _)| !cols.is_empty()), "{label}");
-        let got = staged(n, |s, out| walk.range::<D2, HALF, 1>(s, 0, hi, repeat, out));
+        let got = staged(n, |s, out| {
+            walk.range::<D2, HALF, 1>(s, 0, hi, repeat, out).unwrap()
+        });
         assert_eq!(got, want, "{label} packed one at a time");
         for path in crate::simd::paths_to_compare() {
             #[cfg(target_arch = "x86_64")]
             {
                 walk.path = path;
             }
-            let got = staged(n, |s, out| walk.range_on::<D2, HALF>(s, 0, hi, repeat, out));
+            let got = staged(n, |s, out| {
+                walk.range_on::<D2, HALF>(s, 0, hi, repeat, out).unwrap()
+            });
             assert_eq!(got, want, "{label} {}", path.name());
         }
     }
@@ -1407,14 +1424,14 @@ mod tests {
             let binned = super::super::bin_atoms(&xyz, &cell, cutoff, None, Some(hint), true)
                 .unwrap()
                 .unwrap();
-            let mut walk = Walker::new(&binned, &cell);
+            let mut walk = Walker::new(&binned, &cell).unwrap();
             let off = &walk.grid.offsets;
             let [nx, ny, _] = walk.grid.n.map(|v| v as usize);
             let mut stage = Stage::default();
             let grows = (0..off.len() - 1).any(|c| {
                 let b = [c % nx, c / nx % ny, c / (nx * ny)].map(|v| v as i32);
                 let steps = if walk.steps.is_empty() {
-                    walk.steps_of(c, b, &mut stage);
+                    walk.steps_of(c, b, &mut stage).unwrap();
                     stage.steps.clone()
                 } else {
                     walk.steps[walk.class(b)].clone()

@@ -23,13 +23,21 @@ pub enum Error {
     /// `cutoff` is not finite and strictly positive.
     BadCutoff,
     /// Periodic image stencil exceeds the 2^24 resource cap.
-    TooManyImages,
-    /// A periodic face altitude has collapsed.
     ///
-    /// The shortest perpendicular width of a periodic axis is at most
-    /// `1e-6` times the longest periodic edge. The linked-cell image
-    /// stencil is not a neighbour list on that lattice. minimage can
-    /// still return a displacement. An open axis is not periodic:
+    /// The partner stencil returns this same error when its reach box
+    /// would hold more than 2^31 slots. That admits a reach of two bins
+    /// on every axis of a mesh at the bin cap. A larger box is not stored.
+    TooManyImages,
+    /// A periodic face width is zero or non-finite.
+    ///
+    /// A positive finite width is not this error. The image count
+    /// (`2 * ceil(cutoff / width) + 1`, product at most 2^24) depends
+    /// on the cutoff. The mesh edge is clamped to the shortest width,
+    /// so a face much shorter than the other edges can exceed the bin
+    /// cap at every cutoff; that is [`Error::TooManyCells`], not this
+    /// error. When both caps hold, including a short face no shorter
+    /// than the cutoff, the search returns the pairs. An open axis is
+    /// not periodic:
     /// [`crate::cell_for_pbc`] replaces that row with a normal of the
     /// periodic rows and does not trip this error.
     Degenerate,
@@ -68,7 +76,10 @@ impl fmt::Display for Error {
             Error::BadCutoff => write!(f, "cutoff must be finite and positive"),
             Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
             Error::Degenerate => {
-                write!(f, "periodic cell is degenerate: a face width has collapsed")
+                write!(
+                    f,
+                    "periodic cell is degenerate: a face width is zero or non-finite"
+                )
             }
             Error::Partial => write!(
                 f,

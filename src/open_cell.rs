@@ -146,8 +146,9 @@ pub fn pairs_open(
 /// `cell` supplies the periodic rows and the origin. An open row is not
 /// read: [`cell_for_pbc`] replaces it with a unit normal of the periodic
 /// rows before the bins are built. The cell is not read when every axis
-/// is open. A fully periodic cell whose face altitude has collapsed
-/// returns [`Error::Degenerate`].
+/// is open. A fully periodic cell whose face width is zero or
+/// non-finite returns [`Error::Degenerate`]. A positive finite width
+/// uses the cutoff-aware image and bin caps.
 pub fn pairs_within_pbc(
     xyz: &[[f64; 3]],
     cell: &Cell,
@@ -204,11 +205,13 @@ pub fn pairs_within_pbc(
 /// the unit normal of their plane. The periodic rows and `origin` are
 /// kept. A fully open mask does not read `rows` and returns a unit cube.
 ///
-/// A fully periodic cell is [`Cell::from_vectors`]. When its shortest
-/// face altitude is at most `1e-6` times its longest edge, the lattice
-/// is numerically flat and this returns [`Error::Degenerate`]. minimage
-/// can still form a displacement on that cell. The linked-cell image
-/// stencil cannot.
+/// A fully periodic cell is [`Cell::from_vectors`]. A periodic face
+/// width that is zero or non-finite returns [`Error::Degenerate`].
+/// A positive finite width is returned as stored. The pair entries
+/// then apply the image count, which depends on the cutoff, and the
+/// bin cap. The mesh edge is clamped to the shortest width, so a face
+/// much shorter than the other edges can exceed the bin cap at every
+/// cutoff. When both caps hold, a short face still builds a list.
 ///
 /// A periodic row that is non-finite, zero, or collinear with the other
 /// periodic rows returns [`Error::BadBox`]. The same error is returned
@@ -1106,7 +1109,10 @@ mod tests {
     use minimage::PartialCell;
 
     use super::{cell_for_pbc, pairs_within_pbc, PbcQuery};
-    use crate::{pairs_within, pairs_within_csr, Cell, Error, Pair, PairCsr};
+    use crate::{
+        pairs_within, pairs_within_columns, pairs_within_csr, Cell, Error, Pair, PairColumns,
+        PairCsr,
+    };
 
     type Key = (usize, usize, [i32; 3]);
 
@@ -1492,37 +1498,37 @@ mod tests {
     }
 
     #[test]
-    fn near_flat_cu_fully_periodic_is_degenerate() {
+    fn near_flat_cu_fully_periodic_is_too_many_images() {
         let rows = near_flat_rows();
         let xyz = near_flat_cu();
         let raw = raw_cell(rows, [0.0; 3]);
-        let err = cell_for_pbc(rows, [0.0; 3], [true, true, true]).unwrap_err();
-        assert_eq!(err, Error::Degenerate);
-        assert_eq!(
-            err.to_string(),
-            "periodic cell is degenerate: a face width has collapsed"
-        );
+        let built = cell_for_pbc(rows, [0.0; 3], [true, true, true]).unwrap();
+        assert!(built.widths().iter().all(|w| w.is_finite() && *w > 0.0));
         assert_eq!(
             pairs_within(&xyz, &raw, 2.6, None, None, true).unwrap_err(),
-            Error::Degenerate
+            Error::TooManyImages
         );
         assert_eq!(
             pairs_within_pbc(&xyz, &raw, &PbcQuery::periodic(2.6)).unwrap_err(),
-            Error::Degenerate
+            Error::TooManyImages
         );
         let mut csr = PairCsr::default();
         assert_eq!(
             pairs_within_csr(&xyz, &raw, &PbcQuery::periodic(2.6), true, &mut csr).unwrap_err(),
-            Error::Degenerate
+            Error::TooManyImages
         );
-        assert_eq!(
-            crate::knearest(&xyz, &raw, 1, None, None).unwrap_err(),
-            Error::Degenerate
+        let nearest = crate::knearest(&xyz, &raw, 1, None, None);
+        assert!(
+            nearest.is_ok()
+                || matches!(
+                    nearest,
+                    Err(Error::TooManyCells | Error::TooManyImages | Error::Degenerate)
+                )
         );
-        assert_eq!(
-            crate::knearest_brute(&xyz, &raw, 1, None).unwrap_err(),
-            Error::Degenerate
-        );
+        let brute = crate::knearest_brute(&xyz, &raw, 1, None).unwrap();
+        assert!(brute
+            .iter()
+            .all(|row| row.dist2.iter().all(|d| d.is_finite())));
         let partial = PartialCell::from_ase(rows, [true, true, true]).unwrap();
         let mut farthest = 0.0f64;
         for i in 0..xyz.len() {
@@ -1612,14 +1618,12 @@ mod tests {
             let mut flat = rows;
             let axis = trial % 3;
             flatten(&mut flat, axis, 1.0e-8);
-            assert_eq!(
-                cell_for_pbc(flat, [0.0; 3], [true, true, true]).unwrap_err(),
-                Error::Degenerate
-            );
+            let built = cell_for_pbc(flat, [0.0; 3], [true, true, true]).unwrap();
+            assert!(built.widths().iter().all(|w| w.is_finite() && *w > 0.0));
             let raw = raw_cell(flat, [0.0; 3]);
             assert_eq!(
                 pairs_within_pbc(&xyz, &raw, &PbcQuery::periodic(1.8)).unwrap_err(),
-                Error::Degenerate
+                Error::TooManyImages
             );
             let mut periodic = [true, true, true];
             periodic[axis] = false;
@@ -1720,7 +1724,589 @@ mod tests {
         let message = unsafe { CStr::from_ptr(crate::lc_last_error()) };
         assert_eq!(
             message.to_str().unwrap(),
-            "periodic cell is degenerate: a face width has collapsed"
+            "periodic image count exceeds 2^24"
         );
+    }
+
+    fn close_dist(left: f64, right: f64) -> bool {
+        let scale = left.abs().max(right.abs()).max(1.0);
+        (left - right).abs() <= 1.0e-9 * scale
+    }
+
+    fn slab(ratio: f64) -> (Cell, Vec<[f64; 3]>) {
+        // One short face. The mesh edge clamps to that face, so the two
+        // long axes exceed the bin cap (or the image cap, when the
+        // cutoff asks for more than 2^24 images). Either is a typed
+        // error and neither reserves the row buffer.
+        let long = 10.0;
+        let thin = long * ratio;
+        let cell = Cell::ortho(long, long, thin).unwrap();
+        let xyz = vec![[1.0, 1.0, thin * 0.30], [1.4, 1.2, thin * 0.70]];
+        (cell, xyz)
+    }
+
+    /// Face ratio `1e-4`, short face equal to `cutoff`. The mesh edge
+    /// clamps to that face, so the long axis has 10_000 bins and the
+    /// reach stays 1: a stencil the bin cap accepts, at a ratio the old
+    /// face-ratio cutoff would also have accepted. Ratios below that
+    /// cutoff are the slab sweep, which the bin cap refuses.
+    fn accepted_rod(cutoff: f64) -> (Cell, Vec<[f64; 3]>) {
+        let ratio = 1.0e-4;
+        let thin = cutoff;
+        let long = cutoff / ratio;
+        let cell = Cell::ortho(long, thin, thin).unwrap();
+        let xyz = vec![
+            [long * 0.20, thin * 0.25, thin * 0.30],
+            [long * 0.20 + 0.40 * cutoff, thin * 0.55, thin * 0.40],
+        ];
+        (cell, xyz)
+    }
+
+    fn brute_axes(
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+        cutoff: f64,
+        reps: [i32; 3],
+    ) -> BTreeMap<Key, f64> {
+        let cut2 = cutoff * cutoff;
+        let mut out = BTreeMap::new();
+        for na in -reps[0]..=reps[0] {
+            for nb in -reps[1]..=reps[1] {
+                for nc in -reps[2]..=reps[2] {
+                    let shift = [na, nb, nc];
+                    for (i, pi) in xyz.iter().enumerate() {
+                        for (j, pj) in xyz.iter().enumerate() {
+                            if i == j && shift == [0, 0, 0] {
+                                continue;
+                            }
+                            if !keep(i, j, shift) {
+                                continue;
+                            }
+                            let delta = if shift == [0, 0, 0] {
+                                [0.0; 3]
+                            } else {
+                                cell.lattice_shift(shift[0], shift[1], shift[2])
+                            };
+                            let dx = (pj[0] + delta[0]) - pi[0];
+                            let dy = (pj[1] + delta[1]) - pi[1];
+                            let dz = (pj[2] + delta[2]) - pi[2];
+                            let dist2 = dx * dx + dy * dy + dz * dz;
+                            if dist2 < cut2 {
+                                out.insert((i, j, shift), dist2);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_typed(err: Error) {
+        assert!(
+            matches!(
+                err,
+                Error::TooManyImages | Error::TooManyCells | Error::Degenerate
+            ),
+            "unexpected {err}"
+        );
+    }
+
+    fn expect_list(cell: &Cell, xyz: &[[f64; 3]], cutoff: f64) {
+        let found = pairs_within(xyz, cell, cutoff, None, None, true).unwrap();
+        let via_pbc = pairs_within_pbc(xyz, cell, &PbcQuery::periodic(cutoff).half(true)).unwrap();
+        assert_eq!(found.len(), via_pbc.len());
+        for (row, other) in found.iter().zip(&via_pbc) {
+            assert_eq!((row.i, row.j, row.shift), (other.i, other.j, other.shift));
+            assert!(close_dist(row.dist2, other.dist2));
+        }
+        let mut columns = PairColumns::default();
+        pairs_within_columns(xyz, cell, cutoff, None, None, true, &mut columns).unwrap();
+        assert_eq!(columns.len(), found.len());
+        let mut csr = PairCsr::default();
+        pairs_within_csr(
+            xyz,
+            cell,
+            &PbcQuery::periodic(cutoff).half(true),
+            true,
+            &mut csr,
+        )
+        .unwrap();
+        assert_eq!(csr.offsets.len(), xyz.len() + 1);
+        let reps = cell.widths().map(|width| (cutoff / width).ceil() as i32);
+        let want = brute_axes(xyz, cell, cutoff, reps);
+        let mut got = BTreeMap::new();
+        for pair in &found {
+            got.insert((pair.i, pair.j, pair.shift), pair.dist2);
+        }
+        assert_eq!(got.len(), want.len());
+        for (key, dist2) in &want {
+            let stored = got[key];
+            assert!(close_dist(stored, *dist2), "{key:?} {stored} {dist2}");
+        }
+    }
+
+    fn expect_capped(cell: &Cell, xyz: &[[f64; 3]], cutoff: f64) {
+        let err = pairs_within(xyz, cell, cutoff, None, None, true).unwrap_err();
+        assert_typed(err);
+        assert_ne!(err, Error::Degenerate);
+        assert_typed(
+            pairs_within_pbc(xyz, cell, &PbcQuery::periodic(cutoff).half(true)).unwrap_err(),
+        );
+        let mut columns = PairColumns::default();
+        assert_typed(
+            pairs_within_columns(xyz, cell, cutoff, None, None, true, &mut columns).unwrap_err(),
+        );
+        let mut csr = PairCsr::default();
+        assert_typed(
+            pairs_within_csr(
+                xyz,
+                cell,
+                &PbcQuery::periodic(cutoff).half(true),
+                true,
+                &mut csr,
+            )
+            .unwrap_err(),
+        );
+    }
+
+    /// Ratios around the old face-ratio cutoff, at three cutoffs. A cell
+    /// the image and bin caps accept matches the minimum image. A cell
+    /// they refuse is a typed error and is not `Degenerate`. Neither aborts.
+    #[test]
+    fn thin_periodic_ratios_match_or_error() {
+        let ratios = [5.0e-7, 9.9e-7, 1.0e-6, 1.1e-6, 2.0e-6, 1.0e-5, 1.0e-4];
+        let cutoffs = [0.1, 2.6, 10.0];
+        for ratio in ratios {
+            let (cell, xyz) = slab(ratio);
+            for cutoff in cutoffs {
+                expect_capped(&cell, &xyz, cutoff);
+            }
+        }
+        // Face ratio 1e-4 at each cutoff. The short face equals the
+        // cutoff, so the image and bin caps accept the cell and the list
+        // matches the minimum image. A positive finite width is not
+        // Degenerate, including a ratio below the old face-ratio cutoff
+        // (those slabs error above with TooManyCells or TooManyImages).
+        for cutoff in cutoffs {
+            let (cell, xyz) = accepted_rod(cutoff);
+            let widths = cell.widths();
+            assert!((widths[1] / widths[0] - 1.0e-4).abs() < 1.0e-12);
+            expect_list(&cell, &xyz, cutoff);
+        }
+
+        // Enough points that reserving the ideal-gas estimate would abort.
+        // The image cap is exceeded, so the call returns before that reserve.
+        let long = 100.0;
+        let thin = long * 1.1e-6;
+        let cell = Cell::ortho(long, thin, thin).unwrap();
+        let xyz = vec![[long * 0.2, thin * 0.5, thin * 0.5]; 512];
+        assert_eq!(
+            pairs_within(&xyz, &cell, 2.6, None, None, true).unwrap_err(),
+            Error::TooManyImages
+        );
+        assert_eq!(
+            pairs_within_pbc(&xyz, &cell, &PbcQuery::periodic(2.6)).unwrap_err(),
+            Error::TooManyImages
+        );
+        let mut columns = PairColumns::default();
+        assert_eq!(
+            pairs_within_columns(&xyz, &cell, 2.6, None, None, true, &mut columns).unwrap_err(),
+            Error::TooManyImages
+        );
+        let mut csr = PairCsr::default();
+        assert_eq!(
+            pairs_within_csr(&xyz, &cell, &PbcQuery::periodic(2.6), true, &mut csr).unwrap_err(),
+            Error::TooManyImages
+        );
+    }
+
+    #[cfg(feature = "capi")]
+    #[test]
+    fn thin_periodic_ratios_c_api_matches_rust() {
+        use std::ffi::CStr;
+
+        let ratios = [5.0e-7, 9.9e-7, 1.0e-6, 1.1e-6, 2.0e-6, 1.0e-5, 1.0e-4];
+        let cutoffs = [0.1, 2.6, 10.0];
+        for ratio in ratios {
+            let (cell, xyz) = slab(ratio);
+            let h = cell.h();
+            let raw = crate::lc_cell {
+                ax: h[0][0],
+                ay: h[0][1],
+                az: h[0][2],
+                bx: h[1][0],
+                by: h[1][1],
+                bz: h[1][2],
+                cx: h[2][0],
+                cy: h[2][1],
+                cz: h[2][2],
+                ox: 0.0,
+                oy: 0.0,
+                oz: 0.0,
+            };
+            let flat: Vec<f64> = xyz.iter().copied().flatten().collect();
+            for cutoff in cutoffs {
+                let rust = pairs_within(&xyz, &cell, cutoff, None, None, true);
+                let mut count = 0usize;
+                let status = unsafe {
+                    crate::lc_pairs_within_pbc(
+                        flat.as_ptr(),
+                        xyz.len(),
+                        &raw,
+                        std::ptr::null(),
+                        cutoff,
+                        std::ptr::null(),
+                        0.0,
+                        1,
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut count,
+                    )
+                };
+                match rust {
+                    Ok(found) => {
+                        assert_eq!(status, 0);
+                        assert_eq!(count, found.len());
+                        let mut out = vec![crate::lc_pair::default(); count];
+                        let mut filled = 0usize;
+                        let status = unsafe {
+                            crate::lc_pairs_within_pbc(
+                                flat.as_ptr(),
+                                xyz.len(),
+                                &raw,
+                                std::ptr::null(),
+                                cutoff,
+                                std::ptr::null(),
+                                0.0,
+                                1,
+                                0,
+                                0,
+                                out.as_mut_ptr(),
+                                count,
+                                &mut filled,
+                            )
+                        };
+                        assert_eq!(status, 0);
+                        assert_eq!(filled, found.len());
+                        for (row, pair) in out.iter().zip(&found) {
+                            assert_eq!(row.i, i32::try_from(pair.i).unwrap());
+                            assert_eq!(row.j, i32::try_from(pair.j).unwrap());
+                            assert_eq!(row.shift, pair.shift);
+                            assert!(close_dist(row.dist2, pair.dist2));
+                        }
+                    }
+                    Err(err) => {
+                        assert_ne!(status, 0);
+                        let message = unsafe { CStr::from_ptr(crate::lc_last_error()) };
+                        assert_eq!(message.to_str().unwrap(), err.to_string());
+                    }
+                }
+            }
+        }
+        for cutoff in cutoffs {
+            let (cell, xyz) = accepted_rod(cutoff);
+            let h = cell.h();
+            let raw = crate::lc_cell {
+                ax: h[0][0],
+                ay: h[0][1],
+                az: h[0][2],
+                bx: h[1][0],
+                by: h[1][1],
+                bz: h[1][2],
+                cx: h[2][0],
+                cy: h[2][1],
+                cz: h[2][2],
+                ox: 0.0,
+                oy: 0.0,
+                oz: 0.0,
+            };
+            let flat: Vec<f64> = xyz.iter().copied().flatten().collect();
+            let found = pairs_within(&xyz, &cell, cutoff, None, None, true).unwrap();
+            let mut count = 0usize;
+            let status = unsafe {
+                crate::lc_pairs_within_pbc(
+                    flat.as_ptr(),
+                    xyz.len(),
+                    &raw,
+                    std::ptr::null(),
+                    cutoff,
+                    std::ptr::null(),
+                    0.0,
+                    1,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            };
+            assert_eq!(status, 0);
+            assert_eq!(count, found.len());
+            let mut out = vec![crate::lc_pair::default(); count];
+            let mut filled = 0usize;
+            let status = unsafe {
+                crate::lc_pairs_within_pbc(
+                    flat.as_ptr(),
+                    xyz.len(),
+                    &raw,
+                    std::ptr::null(),
+                    cutoff,
+                    std::ptr::null(),
+                    0.0,
+                    1,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    count,
+                    &mut filled,
+                )
+            };
+            assert_eq!(status, 0);
+            assert_eq!(filled, found.len());
+            for (row, pair) in out.iter().zip(&found) {
+                assert_eq!(row.i, i32::try_from(pair.i).unwrap());
+                assert_eq!(row.j, i32::try_from(pair.j).unwrap());
+                assert_eq!(row.shift, pair.shift);
+                assert!(close_dist(row.dist2, pair.dist2));
+            }
+        }
+        let long = 100.0;
+        let thin = long * 1.1e-6;
+        let cell = Cell::ortho(long, thin, thin).unwrap();
+        let h = cell.h();
+        let raw = crate::lc_cell {
+            ax: h[0][0],
+            ay: h[0][1],
+            az: h[0][2],
+            bx: h[1][0],
+            by: h[1][1],
+            bz: h[1][2],
+            cx: h[2][0],
+            cy: h[2][1],
+            cz: h[2][2],
+            ox: 0.0,
+            oy: 0.0,
+            oz: 0.0,
+        };
+        let xyz = vec![[long * 0.2, thin * 0.5, thin * 0.5]; 512];
+        let flat: Vec<f64> = xyz.iter().copied().flatten().collect();
+        let mut count = 0usize;
+        let status = unsafe {
+            crate::lc_pairs_within_pbc(
+                flat.as_ptr(),
+                xyz.len(),
+                &raw,
+                std::ptr::null(),
+                2.6,
+                std::ptr::null(),
+                0.0,
+                1,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        assert_ne!(status, 0);
+        let message = unsafe { CStr::from_ptr(crate::lc_last_error()) };
+        assert_eq!(
+            message.to_str().unwrap(),
+            "periodic image count exceeds 2^24"
+        );
+    }
+
+    /// Widths 10, 10, 1.1e-5 at cutoff 10 stay under the image cap
+    /// (16,363,647 images) and miss the bin cap. Eight points make the
+    /// ideal-gas estimate about 12 GB on a full list. The bin cap is
+    /// reported before that buffer is reserved.
+    #[test]
+    fn flat_face_under_the_image_cap_is_too_many_cells() {
+        let thin = 1.1e-5;
+        let cell = Cell::ortho(10.0, 10.0, thin).unwrap();
+        let xyz = vec![[1.0, 2.0, thin * 0.3]; 8];
+        for half in [false, true] {
+            assert_eq!(
+                pairs_within(&xyz, &cell, 10.0, None, None, half).unwrap_err(),
+                Error::TooManyCells
+            );
+            let mut columns = PairColumns::default();
+            assert_eq!(
+                pairs_within_columns(&xyz, &cell, 10.0, None, None, half, &mut columns)
+                    .unwrap_err(),
+                Error::TooManyCells
+            );
+        }
+        for half in [false, true] {
+            let query = PbcQuery::periodic(10.0).half(half);
+            assert_eq!(
+                pairs_within_pbc(&xyz, &cell, &query).unwrap_err(),
+                Error::TooManyCells
+            );
+            let mut csr = PairCsr::default();
+            assert_eq!(
+                pairs_within_csr(&xyz, &cell, &query, true, &mut csr).unwrap_err(),
+                Error::TooManyCells
+            );
+        }
+        // Ratio 1e-6, same long edges. Every cutoff is a typed error.
+        let cell = Cell::ortho(10.0, 10.0, 1.0e-5).unwrap();
+        let xyz = vec![[1.0, 2.0, 1.0e-5 * 0.3]; 4];
+        for cutoff in [0.1, 2.6, 10.0] {
+            let err = pairs_within(&xyz, &cell, cutoff, None, None, false).unwrap_err();
+            assert!(
+                matches!(err, Error::TooManyImages | Error::TooManyCells),
+                "{cutoff} {err}"
+            );
+            assert_ne!(err, Error::Degenerate);
+        }
+        // A cube the baseline accepts still matches the minimum image.
+        let cell = Cell::ortho(10.0, 10.0, 10.0).unwrap();
+        let xyz = vec![[0.2, 0.0, 0.0], [9.4, 0.0, 0.0], [5.0, 5.0, 5.0]];
+        expect_list(&cell, &xyz, 1.5);
+    }
+
+    /// Widths 0.001, 0.001, 10 at cutoff 0.1 pass the image cap and the
+    /// bin cap. The reach box would store far more than 2^24 partners.
+    #[test]
+    fn needle_partner_stencil_is_capped() {
+        let cell = Cell::ortho(0.001, 0.001, 10.0).unwrap();
+        let xyz = vec![[0.0002, 0.0003, 1.0], [0.0005, 0.0007, 1.04]];
+        for half in [false, true] {
+            assert_eq!(
+                pairs_within(&xyz, &cell, 0.1, None, None, half).unwrap_err(),
+                Error::TooManyImages
+            );
+            let mut columns = PairColumns::default();
+            assert_eq!(
+                pairs_within_columns(&xyz, &cell, 0.1, None, None, half, &mut columns).unwrap_err(),
+                Error::TooManyImages
+            );
+            let query = PbcQuery::periodic(0.1).half(half);
+            assert_eq!(
+                pairs_within_pbc(&xyz, &cell, &query).unwrap_err(),
+                Error::TooManyImages
+            );
+        }
+        // The CSR gather does not build that stencil. It keeps the
+        // nearest image of the other point and drops self-images.
+        let mut csr = PairCsr::default();
+        pairs_within_csr(
+            &xyz,
+            &cell,
+            &PbcQuery::periodic(0.1).half(true),
+            true,
+            &mut csr,
+        )
+        .unwrap();
+        assert_eq!(csr.offsets, vec![0, 1, 1]);
+        assert_eq!(csr.cols, vec![1]);
+        let dx = 0.0003_f64;
+        let dy = 0.0004_f64;
+        let dz = 0.04_f64;
+        let dist2 = dx * dx + dy * dy + dz * dz;
+        assert!(close_dist(csr.dist2[0], dist2), "{}", csr.dist2[0]);
+    }
+
+    /// Cells whose partner box is past 2^24 slots and that the previous
+    /// revision searched successfully. The stencil cap has to admit them.
+    #[test]
+    fn wide_partner_stencils_match_brute_force() {
+        let cell = Cell::ortho(80.0, 80.0, 80.0).unwrap();
+        let xyz = vec![[0.2, 0.2, 0.2], [0.7, 0.2, 0.2]];
+        expect_list(&cell, &xyz, 1.0);
+
+        let cell = Cell::ortho(0.01, 0.01, 10.0).unwrap();
+        let xyz = vec![[0.002, 0.003, 1.0], [0.005, 0.007, 1.05]];
+        expect_list(&cell, &xyz, 0.2);
+    }
+
+    #[cfg(feature = "capi")]
+    #[test]
+    fn flat_and_needle_c_api_are_typed_errors() {
+        use std::ffi::CStr;
+
+        fn raw(cell: &Cell) -> crate::lc_cell {
+            let h = cell.h();
+            crate::lc_cell {
+                ax: h[0][0],
+                ay: h[0][1],
+                az: h[0][2],
+                bx: h[1][0],
+                by: h[1][1],
+                bz: h[1][2],
+                cx: h[2][0],
+                cy: h[2][1],
+                cz: h[2][2],
+                ox: 0.0,
+                oy: 0.0,
+                oz: 0.0,
+            }
+        }
+
+        fn expect_message(cell: &Cell, xyz: &[[f64; 3]], cutoff: f64, message: &str) {
+            let raw = raw(cell);
+            let flat: Vec<f64> = xyz.iter().copied().flatten().collect();
+            let mut count = 0usize;
+            let status = unsafe {
+                crate::lc_pairs_within_pbc(
+                    flat.as_ptr(),
+                    xyz.len(),
+                    &raw,
+                    std::ptr::null(),
+                    cutoff,
+                    std::ptr::null(),
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            };
+            assert_ne!(status, 0);
+            let got = unsafe { CStr::from_ptr(crate::lc_last_error()) };
+            assert_eq!(got.to_str().unwrap(), message);
+            let status = unsafe {
+                crate::lc_pairs_within(
+                    flat.as_ptr(),
+                    xyz.len(),
+                    &raw,
+                    cutoff,
+                    std::ptr::null(),
+                    0.0,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            };
+            assert_ne!(status, 0);
+            let got = unsafe { CStr::from_ptr(crate::lc_last_error()) };
+            assert_eq!(got.to_str().unwrap(), message);
+        }
+
+        let thin = 1.1e-5;
+        let cell = Cell::ortho(10.0, 10.0, thin).unwrap();
+        let xyz = vec![[1.0, 2.0, thin * 0.3]; 8];
+        expect_message(&cell, &xyz, 10.0, "linked-cell mesh is too fine");
+
+        let cell = Cell::ortho(10.0, 10.0, 1.0e-5).unwrap();
+        let xyz = vec![[1.0, 2.0, 1.0e-5 * 0.3]; 4];
+        for cutoff in [0.1, 2.6, 10.0] {
+            let err = pairs_within(&xyz, &cell, cutoff, None, None, false).unwrap_err();
+            expect_message(&cell, &xyz, cutoff, &err.to_string());
+        }
+
+        let cell = Cell::ortho(0.001, 0.001, 10.0).unwrap();
+        let xyz = vec![[0.0002, 0.0003, 1.0], [0.0005, 0.0007, 1.04]];
+        expect_message(&cell, &xyz, 0.1, "periodic image count exceeds 2^24");
     }
 }

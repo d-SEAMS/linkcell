@@ -857,9 +857,14 @@ pub unsafe extern "C" fn lc_pairs_open(
 /// `pbc` is fully periodic. An open axis is replaced by a unit normal
 /// of the periodic rows, however long the stored row is, and is binned
 /// on the occupied Cartesian cells of that lattice. A fully periodic
-/// cell whose shortest face altitude is at most one millionth of its
-/// longest edge returns nonzero; `lc_last_error` is
-/// "periodic cell is degenerate: a face width has collapsed". `closed`
+/// cell whose face width is zero or non-finite returns nonzero;
+/// `lc_last_error` is
+/// "periodic cell is degenerate: a face width is zero or non-finite".
+/// A positive finite width that needs more than 2^24 images, a partner
+/// stencil of more than 2^31 slots, or a row buffer that does not
+/// fit, returns nonzero with
+/// "periodic image count exceeds 2^24". A mesh past the bin cap returns
+/// "linked-cell mesh is too fine". `closed`
 /// nonzero keeps `dist2 <= cutoff²` on an open or mixed cell.
 /// `exclude_self_images` nonzero drops `i == j`.
 ///
@@ -1049,7 +1054,9 @@ fn open_rows(
         .exclude_self_images(key.exclude_self);
     query.mask = mask_vec.as_deref();
     let found = with_threads(|| crate::pairs_within_pbc(pts, &cell, &query)).map_err(fail)?;
-    let mut rows = Vec::with_capacity(found.len());
+    let mut rows = Vec::new();
+    rows.try_reserve(found.len())
+        .map_err(|_| fail(Error::TooManyImages))?;
     for pair in found {
         if pair.i > c_int::MAX as usize || pair.j > c_int::MAX as usize {
             return Err(fail(Error::Overflow));

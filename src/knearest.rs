@@ -373,8 +373,7 @@ pub fn knearest_into_many(
 /// [`Error::NonFinite`] when a coordinate (masked or not) or the cell
 /// origin is not finite. The lattice vectors are finite by
 /// construction: [`Cell`] rejects any other as [`Error::BadBox`].
-/// [`Error::Degenerate`] when the shortest face altitude is at most
-/// `1e-6` of the longest edge.
+/// [`Error::Degenerate`] when a face width is zero or non-finite.
 fn check(
     xyz: &[[f64; 3]],
     n: usize,
@@ -808,8 +807,9 @@ pub fn knearest_csr(
 /// is empty, [`Error::Overflow`] when `n * k` does not fit in a slice,
 /// [`Error::NonFinite`] when a coordinate (masked or not) or the cell
 /// origin is NaN or infinite, [`Error::TooManyCells`] when the mesh
-/// exceeds the bin cap, and [`Error::Degenerate`] when the shortest
-/// face altitude is at most `1e-6` of the longest edge. These inputs
+/// exceeds the bin cap, and [`Error::Degenerate`] when a face width is
+/// zero or non-finite. A positive finite width is not rejected by its
+/// aspect ratio. These inputs
 /// return `Err`. [`knearest_into`],
 /// [`knearest_into_d2`], [`knearest_into_many`], [`knearest_csr`] and
 /// [`knearest_brute`] return the same errors.

@@ -15,10 +15,9 @@
 //! image of each column.
 
 use super::gather::{gather, Gathered};
-use super::{bin_atoms, hit_estimate, in_pool, row_guess, Pair};
+use super::{bin_atoms, hit_estimate, in_pool, prepare_pairs, row_guess, try_hold, Pair};
 #[cfg(test)]
 use super::{plan_unshifted, Found, Scratch};
-use crate::cell::periodic_face_collapsed;
 use crate::cell::Cell;
 use crate::open_cell::{pairs_within_pbc, PbcQuery};
 use crate::Error;
@@ -107,22 +106,28 @@ pub fn pairs_within_csr(
         out.offsets.push(0);
         return Ok(());
     }
-    if query.periodic == [true, true, true] && periodic_face_collapsed(cell, query.periodic) {
-        return Err(Error::Degenerate);
+    if query.periodic == [true, true, true] {
+        let n_act = prepare_pairs(xyz, cell, query.cutoff, query.mask, query.cell_hint)?;
+        if n_act == 0 {
+            out.offsets.resize(n + 1, 0);
+            return Ok(());
+        }
     }
     let est = estimate(n, cell, query);
-    // Reserved on the caller's thread, as in `pairs_within`.
+    // Reserved on the caller's thread, as in `pairs_within`, and only
+    // after the image and bin caps. A guess that does not fit is
+    // TooManyImages and does not search.
     let guess = row_guess(est, query.half);
-    out.offsets.reserve(n + 1);
-    out.cols.reserve(guess);
+    try_hold(&mut out.offsets, n + 1)?;
+    try_hold(&mut out.cols, guess)?;
     if dist2 {
-        out.dist2.reserve(guess);
+        try_hold(&mut out.dist2, guess)?;
     }
     in_pool(est, || {
         if query.periodic != [true, true, true] {
             let source = Source::search(xyz, cell, query)?;
             let rows = Rows::new(&source, n, query.half, repeats(cell, query), dist2)?;
-            rows.write_vec(out, dist2);
+            rows.write_vec(out, dist2)?;
             return Ok(());
         }
         let Some(mut rows) = gathered(xyz, cell, query, dist2)? else {
@@ -130,9 +135,9 @@ pub fn pairs_within_csr(
             return Ok(());
         };
         let need = rows.scan()?;
-        out.cols.reserve(need);
+        try_hold(&mut out.cols, need)?;
         if dist2 {
-            out.dist2.reserve(need);
+            try_hold(&mut out.dist2, need)?;
         }
         let d2 = if dist2 {
             out.dist2.as_mut_ptr()
@@ -173,7 +178,7 @@ fn gathered(
         query.half,
         repeat,
         dist2,
-    )))
+    )?))
 }
 
 /// Destination of [`Rows::write`]: `n + 1` offsets, and the columns and
@@ -250,11 +255,12 @@ pub(crate) fn csr_rows(
                     CsrWrite::Direct(need)
                 }
                 None => {
-                    let mut owned = PairCsr {
-                        offsets: Vec::with_capacity(n + 1),
-                        cols: Vec::with_capacity(need),
-                        dist2: Vec::with_capacity(if dist2 { need } else { 0 }),
-                    };
+                    let mut owned = PairCsr::default();
+                    try_hold(&mut owned.offsets, n + 1)?;
+                    try_hold(&mut owned.cols, need)?;
+                    if dist2 {
+                        try_hold(&mut owned.dist2, need)?;
+                    }
                     // Safety: as in `pairs_within_csr`.
                     unsafe {
                         let d2 = if dist2 {
@@ -288,7 +294,7 @@ pub(crate) fn csr_rows(
             }
             None => {
                 let mut owned = PairCsr::default();
-                rows.write_vec(&mut owned, dist2);
+                rows.write_vec(&mut owned, dist2)?;
                 Ok(CsrWrite::Owned(owned))
             }
         }
@@ -600,7 +606,7 @@ impl<'a> Rows<'a> {
         rows.count();
         rows.place();
         if repeat {
-            rows.stage(dist2);
+            rows.stage(dist2)?;
         }
         Ok(rows)
     }
@@ -751,11 +757,15 @@ impl<'a> Rows<'a> {
 
     /// Fill a staging buffer, sort and deduplicate each row, and set the
     /// packed row starts.
-    fn stage(&mut self, dist2: bool) {
+    fn stage(&mut self, dist2: bool) -> Result<(), Error> {
         let (n, blocks) = (self.n, self.blocks);
         let total = self.start[n];
-        let mut cols: Vec<i32> = Vec::with_capacity(total);
-        let mut d2: Vec<f64> = Vec::with_capacity(if dist2 { total } else { 0 });
+        let mut cols: Vec<i32> = Vec::new();
+        let mut d2: Vec<f64> = Vec::new();
+        try_hold(&mut cols, total)?;
+        if dist2 {
+            try_hold(&mut d2, total)?;
+        }
         let cp = Shared(cols.as_mut_ptr());
         let dp = if dist2 {
             Shared(d2.as_mut_ptr())
@@ -794,6 +804,7 @@ impl<'a> Rows<'a> {
             dist2: d2,
             start,
         });
+        Ok(())
     }
 
     /// Write the offsets, the columns, and (when `dest.dist2` is non-null)
@@ -842,16 +853,16 @@ impl<'a> Rows<'a> {
     }
 
     /// [`Rows::write`] into `out`, which this resizes.
-    fn write_vec(self, out: &mut PairCsr, dist2: bool) {
+    fn write_vec(self, out: &mut PairCsr, dist2: bool) -> Result<(), Error> {
         let n = self.n;
         let need = self.need();
         out.offsets.clear();
         out.cols.clear();
         out.dist2.clear();
-        out.offsets.reserve(n + 1);
-        out.cols.reserve(need);
+        try_hold(&mut out.offsets, n + 1)?;
+        try_hold(&mut out.cols, need)?;
         if dist2 {
-            out.dist2.reserve(need);
+            try_hold(&mut out.dist2, need)?;
         }
         let dest = CsrDest {
             offsets: out.offsets.as_mut_ptr(),
@@ -872,6 +883,7 @@ impl<'a> Rows<'a> {
                 out.dist2.set_len(need);
             }
         }
+        Ok(())
     }
 }
 
@@ -1065,7 +1077,7 @@ mod tests {
                     let source = Source::search(&xyz, &cell, &query).unwrap();
                     let rows = Rows::with_lanes(&source, n, half, repeat, true, most).unwrap();
                     let mut out = PairCsr::default();
-                    rows.write_vec(&mut out, true);
+                    rows.write_vec(&mut out, true).unwrap();
                     bits(&out)
                 })
             };
@@ -1137,7 +1149,7 @@ mod tests {
         let source = Source::search(xyz, cell, query).unwrap();
         let rows = Rows::new(&source, xyz.len(), query.half, repeats(cell, query), true).unwrap();
         let mut out = PairCsr::default();
-        rows.write_vec(&mut out, true);
+        rows.write_vec(&mut out, true).unwrap();
         out
     }
 

@@ -67,9 +67,17 @@
 //!
 //! [`pairs_within`] keeps the caller's basis. The image count is the
 //! product of `2 * ceil(cutoff / width) + 1` over the three axes, and
-//! a count above 2^24 is [`Error::TooManyImages`]. A fully periodic
-//! cell whose shortest face altitude is at most `1e-6` of its longest
-//! edge is [`Error::Degenerate`]. With the default
+//! a count above 2^24 is [`Error::TooManyImages`]. Those caps, and a
+//! checked reservation of the estimated rows, run before any buffer is
+//! reserved. A face width that is zero or non-finite is
+//! [`Error::Degenerate`]. A positive finite width is not rejected by
+//! its ratio to the longest edge. The image count depends on the
+//! cutoff. The mesh edge is clamped to the shortest width, so a face
+//! much shorter than the other edges can exceed the bin cap at every
+//! cutoff. When both caps hold, the search returns the pairs. The
+//! partner stencil is capped at 2^31 slots, enough for a reach of two
+//! bins on every axis of a mesh at the bin cap; a larger reach box is
+//! [`Error::TooManyImages`] and is not stored. With the default
 //! bin edge the reach is at most a small constant (the occupancy
 //! integer is clamped to `1..=6`) whenever that edge is shorter than
 //! every box width. One bin that holds every point makes the candidate

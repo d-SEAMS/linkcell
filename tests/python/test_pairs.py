@@ -220,6 +220,158 @@ def test_near_flat_slab_matches_minimum_image():
             assert abs(got[key] - dist2) < 1.0e-8
 
 
-def test_near_flat_slab_fully_periodic_is_degenerate():
-    with pytest.raises(RuntimeError, match="face width has collapsed"):
+def test_near_flat_slab_fully_periodic_is_too_many_images():
+    with pytest.raises(RuntimeError, match="periodic image count exceeds 2\\^24"):
         linkcell.pairs_within_pbc(_NEAR_FLAT_CU, _near_flat_rows(), [True, True, True], 2.6)
+
+
+def _thin_brute(xyz, edges, cutoff):
+    """Minimum image on an orthorhombic box, half list, strict cutoff."""
+    cut2 = cutoff * cutoff
+    reps = [int(np.ceil(cutoff / float(edges[a]))) for a in range(3)]
+    spans = [np.arange(-rep, rep + 1, dtype=np.int32) for rep in reps]
+    sa, sb, sc = np.meshgrid(*spans, indexing="ij")
+    shift = np.stack((sa.ravel(), sb.ravel(), sc.ravel()), axis=1).astype(np.float64)
+    delta = shift * edges
+    want = {}
+    for a in range(len(xyz)):
+        for b in range(a, len(xyz)):
+            diff = xyz[b] - xyz[a] + delta
+            dist2 = np.einsum("ij,ij->i", diff, diff)
+            keep = dist2 < cut2
+            if a == b:
+                zero = np.all(shift == 0.0, axis=1)
+                keep &= ~zero
+            images = shift[keep]
+            values = dist2[keep]
+            for row in range(images.shape[0]):
+                image = images[row]
+                if a == b:
+                    sign = 0
+                    for component in image:
+                        if component != 0.0:
+                            sign = component
+                            break
+                    if sign >= 0.0:
+                        continue
+                key = (a, b, (int(image[0]), int(image[1]), int(image[2])))
+                want[key] = float(values[row])
+    return want
+
+
+def _assert_pairs(xyz, edges, cutoff):
+    i, j, shift, d2 = _pairs(xyz, edges, cutoff, half=True)
+    pbc = linkcell.pairs_within_pbc(xyz, edges, [True, True, True], cutoff, half=True)
+    pi, pj, pshift, pd2 = (np.from_dlpack(part) for part in pbc)
+    assert pi.shape == i.shape
+    got = {}
+    for row in range(i.shape[0]):
+        key = (
+            int(i[row]),
+            int(j[row]),
+            (int(shift[row, 0]), int(shift[row, 1]), int(shift[row, 2])),
+        )
+        got[key] = float(d2[row])
+        pkey = (
+            int(pi[row]),
+            int(pj[row]),
+            (int(pshift[row, 0]), int(pshift[row, 1]), int(pshift[row, 2])),
+        )
+        assert pkey == key
+        assert abs(float(pd2[row]) - float(d2[row])) <= 1e-9 * max(1.0, abs(float(d2[row])))
+    want = _thin_brute(xyz, edges, cutoff)
+    assert set(got) == set(want)
+    for key, dist2 in want.items():
+        assert abs(got[key] - dist2) <= 1e-9 * max(1.0, abs(dist2))
+
+
+def test_thin_periodic_ratios_match_or_error():
+    ratios = (5e-7, 9.9e-7, 1e-6, 1.1e-6, 2e-6, 1e-5, 1e-4)
+    cutoffs = (0.1, 2.6, 10.0)
+    long = 10.0
+    for ratio in ratios:
+        thin = long * ratio
+        edges = np.array([long, long, thin], dtype=np.float64)
+        xyz = np.array(
+            [[1.0, 1.0, thin * 0.30], [1.4, 1.2, thin * 0.70]],
+            dtype=np.float64,
+        )
+        for cutoff in cutoffs:
+            with pytest.raises(RuntimeError) as err:
+                linkcell.pairs_within(xyz, edges, cutoff, half=True)
+            text = str(err.value)
+            assert "face width is zero or non-finite" not in text
+            assert (
+                "periodic image count exceeds 2^24" in text
+                or "linked-cell mesh is too fine" in text
+            )
+            with pytest.raises(RuntimeError) as err:
+                linkcell.pairs_within_pbc(xyz, edges, [True, True, True], cutoff, half=True)
+            assert "face width is zero or non-finite" not in str(err.value)
+    # Face ratio 1e-4 with the short face equal to the cutoff. The mesh
+    # then has 10_000 bins on the long axis and a reach of 1, which the
+    # bin cap accepts, and the list matches the minimum image.
+    for cutoff in cutoffs:
+        thin = cutoff
+        long = cutoff / 1.0e-4
+        edges = np.array([long, thin, thin], dtype=np.float64)
+        xyz = np.array(
+            [
+                [long * 0.20, thin * 0.25, thin * 0.30],
+                [long * 0.20 + 0.40 * cutoff, thin * 0.55, thin * 0.40],
+            ],
+            dtype=np.float64,
+        )
+        _assert_pairs(xyz, edges, cutoff)
+    long = 100.0
+    thin = long * 1.1e-6
+    edges = np.array([long, thin, thin], dtype=np.float64)
+    xyz = np.tile(np.array([[long * 0.2, thin * 0.5, thin * 0.5]], dtype=np.float64), (512, 1))
+    with pytest.raises(RuntimeError, match="periodic image count exceeds 2\\^24"):
+        linkcell.pairs_within(xyz, edges, 2.6, half=True)
+    with pytest.raises(RuntimeError, match="periodic image count exceeds 2\\^24"):
+        linkcell.pairs_within_pbc(xyz, edges, [True, True, True], 2.6)
+
+
+def test_flat_and_needle_are_typed_errors():
+    # Widths 10, 10, 1.1e-5, cutoff 10: under the image cap, over the bin cap.
+    # Eight points make the ideal-gas full list about 12 GB. The mesh error
+    # comes back before that buffer is reserved. half defaults to false.
+    thin = 1.1e-5
+    edges = np.array([10.0, 10.0, thin], dtype=np.float64)
+    xyz = np.tile(np.array([[1.0, 2.0, thin * 0.3]], dtype=np.float64), (8, 1))
+    for half in (False, True):
+        with pytest.raises(RuntimeError, match="linked-cell mesh is too fine"):
+            linkcell.pairs_within(xyz, edges, 10.0, half=half)
+        with pytest.raises(RuntimeError, match="linked-cell mesh is too fine"):
+            linkcell.pairs_within_pbc(xyz, edges, [True, True, True], 10.0, half=half)
+    # Ratio 1e-6.
+    edges = np.array([10.0, 10.0, 1.0e-5], dtype=np.float64)
+    xyz = np.tile(np.array([[1.0, 2.0, 1.0e-5 * 0.3]], dtype=np.float64), (4, 1))
+    for cutoff in (0.1, 2.6, 10.0):
+        with pytest.raises(RuntimeError) as err:
+            linkcell.pairs_within(xyz, edges, cutoff, half=False)
+        text = str(err.value)
+        assert "face width is zero or non-finite" not in text
+        assert (
+            "periodic image count exceeds 2^24" in text
+            or "linked-cell mesh is too fine" in text
+        )
+    # Needle: image cap and bin cap both hold; the partner stencil does not.
+    edges = np.array([0.001, 0.001, 10.0], dtype=np.float64)
+    xyz = np.array([[0.0002, 0.0003, 1.0], [0.0005, 0.0007, 1.04]], dtype=np.float64)
+    with pytest.raises(RuntimeError, match="periodic image count exceeds 2\\^24"):
+        linkcell.pairs_within(xyz, edges, 0.1, half=False)
+    with pytest.raises(RuntimeError, match="periodic image count exceeds 2\\^24"):
+        linkcell.pairs_within_pbc(xyz, edges, [True, True, True], 0.1, half=True)
+
+
+def test_wide_partner_stencils_match_brute_force():
+    # A cube of side 80 at cutoff 1 builds a reach-two stencil of about
+    # 6e7 slots, past 2^24 and inside the 2^31 partner cap.
+    xyz = np.array([[0.2, 0.2, 0.2], [0.7, 0.2, 0.2]], dtype=np.float64)
+    _assert_pairs(xyz, np.array([80.0, 80.0, 80.0]), 1.0)
+    # Widths 0.01, 0.01, 10 at cutoff 0.2: the image cap and the bin cap
+    # both hold, and the reach box is about 7e7 slots.
+    xyz = np.array([[0.002, 0.003, 1.0], [0.005, 0.007, 1.05]], dtype=np.float64)
+    _assert_pairs(xyz, np.array([0.01, 0.01, 10.0]), 0.2)

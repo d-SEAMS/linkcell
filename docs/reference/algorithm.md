@@ -113,7 +113,9 @@ The walk reads each target bin's occupancy from the offsets.
 
 The walk splits across threads from an ideal-gas estimate of ten thousand pairs.
 On this 8-core host one thread is faster at 512 atoms in an 18 Å cube at 4 Å, and eight threads from 768.
-A split call reserves the row buffer on the caller's thread from that estimate.
+A split call checks the image count and the bin cap, then reserves the row buffer on the caller's thread from that estimate when the product of the estimate and the row size fits in `isize::MAX` bytes.
+A cell that fails a check returns `TooManyImages` or `TooManyCells` and does not reserve. An allocator that refuses the buffer returns `TooManyImages`.
+The partner stencil is capped at 2^31 slots. That admits a reach of two bins on every axis of a mesh at the bin cap. A larger reach box returns `TooManyImages` and is not stored.
 It then builds the bins, searches, and writes in one pool entry.
 The caller stays off the serial steps while every worker spins, and sleeps between search and output.
 A short estimate grows that buffer for the calling thread. glibc gives a large block allocated on a worker its own heap and unmaps it when the block is freed, so the buffer the caller keeps is allocated where the caller runs.
@@ -295,8 +297,12 @@ That offset depends on the cutoff and the bin edge.
 A fully open stencil is reused by later frames with the same cutoff and edge.
 With a periodic axis the stencil is rebuilt when the bounding bins change.
 The same 2^24 image cap applies.
-A fully periodic cell whose shortest face altitude is at most one millionth of its longest edge is `Error::Degenerate` (`periodic cell is degenerate: a face width has collapsed`).
-The image stencil is not a neighbour list on that lattice.
+A periodic face width that is zero or non-finite is `Error::Degenerate` (`periodic cell is degenerate: a face width is zero or non-finite`).
+A positive finite width is not rejected by its ratio to the longest edge.
+The image count is the product of `2 * ceil(cutoff / width) + 1` and depends on the cutoff; above 2^24 the call returns `TooManyImages`.
+The mesh edge is clamped to the shortest width, so a face much shorter than the other edges can exceed the bin cap at every cutoff, and that refusal is `TooManyCells`.
+When both caps hold, including a short face no shorter than the cutoff, the search returns the pairs.
+The caps and the checked row reservation run before any buffer is reserved.
 minimage can still return a displacement.
 `lc_stencil_builds` counts builds, not reuses.
 
