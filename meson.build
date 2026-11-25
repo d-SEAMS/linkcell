@@ -241,7 +241,17 @@ linkcell_built_h = custom_target(
 # That consumer's default_library does not change this option, so a
 # shared default here would leave the module needing liblinkcell.so
 # at import time. Subprojects always take the static archive.
-_use_static = meson.is_subproject() or get_option('default_library') == 'static'
+#
+# A sanitized build carries its own rebuilt std. Linked static, those std
+# objects clash with the std of any other Rust staticlib in the same link
+# (rust_eh_personality, __rdl_alloc_error_handler); the shared library
+# exports only the C API and keeps its std private.
+_sanitized = get_option('sanitize') != 'none'
+_use_static = (meson.is_subproject() or get_option('default_library') == 'static') and not _sanitized
+_link_rpath = []
+if _sanitized
+  _link_rpath = ['-Wl,-rpath,' + meson.current_build_dir()]
+endif
 if _use_static
   _link_idx = 1
 elif host_machine.system() == 'windows'
@@ -285,7 +295,7 @@ if _gpu_on
   endif
   linkcell_gpu_dep = declare_dependency(
     link_with: linkcell_gpu,
-    link_args: [linkcell_cargo[_link_idx].full_path()],
+    link_args: [linkcell_cargo[_link_idx].full_path()] + _link_rpath,
     sources: linkcell_built_h,
     include_directories: include_directories('include'),
     compile_args: _gpu_args,
@@ -295,7 +305,7 @@ if _gpu_on
 endif
 
 linkcell_dep = declare_dependency(
-  link_args: [linkcell_cargo[_link_idx].full_path()],
+  link_args: [linkcell_cargo[_link_idx].full_path()] + _link_rpath,
   sources: linkcell_built_h,
   include_directories: include_directories('include'),
   dependencies: rust_sys + _gpu_deps,
