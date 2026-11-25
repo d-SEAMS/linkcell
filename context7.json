@@ -6,11 +6,11 @@
     "docs",
     "examples",
     "include",
-    "python"
+    "python",
+    "benchmarks"
   ],
   "excludeFolders": [
     "changelog.d",
-    "benchmarks",
     "subprojects",
     "third_party",
     "tests",
@@ -22,7 +22,8 @@
   "excludeFiles": [
     "CHANGELOG.md",
     "CODE_OF_CONDUCT.md",
-    "LICENSE"
+    "LICENSE",
+    "summary.md"
   ],
   "rules": []
 }
