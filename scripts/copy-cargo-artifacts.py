@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -53,16 +52,17 @@ def main() -> None:
     # Pixi's cargo is a real binary, not the rustup proxy, and it is ahead
     # of rustup on PATH. rustup run nightly still leaves that rustc first,
     # so the nightly compiler has to be named by its own path.
-    command = [args.cargo]
+    cargo = os.path.abspath(args.cargo) if os.path.dirname(args.cargo) else args.cargo
+    command = [cargo]
     if os.environ.get("LINKCELL_CARGO_VERBOSE") == "1":
         command.append("-vv")
     command += [
         "rustc",
         "--lib",
         "--manifest-path",
-        str(args.source / "Cargo.toml"),
+        str(args.source.absolute() / "Cargo.toml"),
         "--target-dir",
-        str(args.target),
+        str(args.target.absolute()),
         "--features",
         "capi",
     ]
@@ -74,12 +74,15 @@ def main() -> None:
         command.append("--release")
 
     rustc = ["--crate-type=cdylib", "--crate-type=staticlib"]
-    if sys.platform.startswith("linux"):
+    if args.shared.endswith(".so"):
         rustc.append(f"-Clink-arg=-Wl,-soname,{args.shared}")
-    elif sys.platform == "darwin":
+    elif args.shared.endswith(".dylib"):
         rustc.append(f"-Clink-arg=-Wl,-install_name,@rpath/{args.shared}")
     command.extend(["--", *rustc])
     env = os.environ.copy()
+    build_target = env.get("CARGO_BUILD_TARGET")
+    if build_target and build_target.endswith(".json"):
+        env["CARGO_BUILD_TARGET"] = os.path.abspath(build_target)
     # Unset keeps the historical default inside build.rs. Meson always
     # passes the flag so a use_openmp=false build does not emit the region.
     env["LINKCELL_OPENMP"] = "1" if args.openmp == "true" else "0"
@@ -108,9 +111,10 @@ def main() -> None:
         flags = env.get("RUSTFLAGS", "")
         if "-Zsanitizer=thread" not in flags:
             env["RUSTFLAGS"] = (flags + " " + extra).strip()
-    subprocess.check_call(command, env=env)
+    subprocess.check_call(command, cwd=args.source, env=env)
 
-    build_target = "x86_64-unknown-linux-gnu" if tsan else env.get("CARGO_BUILD_TARGET")
+    if tsan:
+        build_target = "x86_64-unknown-linux-gnu"
     built = args.target
     if build_target:
         if build_target.endswith(".json"):
