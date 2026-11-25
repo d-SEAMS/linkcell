@@ -293,12 +293,19 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
     }
 
     /// Build an index over `space` with `metric`.
+    ///
+    /// Returns [`Error::Overflow`] when `space.len() * space.dims()` does
+    /// not fit in `usize`, before any point is read. That error's message
+    /// remains `n * k overflows`.
     pub fn new(space: S, metric: M) -> Result<Self, Error> {
         if space.dims() == 0 || space.dims() != metric.dims() {
             return Err(Error::BadDimensions);
         }
         let n = space.len();
         let d = space.dims();
+        let Some(canonical_len) = n.checked_mul(d) else {
+            return Err(Error::Overflow);
+        };
         for i in 0..n {
             let p = space.point(i);
             if p.len() != d {
@@ -313,9 +320,6 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             slack
         } else {
             f64::INFINITY
-        };
-        let Some(canonical_len) = n.checked_mul(d) else {
-            return Err(Error::Overflow);
         };
         let mut canonical = vec![0.0; canonical_len];
         for i in 0..n {

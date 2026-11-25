@@ -453,10 +453,18 @@ int lc_mesh_cut(const double *xyz,
  * The index owns a copy of `data` and is released by [`lc_nd_free`].
  * On failure, `*out` is set to null.
  *
+ * The period table is one optional period per axis, 16 bytes. `d` greater
+ * than what fits in `isize::MAX` bytes fails with `the period table does
+ * not fit in isize::MAX bytes` before any allocation. A `d` that passes
+ * that check still fails with `the period table could not be allocated`
+ * when the allocator refuses the table. `n * d` that does not fit in
+ * `usize` fails with `n * d overflows` before the coordinates are read.
+ *
  * # Safety
  *
- * `data` is readable for `n * d` doubles. `periods`, if non-null, is readable
- * for `d` doubles. `out` is writable for one pointer.
+ * When `n * d` fits in `usize`, `data` is readable for that many doubles.
+ * `periods`, if non-null, is readable for `d` doubles. `out` is writable
+ * for one pointer.
  */
 int lc_nd_build(const double *data,
                 size_t n,

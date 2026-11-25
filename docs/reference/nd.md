@@ -202,3 +202,10 @@ Inputs whose indices would exceed `INT_MAX` fail with an error code rather than
 silently truncating.
 `lc_nd_build` uses `periods[i] == 0.0` for open axes and `periods[i] > 0.0` for
 periodic axes; negative or NaN period entries are rejected.
+The period table is one optional period per axis, 16 bytes. A dimensionality
+whose table would not fit in `isize::MAX` bytes fails with `the period table
+does not fit in isize::MAX bytes` before allocation. A dimensionality the
+size check accepts can still fail with `the period table could not be
+allocated`. `n * d` that does not fit in `usize` fails with `n * d overflows`
+before the coordinates are read. `VpTreeIndex::new` returns `Overflow` for
+that product, and that error's message remains `n * k overflows`.

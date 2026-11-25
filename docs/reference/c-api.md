@@ -93,6 +93,16 @@ length is `d`; `periods[k] > 0` marks axis `k` periodic, `periods[k] == 0`
 marks it open, and negative or NaN values are rejected.
 On any `lc_nd_build` failure, `*out` is set to `NULL`.
 
+The period table is one optional period per axis, 16 bytes. `d` such that
+this table would not fit in `isize::MAX` bytes fails with `the period table
+does not fit in isize::MAX bytes` before any allocation. A `d` that passes
+that check can still fail with `the period table could not be allocated`
+when the allocator refuses the table. `n * d` that does not fit in `usize`
+fails with `n * d overflows` before the coordinates are read. Those three
+strings are the C messages for these refusals. `Error::Overflow` still
+displays `n * k overflows`, and `VpTreeIndex::new` returns that error for
+the same `n * d` product before it reads a point.
+
 `lc_nd_knn` writes exactly `k` slots (`-1` and optional `NaN` for unused
 slots when `k > n`).
 `radius` for `lc_nd_within` / `lc_nd_pairs_within` must be finite and

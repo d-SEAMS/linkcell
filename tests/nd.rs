@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use linkcell::{ContiguousSpace, Error, Metric, NeighbourIndex, PeriodicSpace, VpTreeIndex};
+use linkcell::{ContiguousSpace, Error, Metric, NeighbourIndex, PeriodicSpace, Space, VpTreeIndex};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::One;
@@ -1798,6 +1798,34 @@ fn min_pts_zero_and_distance_overflow_have_their_own_messages() {
     assert_eq!(eps.to_string(), "eps must be finite and strictly positive");
     assert_ne!(min_pts.to_string(), eps.to_string());
     assert_eq!(Error::Overflow.to_string(), "n * k overflows");
+    // The product does not fit, so `new` must not ask for a point.
+    struct ProductOverflow {
+        n: usize,
+        d: usize,
+    }
+    impl Space for ProductOverflow {
+        fn len(&self) -> usize {
+            self.n
+        }
+        fn dims(&self) -> usize {
+            self.d
+        }
+        fn point(&self, _index: usize) -> &[f64] {
+            panic!("n * d overflow must not read a point");
+        }
+    }
+    let built = VpTreeIndex::new(
+        ProductOverflow {
+            n: usize::MAX / 2 + 1,
+            d: 2,
+        },
+        PeriodicSpace::new(vec![None, None]).unwrap(),
+    );
+    let Err(err) = built else {
+        panic!("n * d overflow built an index");
+    };
+    assert_eq!(err, Error::Overflow);
+    assert_eq!(err.to_string(), "n * k overflows");
     assert_eq!(Error::DistanceOverflow.to_string(), "distance overflowed");
     assert_ne!(
         Error::Overflow.to_string(),

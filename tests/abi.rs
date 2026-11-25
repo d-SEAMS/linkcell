@@ -1704,13 +1704,15 @@ fn lc_nd_rejects_bad_dimensions_nulls_and_bad_periods() {
     );
     assert!(out.is_null());
 
-    // n * d overflow before any read.
+    // n * d overflow before any read. `data` is two doubles; a late check
+    // would form a slice of `usize::MAX * 2` and read it.
     out = 0x123usize as *mut LcNdIndex;
     assert_ne!(
         unsafe { lc_nd_build(data.as_ptr(), usize::MAX, 2, std::ptr::null(), &mut out) },
         0
     );
     assert!(out.is_null());
+    assert_eq!(last_error(), "n * d overflows");
 
     // Non-finite payload rejection.
     let nonfinite = [f64::INFINITY];
@@ -2383,21 +2385,48 @@ fn lc_nd_subnormal_squares_match_a_full_scan() {
     }
 }
 
-/// The period table holds one `Option<f64>` per axis. At the largest `d` the
-/// size check admits, that table is `2^63 - 16` bytes, which no allocator
-/// grants. Smaller sizes such as `2^33` axes are refused only where the
-/// allocator declines to overcommit: macOS grants them and the build then
-/// writes every page.
+/// Period-table limits of `lc_nd_build`.
+///
+/// A product that fits, including `n == 0`, builds. The next `n` whose
+/// product does not fit in `usize` fails before the coordinates are read.
+/// `d` above `(isize::MAX as usize) / size_of::<Option<f64>>()` fails before
+/// allocation. That largest `d` itself asks for a table of `isize::MAX - 15`
+/// bytes and fails when the allocator refuses it.
 #[test]
 fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
-    let data = [0.0f64];
-    let largest = isize::MAX as usize / std::mem::size_of::<Option<f64>>();
-    for &d in &[largest, largest + 1, usize::MAX] {
+    let sample = [0.0f64, 0.0, 0.0, 0.0];
+    let build = |n: usize, d: usize| {
         let mut out = 0x1usize as *mut LcNdIndex;
-        let rc = unsafe { lc_nd_build(data.as_ptr(), 0, d, std::ptr::null(), &mut out) };
-        assert_ne!(rc, 0);
-        assert!(out.is_null());
+        let rc = unsafe { lc_nd_build(sample.as_ptr(), n, d, std::ptr::null(), &mut out) };
+        (rc, out)
+    };
+    for (n, d) in [(0usize, 1usize), (1, 1), (2, 2)] {
+        let (rc, out) = build(n, d);
+        assert_eq!(rc, 0, "n={n} d={d}");
+        assert!(!out.is_null());
+        unsafe { lc_nd_free(out) };
     }
+
+    let (rc, out) = build(usize::MAX / 2 + 1, 2);
+    assert_ne!(rc, 0);
+    assert!(out.is_null());
+    assert_eq!(last_error(), "n * d overflows");
+
+    let largest = isize::MAX as usize / std::mem::size_of::<Option<f64>>();
+    for d in [largest + 1, usize::MAX] {
+        let (rc, out) = build(0, d);
+        assert_ne!(rc, 0, "d={d}");
+        assert!(out.is_null());
+        assert_eq!(
+            last_error(),
+            "the period table does not fit in isize::MAX bytes"
+        );
+    }
+
+    let (rc, out) = build(0, largest);
+    assert_ne!(rc, 0);
+    assert!(out.is_null());
+    assert_eq!(last_error(), "the period table could not be allocated");
 }
 
 /// Under `lc_set_threads(1)` no ND call starts a thread. The suite shares
