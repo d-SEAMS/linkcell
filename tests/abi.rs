@@ -21,6 +21,11 @@ struct LcCell {
     oz: f64,
 }
 
+#[repr(C)]
+struct LcNdIndex {
+    _private: [u8; 0],
+}
+
 extern "C" {
     fn lc_knearest(
         xyz: *const f64,
@@ -78,6 +83,49 @@ extern "C" {
         out: *mut linkcell::lc_pair,
         cap: usize,
         out_count: *mut usize,
+    ) -> c_int;
+    fn lc_nd_build(
+        data: *const f64,
+        n: usize,
+        d: usize,
+        periods: *const f64,
+        out: *mut *mut LcNdIndex,
+    ) -> c_int;
+    fn lc_nd_free(index: *mut LcNdIndex);
+    fn lc_nd_len(index: *const LcNdIndex) -> usize;
+    fn lc_nd_dims(index: *const LcNdIndex) -> usize;
+    fn lc_nd_knn(
+        index: *const LcNdIndex,
+        query: *const f64,
+        k: usize,
+        out_idx: *mut c_int,
+        out_d2: *mut f64,
+    ) -> c_int;
+    fn lc_nd_within(
+        index: *const LcNdIndex,
+        query: *const f64,
+        radius: f64,
+        out_idx: *mut c_int,
+        out_d2: *mut f64,
+        cap: usize,
+        out_count: *mut usize,
+    ) -> c_int;
+    fn lc_nd_pairs_within(
+        index: *const LcNdIndex,
+        radius: f64,
+        out_i: *mut c_int,
+        out_j: *mut c_int,
+        out_d2: *mut f64,
+        cap: usize,
+        out_count: *mut usize,
+    ) -> c_int;
+    fn lc_nd_dbscan(
+        index: *const LcNdIndex,
+        eps: f64,
+        min_pts: usize,
+        out_labels: *mut c_int,
+        out_core: *mut c_int,
+        out_clusters: *mut usize,
     ) -> c_int;
 }
 
@@ -1007,4 +1055,280 @@ fn lc_knearest_entries_reject_non_finite_box_lengths() {
             assert_eq!(last_error(), want);
         }
     }
+}
+
+fn build_nd_index(data: &[f64], n: usize, d: usize, periods: Option<&[f64]>) -> *mut LcNdIndex {
+    let mut out = std::ptr::null_mut();
+    let rc = unsafe {
+        lc_nd_build(
+            data.as_ptr(),
+            n,
+            d,
+            periods.map_or(std::ptr::null(), |p| p.as_ptr()),
+            &mut out,
+        )
+    };
+    assert_eq!(rc, 0, "build failed: {}", last_error());
+    out
+}
+
+#[test]
+fn lc_nd_build_and_queries_work() {
+    let data = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let idx = build_nd_index(&data, 3, 2, None);
+    assert_eq!(unsafe { lc_nd_len(idx) }, 3);
+    assert_eq!(unsafe { lc_nd_dims(idx) }, 2);
+
+    let mut nn = [-1; 5];
+    let mut d2 = [f64::NAN; 5];
+    let q = [0.0, 0.0];
+    let rc = unsafe { lc_nd_knn(idx, q.as_ptr(), 5, nn.as_mut_ptr(), d2.as_mut_ptr()) };
+    assert_eq!(rc, 0);
+    assert_eq!(nn[0], 0);
+    assert!(d2[0].abs() <= 1.0e-14);
+
+    let mut need = 0usize;
+    let rc = unsafe {
+        lc_nd_within(
+            idx,
+            q.as_ptr(),
+            1.01,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut out_i = vec![-1; need];
+    let mut out_d2 = vec![0.0; need];
+    let rc = unsafe {
+        lc_nd_within(
+            idx,
+            q.as_ptr(),
+            1.01,
+            out_i.as_mut_ptr(),
+            out_d2.as_mut_ptr(),
+            need,
+            &mut need,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(out_i.contains(&0));
+
+    let mut labels = vec![-9; 3];
+    let mut core = vec![0; 3];
+    let mut clusters = 0usize;
+    let rc = unsafe {
+        lc_nd_dbscan(
+            idx,
+            1.1,
+            2,
+            labels.as_mut_ptr(),
+            core.as_mut_ptr(),
+            &mut clusters,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(clusters >= 1);
+
+    unsafe { lc_nd_free(idx) };
+}
+
+#[test]
+fn lc_nd_rejects_bad_dimensions_nulls_and_bad_periods() {
+    let data = [0.0, 1.0];
+    let periods = [1.0];
+    let mut out = std::ptr::null_mut();
+    assert_ne!(
+        unsafe { lc_nd_build(std::ptr::null(), 1, 1, periods.as_ptr(), &mut out) },
+        0
+    );
+    assert_ne!(
+        unsafe { lc_nd_build(data.as_ptr(), 1, 0, periods.as_ptr(), &mut out) },
+        0
+    );
+    assert_ne!(
+        unsafe { lc_nd_build(data.as_ptr(), 1, 1, periods.as_ptr(), std::ptr::null_mut()) },
+        0
+    );
+    let bad_neg = [-1.0f64];
+    assert_ne!(
+        unsafe { lc_nd_build(data.as_ptr(), 1, 1, bad_neg.as_ptr(), &mut out) },
+        0
+    );
+    let bad_nan = [f64::NAN];
+    assert_ne!(
+        unsafe { lc_nd_build(data.as_ptr(), 1, 1, bad_nan.as_ptr(), &mut out) },
+        0
+    );
+}
+
+#[test]
+fn lc_nd_count_queries_report_short_buffers() {
+    let data = [
+        0.0, 0.0, //
+        0.1, 0.0, //
+        0.0, 0.1, //
+        0.09, 0.09,
+    ];
+    let idx = build_nd_index(&data, 4, 2, None);
+    let q = [0.0, 0.0];
+    let mut need = 0usize;
+    let rc = unsafe {
+        lc_nd_within(
+            idx,
+            q.as_ptr(),
+            0.2,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut got = need;
+    let mut short_i = vec![-1; need.saturating_sub(1)];
+    let rc = unsafe {
+        lc_nd_within(
+            idx,
+            q.as_ptr(),
+            0.2,
+            short_i.as_mut_ptr(),
+            std::ptr::null_mut(),
+            short_i.len(),
+            &mut got,
+        )
+    };
+    assert_ne!(rc, 0);
+    assert_eq!(got, need);
+
+    let mut need_pairs = 0usize;
+    let rc = unsafe {
+        lc_nd_pairs_within(
+            idx,
+            0.2,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut need_pairs,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut out_i = vec![-1; need_pairs.saturating_sub(1)];
+    let mut out_j = vec![-1; need_pairs.saturating_sub(1)];
+    let mut got_pairs = need_pairs;
+    let rc = unsafe {
+        lc_nd_pairs_within(
+            idx,
+            0.2,
+            out_i.as_mut_ptr(),
+            out_j.as_mut_ptr(),
+            std::ptr::null_mut(),
+            out_i.len(),
+            &mut got_pairs,
+        )
+    };
+    assert_ne!(rc, 0);
+    assert_eq!(got_pairs, need_pairs);
+    unsafe { lc_nd_free(idx) };
+}
+
+#[test]
+fn lc_nd_rejects_non_finite_coordinates_and_null_query_pointers() {
+    let nan_data = [f64::NAN, 0.0];
+    let mut out = std::ptr::null_mut();
+    assert_ne!(
+        unsafe { lc_nd_build(nan_data.as_ptr(), 1, 2, std::ptr::null(), &mut out) },
+        0
+    );
+    assert_eq!(last_error(), Error::NonFinite.to_string());
+
+    let good_data = [0.0, 0.0, 1.0, 0.0];
+    let idx = build_nd_index(&good_data, 2, 2, None);
+    let mut nn = [0; 2];
+    let q = [0.0, 0.0];
+    assert_ne!(
+        unsafe {
+            lc_nd_knn(
+                std::ptr::null(),
+                q.as_ptr(),
+                2,
+                nn.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    assert_ne!(
+        unsafe {
+            lc_nd_knn(
+                idx,
+                std::ptr::null(),
+                2,
+                nn.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let q_nan = [f64::NAN, 0.0];
+    assert_ne!(
+        unsafe {
+            lc_nd_knn(
+                idx,
+                q_nan.as_ptr(),
+                2,
+                nn.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let mut count = 0usize;
+    assert_ne!(
+        unsafe {
+            lc_nd_within(
+                idx,
+                std::ptr::null(),
+                1.0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        },
+        0
+    );
+    assert_ne!(
+        unsafe {
+            lc_nd_pairs_within(
+                idx,
+                1.0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    assert_ne!(
+        unsafe {
+            lc_nd_dbscan(
+                idx,
+                1.0,
+                2,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { lc_nd_len(std::ptr::null()) }, 0);
+    assert_eq!(unsafe { lc_nd_dims(std::ptr::null()) }, 0);
+    unsafe { lc_nd_free(idx) };
 }

@@ -9,7 +9,7 @@ use std::collections::{BinaryHeap, VecDeque};
 use crate::Error;
 
 mod metric;
-pub use metric::{Metric, PeriodicEuclidean};
+pub use metric::{Euclidean, Metric, PeriodicEuclidean, PeriodicSpace};
 
 /// One neighbour hit.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -192,8 +192,8 @@ pub use knearest::{
     knearest_team_threads, pin_knearest_to_least_loaded, shutdown_knearest_team, Neighbors,
 };
 pub use nd::{
-    ContiguousSpace, DbscanResult, Metric, NeighborHit, NeighbourIndex, OwnedContiguousSpace,
-    PairHit, PeriodicEuclidean, Space, VpTreeIndex,
+    ContiguousSpace, DbscanResult, Euclidean, Metric, NeighborHit, NeighbourIndex,
+    OwnedContiguousSpace, PairHit, PeriodicEuclidean, PeriodicSpace, Space, VpTreeIndex,
 };
 pub use open_cell::{cell_for_pbc, pairs_open, pairs_within_pbc, stencil_builds, PbcQuery};
 pub use pairs::{

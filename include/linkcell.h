@@ -444,7 +444,8 @@ int lc_mesh_cut(const double *xyz,
  * Build an N-dimensional exact neighbour index from row-major `n * d` data.
  *
  * `periods` is null for a fully open space, or length `d` with
- * `periods[k] > 0` for periodic axis `k` and `<= 0` for open axis `k`.
+ * `periods[k] > 0` for periodic axis `k`, `periods[k] == 0` for open axis,
+ * and `periods[k] < 0` rejected.
  * The index owns a copy of `data` and is released by [`lc_nd_free`].
  *
  * # Safety

@@ -84,7 +84,8 @@ int lc_nd_dbscan(const lc_nd_index *index, double eps, size_t min_pts,
 
 `lc_nd_build` takes row-major `data` of shape `n x d`.
 `periods` is optional (`NULL` means every axis open); with a non-null pointer,
-length is `d` and each axis is periodic if `periods[k] > 0`.
+length is `d`; `periods[k] > 0` marks axis `k` periodic, `periods[k] == 0`
+marks it open, and negative or NaN values are rejected.
 
 `lc_nd_knn` writes exactly `k` slots (`-1` and optional `NaN` for unused
 slots when `k > n`).
@@ -99,6 +100,8 @@ slots when `k > n`).
 `lc_nd_dbscan` writes one label and one core flag per indexed point.
 Noise has label `-1`.
 `min_pts` includes the point itself.
+Index outputs are `int` to match existing `lc_*` neighbour and pair ABI
+conventions; if an index would not fit in `int`, the call returns nonzero.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,

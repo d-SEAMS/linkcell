@@ -3,7 +3,8 @@
 `linkcell::VpTreeIndex` provides exact N-dimensional neighbour search over
 row-major `f64` feature buffers (`n x d`) with optional per-axis periodicity.
 The API is generic over a metric trait (`linkcell::Metric`) implemented
-currently by `linkcell::PeriodicEuclidean`.
+currently by `linkcell::PeriodicSpace` (with `PeriodicEuclidean` as a
+compatibility alias).
 
 The implementation is intentionally split so that metric and bound logic sits
 behind a single shim module (`src/nd/metric.rs`), which is planned to be
@@ -21,6 +22,13 @@ minimum-image distance through one metric implementation.
 The current choice is a vantage-point tree (Yianilos, SODA 1993): exact search
 with branch-and-bound from the triangle inequality.
 
+For `d` in the tens, distance concentration weakens all exact tree pruning,
+including VP-trees. The exact worst case remains linear scan per query.
+In this crate, VP-trees are still preferred over kd-trees for mixed periodic
+and open axes because VP pruning uses only the metric, while kd pruning relies
+on axis-aligned bounds that become loose in high `d` and awkward on toroidal
+dimensions.
+
 Related work considered:
 
 - Friedman, Bentley, Finkel (ACM TOMS 1977): kd-tree nearest neighbour.
@@ -36,11 +44,16 @@ is not enabled yet.
 ## Space and metric
 
 - `OwnedContiguousSpace` / `ContiguousSpace` read row-major buffers.
-- `PeriodicEuclidean` supports per-axis `Option<f64>` periods:
+- `PeriodicSpace` supports per-axis `Option<f64>` periods:
   - `Some(L)`: periodic axis with period `L`.
   - `None`: open axis.
 - Wrapping follows minimage/linkcell floor-fast conventions (`trunc`-style
   fold semantics), including coordinates outside `[0, L)`.
+- Periodic deltas wrap to `[-L/2, L/2)`, with the tie at `+L/2` mapped to
+  `-L/2`.
+- The torus minimum-image distance on periodic axes is a metric, and the
+  Cartesian product of periodic and open axes with Euclidean aggregation is
+  therefore also a metric; triangle-inequality pruning in the VP-tree is sound.
 
 Metric trait functions:
 
@@ -85,3 +98,11 @@ Results are deterministic:
 
 HDBSCAN is out of scope in this crate.
 
+## C ABI index width
+
+The current `lc_nd_*` neighbour and pair outputs use `int` indices, matching
+the existing `lc_knearest` and pair-list ABI conventions in linkcell.
+Inputs whose indices would exceed `INT_MAX` fail with an error code rather than
+silently truncating.
+`lc_nd_build` uses `periods[i] == 0.0` for open axes and `periods[i] > 0.0` for
+periodic axes; negative or NaN period entries are rejected.

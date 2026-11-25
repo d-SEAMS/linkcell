@@ -366,7 +366,7 @@ pub extern "C" fn lc_version() -> *const c_char {
 }
 
 struct NdHandle {
-    tree: crate::VpTreeIndex<crate::OwnedContiguousSpace, crate::PeriodicEuclidean>,
+    tree: crate::VpTreeIndex<crate::OwnedContiguousSpace, crate::PeriodicSpace>,
 }
 
 /// Opaque N-dimensional neighbour index handle.
@@ -385,7 +385,8 @@ unsafe fn nd_ref<'a>(ptr: *const lc_nd_index) -> Result<&'a NdHandle, c_int> {
 /// Build an N-dimensional exact neighbour index from row-major `n * d` data.
 ///
 /// `periods` is null for a fully open space, or length `d` with
-/// `periods[k] > 0` for periodic axis `k` and `<= 0` for open axis `k`.
+/// `periods[k] > 0` for periodic axis `k`, `periods[k] == 0` for open axis,
+/// and `periods[k] < 0` rejected.
 /// The index owns a copy of `data` and is released by [`lc_nd_free`].
 ///
 /// # Safety
@@ -407,10 +408,16 @@ pub unsafe extern "C" fn lc_nd_build(
         return fail(Error::Overflow);
     };
     let raw = unsafe { std::slice::from_raw_parts(data, len) };
+    if !raw.iter().all(|v| v.is_finite()) {
+        return fail(Error::NonFinite);
+    }
     let period_vec = if periods.is_null() {
         vec![None; d]
     } else {
         let p = unsafe { std::slice::from_raw_parts(periods, d) };
+        if p.iter().any(|&v| v.is_nan() || v < 0.0) {
+            return fail(Error::BadPeriod);
+        }
         p.iter()
             .map(|&v| if v > 0.0 { Some(v) } else { None })
             .collect()
@@ -419,7 +426,7 @@ pub unsafe extern "C" fn lc_nd_build(
         Ok(space) => space,
         Err(err) => return fail(err),
     };
-    let metric = match crate::PeriodicEuclidean::new(period_vec) {
+    let metric = match crate::PeriodicSpace::new(period_vec) {
         Ok(metric) => metric,
         Err(err) => return fail(err),
     };
