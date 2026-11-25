@@ -27,6 +27,7 @@ struct LcNdIndex {
 }
 
 extern "C" {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn lc_set_threads(n: c_int);
     fn lc_knearest(
         xyz: *const f64,
@@ -130,9 +131,106 @@ extern "C" {
     ) -> c_int;
 }
 
+/// Kernel identifiers of this process's live threads.
 #[cfg(target_os = "linux")]
-fn linux_thread_count() -> usize {
-    std::fs::read_dir("/proc/self/task").unwrap().count()
+fn thread_ids() -> std::collections::BTreeSet<u64> {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Kernel identifiers of this process's live threads.
+#[cfg(target_os = "macos")]
+fn thread_ids() -> std::collections::BTreeSet<u64> {
+    extern "C" {
+        fn getpid() -> c_int;
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut std::ffi::c_void,
+            size: c_int,
+        ) -> c_int;
+    }
+    const PROC_PIDLISTTHREADS: c_int = 6;
+    let mut ids = vec![0u64; 64];
+    loop {
+        let bytes = c_int::try_from(ids.len() * 8).unwrap();
+        let got = unsafe {
+            proc_pidinfo(
+                getpid(),
+                PROC_PIDLISTTHREADS,
+                0,
+                ids.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        assert!(got > 0, "proc_pidinfo(PROC_PIDLISTTHREADS) returned {got}");
+        if got < bytes {
+            return ids[..got as usize / 8].iter().copied().collect();
+        }
+        ids.resize(ids.len() * 2, 0);
+    }
+}
+
+/// Kernel identifiers of this process's live threads.
+#[cfg(windows)]
+fn thread_ids() -> std::collections::BTreeSet<u64> {
+    // THREADENTRY32: dwSize, cntUsage, th32ThreadID, th32OwnerProcessID,
+    // tpBasePri, tpDeltaPri, dwFlags. Every field is 32 bits.
+    type ThreadEntry32 = [u32; 7];
+    const SIZE: usize = 0;
+    const THREAD_ID: usize = 2;
+    const OWNER_PROCESS_ID: usize = 3;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut std::ffi::c_void;
+        fn Thread32First(snapshot: *mut std::ffi::c_void, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: *mut std::ffi::c_void, entry: *mut ThreadEntry32) -> i32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn GetCurrentProcessId() -> u32;
+    }
+    const TH32CS_SNAPTHREAD: u32 = 0x4;
+    let entry_size = std::mem::size_of::<ThreadEntry32>() as u32;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    assert_ne!(snapshot as isize, -1, "CreateToolhelp32Snapshot failed");
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut entry: ThreadEntry32 = [0; 7];
+    entry[SIZE] = entry_size;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while more {
+        if entry[OWNER_PROCESS_ID] == pid {
+            ids.insert(u64::from(entry[THREAD_ID]));
+        }
+        entry[SIZE] = entry_size;
+        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    assert_ne!(unsafe { CloseHandle(snapshot) }, 0, "CloseHandle failed");
+    assert!(!ids.is_empty(), "the snapshot did not list this thread");
+    ids
+}
+
+/// Runs `call` and asserts that no thread alive afterwards is new.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn assert_starts_no_thread(label: &str, call: impl FnOnce()) {
+    let before = thread_ids();
+    call();
+    let started: Vec<u64> = thread_ids().difference(&before).copied().collect();
+    assert_eq!(
+        started,
+        Vec::<u64>::new(),
+        "under lc_set_threads(1), {label} started a thread"
+    );
 }
 
 fn ortho_c(lx: f64, ly: f64, lz: f64) -> LcCell {
@@ -1363,10 +1461,16 @@ fn lc_nd_rejects_non_finite_coordinates_and_null_query_pointers() {
     unsafe { lc_nd_free(idx) };
 }
 
+/// The period table holds one `Option<f64>` per axis. At the largest `d` the
+/// size check admits, that table is `2^63 - 16` bytes, which no allocator
+/// grants. Smaller sizes such as `2^33` axes are refused only where the
+/// allocator declines to overcommit: macOS grants them and the build then
+/// writes every page.
 #[test]
 fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
     let data = [0.0f64];
-    for &d in &[1usize << 33, 1usize << 40] {
+    let largest = isize::MAX as usize / std::mem::size_of::<Option<f64>>();
+    for &d in &[largest, largest + 1, usize::MAX] {
         let mut out = 0x1usize as *mut LcNdIndex;
         let rc = unsafe { lc_nd_build(data.as_ptr(), 0, d, std::ptr::null(), &mut out) };
         assert_ne!(rc, 0);
@@ -1374,12 +1478,15 @@ fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Under `lc_set_threads(1)` no ND call starts a thread. The suite shares
+/// this process with tests that do start threads, so the check runs in a
+/// child whose only work is these calls. Each call is bracketed by its own
+/// snapshot of thread identifiers. A count that spans a `join` is not
+/// enough: Linux keeps listing a joined thread in `/proc/self/task` for a
+/// moment after `join` returns.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn lc_nd_respects_set_threads_one_without_growing_threads() {
-    // The suite shares this process, so `/proc/self/task` also counts threads
-    // other tests start. The strict count runs in a child whose only work is
-    // this search.
     if std::env::var_os("LC_ND_ONE_THREAD_PROBE").is_none() {
         let exe = std::env::current_exe().unwrap();
         let out = std::process::Command::new(exe)
@@ -1413,49 +1520,22 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
         return;
     }
     let data = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-    let idx = build_nd_index(&data, 4, 2, None);
     let q = [0.0, 0.0];
     unsafe { lc_set_threads(1) };
-    let before = linux_thread_count();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(before));
-    let stop_c = std::sync::Arc::clone(&stop);
-    let peak_c = std::sync::Arc::clone(&peak);
-    let sampler = std::thread::Builder::new()
-        .name("nd-thread-sampler".into())
-        .spawn(move || {
-            let mut max = linux_thread_count();
-            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
-                max = max.max(linux_thread_count());
-            }
-            max = max.max(linux_thread_count());
-            peak_c.store(max, std::sync::atomic::Ordering::Relaxed);
-        })
-        .unwrap();
-    let mut during = linux_thread_count();
-    let mut spins = 0u32;
-    loop {
-        let now = linux_thread_count();
-        if now == during && now == before + 1 {
-            break;
-        }
-        during = now;
-        spins += 1;
-        assert!(
-            spins < 10_000_000,
-            "sampler thread was not the only extra thread: before={before} now={now}"
-        );
-        std::thread::yield_now();
-    }
+    let mut idx = std::ptr::null_mut();
+    assert_starts_no_thread("lc_nd_build", || {
+        idx = build_nd_index(&data, 4, 2, None);
+    });
     for _ in 0..200 {
-        let mut nn = [-1; 4];
-        assert_eq!(
-            unsafe { lc_nd_knn(idx, q.as_ptr(), 4, nn.as_mut_ptr(), std::ptr::null_mut()) },
-            0
-        );
-        let mut count = 0usize;
-        assert_eq!(
-            unsafe {
+        assert_starts_no_thread("lc_nd_knn", || {
+            let mut nn = [-1; 4];
+            let rc =
+                unsafe { lc_nd_knn(idx, q.as_ptr(), 4, nn.as_mut_ptr(), std::ptr::null_mut()) };
+            assert_eq!(rc, 0);
+        });
+        assert_starts_no_thread("lc_nd_within", || {
+            let mut count = 0usize;
+            let rc = unsafe {
                 lc_nd_within(
                     idx,
                     q.as_ptr(),
@@ -1465,11 +1545,13 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
                     0,
                     &mut count,
                 )
-            },
-            0
-        );
-        assert_eq!(
-            unsafe {
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(count, 4);
+        });
+        assert_starts_no_thread("lc_nd_pairs_within", || {
+            let mut count = 0usize;
+            let rc = unsafe {
                 lc_nd_pairs_within(
                     idx,
                     2.0,
@@ -1479,14 +1561,15 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
                     0,
                     &mut count,
                 )
-            },
-            0
-        );
-        let mut labels = [-1; 4];
-        let mut core = [0; 4];
-        let mut clusters = 0usize;
-        assert_eq!(
-            unsafe {
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(count, 6);
+        });
+        assert_starts_no_thread("lc_nd_dbscan", || {
+            let mut labels = [-1; 4];
+            let mut core = [0; 4];
+            let mut clusters = 0usize;
+            let rc = unsafe {
                 lc_nd_dbscan(
                     idx,
                     2.0,
@@ -1495,18 +1578,12 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
                     core.as_mut_ptr(),
                     &mut clusters,
                 )
-            },
-            0
-        );
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(clusters, 1);
+        });
     }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    sampler.join().unwrap();
-    let max_seen = peak.load(std::sync::atomic::Ordering::Relaxed);
-    let after = linux_thread_count();
+    assert_starts_no_thread("lc_nd_free", || unsafe { lc_nd_free(idx) });
     unsafe { lc_set_threads(0) };
-    unsafe { lc_nd_free(idx) };
-    assert_eq!(during, before + 1, "sampler was not the only extra thread");
-    assert_eq!(max_seen, during, "a query started a thread");
-    assert_eq!(after, before, "lc_set_threads(1) left a thread behind");
     println!("LC_ND_ONE_THREAD_PROBE_OK");
 }
