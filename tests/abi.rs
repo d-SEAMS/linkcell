@@ -220,16 +220,446 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
     ids
 }
 
-/// Runs `call` and asserts that no thread alive afterwards is new.
+/// Counts threads created while a call runs, including one it has already joined.
+///
+/// A before/after set of live thread ids misses a worker that is spawned and
+/// joined inside the call: the id is gone when the call returns.
+/// `tests/one_thread.rs` counts `pthread_create` on Linux gnu for every C
+/// entry. This probe counts the create itself on each OS the id snapshot
+/// runs on, and still compares live ids so a thread left running is caught.
+///
+/// * Linux. This binary defines `pthread_create` and forwards to libc with
+///   `dlsym(RTLD_NEXT)`. The statically linked standard library resolves
+///   that symbol to this definition, so `std::thread::spawn` increments the
+///   counter even when the worker has exited. The increment happens before
+///   that call returns, because the new thread can finish first and the
+///   harness is still inside `pthread_create` for this test's own thread
+///   when the body arms the counter. A failed create rolls the count back.
+///   A nested `pthread_create` on the same thread is one worker: glibc
+///   re-enters the public symbol from inside the call.
+/// * macOS. dyld's two-level namespace records `std`'s `pthread_create`
+///   reference against libSystem. A definition of the same symbol in this
+///   binary is not the call `std::thread::spawn` makes. The probe interposes
+///   libSystem's `pthread_create` through `__DATA,__interpose` and forwards
+///   with `dlsym(RTLD_NEXT)`.
+/// * Windows. The standard library imports `CreateThread` from
+///   `kernel32.dll`. A `CreateThread` defined in this binary does not
+///   intercept that import, and a Toolhelp snapshot does not list a thread
+///   that has exited. The probe replaces this executable's import-address
+///   slot, which is the pointer the statically linked standard library
+///   calls, and forwards to the address the loader wrote there.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod nd_spawn {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static SPAWNS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn armed() -> bool {
+        ARMED.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn count() -> u64 {
+        SPAWNS.load(Ordering::SeqCst)
+    }
+
+    /// Records one create. The caller must do this before the OS call
+    /// returns: the new thread can run to completion first, and the test
+    /// harness's own create of this test's thread can still be in that
+    /// call when the test body arms the counter.
+    fn note() -> bool {
+        if ARMED.load(Ordering::SeqCst) {
+            SPAWNS.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn unnote() {
+        SPAWNS.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod unix {
+        use std::os::raw::{c_char, c_int, c_void};
+        use std::sync::atomic::{AtomicPtr, Ordering};
+
+        use super::{note, unnote};
+
+        type Start = extern "C" fn(*mut c_void) -> *mut c_void;
+        type Create = unsafe extern "C" fn(*mut c_void, *const c_void, Start, *mut c_void) -> c_int;
+
+        const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
+        static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+        unsafe extern "C" {
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            fn abort() -> !;
+        }
+
+        std::thread_local! {
+            static IN_RESOLVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            /// Nested `pthread_create` on this thread. glibc calls the public
+            /// symbol again from inside `pthread_create`; that re-entry is the
+            /// same worker, not a second one.
+            static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+
+        fn real() -> Create {
+            let existing = REAL.load(Ordering::Acquire);
+            if !existing.is_null() {
+                // SAFETY: `REAL` is the `pthread_create` `dlsym(RTLD_NEXT)` returned.
+                return unsafe { std::mem::transmute::<*mut c_void, Create>(existing) };
+            }
+            let reentered = IN_RESOLVE.with(|flag| flag.replace(true));
+            if reentered {
+                unsafe { abort() };
+            }
+            let found = unsafe { dlsym(RTLD_NEXT, c"pthread_create".as_ptr()) };
+            if found.is_null() {
+                unsafe { abort() };
+            }
+            REAL.store(found, Ordering::Release);
+            IN_RESOLVE.with(|flag| flag.set(false));
+            // SAFETY: `dlsym` returned libc's or libSystem's `pthread_create`.
+            unsafe { std::mem::transmute::<*mut c_void, Create>(found) }
+        }
+
+        /// # Safety
+        ///
+        /// The arguments are those of `pthread_create(3)`.
+        pub(super) unsafe extern "C" fn counted(
+            thread: *mut c_void,
+            attr: *const c_void,
+            start: Start,
+            arg: *mut c_void,
+        ) -> c_int {
+            let real = real();
+            let outer = DEPTH.with(|depth| {
+                let now = depth.get();
+                depth.set(now + 1);
+                now == 0
+            });
+            let counted = outer && note();
+            let rc = unsafe { real(thread, attr, start, arg) };
+            DEPTH.with(|depth| depth.set(depth.get() - 1));
+            if rc != 0 && counted {
+                unnote();
+            }
+            rc
+        }
+
+        pub(super) fn ensure() {
+            let _ = real();
+        }
+    }
+
+    /// Linux binds this executable's definition. macOS uses the interpose
+    /// below instead: a same-named definition is not what libSystem-bound
+    /// references call.
+    ///
+    /// # Safety
+    ///
+    /// The arguments are those of `pthread_create(3)`.
+    #[cfg(target_os = "linux")]
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_create(
+        thread: *mut std::os::raw::c_void,
+        attr: *const std::os::raw::c_void,
+        start: extern "C" fn(*mut std::os::raw::c_void) -> *mut std::os::raw::c_void,
+        arg: *mut std::os::raw::c_void,
+    ) -> std::os::raw::c_int {
+        unsafe { unix::counted(thread, attr, start, arg) }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct DyldInterpose {
+        replacement: *const (),
+        replacee: *const (),
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn pthread_create(
+            thread: *mut std::os::raw::c_void,
+            attr: *const std::os::raw::c_void,
+            start: extern "C" fn(*mut std::os::raw::c_void) -> *mut std::os::raw::c_void,
+            arg: *mut std::os::raw::c_void,
+        ) -> std::os::raw::c_int;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[used]
+    #[link_section = "__DATA,__interpose"]
+    static PTHREAD_CREATE_INTERPOSE: DyldInterpose = DyldInterpose {
+        replacement: unix::counted as *const (),
+        replacee: pthread_create as *const (),
+    };
+
+    #[cfg(windows)]
+    mod win {
+        use std::sync::atomic::{AtomicPtr, Ordering};
+
+        use super::{note, unnote};
+
+        type Start = Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> u32>;
+        type CreateThread = unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            usize,
+            Start,
+            *mut std::ffi::c_void,
+            u32,
+            *mut u32,
+        ) -> *mut std::ffi::c_void;
+
+        static REAL: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+        std::thread_local! {
+            /// Nested `CreateThread` on this thread is the same worker.
+            static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+            fn VirtualProtect(
+                addr: *mut std::ffi::c_void,
+                size: usize,
+                new_protect: u32,
+                old_protect: *mut u32,
+            ) -> i32;
+        }
+
+        const PAGE_READWRITE: u32 = 0x04;
+
+        fn read_u16(base: *const u8, off: usize, size: usize) -> Result<u16, String> {
+            let end = off.checked_add(2).ok_or("PE offset overflows")?;
+            if end > size {
+                return Err(format!("PE offset {off} is outside the image"));
+            }
+            // SAFETY: `end` is within the mapped image `GetModuleHandleW` returned.
+            let p = unsafe { base.add(off) };
+            Ok(u16::from_le_bytes(unsafe { [*p, *p.add(1)] }))
+        }
+
+        fn read_u32(base: *const u8, off: usize, size: usize) -> Result<u32, String> {
+            let end = off.checked_add(4).ok_or("PE offset overflows")?;
+            if end > size {
+                return Err(format!("PE offset {off} is outside the image"));
+            }
+            let p = unsafe { base.add(off) };
+            Ok(u32::from_le_bytes(unsafe {
+                [*p, *p.add(1), *p.add(2), *p.add(3)]
+            }))
+        }
+
+        fn read_usize_at(ptr: *const u8) -> usize {
+            // SAFETY: caller keeps `ptr` inside the image and pointer-aligned.
+            unsafe { std::ptr::read_unaligned(ptr.cast::<usize>()) }
+        }
+
+        fn cstr_eq(base: *const u8, rva: u32, size: usize, want: &[u8]) -> Result<bool, String> {
+            let start = rva as usize;
+            if start >= size {
+                return Err("import name is outside the image".to_string());
+            }
+            let mut got = Vec::new();
+            let mut off = start;
+            while off < size {
+                let byte = unsafe { *base.add(off) };
+                if byte == 0 {
+                    return Ok(got == want);
+                }
+                got.push(byte);
+                if got.len() > want.len() {
+                    return Ok(false);
+                }
+                off += 1;
+            }
+            Err("import name is not terminated".to_string())
+        }
+
+        /// Replace every `CreateThread` import slot in this executable.
+        pub(super) fn patch() -> Result<(), String> {
+            let base = unsafe { GetModuleHandleW(std::ptr::null()) };
+            if base.is_null() {
+                return Err("GetModuleHandleW returned null".to_string());
+            }
+            let base = base.cast::<u8>();
+            if read_u16(base, 0, 64)? != 0x5A4D {
+                return Err("executable is not a PE image".to_string());
+            }
+            // `e_lfanew` is a `LONG` at offset 0x3C, inside the first page.
+            let e_lfanew = read_u32(base, 0x3C, 0x400)? as usize;
+            let opt = e_lfanew.checked_add(24).ok_or("PE header overflows")?;
+            // `SizeOfImage` is at the same optional-header offset for PE32 and PE32+.
+            // Read it through a bound that covers the header before that size is known.
+            let header_bound = e_lfanew.checked_add(0x400).ok_or("PE header overflows")?;
+            let size = read_u32(base, opt + 56, header_bound)? as usize;
+            if size < opt + 128 {
+                return Err("SizeOfImage does not cover the optional header".to_string());
+            }
+            if read_u32(base, e_lfanew, size)? != 0x0000_4550 {
+                return Err("executable has no PE signature".to_string());
+            }
+            let magic = read_u16(base, opt, size)?;
+            let import_dir = if magic == 0x20B {
+                opt + 120
+            } else if magic == 0x10B {
+                opt + 104
+            } else {
+                return Err(format!("unknown PE magic {magic:#x}"));
+            };
+            if std::mem::size_of::<usize>() != if magic == 0x20B { 8 } else { 4 } {
+                return Err("PE pointer width does not match this process".to_string());
+            }
+            let import_rva = read_u32(base, import_dir, size)? as usize;
+            if import_rva == 0 {
+                return Err("executable has no import directory".to_string());
+            }
+            let ordinal = 1usize << (usize::BITS - 1);
+            let hook = counted_create_thread as usize;
+            let mut patched = 0usize;
+            for desc in 0..512usize {
+                let at = import_rva + desc * 20;
+                let name_rva = read_u32(base, at + 12, size)?;
+                if name_rva == 0 {
+                    break;
+                }
+                let int_rva = read_u32(base, at, size)? as usize;
+                let iat_rva = read_u32(base, at + 16, size)? as usize;
+                let names = if int_rva == 0 { iat_rva } else { int_rva };
+                if names == 0 || iat_rva == 0 {
+                    continue;
+                }
+                for slot in 0..8192usize {
+                    let name_off = names + slot * std::mem::size_of::<usize>();
+                    let iat_off = iat_rva + slot * std::mem::size_of::<usize>();
+                    if name_off + std::mem::size_of::<usize>() > size
+                        || iat_off + std::mem::size_of::<usize>() > size
+                    {
+                        return Err("import thunk is outside the image".to_string());
+                    }
+                    let named = read_usize_at(unsafe { base.add(name_off) });
+                    if named == 0 {
+                        break;
+                    }
+                    if named & ordinal != 0 {
+                        continue;
+                    }
+                    // `IMAGE_IMPORT_BY_NAME`: a `u16` hint, then the name.
+                    let name_rva = u32::try_from(named)
+                        .map_err(|_| "import name RVA does not fit u32".to_string())?;
+                    let name_at = name_rva.checked_add(2).ok_or("import name overflows")?;
+                    if !cstr_eq(base, name_at, size, b"CreateThread")? {
+                        continue;
+                    }
+                    let iat = unsafe { base.add(iat_off) as *mut usize };
+                    let current = unsafe { std::ptr::read_volatile(iat) };
+                    if current == hook {
+                        patched += 1;
+                        continue;
+                    }
+                    if REAL.load(Ordering::Acquire).is_null() {
+                        REAL.store(current as *mut std::ffi::c_void, Ordering::SeqCst);
+                    }
+                    let mut old = 0u32;
+                    let ok = unsafe {
+                        VirtualProtect(
+                            iat.cast(),
+                            std::mem::size_of::<usize>(),
+                            PAGE_READWRITE,
+                            &mut old,
+                        )
+                    };
+                    if ok == 0 {
+                        return Err("VirtualProtect failed on the import slot".to_string());
+                    }
+                    unsafe { std::ptr::write_volatile(iat, hook) };
+                    let mut restore = 0u32;
+                    unsafe {
+                        VirtualProtect(iat.cast(), std::mem::size_of::<usize>(), old, &mut restore);
+                    }
+                    patched += 1;
+                }
+            }
+            if patched == 0 {
+                return Err(
+                    "CreateThread is not imported by this executable; a joined worker would be missed"
+                        .to_string(),
+                );
+            }
+            if REAL.load(Ordering::Acquire).is_null() {
+                return Err("CreateThread import slot had no original address".to_string());
+            }
+            Ok(())
+        }
+
+        /// # Safety
+        ///
+        /// The arguments are those of `CreateThread`.
+        unsafe extern "system" fn counted_create_thread(
+            attrs: *mut std::ffi::c_void,
+            stack: usize,
+            start: Start,
+            param: *mut std::ffi::c_void,
+            flags: u32,
+            tid: *mut u32,
+        ) -> *mut std::ffi::c_void {
+            let real = REAL.load(Ordering::SeqCst);
+            if real.is_null() {
+                std::process::abort();
+            }
+            let real: CreateThread =
+                unsafe { std::mem::transmute::<*mut std::ffi::c_void, CreateThread>(real) };
+            let outer = DEPTH.with(|depth| {
+                let now = depth.get();
+                depth.set(now + 1);
+                now == 0
+            });
+            let counted = outer && note();
+            let handle = unsafe { real(attrs, stack, start, param, flags, tid) };
+            DEPTH.with(|depth| depth.set(depth.get() - 1));
+            if handle.is_null() && counted {
+                unnote();
+            }
+            handle
+        }
+    }
+
+    pub(super) fn arm() -> Result<(), String> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unix::ensure();
+        #[cfg(windows)]
+        win::patch()?;
+        ARMED.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Runs `call` and asserts that it neither leaves a new thread alive nor
+/// creates one it joins before returning.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn assert_starts_no_thread(label: &str, call: impl FnOnce()) {
+    assert!(
+        nd_spawn::armed(),
+        "spawn counter is not armed; a joined worker would be missed"
+    );
     let before = thread_ids();
+    let spawned = nd_spawn::count();
     call();
     let started: Vec<u64> = thread_ids().difference(&before).copied().collect();
+    let created = nd_spawn::count() - spawned;
     assert_eq!(
         started,
         Vec::<u64>::new(),
-        "under lc_set_threads(1), {label} started a thread"
+        "under lc_set_threads(1), {label} left a thread alive"
+    );
+    assert_eq!(
+        created, 0,
+        "under lc_set_threads(1), {label} created {created} thread(s) and joined them before returning"
     );
 }
 
@@ -1973,9 +2403,10 @@ fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
 /// Under `lc_set_threads(1)` no ND call starts a thread. The suite shares
 /// this process with tests that do start threads, so the check runs in a
 /// child whose only work is these calls. Each call is bracketed by its own
-/// snapshot of thread identifiers. A count that spans a `join` is not
-/// enough: Linux keeps listing a joined thread in `/proc/self/task` for a
-/// moment after `join` returns.
+/// snapshot of thread identifiers and by the spawn counter. The snapshot
+/// alone misses a worker that is created and joined inside the call. The
+/// counter is checked first by creating and joining one thread: that create
+/// must be visible, or the probe would pass without seeing a joined worker.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn lc_nd_respects_set_threads_one_without_growing_threads() {
@@ -2011,6 +2442,20 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
         );
         return;
     }
+    nd_spawn::arm().unwrap_or_else(|err| panic!("spawn counter: {err}"));
+    let spawned = nd_spawn::count();
+    let before_ids = thread_ids();
+    std::thread::spawn(|| {}).join().unwrap();
+    assert_eq!(
+        nd_spawn::count(),
+        spawned + 1,
+        "spawn counter missed a thread that was created and joined"
+    );
+    assert_eq!(
+        thread_ids(),
+        before_ids,
+        "a thread created and joined stayed in the id snapshot"
+    );
     let data = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     let q = [0.0, 0.0];
     unsafe { lc_set_threads(1) };
