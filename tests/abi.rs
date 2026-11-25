@@ -225,30 +225,38 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
 /// A before/after set of live thread ids misses a worker that is spawned and
 /// joined inside the call: the id is gone when the call returns.
 /// `tests/one_thread.rs` counts `pthread_create` on Linux gnu for every C
-/// entry. This probe counts the create itself on each OS the id snapshot
-/// runs on, and still compares live ids so a thread left running is caught.
+/// entry. This probe counts the create itself on glibc, macOS, and Windows,
+/// and still compares live ids so a thread left running is caught. Other
+/// Linux targets keep that id snapshot and do not define `pthread_create`:
+/// `dlsym(RTLD_NEXT)` is null in a static musl binary.
 ///
-/// * Linux. This binary defines `pthread_create` and forwards to libc with
-///   `dlsym(RTLD_NEXT)`. The statically linked standard library resolves
-///   that symbol to this definition, so `std::thread::spawn` increments the
-///   counter even when the worker has exited. The increment happens before
-///   that call returns, because the new thread can finish first and the
-///   harness is still inside `pthread_create` for this test's own thread
-///   when the body arms the counter. A failed create rolls the count back.
-///   A nested `pthread_create` on the same thread is one worker: glibc
-///   re-enters the public symbol from inside the call.
+/// * Linux with glibc (`target_env = "gnu"`). This binary defines
+///   `pthread_create` and forwards to libc with `dlsym(RTLD_NEXT)`. The
+///   statically linked standard library resolves that symbol to this
+///   definition, so `std::thread::spawn` increments the counter even when
+///   the worker has exited. The increment happens before that call returns,
+///   because the new thread can finish first and the harness is still
+///   inside `pthread_create` for this test's own thread when the body arms
+///   the counter. A failed create rolls the count back. A nested
+///   `pthread_create` on the same thread counts as one worker. That nesting
+///   is the counter's rule; it is not a claim that the C library calls the
+///   symbol again. The abi tests pass on glibc 2.39 with the depth unused.
 /// * macOS. dyld's two-level namespace records `std`'s `pthread_create`
 ///   reference against libSystem. A definition of the same symbol in this
 ///   binary is not the call `std::thread::spawn` makes. The probe interposes
 ///   libSystem's `pthread_create` through `__DATA,__interpose` and forwards
-///   with `dlsym(RTLD_NEXT)`.
+///   with `dlsym(RTLD_NEXT)`. This interposition has not been run on macOS.
 /// * Windows. The standard library imports `CreateThread` from
 ///   `kernel32.dll`. A `CreateThread` defined in this binary does not
 ///   intercept that import, and a Toolhelp snapshot does not list a thread
 ///   that has exited. The probe replaces this executable's import-address
 ///   slot, which is the pointer the statically linked standard library
 ///   calls, and forwards to the address the loader wrote there.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    windows
+))]
 mod nd_spawn {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -280,7 +288,7 @@ mod nd_spawn {
         SPAWNS.fetch_sub(1, Ordering::SeqCst);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
     mod unix {
         use std::os::raw::{c_char, c_int, c_void};
         use std::sync::atomic::{AtomicPtr, Ordering};
@@ -300,9 +308,10 @@ mod nd_spawn {
 
         std::thread_local! {
             static IN_RESOLVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-            /// Nested `pthread_create` on this thread. glibc calls the public
-            /// symbol again from inside `pthread_create`; that re-entry is the
-            /// same worker, not a second one.
+            /// Nesting of `pthread_create` on this thread. Only the outer call
+            /// is a worker. This records that rule; glibc 2.39 was not observed
+            /// to call the symbol again, and the abi tests pass there with this
+            /// depth unused.
             static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
 
@@ -355,14 +364,15 @@ mod nd_spawn {
         }
     }
 
-    /// Linux binds this executable's definition. macOS uses the interpose
+    /// Glibc binds this executable's definition. macOS uses the interpose
     /// below instead: a same-named definition is not what libSystem-bound
-    /// references call.
+    /// references call. Other Linux targets do not define this symbol:
+    /// `dlsym(RTLD_NEXT)` is null when musl is linked statically.
     ///
     /// # Safety
     ///
     /// The arguments are those of `pthread_create(3)`.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[no_mangle]
     pub unsafe extern "C" fn pthread_create(
         thread: *mut std::os::raw::c_void,
@@ -635,7 +645,7 @@ mod nd_spawn {
     }
 
     pub(super) fn arm() -> Result<(), String> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
         unix::ensure();
         #[cfg(windows)]
         win::patch()?;
@@ -646,7 +656,11 @@ mod nd_spawn {
 
 /// Runs `call` and asserts that it neither leaves a new thread alive nor
 /// creates one it joins before returning.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    windows
+))]
 fn assert_starts_no_thread(label: &str, call: impl FnOnce()) {
     assert!(
         nd_spawn::armed(),
@@ -665,6 +679,23 @@ fn assert_starts_no_thread(label: &str, call: impl FnOnce()) {
     assert_eq!(
         created, 0,
         "under lc_set_threads(1), {label} created {created} thread(s) and joined them before returning"
+    );
+}
+
+/// Runs `call` and asserts that no thread alive afterwards is new.
+///
+/// Linux targets other than glibc use this snapshot. A static musl binary
+/// gets a null `dlsym(RTLD_NEXT)`, so this executable does not define
+/// `pthread_create`.
+#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+fn assert_starts_no_thread(label: &str, call: impl FnOnce()) {
+    let before = thread_ids();
+    call();
+    let started: Vec<u64> = thread_ids().difference(&before).copied().collect();
+    assert_eq!(
+        started,
+        Vec::<u64>::new(),
+        "under lc_set_threads(1), {label} started a thread"
     );
 }
 
@@ -2434,13 +2465,89 @@ fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
     assert_eq!(last_error(), "the period table could not be allocated");
 }
 
+/// Kernel id of the calling thread. The value is one of the ids
+/// [`thread_ids`] returns.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn current_thread_id() -> u64 {
+    // The link is `<pid>/task/<tid>` relative to `/proc`, not a bare tid.
+    let name = std::fs::read_link("/proc/thread-self")
+        .unwrap_or_else(|err| panic!("/proc/thread-self: {err}"));
+    let text = name
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or_else(|| panic!("/proc/thread-self has no tid"));
+    text.parse()
+        .unwrap_or_else(|err| panic!("/proc/thread-self: {err}"))
+}
+
+/// Kernel id of the calling thread. The value is one of the ids
+/// [`thread_ids`] returns.
+#[cfg(target_os = "macos")]
+fn current_thread_id() -> u64 {
+    extern "C" {
+        fn pthread_self() -> *mut std::ffi::c_void;
+        fn pthread_threadid_np(thread: *mut std::ffi::c_void, id: *mut u64) -> c_int;
+    }
+    let mut id = 0u64;
+    let rc = unsafe { pthread_threadid_np(pthread_self(), &mut id) };
+    assert_eq!(rc, 0, "pthread_threadid_np returned {rc}");
+    id
+}
+
+/// Kernel id of the calling thread. The value is one of the ids
+/// [`thread_ids`] returns.
+#[cfg(windows)]
+fn current_thread_id() -> u64 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    u64::from(unsafe { GetCurrentThreadId() })
+}
+
+/// A joined thread can remain in the kernel task list after `join` returns.
+/// Wait until every id absent from `before` has left. An id other than
+/// `joined` fails immediately. `joined` fails if it is still listed after
+/// two seconds.
+#[cfg(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    windows
+))]
+fn wait_until_joined_tids_leave(before: &std::collections::BTreeSet<u64>, joined: u64) {
+    let bound = std::time::Duration::from_secs(2);
+    let start = std::time::Instant::now();
+    loop {
+        let now = thread_ids();
+        if now == *before {
+            return;
+        }
+        let extra: Vec<u64> = now.difference(before).copied().collect();
+        if extra.iter().any(|id| *id != joined) {
+            panic!("a thread other than joined tid {joined} is in the id snapshot: {extra:?}");
+        }
+        if start.elapsed() >= bound {
+            panic!("joined tid {joined} stayed in the task list for {bound:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// Under `lc_set_threads(1)` no ND call starts a thread. The suite shares
 /// this process with tests that do start threads, so the check runs in a
-/// child whose only work is these calls. Each call is bracketed by its own
-/// snapshot of thread identifiers and by the spawn counter. The snapshot
-/// alone misses a worker that is created and joined inside the call. The
-/// counter is checked first by creating and joining one thread: that create
-/// must be visible, or the probe would pass without seeing a joined worker.
+/// child whose only work is these calls.
+///
+/// On glibc, macOS, and Windows each call is bracketed by a spawn counter
+/// and by a snapshot of thread identifiers. The snapshot alone misses a
+/// worker that is created and joined inside the call. The counter is
+/// checked first by creating and joining one thread: that create must be
+/// visible. The joined id must then leave the task list. A joined id can
+/// remain listed for a moment after `join`; the probe waits for that id,
+/// and a wait that expires is a failure.
+///
+/// On other Linux targets the counter is not installed. `dlsym(RTLD_NEXT)`
+/// is null in a static musl binary, and defining `pthread_create` aborts
+/// the process. Those targets keep the thread-id snapshot only.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn lc_nd_respects_set_threads_one_without_growing_threads() {
@@ -2476,20 +2583,36 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
         );
         return;
     }
-    nd_spawn::arm().unwrap_or_else(|err| panic!("spawn counter: {err}"));
-    let spawned = nd_spawn::count();
-    let before_ids = thread_ids();
-    std::thread::spawn(|| {}).join().unwrap();
-    assert_eq!(
-        nd_spawn::count(),
-        spawned + 1,
-        "spawn counter missed a thread that was created and joined"
-    );
-    assert_eq!(
-        thread_ids(),
-        before_ids,
-        "a thread created and joined stayed in the id snapshot"
-    );
+    #[cfg(any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        windows
+    ))]
+    {
+        nd_spawn::arm().unwrap_or_else(|err| panic!("spawn counter: {err}"));
+        let spawned = nd_spawn::count();
+        let before_ids = thread_ids();
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let slot = std::sync::Arc::clone(&joined);
+        std::thread::spawn(move || {
+            slot.store(current_thread_id(), std::sync::atomic::Ordering::SeqCst);
+        })
+        .join()
+        .unwrap();
+        let joined = joined.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(joined, 0, "the joined thread did not record its id");
+        assert_eq!(
+            nd_spawn::count(),
+            spawned + 1,
+            "spawn counter missed a thread that was created and joined"
+        );
+        wait_until_joined_tids_leave(&before_ids, joined);
+        assert_eq!(
+            thread_ids(),
+            before_ids,
+            "a thread created and joined stayed in the id snapshot"
+        );
+    }
     let data = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     let q = [0.0, 0.0];
     unsafe { lc_set_threads(1) };
