@@ -12,7 +12,7 @@
   N-dimensional shape/period/index validation failures. This is recorded as a
   semver-significant API expansion because `Error` is not marked
   `#[non_exhaustive]` in this release line.
-- N-dimensional VP-tree branch pruning now uses a dimension-scaled conservative
-  floating-point widening margin derived from Higham `gamma_n` error bounds,
-  so ND query/dbscan outputs are bitwise-equal to brute force under the same
-  metric on finite, non-overflowing inputs.
+- N-dimensional queries compare equal to brute force under the same `dist2`
+  on finite inputs that do not overflow. Periodic coordinates are reduced
+  into `[0, L)` once, and pruning adds the proved absolute slack of that
+  reduction to a Higham relative factor.

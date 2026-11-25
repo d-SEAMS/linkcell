@@ -45,13 +45,18 @@ is not enabled yet.
 - `PeriodicSpace` supports per-axis `Option<f64>` periods:
   - `Some(L)`: periodic axis with period `L`.
   - `None`: open axis.
-- Wrapping follows minimage/linkcell floor-fast conventions (`trunc`-style
-  fold semantics), including coordinates outside `[0, L)`.
+- Each periodic coordinate is reduced into `[0, L)` once: at index build
+  for stored points, and at the start of a query. `dist2` reduces its
+  arguments the same way, and a value already in `[0, L)` is left unchanged.
+- The reduction is one truncating fused remainder `x - trunc(x/L) * L`,
+  shifted by `L` until it lies in `[0, L)`. When `x/L` is not finite the
+  binary64 value has no unique residue and the representative is `0`.
 - Periodic deltas wrap to `[-L/2, L/2)`, with the tie at `+L/2` mapped to
   `-L/2`.
-- The torus minimum-image distance on periodic axes is a metric, and the
-  Cartesian product of periodic and open axes with Euclidean aggregation is
-  therefore also a metric; triangle-inequality pruning in the VP-tree is sound.
+- On those representatives the circular distance of one axis is within
+  `4 * ulp(L)` of the real circular distance, and the real product of
+  circular and open axes is a metric. The floating-point distance therefore
+  violates the triangle inequality by at most a proved slack.
 
 Metric trait functions:
 
@@ -62,24 +67,27 @@ Metric trait functions:
 The point metric is exactly symmetric (`dist2(a, b) == dist2(b, a)`) and
 `dist2(a, a) == 0`.
 
-For finite inputs where each per-axis delta, square, and accumulated sum stays
-finite (otherwise the API returns `Overflow`), the search acceptance predicate
-is exactly `dist2 <= r^2`, and branch pruning is widened by a conservative
-floating-point guard. Therefore the returned neighbour sets, k-NN ordering
-(`dist2`, then index), pair lists, and DBSCAN labels are bitwise identical to
-the same-metric brute-force oracle for all dimensions.
+For finite inputs whose squared axis distances do not overflow (otherwise the
+API returns `Overflow`), acceptance is exactly `dist2 <= r^2` using this
+metric. Branch pruning widens each triangle test by a relative Higham factor
+on the norm, the square root, and the branch-test addition, plus
+`Metric::vp_absolute_slack`.
 
-Pruning margin derivation (Higham-style forward error):
+That slack is `8 * ||η||_2` with `η_i = 4 * ulp(L_i)` on each periodic axis
+and `0` on an open axis. `4 * ulp(L)` bounds the circular-distance error on
+`[0, L)` (`|fl(a-b) - |a-b|| <= u*L` and one further rounding of `L - w`,
+and `2*u*L <= 4*ulp(L)`). Three distances appear in the test, so the defect
+is at most `3 * ||η||_2`; the factor eight also covers rounding the slack.
+Open axes contribute no absolute term. Their error stays in the relative
+factor, which is zero at distance zero, so a tiny open data set still prunes.
 
-- Let `u = 2^-53` (unit roundoff for binary64).
-- For a distance-squared sum of `d` terms, use `gamma_n = n*u/(1 - n*u)` with
-  `n = d + c` (`c` is a small constant for subtraction/multiplication rounds).
-- Add one rounding for `sqrt` and one for the final two-term branch-test add.
-- Convert that relative bound to an absolute widening on `|a| + |b| + |c|`
-  for each triangle-inequality comparison.
-
-This widening never overestimates pruning safety (it only widens), so it can
-reduce pruning efficiency but does not lose exact neighbours.
+The neighbour set, the k-NN order `(dist2, index)`, the pair list, and the
+DBSCAN labels therefore match brute force under this `dist2`. The distances
+themselves are that `dist2`, including a periodic pair whose raw coordinates
+differ by many periods. This is not a claim that `dist2` is a correctly
+rounded mathematical minimum image for every finite magnitude: when `x/L`
+is not finite the representative is defined to be `0`, and both the index
+and brute force use that rule.
 
 The axis and box lower bounds are sound for periodic intervals including
 intervals wider than `L/2` and full-period coverage (`width >= L`), where the

@@ -533,6 +533,202 @@ fn high_dimensional_boundary_radii_match_oracle_on_collinear_rays() {
     }
 }
 
+fn assert_hit_pairs(got: &[linkcell::NeighborHit], want: &[(usize, f64)], what: &str) {
+    let got_pairs: Vec<(usize, f64)> = got.iter().map(|h| (h.index, h.dist2)).collect();
+    assert_eq!(got_pairs, want, "{what}");
+}
+
+/// Reviewer repro: L = 2π, coordinates across 20 periods, and the boundary
+/// radius that dropped point 1. Every listed radius is checked against brute
+/// force, including the exact distance to each point and its neighbours.
+#[test]
+fn periodic_span_of_many_periods_matches_bruteforce_at_boundary_radii() {
+    let l = 2.0 * std::f64::consts::PI;
+    let periods = vec![Some(l)];
+    let metric = PeriodicSpace::new(periods.clone()).unwrap();
+    let mut data = Vec::new();
+    for i in 0..96usize {
+        let periods_out = -10.0 + (i as f64) * 20.0 / 95.0;
+        let jitter = (i as f64) * 0.37 + (i * i) as f64 * 1.0e-4;
+        data.push(jitter + periods_out * l);
+    }
+    let q_review = -5.675156211725825;
+    let r_review = 5.4225756419539195e-3;
+    data.push(q_review);
+    data.push(q_review + l);
+    data.push(q_review - 3.0 * l);
+    data.push(q_review + 20.0 * l);
+    data.push(q_review + r_review);
+    data.push(q_review + 20.0 * l + r_review);
+    data.push(q_review - r_review * 0.5 + 7.0 * l);
+    let n = data.len();
+    let idx = build_index(&data, n, 1, &periods);
+    let queries = [
+        q_review,
+        0.0,
+        l,
+        -l,
+        data[1],
+        data[50.min(n - 1)],
+        data[82.min(n - 1)],
+        data[0],
+        data[n - 1],
+    ];
+    for &q in &queries {
+        let qv = [q];
+        let mut radii = vec![
+            0.0,
+            r_review,
+            next_down(r_review),
+            next_up(r_review),
+            0.5 * l,
+        ];
+        for &p in &data {
+            let dist = metric.distance(&[p], &qv).unwrap();
+            radii.push(dist);
+            if dist > 0.0 {
+                radii.push(next_down(dist));
+            }
+            radii.push(next_up(dist));
+        }
+        for &r in &radii {
+            if !r.is_finite() || r < 0.0 {
+                continue;
+            }
+            let got = idx.within(&qv, r).unwrap();
+            let want = brute_within(&metric, &data, n, 1, &qv, r);
+            assert_hit_pairs(&got, &want, &format!("within q={q} r={r}"));
+        }
+        let got = idx.knn(&qv, n).unwrap();
+        let want = brute_knn(&metric, &data, n, 1, &qv, n);
+        assert_hit_pairs(&got, &want, &format!("knn q={q}"));
+    }
+    for &r in &[0.0, r_review, next_down(r_review), next_up(r_review)] {
+        let got: Vec<_> = idx
+            .pairs_within(r)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.i, p.j, p.dist2))
+            .collect();
+        let want = brute_pairs_within(&metric, &data, n, 1, r);
+        assert_eq!(got, want, "pairs r={r}");
+    }
+
+    // Mixed open and periodic axes, still spanning many periods.
+    let d = 3usize;
+    let periods3 = vec![Some(l), None, Some(1.7)];
+    let metric3 = PeriodicSpace::new(periods3.clone()).unwrap();
+    let n3 = 36usize;
+    let mut data3 = vec![0.0; n3 * d];
+    for i in 0..n3 {
+        data3[i * d] = -8.0 * l + (i as f64) * (16.0 * l) / (n3 as f64);
+        data3[i * d + 1] = (i as f64) * 0.2 - 3.0;
+        data3[i * d + 2] = (i as f64) * 0.15 + (i / 3) as f64 * 1.7;
+    }
+    let idx3 = build_index(&data3, n3, d, &periods3);
+    for i in [0usize, 1, 17, n3 - 1] {
+        let q = &data3[i * d..(i + 1) * d];
+        let mut radii3 = vec![0.0, r_review, 1e-15];
+        for j in 0..n3 {
+            let p = &data3[j * d..(j + 1) * d];
+            let dist = metric3.distance(q, p).unwrap();
+            radii3.push(dist);
+            if dist > 0.0 {
+                radii3.push(next_down(dist));
+            }
+            radii3.push(next_up(dist));
+        }
+        for &r in &radii3 {
+            let got = idx3.within(q, r).unwrap();
+            let want = brute_within(&metric3, &data3, n3, d, q, r);
+            assert_hit_pairs(&got, &want, &format!("3d within i={i} r={r}"));
+        }
+        let got = idx3.knn(q, n3).unwrap();
+        let want = brute_knn(&metric3, &data3, n3, d, q, n3);
+        assert_hit_pairs(&got, &want, &format!("3d knn i={i}"));
+    }
+}
+
+fn next_down(x: f64) -> f64 {
+    if x.is_nan() || x == f64::NEG_INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return -f64::from_bits(1);
+    }
+    if x > 0.0 {
+        f64::from_bits(x.to_bits() - 1)
+    } else {
+        f64::from_bits(x.to_bits() + 1)
+    }
+}
+
+#[test]
+fn tiny_radii_on_periodic_duplicates_match_bruteforce() {
+    let l = 2.0 * std::f64::consts::PI;
+    let x = 1.0 / 3.0;
+    let mut data = Vec::new();
+    for k in -6..=16 {
+        data.push(x + (k as f64) * l);
+    }
+    data.push(x + 20.0 * l);
+    data.push(x - 20.0 * l);
+    data.push(x + 40.0 * l);
+    data.push(x + 1.0e-18);
+    data.push(x + l + 5.0e-324);
+    let periods = vec![Some(l), Some(4.0)];
+    // Second axis is a periodic duplicate too: (x, 0.5) and (x+kL, 0.5+m*4).
+    let d = 2usize;
+    let n1 = data.len();
+    let mut pts = Vec::with_capacity(n1 * 2 * d);
+    for (i, &a) in data.iter().enumerate() {
+        pts.push(a);
+        pts.push(0.5);
+        pts.push(a);
+        pts.push(0.5 + (i as f64) * 4.0);
+    }
+    let n = pts.len() / d;
+    let metric = PeriodicSpace::new(periods.clone()).unwrap();
+    let idx = build_index(&pts, n, d, &periods);
+    let radii = [
+        0.0,
+        f64::from_bits(1),
+        f64::from_bits(2),
+        1.0e-320,
+        1.0e-300,
+        1.0e-200,
+        1.0e-154,
+        1.0e-40,
+        1.0e-20,
+        1.0e-16,
+        1.0e-15,
+        1.0e-14,
+        1.0e-12,
+        1.0e-9,
+    ];
+    for &r in &radii {
+        for i in 0..n {
+            let q = &pts[i * d..(i + 1) * d];
+            let got = idx.within(q, r).unwrap();
+            let want = brute_within(&metric, &pts, n, d, q, r);
+            assert_hit_pairs(&got, &want, &format!("within i={i} r={r}"));
+            for &k in &[1usize, 3, n] {
+                let got = idx.knn(q, k).unwrap();
+                let want = brute_knn(&metric, &pts, n, d, q, k);
+                assert_hit_pairs(&got, &want, &format!("knn i={i} k={k} r={r}"));
+            }
+        }
+        let got: Vec<_> = idx
+            .pairs_within(r)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.i, p.j, p.dist2))
+            .collect();
+        let want = brute_pairs_within(&metric, &pts, n, d, r);
+        assert_eq!(got, want, "pairs r={r}");
+    }
+}
+
 #[cfg(feature = "parallel")]
 #[test]
 fn parallel_and_serial_paths_match_exactly() {
@@ -586,4 +782,118 @@ fn parallel_and_serial_paths_match_exactly() {
     let d1 = pool1.install(|| idx.dbscan(1.8, 5).unwrap());
     let d4 = pool4.install(|| idx.dbscan(1.8, 5).unwrap());
     assert_eq!(d1.labels, d4.labels);
+}
+
+#[test]
+fn periodic_reduction_matches_bruteforce_across_magnitudes() {
+    let l = 2.0 * std::f64::consts::PI;
+    let q = -5.675156211725825;
+    let periods = vec![Some(l)];
+    let metric = PeriodicSpace::new(periods.clone()).unwrap();
+    let mut data = vec![q, 0.0, l, -l];
+    for &k in &[
+        1.0,
+        -1.0,
+        20.0,
+        -20.0,
+        1.0e6,
+        -1.0e6,
+        2.0f64.powi(40),
+        -2.0f64.powi(50),
+        1.0e16,
+        -1.0e16,
+    ] {
+        let shifted = q + k * l;
+        let scaled = k * l;
+        assert!(shifted.is_finite() && scaled.is_finite());
+        data.push(shifted);
+        data.push(scaled);
+    }
+    for x in [1.0e300, -1.0e300, f64::MAX / 4.0, -f64::MAX / 4.0] {
+        assert!(x.is_finite());
+        data.push(x);
+    }
+    let n = data.len();
+    let idx = build_index(&data, n, 1, &periods);
+    let radii = [
+        0.0,
+        f64::from_bits(1),
+        1.0e-15,
+        5.4225756419539195e-3,
+        0.1,
+        1.0,
+        0.5 * l,
+    ];
+    for i in 0..n {
+        let qv = [data[i]];
+        for &r in &radii {
+            let got = idx.within(&qv, r).unwrap();
+            let want = brute_within(&metric, &data, n, 1, &qv, r);
+            assert_hit_pairs(&got, &want, &format!("within i={i} r={r}"));
+        }
+        let got = idx.knn(&qv, n).unwrap();
+        let want = brute_knn(&metric, &data, n, 1, &qv, n);
+        assert_hit_pairs(&got, &want, &format!("knn i={i}"));
+    }
+    for &r in &radii {
+        let got: Vec<_> = idx
+            .pairs_within(r)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.i, p.j, p.dist2))
+            .collect();
+        let want = brute_pairs_within(&metric, &data, n, 1, r);
+        assert_eq!(got, want, "pairs r={r}");
+        if r > 0.0 {
+            let got_db = idx.dbscan(r, 2).unwrap();
+            let want_db = brute_dbscan(&metric, &data, n, 1, r, 2);
+            assert_eq!(got_db.labels, want_db, "dbscan r={r}");
+        }
+    }
+}
+
+/// 20_000 identical points used to recurse one level per point and overflow
+/// a 2 MiB stack. The build and the queries run on a 256 KiB stack.
+#[test]
+fn large_duplicate_set_builds_on_a_small_stack() {
+    const N: usize = 20_000;
+    let built = std::thread::Builder::new()
+        .name("nd-small-stack".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let data = vec![0.125f64; N];
+            let periods = vec![Some(1.0)];
+            let idx = build_index(&data, N, 1, &periods);
+            let metric = PeriodicSpace::new(periods).unwrap();
+            let q = [0.125];
+            let got = idx.knn(&q, 8).unwrap();
+            let want = brute_knn(&metric, &data, N, 1, &q, 8);
+            assert_hit_pairs(&got, &want, "identical knn");
+            let got_w = idx.within(&q, 0.0).unwrap();
+            let want_w = brute_within(&metric, &data, N, 1, &q, 0.0);
+            assert_hit_pairs(&got_w, &want_w, "identical within 0");
+            assert_eq!(want_w.len(), N);
+
+            let l = 2.0 * std::f64::consts::PI;
+            let base = -5.675156211725825;
+            let mut images = Vec::with_capacity(N);
+            for i in 0..N {
+                let k = (i as i32) - 10_000;
+                images.push(base + f64::from(k) * l);
+            }
+            let periods = vec![Some(l)];
+            let idx = build_index(&images, N, 1, &periods);
+            let metric = PeriodicSpace::new(periods).unwrap();
+            let q = [base];
+            let got = idx.knn(&q, 5).unwrap();
+            let want = brute_knn(&metric, &images, N, 1, &q, 5);
+            assert_hit_pairs(&got, &want, "image knn");
+            for &r in &[0.0, f64::from_bits(1), 1.0e-15, 5.4225756419539195e-3] {
+                let got_w = idx.within(&q, r).unwrap();
+                let want_w = brute_within(&metric, &images, N, 1, &q, r);
+                assert_hit_pairs(&got_w, &want_w, &format!("image within r={r}"));
+            }
+        })
+        .expect("spawn small stack");
+    built.join().expect("small-stack build panicked");
 }

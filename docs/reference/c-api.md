@@ -113,10 +113,14 @@ intermediates (for example a finite subtraction or squared accumulation becomes
 `inf`/`NaN`), the call fails with overflow instead of returning a non-finite
 distance.
 
-Exactness guarantee: returned ND results are bitwise-equal to brute force under
-the same `dist2` function. VP-tree pruning uses a conservative widening margin
-derived from `gamma_n = n*u/(1-n*u)` forward-error bounds (distance sum, sqrt,
-and branch-test additions), so pruning never drops a true in-radius point.
+Exactness guarantee: for finite inputs that do not overflow, returned ND
+results match brute force under the same `dist2`. Each periodic coordinate is
+reduced into `[0, L)` once. On that interval the circular distance errs by at
+most `4 * ulp(L)` per axis. Pruning widens every triangle test by a Higham
+relative factor and by `8 * ||η||_2` (`η_i = 4 * ulp(L_i)` on periodic axes),
+which covers that defect, so a true `dist2 <= r^2` neighbour is not dropped.
+When `x/L` is not finite the representative is `0`, and brute force uses the
+same rule.
 
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,

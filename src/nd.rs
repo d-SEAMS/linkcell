@@ -155,11 +155,19 @@ struct Node {
 }
 
 /// Exact VP-tree index.
+///
+/// Stored points and each query are reduced with [`Metric::write_canonical`]
+/// once. Pruning widens the triangle test by a relative Higham factor and by
+/// [`Metric::vp_absolute_slack`].
 pub struct VpTreeIndex<S, M> {
     space: S,
     metric: M,
     nodes: Vec<Node>,
     root: Option<usize>,
+    /// Row-major representatives. Periodic axes lie in `[0, L)`.
+    canonical: Vec<f64>,
+    /// Absolute triangle slack for this metric.
+    periodic_slack: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -197,25 +205,46 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
     }
 
     fn pruning_margin(&self, a: f64, b: f64, c: f64) -> f64 {
-        // Conservative outward guard for VP triangle tests:
-        //
-        // - Each axis contributes several rounded steps (delta, wrap/reduce,
-        //   square, and accumulation), so we bound distance evaluation by
-        //   gamma_{6d+16}.
-        // - sqrt contributes one extra rounding stage.
-        // - each branch test adds/subtracts up to two values.
-        //
-        // We bound those by one relative factor and convert to an absolute
-        // widening term on |a|+|b|+|c|. No absolute floor is used so tiny-scale
-        // data still prunes.
+        // Relative guard for the norm, the square root, and the branch test.
+        // The absolute term is the periodic reduction's proved slack. It is
+        // zero for an open metric, so tiny open data still prunes. It scales
+        // with ulp(L) on a periodic axis, which is the error left after both
+        // endpoints have been reduced into [0, L).
         let d = self.space.dims();
         let n_ops = d.saturating_mul(6).saturating_add(16);
         let g_dist2 = Self::gamma(n_ops);
         let g_sqrt = Self::gamma(2);
         let g_add = Self::gamma(3);
+        if !g_dist2.is_finite() || !g_sqrt.is_finite() || !g_add.is_finite() {
+            return f64::INFINITY;
+        }
         let rel = (1.0 + g_dist2) * (1.0 + g_sqrt) * (1.0 + g_add) - 1.0;
         let scale = a.abs() + b.abs() + c.abs();
-        rel * scale + 16.0 * (Self::ulp(a) + Self::ulp(b) + Self::ulp(c))
+        let relative = rel * scale + 16.0 * (Self::ulp(a) + Self::ulp(b) + Self::ulp(c));
+        let margin = relative + self.periodic_slack;
+        if margin.is_finite() && margin >= 0.0 {
+            margin
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn visit_left(d: f64, mu: f64, tau: f64, margin: f64) -> bool {
+        // Left holds dist(vp, p) <= mu. A point there satisfies
+        // dist(q, p) >= d - mu - defect, so it can be inside tau only when
+        // d <= mu + tau + defect.
+        d <= mu + tau + margin
+    }
+
+    fn visit_right(d: f64, mu: f64, tau: f64, margin: f64) -> bool {
+        // Right holds dist(vp, p) >= mu, so dist(q, p) >= mu - d - defect.
+        d + tau + margin >= mu
+    }
+
+    fn point_canon(&self, index: usize) -> &[f64] {
+        let d = self.space.dims();
+        let off = index * d;
+        &self.canonical[off..off + d]
     }
 
     fn ulp(x: f64) -> f64 {
@@ -235,78 +264,146 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         if space.dims() == 0 || space.dims() != metric.dims() {
             return Err(Error::BadDimensions);
         }
-        for i in 0..space.len() {
+        let n = space.len();
+        let d = space.dims();
+        for i in 0..n {
             let p = space.point(i);
-            if p.len() != space.dims() {
+            if p.len() != d {
                 return Err(Error::BadDimensions);
             }
-            if !p.iter().all(|v| v.is_finite()) {
+            if !p.iter().copied().all(f64::is_finite) {
                 return Err(Error::NonFinite);
             }
+        }
+        let slack = metric.vp_absolute_slack();
+        let periodic_slack = if slack.is_finite() && slack >= 0.0 {
+            slack
+        } else {
+            f64::INFINITY
+        };
+        let Some(canonical_len) = n.checked_mul(d) else {
+            return Err(Error::Overflow);
+        };
+        let mut canonical = vec![0.0; canonical_len];
+        for i in 0..n {
+            let dst = &mut canonical[i * d..(i + 1) * d];
+            metric.write_canonical(space.point(i), dst)?;
         }
         let mut me = Self {
             space,
             metric,
             nodes: Vec::new(),
             root: None,
+            canonical,
+            periodic_slack,
         };
-        let mut ids: Vec<usize> = (0..me.space.len()).collect();
-        me.root = me.build_node(&mut ids)?;
+        me.root = me.build_iter()?;
         Ok(me)
     }
 
-    fn build_node(&mut self, ids: &mut [usize]) -> Result<Option<usize>, Error> {
-        if ids.is_empty() {
+    /// One node per point. The explicit stack is on the heap, so a duplicate
+    /// cloud cannot overflow the calling thread. Ties split by count: the
+    /// left half has `dist <= threshold` and the right half has
+    /// `dist >= threshold`, and both halves are non-empty whenever more than
+    /// one point remains beside the vantage point.
+    fn build_iter(&mut self) -> Result<Option<usize>, Error> {
+        let n = self.space.len();
+        if n == 0 {
             return Ok(None);
         }
-        if ids.len() == 1 {
-            let id = self.nodes.len();
+        let mut ids: Vec<usize> = (0..n).collect();
+        struct Job {
+            start: usize,
+            end: usize,
+            parent: Option<usize>,
+            is_right: bool,
+        }
+        let mut stack = Vec::new();
+        stack.push(Job {
+            start: 0,
+            end: n,
+            parent: None,
+            is_right: false,
+        });
+        let mut root = None;
+        self.nodes.reserve(n);
+        while let Some(job) = stack.pop() {
+            let len = job.end - job.start;
+            if len == 0 {
+                continue;
+            }
+            let node_id = self.nodes.len();
+            if let Some(parent) = job.parent {
+                if job.is_right {
+                    self.nodes[parent].right = Some(node_id);
+                } else {
+                    self.nodes[parent].left = Some(node_id);
+                }
+            } else {
+                root = Some(node_id);
+            }
+            if len == 1 {
+                self.nodes.push(Node {
+                    vp: ids[job.start],
+                    threshold2: 0.0,
+                    left: None,
+                    right: None,
+                });
+                continue;
+            }
+            let vp = ids[job.end - 1];
+            let anchor = self.point_canon(vp).to_vec();
+            let count = len - 1;
+            let mut dist = Vec::with_capacity(count);
+            for &idx in &ids[job.start..job.end - 1] {
+                let d2 = self.metric.dist2(&anchor, self.point_canon(idx))?;
+                dist.push((idx, d2));
+            }
+            dist.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            if count == 1 {
+                let threshold2 = dist[0].1;
+                ids[job.start] = dist[0].0;
+                self.nodes.push(Node {
+                    vp,
+                    threshold2,
+                    left: None,
+                    right: None,
+                });
+                stack.push(Job {
+                    start: job.start,
+                    end: job.start + 1,
+                    parent: Some(node_id),
+                    is_right: true,
+                });
+                continue;
+            }
+            let mid = count / 2;
+            let threshold2 = dist[mid].1;
+            debug_assert!(dist[..mid].iter().all(|p| p.1 <= threshold2));
+            debug_assert!(dist[mid..].iter().all(|p| p.1 >= threshold2));
+            for (i, (idx, _)) in dist.iter().enumerate() {
+                ids[job.start + i] = *idx;
+            }
             self.nodes.push(Node {
-                vp: ids[0],
-                threshold2: 0.0,
+                vp,
+                threshold2,
                 left: None,
                 right: None,
             });
-            return Ok(Some(id));
+            stack.push(Job {
+                start: job.start + mid,
+                end: job.end - 1,
+                parent: Some(node_id),
+                is_right: true,
+            });
+            stack.push(Job {
+                start: job.start,
+                end: job.start + mid,
+                parent: Some(node_id),
+                is_right: false,
+            });
         }
-        let vp = ids[ids.len() - 1];
-        let anchor = self.space.point(vp);
-        let mut dist: Vec<(usize, f64)> = ids[..ids.len() - 1]
-            .iter()
-            .map(|&idx| {
-                self.metric
-                    .dist2(anchor, self.space.point(idx))
-                    .map(|d| (idx, d))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        dist.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        let mid = dist.len() / 2;
-        let threshold2 = dist[mid].1;
-        let mut left_ids = Vec::new();
-        let mut right_ids = Vec::new();
-        left_ids.reserve(dist.len());
-        right_ids.reserve(dist.len());
-        for (idx, d2) in dist {
-            // Keep pruning invariants sound across exact ties:
-            // left has dist < threshold, right has dist >= threshold.
-            if d2 < threshold2 {
-                left_ids.push(idx);
-            } else {
-                right_ids.push(idx);
-            }
-        }
-        let node_id = self.nodes.len();
-        self.nodes.push(Node {
-            vp,
-            threshold2,
-            left: None,
-            right: None,
-        });
-        let left = self.build_node(&mut left_ids)?;
-        let right = self.build_node(&mut right_ids)?;
-        self.nodes[node_id].left = left;
-        self.nodes[node_id].right = right;
-        Ok(Some(node_id))
+        Ok(root)
     }
 
     fn check_query(&self, query: &[f64]) -> Result<(), Error> {
@@ -334,88 +431,188 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         }
     }
 
-    fn knn_rec(
+    fn tau_of(heap: &BinaryHeap<HeapEntry>, k: usize) -> f64 {
+        if heap.len() < k {
+            f64::INFINITY
+        } else {
+            heap.peek().map(|h| h.dist2.sqrt()).unwrap_or(f64::INFINITY)
+        }
+    }
+
+    fn knn_walk(
         &self,
-        node_id: Option<usize>,
         query: &[f64],
         k: usize,
         skip: Option<usize>,
         heap: &mut BinaryHeap<HeapEntry>,
     ) -> Result<(), Error> {
-        let Some(nid) = node_id else {
+        let Some(root) = self.root else {
             return Ok(());
         };
-        let node = &self.nodes[nid];
-        let idx = node.vp;
-        let d2 = self.metric.dist2(query, self.space.point(idx))?;
-        if skip != Some(idx) {
-            Self::maybe_push(
-                heap,
-                k,
-                HeapEntry {
-                    dist2: d2,
-                    index: idx,
-                },
-            );
+        struct Frame {
+            nid: usize,
+            phase: u8,
+            d: f64,
+            mu: f64,
+            far: Option<usize>,
+            far_is_right: bool,
         }
-        if node.left.is_none() && node.right.is_none() {
-            return Ok(());
-        }
-        let tau = if heap.len() < k {
-            f64::INFINITY
-        } else {
-            heap.peek().map(|h| h.dist2.sqrt()).unwrap_or(f64::INFINITY)
-        };
-        let d = d2.sqrt();
-        let mu = node.threshold2.sqrt();
-        let margin = self.pruning_margin(d, tau, mu);
-        if d < mu {
-            self.knn_rec(node.left, query, k, skip, heap)?;
-            if d + tau + margin >= mu {
-                self.knn_rec(node.right, query, k, skip, heap)?;
+        let mut stack = Vec::new();
+        stack.push(Frame {
+            nid: root,
+            phase: 0,
+            d: 0.0,
+            mu: 0.0,
+            far: None,
+            far_is_right: false,
+        });
+        while let Some(frame) = stack.pop() {
+            if frame.phase == 1 {
+                let tau = Self::tau_of(heap, k);
+                let margin = self.pruning_margin(frame.d, tau, frame.mu);
+                let go = if frame.far_is_right {
+                    Self::visit_right(frame.d, frame.mu, tau, margin)
+                } else {
+                    Self::visit_left(frame.d, frame.mu, tau, margin)
+                };
+                if go {
+                    if let Some(fid) = frame.far {
+                        stack.push(Frame {
+                            nid: fid,
+                            phase: 0,
+                            d: 0.0,
+                            mu: 0.0,
+                            far: None,
+                            far_is_right: false,
+                        });
+                    }
+                }
+                continue;
             }
-        } else {
-            self.knn_rec(node.right, query, k, skip, heap)?;
-            if d <= mu + tau + margin {
-                self.knn_rec(node.left, query, k, skip, heap)?;
+            let (vp, left, right, threshold2) = {
+                let node = &self.nodes[frame.nid];
+                (node.vp, node.left, node.right, node.threshold2)
+            };
+            let d2 = self.metric.dist2(query, self.point_canon(vp))?;
+            if skip != Some(vp) {
+                Self::maybe_push(
+                    heap,
+                    k,
+                    HeapEntry {
+                        dist2: d2,
+                        index: vp,
+                    },
+                );
+            }
+            if left.is_none() && right.is_none() {
+                continue;
+            }
+            let d = d2.sqrt();
+            let mu = threshold2.sqrt();
+            let tau = Self::tau_of(heap, k);
+            let margin = self.pruning_margin(d, tau, mu);
+            let prefer_left = d < mu;
+            let (near, far, far_is_right) = if prefer_left {
+                (left, right, true)
+            } else {
+                (right, left, false)
+            };
+            let visit_near = if prefer_left {
+                Self::visit_left(d, mu, tau, margin)
+            } else {
+                Self::visit_right(d, mu, tau, margin)
+            };
+            let visit_far = if far_is_right {
+                Self::visit_right(d, mu, tau, margin)
+            } else {
+                Self::visit_left(d, mu, tau, margin)
+            };
+            if let Some(near_id) = near {
+                if visit_near {
+                    stack.push(Frame {
+                        nid: frame.nid,
+                        phase: 1,
+                        d,
+                        mu,
+                        far,
+                        far_is_right,
+                    });
+                    stack.push(Frame {
+                        nid: near_id,
+                        phase: 0,
+                        d: 0.0,
+                        mu: 0.0,
+                        far: None,
+                        far_is_right: false,
+                    });
+                    continue;
+                }
+            }
+            if visit_far {
+                if let Some(far_id) = far {
+                    stack.push(Frame {
+                        nid: far_id,
+                        phase: 0,
+                        d: 0.0,
+                        mu: 0.0,
+                        far: None,
+                        far_is_right: false,
+                    });
+                }
             }
         }
         Ok(())
     }
 
-    fn within_rec(
+    fn within_walk(
         &self,
-        node_id: Option<usize>,
         query: &[f64],
         radius: f64,
         skip: Option<usize>,
         out: &mut Vec<NeighborHit>,
     ) -> Result<(), Error> {
-        let Some(nid) = node_id else {
+        let Some(root) = self.root else {
             return Ok(());
         };
-        let node = &self.nodes[nid];
-        let idx = node.vp;
-        let d2 = self.metric.dist2(query, self.space.point(idx))?;
-        if d2 <= radius * radius && skip != Some(idx) {
-            out.push(NeighborHit {
-                index: idx,
-                dist2: d2,
-            });
-        }
-        if node.left.is_none() && node.right.is_none() {
-            return Ok(());
-        }
-        let d = d2.sqrt();
-        let mu = node.threshold2.sqrt();
-        let margin = self.pruning_margin(d, radius, mu);
-        if d <= mu + radius + margin {
-            self.within_rec(node.left, query, radius, skip, out)?;
-        }
-        if d + radius + margin >= mu {
-            self.within_rec(node.right, query, radius, skip, out)?;
+        let mut stack = Vec::new();
+        stack.push(root);
+        let r2 = radius * radius;
+        while let Some(nid) = stack.pop() {
+            let (vp, left, right, threshold2) = {
+                let node = &self.nodes[nid];
+                (node.vp, node.left, node.right, node.threshold2)
+            };
+            let d2 = self.metric.dist2(query, self.point_canon(vp))?;
+            if d2 <= r2 && skip != Some(vp) {
+                out.push(NeighborHit {
+                    index: vp,
+                    dist2: d2,
+                });
+            }
+            if left.is_none() && right.is_none() {
+                continue;
+            }
+            let d = d2.sqrt();
+            let mu = threshold2.sqrt();
+            let margin = self.pruning_margin(d, radius, mu);
+            if let Some(id) = left {
+                if Self::visit_left(d, mu, radius, margin) {
+                    stack.push(id);
+                }
+            }
+            if let Some(id) = right {
+                if Self::visit_right(d, mu, radius, margin) {
+                    stack.push(id);
+                }
+            }
         }
         Ok(())
+    }
+
+    fn prepare_query(&self, query: &[f64]) -> Result<Vec<f64>, Error> {
+        let mut prepared = vec![0.0; self.space.dims()];
+        self.metric.write_canonical(query, &mut prepared)?;
+        Ok(prepared)
     }
 
     fn knn_skip(
@@ -424,8 +621,9 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         k: usize,
         skip: Option<usize>,
     ) -> Result<Vec<NeighborHit>, Error> {
+        let prepared = self.prepare_query(query)?;
         let mut heap = BinaryHeap::new();
-        self.knn_rec(self.root, query, k, skip, &mut heap)?;
+        self.knn_walk(&prepared, k, skip, &mut heap)?;
         let mut out: Vec<_> = heap
             .into_iter()
             .map(|h| NeighborHit {
@@ -450,29 +648,9 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         if !radius.is_finite() || radius < 0.0 {
             return Err(Error::BadNdRadius);
         }
-        if radius == 0.0 {
-            let mut out = Vec::new();
-            for i in 0..self.space.len() {
-                if skip == Some(i) {
-                    continue;
-                }
-                let d2 = self.metric.dist2(query, self.space.point(i))?;
-                if d2 == 0.0 {
-                    out.push(NeighborHit {
-                        index: i,
-                        dist2: d2,
-                    });
-                }
-            }
-            out.sort_by(|a, b| {
-                a.dist2
-                    .total_cmp(&b.dist2)
-                    .then_with(|| a.index.cmp(&b.index))
-            });
-            return Ok(out);
-        }
+        let prepared = self.prepare_query(query)?;
         let mut out = Vec::new();
-        self.within_rec(self.root, query, radius, skip, &mut out)?;
+        self.within_walk(&prepared, radius, skip, &mut out)?;
         out.sort_by(|a, b| {
             a.dist2
                 .total_cmp(&b.dist2)
@@ -653,19 +831,6 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
     fn pairs_within(&self, radius: f64) -> Result<Vec<PairHit>, Error> {
         if !radius.is_finite() || radius < 0.0 {
             return Err(Error::BadNdRadius);
-        }
-        if radius == 0.0 {
-            let mut out = Vec::new();
-            for i in 0..self.space.len() {
-                let pi = self.space.point(i);
-                for j in (i + 1)..self.space.len() {
-                    let d2 = self.metric.dist2(pi, self.space.point(j))?;
-                    if d2 == 0.0 {
-                        out.push(PairHit { i, j, dist2: d2 });
-                    }
-                }
-            }
-            return Ok(out);
         }
         #[cfg(feature = "parallel")]
         {

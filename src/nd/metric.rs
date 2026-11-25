@@ -26,6 +26,30 @@ pub trait Metric<T = f64> {
     fn dist2_batch(&self, a: &[T], b: &[T], out: &mut [T]) -> Result<(), Error>;
     /// Batched distances, row-major points.
     fn distance_batch(&self, a: &[T], b: &[T], out: &mut [T]) -> Result<(), Error>;
+
+    /// Representative of `src` stored by [`crate::VpTreeIndex`].
+    ///
+    /// The default copies `src`. A periodic metric folds each periodic axis
+    /// into `[0, L)` so every later distance is taken on that representative.
+    fn write_canonical(&self, src: &[f64], dst: &mut [f64]) -> Result<(), Error> {
+        if src.len() != self.dims() || dst.len() != src.len() {
+            return Err(Error::BadDimensions);
+        }
+        if !src.iter().copied().all(f64::is_finite) {
+            return Err(Error::NonFinite);
+        }
+        dst.copy_from_slice(src);
+        Ok(())
+    }
+
+    /// Absolute slack added to every vantage-point triangle test.
+    ///
+    /// Zero when a relative Higham factor covers the error of
+    /// [`Metric::distance`]. Periodic metrics return the bound proved for
+    /// the reduction into `[0, L)`.
+    fn vp_absolute_slack(&self) -> f64 {
+        0.0
+    }
 }
 
 /// Open Euclidean metric in `dims` dimensions.
@@ -107,13 +131,131 @@ impl PeriodicSpace {
         y
     }
 
+    /// Spacing to the next binary64 value of a positive finite `x`.
+    fn ulp_at(x: f64) -> f64 {
+        if !x.is_finite() || x == 0.0 {
+            return f64::from_bits(1);
+        }
+        let next = if x > 0.0 {
+            f64::from_bits(x.to_bits().saturating_add(1))
+        } else {
+            f64::from_bits(x.to_bits().saturating_sub(1))
+        };
+        let gap = (next - x).abs();
+        if gap.is_finite() && gap > 0.0 {
+            gap
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Reduce one finite coordinate into `[0, L)`.
+    ///
+    /// Values already in `[0, L)` are returned unchanged, so a second call is
+    /// the identity. Otherwise `y = x - trunc(x/L)*L` is one fused rounding,
+    /// then `y` is shifted by `L` until it lies in range. `trunc(x/L)` is off
+    /// by at most one when `|x| < 2^52 * L`; the loop absorbs a few more.
+    /// When `x/L` is not finite, `x` has no unique residue and the
+    /// representative is `0`.
+    fn canon(x: f64, l: f64) -> Result<f64, Error> {
+        if x >= 0.0 && x < l {
+            return Ok(x);
+        }
+        let quot = x / l;
+        if !quot.is_finite() {
+            return Ok(0.0);
+        }
+        let q = quot.trunc();
+        if !q.is_finite() {
+            return Ok(0.0);
+        }
+        let mut y = (-q).mul_add(l, x);
+        if !y.is_finite() {
+            return Err(Error::Overflow);
+        }
+        for _ in 0..16 {
+            if y >= 0.0 && y < l {
+                return Ok(y);
+            }
+            if y >= l {
+                let next = y - l;
+                if next == y || !next.is_finite() {
+                    return Ok(0.0);
+                }
+                y = next;
+            } else {
+                let next = y + l;
+                if next == y || !next.is_finite() {
+                    return Ok(0.0);
+                }
+                y = next;
+            }
+        }
+        if y >= 0.0 && y < l {
+            Ok(y)
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Circular distance of two representatives in `[0, L)`.
+    ///
+    /// For `0 <= a < L` and `0 <= b < L`, `|fl(a-b)|` is strictly below `L`
+    /// (the largest difference of such values is `nextDown(L)`, and it does
+    /// not round up to `L`). The real circular distance is 1-Lipschitz in that
+    /// difference, the subtraction errs by at most `u*L`, and `fl(L - w)`
+    /// adds another `u*L`. The computed result therefore lies within
+    /// `2*u*L <= 4*ulp(L)` of the real circular distance.
+    fn circular(a: f64, b: f64, l: f64) -> Result<f64, Error> {
+        let mut w = (a - b).abs();
+        if !w.is_finite() {
+            return Err(Error::Overflow);
+        }
+        if w >= l {
+            w = 0.0;
+        }
+        let alt = l - w;
+        if !alt.is_finite() {
+            return Err(Error::Overflow);
+        }
+        Ok(if alt < w { alt } else { w })
+    }
+
+    /// `4 * ulp(L)` per periodic axis, as a Euclidean norm, times 8.
+    ///
+    /// Three distances enter each triangle test, so the defect is at most
+    /// `3 * ||η||`. Eight leaves room for rounding the slack itself.
+    fn proven_slack(periods: &[Option<f64>]) -> f64 {
+        let mut sum = 0.0;
+        for period in periods {
+            let Some(l) = *period else {
+                continue;
+            };
+            let eta = 4.0 * Self::ulp_at(l);
+            let term = eta * eta;
+            if !term.is_finite() {
+                return f64::INFINITY;
+            }
+            sum += term;
+            if !sum.is_finite() {
+                return f64::INFINITY;
+            }
+        }
+        let slack = 8.0 * sum.sqrt();
+        if slack.is_finite() && slack >= 0.0 {
+            slack
+        } else {
+            f64::INFINITY
+        }
+    }
+
     /// Wrap one coordinate to `[0, L)`.
     pub fn wrap_point_axis(&self, x: f64, axis: usize) -> Result<f64, Error> {
         if axis >= self.periods.len() || !x.is_finite() {
             return Err(Error::BadDimensions);
         }
         Ok(match self.periods[axis] {
-            Some(l) => Self::wrap01(x / l) * l,
+            Some(l) => Self::canon(x, l)?,
             None => x,
         })
     }
@@ -125,14 +267,20 @@ impl PeriodicSpace {
         }
         Ok(match self.periods[axis] {
             Some(l) => {
-                let mut y = delta - l * (delta / l).trunc();
-                if y < 0.0 {
-                    y += l;
+                let y = Self::canon(delta, l)?;
+                let half = 0.5 * l;
+                if !half.is_finite() {
+                    return Err(Error::Overflow);
                 }
-                if y >= 0.5 * l {
-                    y -= l;
+                if y >= half {
+                    let z = y - l;
+                    if !z.is_finite() {
+                        return Err(Error::Overflow);
+                    }
+                    z
+                } else {
+                    y
                 }
-                y
             }
             None => delta,
         })
@@ -310,23 +458,12 @@ impl Metric<f64> for PeriodicSpace {
         let mut s = 0.0;
         for i in 0..self.periods.len() {
             let d = if let Some(l) = self.periods[i] {
-                // Keep point distance exactly symmetric and self-zero.
-                let mut w = (a[i] - b[i]).abs();
-                if !w.is_finite() {
-                    return Err(Error::Overflow);
-                }
-                let q = (w / l).trunc();
-                if !q.is_finite() {
-                    return Err(Error::Overflow);
-                }
-                w -= l * q;
-                if w < 0.0 {
-                    w = 0.0;
-                }
-                if w >= l {
-                    w = 0.0;
-                }
-                w.min(l - w)
+                // Reduce each endpoint once. The fold of a raw difference
+                // spanning many periods errs by about u*|a-b| and is not a
+                // metric at that scale. On [0, L) the circular distance is.
+                let aw = Self::canon(a[i], l)?;
+                let bw = Self::canon(b[i], l)?;
+                Self::circular(aw, bw, l)?
             } else {
                 let w = (a[i] - b[i]).abs();
                 if !w.is_finite() {
@@ -411,6 +548,24 @@ impl Metric<f64> for PeriodicSpace {
             *v = v.sqrt();
         }
         Ok(())
+    }
+
+    fn write_canonical(&self, src: &[f64], dst: &mut [f64]) -> Result<(), Error> {
+        self.check_point_shape(src)?;
+        if dst.len() != src.len() {
+            return Err(Error::BadDimensions);
+        }
+        for i in 0..src.len() {
+            dst[i] = match self.periods[i] {
+                Some(l) => Self::canon(src[i], l)?,
+                None => src[i],
+            };
+        }
+        Ok(())
+    }
+
+    fn vp_absolute_slack(&self) -> f64 {
+        Self::proven_slack(&self.periods)
     }
 }
 
@@ -550,12 +705,44 @@ mod tests {
 
     #[test]
     fn finite_overflow_in_dist2_is_error() {
-        let periodic = PeriodicSpace::new(vec![Some(1.0e308)]).unwrap();
-        let a = [1.0e308];
-        let b = [-1.0e308];
-        assert_eq!(periodic.dist2(&a, &b), Err(Error::Overflow));
+        // Half a huge period is finite, and its square is not.
+        let periodic = PeriodicSpace::new(vec![Some(1.0e200)]).unwrap();
+        assert_eq!(periodic.dist2(&[0.0], &[6.0e199]), Err(Error::Overflow));
+
+        // The raw difference overflows binary64. Both coordinates are the
+        // same point on the circle, so the reduced distance is zero.
+        let images = PeriodicSpace::new(vec![Some(1.0e308)]).unwrap();
+        assert_eq!(images.dist2(&[1.0e308], &[-1.0e308]).unwrap(), 0.0);
 
         let euclid = Euclidean::new(1).unwrap();
-        assert_eq!(euclid.dist2(&a, &b), Err(Error::Overflow));
+        assert_eq!(euclid.dist2(&[1.0e308], &[-1.0e308]), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn canon_is_idempotent_and_inside_the_period() {
+        let l = 2.0 * std::f64::consts::PI;
+        let metric = PeriodicSpace::new(vec![Some(l)]).unwrap();
+        let samples = [
+            0.0,
+            -0.0,
+            l,
+            -l,
+            0.5 * l,
+            -1.0e-20,
+            -1.0e-300,
+            1.0e-300,
+            20.0 * l,
+            -20.0 * l,
+            1.0e20,
+            -1.0e20,
+            12_345.678_9,
+            -5.675156211725825,
+        ];
+        for x in samples {
+            let y = metric.wrap_point_axis(x, 0).unwrap();
+            assert!(y >= 0.0 && y < l, "{x} -> {y}");
+            assert_eq!(metric.wrap_point_axis(y, 0).unwrap(), y);
+            assert_eq!(metric.dist2(&[x], &[x]).unwrap(), 0.0);
+        }
     }
 }
