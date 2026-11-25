@@ -186,10 +186,25 @@ impl PartialOrd for HeapEntry {
 }
 
 impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
+    fn pruning_margin(a: f64, b: f64, c: f64) -> f64 {
+        // Outward rounding guard for sums/differences in branch tests.
+        let scale = a.abs().max(b.abs()).max(c.abs()).max(1.0);
+        8.0 * f64::EPSILON * scale
+    }
+
     /// Build an index over `space` with `metric`.
     pub fn new(space: S, metric: M) -> Result<Self, Error> {
         if space.dims() == 0 || space.dims() != metric.dims() {
             return Err(Error::BadDimensions);
+        }
+        for i in 0..space.len() {
+            let p = space.point(i);
+            if p.len() != space.dims() {
+                return Err(Error::BadDimensions);
+            }
+            if !p.iter().all(|v| v.is_finite()) {
+                return Err(Error::NonFinite);
+            }
         }
         let mut me = Self {
             space,
@@ -311,14 +326,15 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         };
         let d = d2.sqrt();
         let mu = node.threshold2.sqrt();
+        let margin = Self::pruning_margin(d, tau, mu);
         if d < mu {
             self.knn_rec(node.left, query, k, skip, heap)?;
-            if d + tau >= mu {
+            if d + tau + margin >= mu {
                 self.knn_rec(node.right, query, k, skip, heap)?;
             }
         } else {
             self.knn_rec(node.right, query, k, skip, heap)?;
-            if d <= mu + tau {
+            if d <= mu + tau + margin {
                 self.knn_rec(node.left, query, k, skip, heap)?;
             }
         }
@@ -350,10 +366,11 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         }
         let d = d2.sqrt();
         let mu = node.threshold2.sqrt();
-        if d - radius <= mu {
+        let margin = Self::pruning_margin(d, radius, mu);
+        if d <= mu + radius + margin {
             self.within_rec(node.left, query, radius, skip, out)?;
         }
-        if d + radius >= mu {
+        if d + radius + margin >= mu {
             self.within_rec(node.right, query, radius, skip, out)?;
         }
         Ok(())
@@ -485,6 +502,8 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
         let n = self.space.len();
         let mut labels = vec![-2; n];
         let mut core = vec![false; n];
+        let mut queued = vec![0u32; n];
+        let mut stamp = 1u32;
         let mut cluster = 0i32;
         const UNASSIGNED: i32 = -2;
         const NOISE: i32 = -1;
@@ -500,11 +519,15 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
             }
             labels[i] = cluster;
             core[i] = true;
-            let mut queued = vec![false; n];
+            stamp = stamp.wrapping_add(1);
+            if stamp == 0 {
+                queued.fill(0);
+                stamp = 1;
+            }
             let mut queue = VecDeque::new();
             for h in neigh {
-                if h.index != i && !queued[h.index] {
-                    queued[h.index] = true;
+                if h.index != i && queued[h.index] != stamp {
+                    queued[h.index] = stamp;
                     queue.push_back(h.index);
                 }
             }
@@ -521,8 +544,8 @@ impl<S: Space + Sync, M: Metric + Sync> VpTreeIndex<S, M> {
                 if p_neigh.len() >= min_pts {
                     core[p] = true;
                     for h in p_neigh {
-                        if !queued[h.index] {
-                            queued[h.index] = true;
+                        if queued[h.index] != stamp {
+                            queued[h.index] = stamp;
                             queue.push_back(h.index);
                         }
                     }
@@ -559,7 +582,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
 
     fn within_index(&self, index: usize, radius: f64) -> Result<Vec<NeighborHit>, Error> {
         if index >= self.space.len() {
-            return Err(Error::Overflow);
+            return Err(Error::IndexOutOfRange);
         }
         self.within_skip(self.space.point(index), radius, None)
     }
@@ -570,23 +593,39 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
         }
         #[cfg(feature = "parallel")]
         {
-            use rayon::prelude::*;
-            let nested: Vec<Vec<PairHit>> = (0..self.space.len())
-                .into_par_iter()
-                .map(|i| -> Result<Vec<PairHit>, Error> {
+            if crate::on_caller() {
+                let mut out = Vec::new();
+                for i in 0..self.space.len() {
                     let hits = self.within_skip(self.space.point(i), radius, Some(i))?;
-                    Ok(hits
-                        .into_iter()
-                        .filter(|h| i < h.index)
-                        .map(|h| PairHit {
-                            i,
-                            j: h.index,
-                            dist2: h.dist2,
-                        })
-                        .collect())
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            Ok(nested.into_iter().flatten().collect())
+                    out.extend(hits.into_iter().filter(|h| i < h.index).map(|h| PairHit {
+                        i,
+                        j: h.index,
+                        dist2: h.dist2,
+                    }));
+                }
+                out.sort_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
+                Ok(out)
+            } else {
+                use rayon::prelude::*;
+                let nested: Vec<Vec<PairHit>> = (0..self.space.len())
+                    .into_par_iter()
+                    .map(|i| -> Result<Vec<PairHit>, Error> {
+                        let hits = self.within_skip(self.space.point(i), radius, Some(i))?;
+                        Ok(hits
+                            .into_iter()
+                            .filter(|h| i < h.index)
+                            .map(|h| PairHit {
+                                i,
+                                j: h.index,
+                                dist2: h.dist2,
+                            })
+                            .collect())
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                let mut out: Vec<_> = nested.into_iter().flatten().collect();
+                out.sort_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
+                Ok(out)
+            }
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -599,6 +638,7 @@ impl<S: Space + Sync, M: Metric + Sync> NeighbourIndex for VpTreeIndex<S, M> {
                     dist2: h.dist2,
                 }));
             }
+            out.sort_by(|a, b| a.i.cmp(&b.i).then_with(|| a.j.cmp(&b.j)));
             Ok(out)
         }
     }

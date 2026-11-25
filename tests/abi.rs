@@ -27,6 +27,7 @@ struct LcNdIndex {
 }
 
 extern "C" {
+    fn lc_set_threads(n: c_int);
     fn lc_knearest(
         xyz: *const f64,
         n: usize,
@@ -127,6 +128,11 @@ extern "C" {
         out_core: *mut c_int,
         out_clusters: *mut usize,
     ) -> c_int;
+}
+
+#[cfg(target_os = "linux")]
+fn linux_thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task").unwrap().count()
 }
 
 fn ortho_c(lx: f64, ly: f64, lz: f64) -> LcCell {
@@ -1162,6 +1168,7 @@ fn lc_nd_rejects_bad_dimensions_nulls_and_bad_periods() {
         unsafe { lc_nd_build(data.as_ptr(), 1, 1, bad_nan.as_ptr(), &mut out) },
         0
     );
+    assert!(out.is_null());
 }
 
 #[test]
@@ -1331,4 +1338,57 @@ fn lc_nd_rejects_non_finite_coordinates_and_null_query_pointers() {
     assert_eq!(unsafe { lc_nd_len(std::ptr::null()) }, 0);
     assert_eq!(unsafe { lc_nd_dims(std::ptr::null()) }, 0);
     unsafe { lc_nd_free(idx) };
+}
+
+#[test]
+fn lc_nd_build_huge_dims_fails_and_leaves_null_out() {
+    let data = [0.0f64];
+    let mut out = 0x1usize as *mut LcNdIndex;
+    let rc = unsafe {
+        lc_nd_build(
+            data.as_ptr(),
+            0,
+            usize::MAX / 16,
+            std::ptr::null(),
+            &mut out,
+        )
+    };
+    assert_ne!(rc, 0);
+    assert!(out.is_null());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn lc_nd_respects_set_threads_one_without_growing_threads() {
+    let data = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let idx = build_nd_index(&data, 4, 2, None);
+    let q = [0.0, 0.0];
+    unsafe { lc_set_threads(1) };
+    let before = linux_thread_count();
+    for _ in 0..200 {
+        let mut nn = [-1; 4];
+        assert_eq!(
+            unsafe { lc_nd_knn(idx, q.as_ptr(), 4, nn.as_mut_ptr(), std::ptr::null_mut()) },
+            0
+        );
+        let mut count = 0usize;
+        assert_eq!(
+            unsafe {
+                lc_nd_within(
+                    idx,
+                    q.as_ptr(),
+                    2.0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            },
+            0
+        );
+    }
+    let after = linux_thread_count();
+    unsafe { lc_set_threads(0) };
+    unsafe { lc_nd_free(idx) };
+    assert!(after <= before);
 }

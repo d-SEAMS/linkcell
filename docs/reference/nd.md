@@ -34,9 +34,7 @@ Related work considered:
 - Friedman, Bentley, Finkel (ACM TOMS 1977): kd-tree nearest neighbour.
 - Omohundro (ICSI TR-89-063): ball trees and variants.
 - Beygelzimer, Kakade, Langford (ICML 2006): cover trees.
-- Arya, Mount et al. (SODA 1993; JACM 1998): ANN via balanced box-decomposition.
-- scikit-learn / FLANN / nanoflann design notes (practical high-dimensional
-  trade-offs between exact and approximate trees).
+- Arya, Mount et al. (SODA 1994; JACM 1998): ANN via balanced box-decomposition.
 
 The present API is exact by default; approximate search with explicit epsilon
 is not enabled yet.
@@ -60,6 +58,11 @@ Metric trait functions:
 - `dist2(a, b)`
 - `axis_min_dist2(x, lo, hi, axis)`
 - `aabb_min_dist2(point, lo, hi)`
+
+The point metric is exactly symmetric (`dist2(a, b) == dist2(b, a)`) and
+`dist2(a, a) == 0`. Query acceptance uses the exact predicate `dist2 <= r^2`
+with the same metric function as brute-force checks, so neighbour and clustering
+results are identical to brute force under this metric.
 
 The axis and box lower bounds are sound for periodic intervals including
 intervals wider than `L/2` and full-period coverage (`width >= L`), where the

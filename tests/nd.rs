@@ -13,22 +13,6 @@ fn build_index<'a>(
     VpTreeIndex::new(space, metric).unwrap()
 }
 
-fn periodic_dist2(a: &[f64], b: &[f64], periods: &[Option<f64>]) -> f64 {
-    let mut sum = 0.0;
-    for k in 0..a.len() {
-        let mut d = (a[k] - b[k]).abs();
-        if let Some(l) = periods[k] {
-            d = d - l * (d / l).trunc();
-            if d < 0.0 {
-                d += l;
-            }
-            d = d.min(l - d);
-        }
-        sum += d * d;
-    }
-    sum
-}
-
 fn brute_axis_min_dist2(x: f64, lo: f64, hi: f64, period: Option<f64>) -> f64 {
     if let Some(l) = period {
         if hi - lo >= l {
@@ -57,17 +41,17 @@ fn brute_axis_min_dist2(x: f64, lo: f64, hi: f64, period: Option<f64>) -> f64 {
 }
 
 fn brute_knn(
+    metric: &PeriodicSpace,
     data: &[f64],
     n: usize,
     d: usize,
-    periods: &[Option<f64>],
     q: &[f64],
     k: usize,
 ) -> Vec<(usize, f64)> {
     let mut hits: Vec<_> = (0..n)
         .map(|i| {
             let p = &data[i * d..(i + 1) * d];
-            (i, periodic_dist2(p, q, periods))
+            (i, metric.dist2(p, q).unwrap())
         })
         .collect();
     hits.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -76,10 +60,10 @@ fn brute_knn(
 }
 
 fn brute_within(
+    metric: &PeriodicSpace,
     data: &[f64],
     n: usize,
     d: usize,
-    periods: &[Option<f64>],
     q: &[f64],
     r: f64,
 ) -> Vec<(usize, f64)> {
@@ -87,7 +71,7 @@ fn brute_within(
     let mut hits: Vec<_> = (0..n)
         .filter_map(|i| {
             let p = &data[i * d..(i + 1) * d];
-            let d2 = periodic_dist2(p, q, periods);
+            let d2 = metric.dist2(p, q).unwrap();
             (d2 <= r2).then_some((i, d2))
         })
         .collect();
@@ -96,10 +80,10 @@ fn brute_within(
 }
 
 fn brute_dbscan(
+    metric: &PeriodicSpace,
     data: &[f64],
     n: usize,
     d: usize,
-    periods: &[Option<f64>],
     eps: f64,
     min_pts: usize,
 ) -> Vec<i32> {
@@ -112,7 +96,7 @@ fn brute_dbscan(
             continue;
         }
         let qi = &data[i * d..(i + 1) * d];
-        let mut neigh: Vec<_> = brute_within(data, n, d, periods, qi, eps)
+        let mut neigh: Vec<_> = brute_within(metric, data, n, d, qi, eps)
             .into_iter()
             .map(|(idx, _)| idx)
             .collect();
@@ -139,7 +123,7 @@ fn brute_dbscan(
             }
             labels[p] = cluster;
             let qp = &data[p * d..(p + 1) * d];
-            let mut pn: Vec<_> = brute_within(data, n, d, periods, qp, eps)
+            let mut pn: Vec<_> = brute_within(metric, data, n, d, qp, eps)
                 .into_iter()
                 .map(|(idx, _)| idx)
                 .collect();
@@ -159,6 +143,28 @@ fn brute_dbscan(
         .into_iter()
         .map(|v| if v == UNASSIGNED { -1 } else { v })
         .collect()
+}
+
+fn brute_pairs_within(
+    metric: &PeriodicSpace,
+    data: &[f64],
+    n: usize,
+    d: usize,
+    radius: f64,
+) -> Vec<(usize, usize, f64)> {
+    let mut out = Vec::new();
+    let r2 = radius * radius;
+    for i in 0..n {
+        let pi = &data[i * d..(i + 1) * d];
+        for j in (i + 1)..n {
+            let pj = &data[j * d..(j + 1) * d];
+            let d2 = metric.dist2(pi, pj).unwrap();
+            if d2 <= r2 {
+                out.push((i, j, d2));
+            }
+        }
+    }
+    out
 }
 
 #[test]
@@ -192,10 +198,11 @@ fn random_knn_and_within_match_bruteforce() {
         }
 
         let idx = build_index(&data, n, d, &periods);
+        let metric = PeriodicSpace::new(periods.clone()).unwrap();
         let q = &data[..d];
         let k = rng.random_range(1..=n + 7);
         let got = idx.knn(q, k).unwrap();
-        let want = brute_knn(&data, n, d, &periods, q, k);
+        let want = brute_knn(&metric, &data, n, d, q, k);
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want.iter()) {
             assert_eq!(g.index, w.0);
@@ -204,7 +211,7 @@ fn random_knn_and_within_match_bruteforce() {
 
         let r = rng.random_range(0.1..4.0);
         let got_w = idx.within(q, r).unwrap();
-        let want_w = brute_within(&data, n, d, &periods, q, r);
+        let want_w = brute_within(&metric, &data, n, d, q, r);
         assert_eq!(got_w.len(), want_w.len());
         for (g, w) in got_w.iter().zip(want_w.iter()) {
             assert_eq!(g.index, w.0);
@@ -244,12 +251,13 @@ fn many_seeds_cover_edge_cases_and_ties() {
                 }
             }
             let idx = build_index(&data, n, d, &periods);
+            let metric = PeriodicSpace::new(periods.clone()).unwrap();
             let query_ids = [0usize, n / 3, n - 1];
             for &qi in &query_ids {
                 let q = &data[qi * d..(qi + 1) * d];
                 for &k in &[0usize, 1, 4, n / 2, n + 13] {
                     let got = idx.knn(q, k).unwrap();
-                    let want = brute_knn(&data, n, d, &periods, q, k);
+                    let want = brute_knn(&metric, &data, n, d, q, k);
                     assert_eq!(got.len(), want.len());
                     for (g, w) in got.iter().zip(&want) {
                         assert_eq!(g.index, w.0);
@@ -281,6 +289,10 @@ fn edge_cases_work() {
     let self_hits = one.within_index(0, 0.01).unwrap();
     assert_eq!(self_hits.len(), 1);
     assert_eq!(self_hits[0].index, 0);
+    assert_eq!(
+        one.within_index(1, 0.1).unwrap_err(),
+        linkcell::Error::IndexOutOfRange
+    );
 }
 
 #[test]
@@ -300,6 +312,17 @@ fn n_zero_and_n_one_and_periodic_half_box_radius() {
     let one = build_index(&[3.0], 1, d, &periods);
     assert_eq!(one.knn(&[3.0], 0).unwrap().len(), 0);
     assert_eq!(one.knn(&[3.0], 5).unwrap().len(), 1);
+}
+
+#[test]
+fn rust_index_build_rejects_nan_points() {
+    let data = [f64::NAN, 0.0];
+    let space = ContiguousSpace::from_row_major(&data, 1, 2).unwrap();
+    let metric = PeriodicSpace::new(vec![None, None]).unwrap();
+    match VpTreeIndex::new(space, metric) {
+        Ok(_) => panic!("building index with NaN should fail"),
+        Err(err) => assert_eq!(err, linkcell::Error::NonFinite),
+    }
 }
 
 #[test]
@@ -333,10 +356,11 @@ fn dbscan_matches_oracle_and_sklearn_toy() {
             *v = rng.random_range(-5.0..5.0);
         }
         let idx = build_index(&data, n, d, &periods);
+        let metric = PeriodicSpace::new(periods.clone()).unwrap();
         let eps = rng.random_range(0.3..2.0);
         let min_pts = rng.random_range(2..=6);
         let got = idx.dbscan(eps, min_pts).unwrap();
-        let want = brute_dbscan(&data, n, d, &periods, eps, min_pts);
+        let want = brute_dbscan(&metric, &data, n, d, eps, min_pts);
         assert_eq!(got.labels, want);
     }
 }
@@ -355,6 +379,64 @@ fn dbscan_border_assignment_is_deterministic() {
     let a = idx.dbscan(0.5, 3).unwrap();
     let b = idx.dbscan(0.5, 3).unwrap();
     assert_eq!(a.labels, b.labels);
+}
+
+#[test]
+fn metric_distance_is_symmetric_and_self_zero() {
+    let metric = PeriodicSpace::new(vec![Some(0.5), Some(1.0), None]).unwrap();
+    let a = [0.0, 0.3, -1.0];
+    let b = [0.1, -0.2, 4.0];
+    assert_eq!(metric.dist2(&a, &a).unwrap(), 0.0);
+    assert_eq!(metric.dist2(&b, &b).unwrap(), 0.0);
+    assert_eq!(metric.dist2(&a, &b).unwrap(), metric.dist2(&b, &a).unwrap());
+}
+
+#[test]
+fn exact_boundary_queries_match_oracle_on_periodic_lattice() {
+    let d = 1usize;
+    let periods = vec![Some(0.5)];
+    let metric = PeriodicSpace::new(periods.clone()).unwrap();
+    let mut data = Vec::new();
+    for i in 0..24usize {
+        data.push(i as f64 * 0.1);
+    }
+    let idx = build_index(&data, data.len(), d, &periods);
+    for i in 0..data.len() {
+        let q = [data[i]];
+        for &radius in &[0.0, 0.1, 0.2, 0.25] {
+            let got = idx.within(&q, radius).unwrap();
+            let want = brute_within(&metric, &data, data.len(), d, &q, radius);
+            let got_pairs: Vec<_> = got.into_iter().map(|h| (h.index, h.dist2)).collect();
+            assert_eq!(got_pairs, want);
+        }
+        let got_knn = idx.knn(&q, 7).unwrap();
+        let want_knn = brute_knn(&metric, &data, data.len(), d, &q, 7);
+        let got_pairs: Vec<_> = got_knn.into_iter().map(|h| (h.index, h.dist2)).collect();
+        assert_eq!(got_pairs, want_knn);
+    }
+    let got_pairs = idx.pairs_within(0.1).unwrap();
+    let got: Vec<_> = got_pairs.into_iter().map(|p| (p.i, p.j, p.dist2)).collect();
+    let want = brute_pairs_within(&metric, &data, data.len(), d, 0.1);
+    assert_eq!(got, want);
+    let db = idx.dbscan(0.1, 2).unwrap();
+    let want_labels = brute_dbscan(&metric, &data, data.len(), d, 0.1, 2);
+    assert_eq!(db.labels, want_labels);
+}
+
+#[test]
+fn exact_boundary_queries_match_oracle_on_open_integer_lattice() {
+    let d = 1usize;
+    let periods = vec![None];
+    let metric = PeriodicSpace::new(periods.clone()).unwrap();
+    let data: Vec<f64> = (0..40usize).map(|i| i as f64).collect();
+    let idx = build_index(&data, data.len(), d, &periods);
+    let q = [17.0];
+    for &radius in &[0.0, 1.0, 2.0, 5.0] {
+        let got = idx.within(&q, radius).unwrap();
+        let want = brute_within(&metric, &data, data.len(), d, &q, radius);
+        let got_pairs: Vec<_> = got.into_iter().map(|h| (h.index, h.dist2)).collect();
+        assert_eq!(got_pairs, want);
+    }
 }
 
 #[test]

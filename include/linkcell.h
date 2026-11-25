@@ -447,6 +447,7 @@ int lc_mesh_cut(const double *xyz,
  * `periods[k] > 0` for periodic axis `k`, `periods[k] == 0` for open axis,
  * and `periods[k] < 0` rejected.
  * The index owns a copy of `data` and is released by [`lc_nd_free`].
+ * On failure, `*out` is set to null.
  *
  * # Safety
  *

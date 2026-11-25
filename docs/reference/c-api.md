@@ -86,6 +86,7 @@ int lc_nd_dbscan(const lc_nd_index *index, double eps, size_t min_pts,
 `periods` is optional (`NULL` means every axis open); with a non-null pointer,
 length is `d`; `periods[k] > 0` marks axis `k` periodic, `periods[k] == 0`
 marks it open, and negative or NaN values are rejected.
+On any `lc_nd_build` failure, `*out` is set to `NULL`.
 
 `lc_nd_knn` writes exactly `k` slots (`-1` and optional `NaN` for unused
 slots when `k > n`).
@@ -96,6 +97,9 @@ slots when `k > n`).
   `*out_count`;
 - for `lc_nd_pairs_within`, set `out_i = out_j = out_d2 = NULL` to query
   `*out_count`.
+
+For fill calls, if `cap < *out_count`, the call returns nonzero and keeps
+`*out_count` at the required size without writing partial output.
 
 `lc_nd_dbscan` writes one label and one core flag per indexed point.
 Noise has label `-1`.

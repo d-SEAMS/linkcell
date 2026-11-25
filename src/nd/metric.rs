@@ -100,6 +100,10 @@ impl PeriodicSpace {
         if y < 0.0 {
             y += 1.0;
         }
+        if y >= 1.0 {
+            // Tiny negative inputs can round to exactly one ulp below 1 then to 1.0.
+            y = 0.0;
+        }
         y
     }
 
@@ -198,8 +202,11 @@ impl PeriodicSpace {
     }
 
     fn check_point_shape(&self, p: &[f64]) -> Result<(), Error> {
-        if p.len() != self.periods.len() || !p.iter().all(|v| v.is_finite()) {
+        if p.len() != self.periods.len() {
             return Err(Error::BadDimensions);
+        }
+        if !p.iter().all(|v| v.is_finite()) {
+            return Err(Error::NonFinite);
         }
         Ok(())
     }
@@ -287,7 +294,21 @@ impl Metric<f64> for PeriodicSpace {
         self.check_point_shape(b)?;
         let mut s = 0.0;
         for i in 0..self.periods.len() {
-            let d = self.wrap_delta_axis(a[i] - b[i], i)?;
+            let d = if let Some(l) = self.periods[i] {
+                // Keep point distance exactly symmetric and self-zero.
+                let mut w = (a[i] - b[i]).abs();
+                let q = (w / l).trunc();
+                w -= l * q;
+                if w < 0.0 {
+                    w = 0.0;
+                }
+                if w >= l {
+                    w = 0.0;
+                }
+                w.min(l - w)
+            } else {
+                (a[i] - b[i]).abs()
+            };
             s += d * d;
         }
         Ok(s)
@@ -391,6 +412,26 @@ mod tests {
         let metric = PeriodicSpace::new(vec![Some(10.0)]).unwrap();
         let got = metric.wrap_delta_axis(5.0, 0).unwrap();
         assert_eq!(got, -5.0);
+    }
+
+    #[test]
+    fn point_wrap_stays_in_half_open_interval_for_tiny_negatives() {
+        let metric = PeriodicSpace::new(vec![Some(3.0)]).unwrap();
+        for &x in &[-1.0e-20, -1.0e-300] {
+            let wrapped = metric.wrap_point_axis(x, 0).unwrap();
+            assert!(wrapped >= 0.0);
+            assert!(wrapped < 3.0);
+        }
+    }
+
+    #[test]
+    fn periodic_dist2_is_symmetric_and_self_zero() {
+        let metric = PeriodicSpace::new(vec![Some(0.5), None, Some(3.0)]).unwrap();
+        let a = [0.0, -2.0, 4.5];
+        let b = [0.1, -1.0, -7.5];
+        assert_eq!(metric.dist2(&a, &a).unwrap(), 0.0);
+        assert_eq!(metric.dist2(&b, &b).unwrap(), 0.0);
+        assert_eq!(metric.dist2(&a, &b).unwrap(), metric.dist2(&b, &a).unwrap());
     }
 
     #[test]

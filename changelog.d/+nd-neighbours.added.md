@@ -7,3 +7,6 @@
 - Added the N-dimensional metric shim module (`src/nd/metric.rs`) that centralizes
   distance and lower-bound logic behind one trait for future replacement by
   upstream minimage N-dimensional metrics.
+- Notable API surface change: public `linkcell::Error` gained
+  `BadDimensions` and `BadPeriod` variants for N-dimensional shape/period
+  validation failures.

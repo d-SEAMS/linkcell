@@ -388,6 +388,7 @@ unsafe fn nd_ref<'a>(ptr: *const lc_nd_index) -> Result<&'a NdHandle, c_int> {
 /// `periods[k] > 0` for periodic axis `k`, `periods[k] == 0` for open axis,
 /// and `periods[k] < 0` rejected.
 /// The index owns a copy of `data` and is released by [`lc_nd_free`].
+/// On failure, `*out` is set to null.
 ///
 /// # Safety
 ///
@@ -403,6 +404,13 @@ pub unsafe extern "C" fn lc_nd_build(
 ) -> c_int {
     if out.is_null() || data.is_null() || d == 0 {
         return fail_msg("null pointer");
+    }
+    unsafe {
+        *out = ptr::null_mut();
+    }
+    let max_d = (isize::MAX as usize) / std::mem::size_of::<Option<f64>>();
+    if d > max_d {
+        return fail(Error::Overflow);
     }
     let Some(len) = n.checked_mul(d) else {
         return fail(Error::Overflow);
@@ -509,7 +517,7 @@ pub unsafe extern "C" fn lc_nd_knn(
     };
     let d = h.tree.dims();
     let q = unsafe { std::slice::from_raw_parts(query, d) };
-    let hits = match h.tree.knn(q, k) {
+    let hits = match with_threads(|| h.tree.knn(q, k)) {
         Ok(hits) => hits,
         Err(err) => return fail(err),
     };
@@ -563,7 +571,7 @@ pub unsafe extern "C" fn lc_nd_within(
     };
     let d = h.tree.dims();
     let q = unsafe { std::slice::from_raw_parts(query, d) };
-    let hits = match h.tree.within(q, radius) {
+    let hits = match with_threads(|| h.tree.within(q, radius)) {
         Ok(hits) => hits,
         Err(err) => return fail(err),
     };
@@ -619,7 +627,7 @@ pub unsafe extern "C" fn lc_nd_pairs_within(
         Ok(h) => h,
         Err(code) => return code,
     };
-    let pairs = match h.tree.pairs_within(radius) {
+    let pairs = match with_threads(|| h.tree.pairs_within(radius)) {
         Ok(rows) => rows,
         Err(err) => return fail(err),
     };
@@ -681,7 +689,7 @@ pub unsafe extern "C" fn lc_nd_dbscan(
         Ok(h) => h,
         Err(code) => return code,
     };
-    let res = match h.tree.dbscan(eps, min_pts) {
+    let res = match with_threads(|| h.tree.dbscan(eps, min_pts)) {
         Ok(res) => res,
         Err(err) => return fail(err),
     };

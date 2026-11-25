@@ -48,6 +48,8 @@ pub enum Error {
     BadDimensions,
     /// A periodic length is not finite and strictly positive.
     BadPeriod,
+    /// Point index is outside the indexed range.
+    IndexOutOfRange,
 }
 
 impl fmt::Display for Error {
@@ -60,7 +62,7 @@ impl fmt::Display for Error {
             Error::Overflow => write!(f, "n * k overflows"),
             Error::MaskLen => write!(f, "mask length must be n"),
             Error::TooManyCells => write!(f, "linked-cell mesh is too fine"),
-            Error::BadCutoff => write!(f, "cutoff must be finite and positive"),
+            Error::BadCutoff => write!(f, "cutoff must be finite and non-negative"),
             Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
             Error::Partial => write!(
                 f,
@@ -81,6 +83,7 @@ impl fmt::Display for Error {
             Error::ScotchFailed => write!(f, "Scotch returned an error"),
             Error::BadDimensions => write!(f, "row-major buffer shape is inconsistent"),
             Error::BadPeriod => write!(f, "period length must be finite and positive"),
+            Error::IndexOutOfRange => write!(f, "point index is out of range"),
         }
     }
 }

@@ -369,6 +369,19 @@ summary({
 }, section: 'Configuration')
 
 if get_option('with_tests')
+  nd_capi_smoke = executable(
+    'nd_capi_smoke',
+    meson.project_source_root() / 'tests/nd_capi_smoke.c',
+    dependencies: [linkcell_dep, cc.find_library('m', required: false)],
+    build_rpath: meson.project_build_root(),
+  )
+  _meson_test_env = environment()
+  if host_machine.system() == 'linux'
+    _meson_test_env.prepend('LD_LIBRARY_PATH', meson.project_build_root())
+  elif host_machine.system() == 'darwin'
+    _meson_test_env.prepend('DYLD_LIBRARY_PATH', meson.project_build_root())
+  endif
+  test('nd-capi-smoke-c', nd_capi_smoke, env: _meson_test_env)
   test(
     'cargo-tests',
     cargo_prog,
