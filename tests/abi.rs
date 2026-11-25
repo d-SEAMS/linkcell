@@ -293,7 +293,7 @@ mod nd_spawn {
         const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
         static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-        unsafe extern "C" {
+        extern "C" {
             fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
             fn abort() -> !;
         }
@@ -381,7 +381,7 @@ mod nd_spawn {
     }
 
     #[cfg(target_os = "macos")]
-    unsafe extern "C" {
+    extern "C" {
         fn pthread_create(
             thread: *mut std::os::raw::c_void,
             attr: *const std::os::raw::c_void,
@@ -422,7 +422,7 @@ mod nd_spawn {
         }
 
         #[link(name = "kernel32")]
-        unsafe extern "system" {
+        extern "system" {
             fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
             fn VirtualProtect(
                 addr: *mut std::ffi::c_void,
