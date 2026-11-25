@@ -94,6 +94,7 @@ linkcell_gpu_dep = dependency(
 ```
 
 `with_gpulite` controls the device target and defaults to `auto`.
+`sanitize=thread`, like `LINKCELL_SANITIZE=thread`, rebuilds the crate, std and Rayon with `-Zsanitizer=thread` (rustup's nightly toolchain) for a host built with `-fsanitize=thread`.
 
 ### CMake
 

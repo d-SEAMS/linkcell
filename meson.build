@@ -200,6 +200,9 @@ _cargo_command += ['--cc', ' '.join(cc.cmd_array() + _omp_c_args)]
 foreach _dir : _omp_dirs
   _cargo_command += ['--library-path', _dir]
 endforeach
+if get_option('sanitize') != 'none'
+  _cargo_command += ['--sanitize', get_option('sanitize')]
+endif
 
 # cargo rustc emits both crate types; the target lists both so Meson
 # does not pretend the static archive is the only artifact.

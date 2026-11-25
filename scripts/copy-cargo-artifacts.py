@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         default="true",
         help="Compile the fused k-nearest OpenMP region (LINKCELL_OPENMP).",
     )
+    parser.add_argument(
+        "--sanitize",
+        choices=("none", "thread"),
+        default="none",
+        help="Rebuild the crate and std with this sanitizer (LINKCELL_SANITIZE).",
+    )
     args = parser.parse_args()
     if (args.implib is None) != (args.out_implib is None):
         parser.error("--implib and --out-implib must be supplied together")
@@ -48,7 +54,7 @@ def main() -> None:
     # ThreadSanitizer does not see Rayon's futex join unless std and rayon
     # are rebuilt with the sanitizer. The final C++ link supplies one
     # compiler-rt via -Zexternal-clangrt, so the pool stays multithreaded.
-    tsan = os.environ.get("LINKCELL_SANITIZE") == "thread"
+    tsan = args.sanitize == "thread" or os.environ.get("LINKCELL_SANITIZE") == "thread"
     # Pixi's cargo is a real binary, not the rustup proxy, and it is ahead
     # of rustup on PATH. rustup run nightly still leaves that rustc first,
     # so the nightly compiler has to be named by its own path.
