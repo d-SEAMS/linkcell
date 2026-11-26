@@ -617,16 +617,20 @@ jobs:
               test -f "$prefix/lib/linkcell.dll.lib"
               test -f "$prefix/lib/linkcell.lib"
               test -f "$prefix/lib/linkcell_gpu.lib"
+              test -f "$prefix/bin/linkcell_eh.dll"
+              test -f "$prefix/lib/linkcell_eh.lib"
               ;;
             macOS)
               test -f "$prefix/lib/liblinkcell.dylib"
               test -f "$prefix/lib/liblinkcell.a"
               test -f "$prefix/lib/liblinkcell_gpu.a"
+              test -f "$prefix/lib/liblinkcell_eh.dylib"
               ;;
             Linux)
               test -f "$prefix/lib/liblinkcell.so"
               test -f "$prefix/lib/liblinkcell.a"
               test -f "$prefix/lib/liblinkcell_gpu.a"
+              test -f "$prefix/lib/liblinkcell_eh.so"
               ;;
           esac
       - name: pkg-config after meson install
@@ -699,14 +703,18 @@ jobs:
             test -f prefix/lib/linkcell.dll.lib
             test -f prefix/lib/linkcell.lib
             test -f prefix/lib/linkcell_gpu.lib
+            test -f prefix/bin/linkcell_eh.dll
+            test -f prefix/lib/linkcell_eh.lib
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             test -f prefix/lib/liblinkcell.dylib
             test -f prefix/lib/liblinkcell.a
             test -f prefix/lib/liblinkcell_gpu.a
+            test -f prefix/lib/liblinkcell_eh.dylib
           else
             test -f prefix/lib/liblinkcell.so
             test -f prefix/lib/liblinkcell.a
             test -f prefix/lib/liblinkcell_gpu.a
+            test -f prefix/lib/liblinkcell_eh.so
           fi
           cmake -S tests/cmake-consumer -B find-build \
             -DCMAKE_PREFIX_PATH="$PWD/prefix" \

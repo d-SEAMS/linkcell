@@ -19,6 +19,7 @@ On Debian multiarch the `.pc` may sit under `$PREFIX/lib/x86_64-linux-gnu/pkgcon
 Put that directory on `PKG_CONFIG_PATH` instead.
 
 CPU `--cflags` contains `-I$PREFIX/include`; GPU cflags also define `LINKCELL_HAS_GPULITE`.
+CPU `--libs` also contains `-llinkcell_eh`, the shared library that owns `linkcell::Error`. A fully static build adds `-DLINKCELL_EH_STATIC` to `--cflags` and the archive of the same name; that object is one copy per final link.
 The GPU query adds `-llinkcell_gpu` and the CPU package.
 `pkg-config --static --libs linkcell` includes the private Rust system libraries (`dl`, threads, and `m` where required).
 

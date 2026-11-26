@@ -11,7 +11,7 @@ DIR is a checkout with `target/release/examples/pairs_scale` and
 `target/release/pairs_bind_cpp` built:
 
     cargo build --release --lib --examples
-    g++ -O2 -std=c++17 -Iinclude examples/pairs_bind.cpp \\
+    g++ -O2 -std=c++17 -DLINKCELL_EH_STATIC -Iinclude examples/pairs_bind.cpp src/error.cpp \\
         -o target/release/pairs_bind_cpp target/release/liblinkcell.a \\
         -lpthread -ldl -lm
 
