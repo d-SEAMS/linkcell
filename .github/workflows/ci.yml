@@ -175,9 +175,6 @@ jobs:
           grep -F -- "-L native=$prefix/lib" "$RUNNER_TEMP/cargo-openmp.log" \
             | grep -F -- "-l omp"
       - run: cargo test --locked ${{ matrix.crate.flags }}
-      - name: SIMD paths exercised
-        shell: bash
-        run: cargo test --locked ${{ matrix.crate.flags }} --lib simd_paths_exercised -- --nocapture
       - run: cargo clippy --locked --all-targets ${{ matrix.crate.flags }} -- -D warnings
 
   scalar-lib:

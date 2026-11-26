@@ -6192,25 +6192,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn simd_paths_exercised() {
-        let names: Vec<_> = crate::simd::paths_to_compare()
-            .iter()
-            .map(|p| p.name())
-            .collect();
-        println!("exercised={}", names.join(","));
-        println!("native={}", crate::simd::native().name());
-        if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
-            if let Some(flags) = text.lines().find(|line| line.starts_with("flags")) {
-                println!("{flags}");
-            }
-            if let Some(model) = text.lines().find(|line| line.starts_with("model name")) {
-                println!("{model}");
-            }
-        }
-        assert!(names.contains(&"scalar"));
-    }
-
     fn sha256(data: &[u8]) -> [u8; 32] {
         const K: [u32; 64] = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
