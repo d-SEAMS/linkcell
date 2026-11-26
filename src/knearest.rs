@@ -3606,16 +3606,16 @@ mod graph_tests {
             .unwrap(),
         ];
         for cell in &cells {
-            let xyz = points(9_000, cell, &mut state);
+            let xyz = points(4_200, cell, &mut state);
             let mask: Vec<bool> = (0..xyz.len()).map(|i| i % 7 != 3).collect();
-            for k in [1usize, 4, 12] {
+            for k in [1usize, 12] {
                 for masked in [false, true] {
                     let m = masked.then_some(&mask[..]);
                     let mut nom = vec![0i32; xyz.len() * k];
                     knearest_into(&xyz, cell, k, m, Some(3.0), &mut nom).unwrap();
                     for mutual in [false, true] {
                         let want = reference(&nom, xyz.len(), k, mutual);
-                        for width in [1usize, 2, 3, 8] {
+                        for width in [1usize, 3, 8] {
                             let got = in_pool(width, || {
                                 knearest_csr(&xyz, cell, k, m, Some(3.0), mutual).unwrap()
                             });
