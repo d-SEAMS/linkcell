@@ -57,26 +57,13 @@ fn mask_drops_sources_and_candidates() {
     assert_eq!(rows[2].indices, vec![0]);
 }
 
-#[test]
-fn agrees_with_brute_force_on_a_random_cell() {
-    let b = Cell::ortho(12.0, 11.0, 13.0).unwrap();
-    let mut xyz = Vec::new();
-    let mut s: u64 = 1;
-    for _ in 0..64 {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let x = ((s >> 11) as f64 / (1u64 << 53) as f64) * 12.0;
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let y = ((s >> 11) as f64 / (1u64 << 53) as f64) * 11.0;
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let z = ((s >> 11) as f64 / (1u64 << 53) as f64) * 13.0;
-        xyz.push([x, y, z]);
-    }
-    let cell = knearest(&xyz, &b, 4, None, Some(2.5)).unwrap();
-    let brute = knearest_brute(&xyz, &b, 4, None).unwrap();
+fn assert_matches_brute(label: &str, cell: &Cell, xyz: &[[f64; 3]], k: usize, cutoff: Option<f64>) {
+    let linked = knearest(xyz, cell, k, None, cutoff).unwrap();
+    let brute = knearest_brute(xyz, cell, k, None).unwrap();
     for i in 0..xyz.len() {
-        assert_eq!(cell[i].indices, brute[i].indices, "source {i}");
-        for (a, c) in cell[i].dist2.iter().zip(brute[i].dist2.iter()) {
-            assert!(almost(*a, *c), "{a} vs {c}");
+        assert_eq!(linked[i].indices, brute[i].indices, "{label} source {i}");
+        for (a, c) in linked[i].dist2.iter().zip(brute[i].dist2.iter()) {
+            assert!(almost(*a, *c), "{label} {a} vs {c} at {i}");
         }
     }
 }
@@ -153,9 +140,23 @@ fn unreduced_skew_knn_beats_unreduced_27_image() {
 }
 
 #[test]
-fn agrees_with_brute_force_on_a_sheared_cell() {
-    let b = hex_prism();
-    let mut xyz = Vec::new();
+fn agrees_with_brute_force_on_random_cells() {
+    let ortho = Cell::ortho(12.0, 11.0, 13.0).unwrap();
+    let mut ortho_xyz = Vec::new();
+    let mut s: u64 = 1;
+    for _ in 0..64 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let x = ((s >> 11) as f64 / (1u64 << 53) as f64) * 12.0;
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let y = ((s >> 11) as f64 / (1u64 << 53) as f64) * 11.0;
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let z = ((s >> 11) as f64 / (1u64 << 53) as f64) * 13.0;
+        ortho_xyz.push([x, y, z]);
+    }
+    assert_matches_brute("ortho", &ortho, &ortho_xyz, 4, Some(2.5));
+
+    let shear = hex_prism();
+    let mut shear_xyz = Vec::new();
     let mut s: u64 = 7;
     for _ in 0..48 {
         s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -165,16 +166,9 @@ fn agrees_with_brute_force_on_a_sheared_cell() {
         s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
         let w = (s >> 11) as f64 / (1u64 << 53) as f64;
         let r = [10.0 * u + 5.0 * v, 8.660254037844386 * v, 10.0 * w];
-        xyz.push(r);
+        shear_xyz.push(r);
     }
-    let cell = knearest(&xyz, &b, 4, None, Some(2.0)).unwrap();
-    let brute = knearest_brute(&xyz, &b, 4, None).unwrap();
-    for i in 0..xyz.len() {
-        assert_eq!(cell[i].indices, brute[i].indices, "source {i}");
-        for (a, c) in cell[i].dist2.iter().zip(brute[i].dist2.iter()) {
-            assert!(almost(*a, *c), "{a} vs {c} at {i}");
-        }
-    }
+    assert_matches_brute("shear", &shear, &shear_xyz, 4, Some(2.0));
 }
 
 fn triclinic() -> Cell {
