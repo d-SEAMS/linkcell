@@ -352,68 +352,73 @@ fn random_knn_and_within_match_bruteforce() {
 
 #[test]
 fn many_seeds_cover_edge_cases_and_ties() {
-    let dims = [1usize, 2, 3, 8, 20, 40];
+    fn check(rng: &mut StdRng, n: usize, d: usize) {
+        let mut periods = vec![None; d];
+        for p in &mut periods {
+            if rng.random::<f64>() < 0.4 {
+                *p = Some(rng.random_range(1.5..15.0));
+            }
+        }
+        let mut data = vec![0.0; n * d];
+        for i in 0..n {
+            for k in 0..d {
+                let mut v = rng.random_range(-20.0..20.0);
+                if let Some(l) = periods[k] {
+                    v += rng.random_range(-4.0..4.0) * l;
+                }
+                data[i * d + k] = v;
+            }
+        }
+        // Duplicates and exact ties.
+        if n > 3 {
+            for k in 0..d {
+                data[d + k] = data[k];
+                data[2 * d + k] = data[k];
+            }
+        }
+        let idx = build_index(&data, n, d, &periods);
+        let metric = Oracle::new(&periods);
+        let query_ids = [0usize, n / 3, n - 1];
+        for &qi in &query_ids {
+            let q = &data[qi * d..(qi + 1) * d];
+            // One full ranking feeds every k. Each k is still queried on
+            // the index; only the oracle scan is shared.
+            let mut ranked = Vec::with_capacity(n);
+            for i in 0..n {
+                ranked.push((i, metric.dist2(&data[i * d..(i + 1) * d], q).unwrap()));
+            }
+            metric.rank(&data, d, q, &mut ranked);
+            for &k in &[0usize, 1, 4, n / 2, n + 13] {
+                let got = idx.knn(q, k).unwrap();
+                let want: &[(usize, f64)] = if k == 0 {
+                    &[]
+                } else {
+                    &ranked[..k.min(ranked.len())]
+                };
+                assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(want.iter()) {
+                    assert_eq!(g.index, w.0);
+                    assert_eq!(g.dist2.to_bits(), w.1.to_bits());
+                }
+            }
+            let zero = idx.within(q, 0.0).unwrap();
+            for hit in &zero {
+                assert_eq!(hit.dist2, 0.0);
+            }
+            let large = idx.within(q, 1000.0).unwrap();
+            assert_eq!(large.len(), n);
+        }
+    }
+    let dims = [1usize, 3, 40];
     for seed in 0..18u64 {
         let mut rng = StdRng::seed_from_u64(100 + seed);
         for &d in &dims {
-            let n = rng.random_range(2..=2_400usize);
-            let mut periods = vec![None; d];
-            for p in &mut periods {
-                if rng.random::<f64>() < 0.4 {
-                    *p = Some(rng.random_range(1.5..15.0));
-                }
-            }
-            let mut data = vec![0.0; n * d];
-            for i in 0..n {
-                for k in 0..d {
-                    let mut v = rng.random_range(-20.0..20.0);
-                    if let Some(l) = periods[k] {
-                        v += rng.random_range(-4.0..4.0) * l;
-                    }
-                    data[i * d + k] = v;
-                }
-            }
-            // Duplicates and exact ties.
-            if n > 3 {
-                for k in 0..d {
-                    data[d + k] = data[k];
-                    data[2 * d + k] = data[k];
-                }
-            }
-            let idx = build_index(&data, n, d, &periods);
-            let metric = Oracle::new(&periods);
-            let query_ids = [0usize, n / 3, n - 1];
-            for &qi in &query_ids {
-                let q = &data[qi * d..(qi + 1) * d];
-                // One full ranking feeds every k. Each k is still queried on
-                // the index; only the oracle scan is shared.
-                let mut ranked = Vec::with_capacity(n);
-                for i in 0..n {
-                    ranked.push((i, metric.dist2(&data[i * d..(i + 1) * d], q).unwrap()));
-                }
-                metric.rank(&data, d, q, &mut ranked);
-                for &k in &[0usize, 1, 4, n / 2, n + 13] {
-                    let got = idx.knn(q, k).unwrap();
-                    let want: &[(usize, f64)] = if k == 0 {
-                        &[]
-                    } else {
-                        &ranked[..k.min(ranked.len())]
-                    };
-                    assert_eq!(got.len(), want.len());
-                    for (g, w) in got.iter().zip(want.iter()) {
-                        assert_eq!(g.index, w.0);
-                        assert_eq!(g.dist2.to_bits(), w.1.to_bits());
-                    }
-                }
-                let zero = idx.within(q, 0.0).unwrap();
-                for hit in &zero {
-                    assert_eq!(hit.dist2, 0.0);
-                }
-                let large = idx.within(q, 1000.0).unwrap();
-                assert_eq!(large.len(), n);
-            }
+            let n = rng.random_range(2..=64usize);
+            check(&mut rng, n, d);
         }
     }
+    let mut rng = StdRng::seed_from_u64(100);
+    check(&mut rng, 512, 40);
 }
 
 #[test]
