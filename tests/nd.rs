@@ -2512,7 +2512,7 @@ fn zero_k_and_zero_radius_do_not_walk_the_tree() {
         (2, vec![None, Some(1.0)]),
         (3, vec![Some(1.0); 3]),
     ] {
-        let n = 256usize;
+        let n = 4096usize;
         let mut data: Vec<f64> = (0..n * d).map(|_| rng.random_range(0.0..1.0)).collect();
         for i in 1..9 {
             data.copy_within(0..d, i * d);
