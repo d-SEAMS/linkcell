@@ -654,8 +654,8 @@ mod capi {
     #[test]
     fn rows_are_the_same_bits_at_every_width() {
         let mut cases: Vec<(&str, f64, [f64; 3], [bool; 3])> = vec![
-            ("orthorhombic 20k", 84.0, [0.0; 3], [true; 3]),
-            ("triclinic 20k", 84.0, [0.2, 0.0, 0.0], [true; 3]),
+            ("orthorhombic edge 50", 50.0, [0.0; 3], [true; 3]),
+            ("triclinic edge 50", 50.0, [0.2, 0.0, 0.0], [true; 3]),
         ];
         cases.extend(systems());
         for (label, edge, tilt, periodic) in cases {
