@@ -1,0 +1,1 @@
+The Windows one-thread ND probe counts threads this executable created with `CreateThread` and that Toolhelp still lists. Loader and thread-pool threads, which `ntdll` starts without that import, no longer fail `lc_set_threads(1)`. `lc_nd_pairs_within` under one thread still runs on the caller and starts no worker.

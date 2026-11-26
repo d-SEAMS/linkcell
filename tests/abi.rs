@@ -182,7 +182,13 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
     }
 }
 
-/// Kernel identifiers of this process's live threads.
+/// Threads this executable created with `CreateThread` that are still alive.
+///
+/// Toolhelp lists every thread in the process. Loader and thread-pool
+/// threads that `ntdll` starts without this executable's `CreateThread` are
+/// not linkcell's, and the Linux and macOS snapshots do not include an
+/// equivalent. The raw walk must still see this thread; the returned set is
+/// the recorded ids that walk still contains.
 #[cfg(windows)]
 fn thread_ids() -> std::collections::BTreeSet<u64> {
     // THREADENTRY32: dwSize, cntUsage, th32ThreadID, th32OwnerProcessID,
@@ -217,7 +223,8 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
     }
     assert_ne!(unsafe { CloseHandle(snapshot) }, 0, "CloseHandle failed");
     assert!(!ids.is_empty(), "the snapshot did not list this thread");
-    ids
+    let created = nd_spawn::created_ids();
+    ids.intersection(&created).copied().collect()
 }
 
 /// Counts threads created while a call runs, including one it has already joined.
@@ -254,11 +261,18 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
 ///   DESTROY with no START rolls that CREATE back: `__bsdthread_create`
 ///   failed and no thread ran.
 /// * Windows. The standard library imports `CreateThread` from
-///   `kernel32.dll`. A `CreateThread` defined in this binary does not
-///   intercept that import, and a Toolhelp snapshot does not list a thread
-///   that has exited. The probe replaces this executable's import-address
-///   slot, which is the pointer the statically linked standard library
-///   calls, and forwards to the address the loader wrote there.
+///   `kernel32.dll` and passes a null id pointer, so the probe reads
+///   `GetThreadId` on the returned handle. A `CreateThread` defined in this
+///   binary does not intercept that import, and a Toolhelp snapshot does not
+///   list a thread that has exited. The probe replaces this executable's
+///   import-address slot, which is the pointer the statically linked
+///   standard library calls, and forwards to the address the loader wrote
+///   there. The live snapshot keeps only those recorded ids that Toolhelp
+///   still lists for this process. Toolhelp also lists loader and
+///   thread-pool threads that `ntdll` starts without going through this
+///   executable's `CreateThread`; they are not linkcell's. Linux
+///   `/proc/self/task` and macOS `proc_pidinfo` have no such threads, so
+///   listing every thread there is the same set.
 #[cfg(any(
     all(target_os = "linux", target_env = "gnu"),
     target_os = "macos",
@@ -276,6 +290,14 @@ mod nd_spawn {
 
     pub(super) fn count() -> u64 {
         SPAWNS.load(Ordering::SeqCst)
+    }
+
+    /// Ids of threads this executable's `CreateThread` hook has created.
+    /// Dead threads stay recorded; the live snapshot intersects this with
+    /// Toolhelp.
+    #[cfg(windows)]
+    pub(super) fn created_ids() -> std::collections::BTreeSet<u64> {
+        win::created_ids()
     }
 
     /// Records one create. The caller must do this before the OS call
@@ -519,12 +541,34 @@ mod nd_spawn {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+            fn GetThreadId(thread: *mut std::ffi::c_void) -> u32;
             fn VirtualProtect(
                 addr: *mut std::ffi::c_void,
                 size: usize,
                 new_protect: u32,
                 old_protect: *mut u32,
             ) -> i32;
+        }
+
+        static CREATED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+        fn remember(id: u64) {
+            // A created thread with no id would be invisible to the snapshot.
+            if id == 0 {
+                std::process::abort();
+            }
+            CREATED
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(id);
+        }
+
+        pub(super) fn created_ids() -> std::collections::BTreeSet<u64> {
+            CREATED
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone()
         }
 
         const PAGE_READWRITE: u32 = 0x04;
@@ -717,8 +761,13 @@ mod nd_spawn {
             let counted = outer && note();
             let handle = unsafe { real(attrs, stack, start, param, flags, tid) };
             DEPTH.with(|depth| depth.set(depth.get() - 1));
-            if handle.is_null() && counted {
-                unnote();
+            if handle.is_null() {
+                if counted {
+                    unnote();
+                }
+            } else {
+                // Rust passes a null id pointer. The handle is still open here.
+                remember(u64::from(unsafe { GetThreadId(handle) }));
             }
             handle
         }
@@ -2576,8 +2625,59 @@ fn current_thread_id() -> u64 {
     id
 }
 
-/// Kernel id of the calling thread. The value is one of the ids
-/// [`thread_ids`] returns.
+/// A Windows thread-pool worker stays in Toolhelp after its callback returns.
+/// `ntdll` does not start it through this executable's `CreateThread`, so
+/// the probe must not count it. Linkcell's own `std::thread` still goes
+/// through that import and is counted by the spawn self-check.
+#[cfg(windows)]
+fn assert_threadpool_worker_is_not_linkcells() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateThreadpoolWork(
+            callback: Option<
+                unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                ),
+            >,
+            ctx: *mut std::ffi::c_void,
+            env: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn SubmitThreadpoolWork(work: *mut std::ffi::c_void);
+        fn WaitForThreadpoolWorkCallbacks(work: *mut std::ffi::c_void, cancel: i32);
+        fn CloseThreadpoolWork(work: *mut std::ffi::c_void);
+    }
+    unsafe extern "system" fn done(
+        _instance: *mut std::ffi::c_void,
+        _ctx: *mut std::ffi::c_void,
+        _work: *mut std::ffi::c_void,
+    ) {
+    }
+    let before = thread_ids();
+    let spawned = nd_spawn::count();
+    let work =
+        unsafe { CreateThreadpoolWork(Some(done), std::ptr::null_mut(), std::ptr::null_mut()) };
+    assert!(!work.is_null(), "CreateThreadpoolWork failed");
+    unsafe {
+        SubmitThreadpoolWork(work);
+        WaitForThreadpoolWorkCallbacks(work, 0);
+        CloseThreadpoolWork(work);
+    }
+    assert_eq!(
+        nd_spawn::count(),
+        spawned,
+        "a thread-pool worker was created with this executable's CreateThread"
+    );
+    assert_eq!(
+        thread_ids(),
+        before,
+        "a thread-pool worker was counted as a linkcell thread"
+    );
+}
+
+/// Kernel id of the calling thread. A thread this executable created with
+/// `CreateThread` is one of the ids [`thread_ids`] returns while it is alive.
 #[cfg(windows)]
 fn current_thread_id() -> u64 {
     #[link(name = "kernel32")]
@@ -2695,6 +2795,8 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
             "a thread created and joined stayed in the id snapshot"
         );
     }
+    #[cfg(windows)]
+    assert_threadpool_worker_is_not_linkcells();
     let data = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     let q = [0.0, 0.0];
     unsafe { lc_set_threads(1) };
