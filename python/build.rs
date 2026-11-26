@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=../src/error.cpp");
     println!("cargo:rerun-if-changed=../src/gpu/knearest.cpp");
     println!("cargo:rerun-if-changed=../src/gpu/capi.cpp");
     println!("cargo:rerun-if-changed=../src/gpu/partition.cpp");
@@ -11,14 +12,20 @@ fn main() {
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.parent().unwrap();
 
+    // The GPU sources throw linkcell::Error. The extension is one final
+    // image, so the key function is compiled into it. A wheel then defines
+    // the type itself and does not need a second shared library for
+    // auditwheel, delocate, or delvewheel to vendor.
     let mut build = cc::Build::new();
     build
         .cpp(true)
         .std("c++17")
         .define("LINKCELL_HAS_GPULITE", "1")
+        .define("LINKCELL_EH_STATIC", None)
         .define("NOMINMAX", None)
         .include(root.join("include"))
         .include(root.join("third_party/gpulite"))
+        .file(root.join("src/error.cpp"))
         .file(root.join("src/gpu/knearest.cpp"))
         .file(root.join("src/gpu/capi.cpp"))
         .file(root.join("src/gpu/partition.cpp"))
