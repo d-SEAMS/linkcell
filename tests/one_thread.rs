@@ -48,10 +48,10 @@ fn task_count() -> usize {
         .unwrap_or(0)
 }
 
-/// 12000 points on a jittered lattice, above the size at which binning
-/// splits over threads.
+/// 8256 points on a jittered lattice, 64 past PARALLEL_MESH (8192), so
+/// binning would split over threads.
 fn frame() -> (Vec<f64>, lc_cell) {
-    let n = 12000usize;
+    let n = 8256usize;
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut jitter = move || {
         state ^= state << 13;
