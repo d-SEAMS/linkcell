@@ -31,8 +31,9 @@ add_executable(app app.cpp)
 target_link_libraries(app PRIVATE linkcell::cpp)
 ```
 
-`linkcell::cpp` links the C ABI and requires C++17. `linkcell::linkcell` has no C++ language requirement and remains usable by C-only projects.
-`tests/cmake-consumer/` exercises both patterns against an installed prefix.
+`linkcell::cpp` links the C ABI and the shared library `linkcell_eh`, and requires C++17. `linkcell::linkcell` has no C++ language requirement and remains usable by C-only projects.
+`linkcell_eh` owns `linkcell::Error`'s typeinfo. It stays shared when linkcell is a Meson subproject or when `default_library` is static, so a hidden-visibility DSO and its caller catch the exception by type. Meson `eh_shared=false` and CMake `LINKCELL_EH_STATIC=ON` link that object into each final image instead. That copy is unique only inside one final link; two DSOs that each link the static archive each get a typeinfo, and libc++ then misses the handler.
+`tests/cmake-consumer/` exercises both patterns against an installed prefix, including a catch of `linkcell::Error` thrown from a second shared library.
 
 ## Call
 

@@ -47,6 +47,7 @@ rayon = { version = "1.10", optional = true }
 cc = "1.2"
 
 [dev-dependencies]
+cc = "1.2"
 num-bigint = "0.4.8"
 num-rational = "0.4.2"
 num-traits = "0.2.19"

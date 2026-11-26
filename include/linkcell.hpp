@@ -25,22 +25,51 @@ extern "C" {
 
 namespace linkcell {
 
+// The destructor in src/error.cpp is the key function and lives in the
+// shared library linkcell_eh, so every image sees one typeinfo. Windows
+// exports it from that library and imports it everywhere else.
+// LINKCELL_EH_STATIC is the fully static link: one copy in each final image.
+#if defined(LINKCELL_EH_STATIC)
+#define LINKCELL_EH_API
+#elif defined(_WIN32)
+#if defined(LINKCELL_EH_BUILDING)
+#define LINKCELL_EH_API __declspec(dllexport)
+#else
+#define LINKCELL_EH_API __declspec(dllimport)
+#endif
+#elif defined(__GNUC__) || defined(__clang__)
+#define LINKCELL_EH_API __attribute__((visibility("default")))
+#else
+#define LINKCELL_EH_API
+#endif
+
 /// Failure from a neighbour search. `status()` is the C ABI return
 /// (0 success, nonzero failure).
-class Error : public std::runtime_error {
+/// libc++ matches a `catch` by the typeinfo address. This class has one
+/// address because its destructor is the key function.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4275) // std::runtime_error has no dll interface
+#endif
+class LINKCELL_EH_API Error : public std::runtime_error {
 public:
-  Error(int status, std::string message)
-      : std::runtime_error(message.empty() ? "linkcell: knearest failed"
-                                           : std::move(message)),
-        status_(status) {}
+  Error(int status, std::string message);
+  explicit Error(std::string message);
+  Error(const Error &);
+  Error(Error &&) noexcept;
+  Error &operator=(const Error &);
+  Error &operator=(Error &&) noexcept;
+  ~Error() override;
 
-  explicit Error(std::string message) : Error(1, std::move(message)) {}
-
-  [[nodiscard]] int status() const noexcept { return status_; }
+  [[nodiscard]] int status() const noexcept;
 
 private:
   int status_;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+#undef LINKCELL_EH_API
 
 /// Periodic parallelepiped. Fields match `lc_cell` (lattice vectors
 /// a, b, c and dump-cell origin).

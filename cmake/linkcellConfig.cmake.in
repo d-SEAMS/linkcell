@@ -23,10 +23,42 @@ if(NOT TARGET linkcell::linkcell)
   endif()
 endif()
 
+if(NOT TARGET linkcell::eh)
+  if(@LINKCELL_EH_STATIC@)
+    set_and_check(LINKCELL_EH_LIBRARY
+      "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/@LINKCELL_EH_STATIC_NAME@")
+    add_library(linkcell::eh STATIC IMPORTED)
+    set_target_properties(linkcell::eh PROPERTIES
+      IMPORTED_LOCATION "${LINKCELL_EH_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${LINKCELL_INCLUDE_DIR}"
+      INTERFACE_COMPILE_FEATURES cxx_std_17
+      INTERFACE_COMPILE_DEFINITIONS LINKCELL_EH_STATIC)
+  else()
+    if(WIN32)
+      set_and_check(LINKCELL_EH_LIBRARY
+        "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@/@LINKCELL_EH_SHARED_NAME@")
+      set_and_check(LINKCELL_EH_IMPLIB
+        "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/@LINKCELL_EH_IMPLIB_NAME@")
+    else()
+      set_and_check(LINKCELL_EH_LIBRARY
+        "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/@LINKCELL_EH_SHARED_NAME@")
+    endif()
+    add_library(linkcell::eh SHARED IMPORTED)
+    set_target_properties(linkcell::eh PROPERTIES
+      IMPORTED_LOCATION "${LINKCELL_EH_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${LINKCELL_INCLUDE_DIR}"
+      INTERFACE_COMPILE_FEATURES cxx_std_17)
+    if(WIN32)
+      set_target_properties(linkcell::eh PROPERTIES
+        IMPORTED_IMPLIB "${LINKCELL_EH_IMPLIB}")
+    endif()
+  endif()
+endif()
+
 if(NOT TARGET linkcell::cpp)
   add_library(linkcell::cpp INTERFACE IMPORTED)
   set_target_properties(linkcell::cpp PROPERTIES
-    INTERFACE_LINK_LIBRARIES linkcell::linkcell
+    INTERFACE_LINK_LIBRARIES "linkcell::linkcell;linkcell::eh"
     INTERFACE_COMPILE_FEATURES cxx_std_17)
 endif()
 
@@ -39,7 +71,7 @@ if(@LINKCELL_WITH_GPULITE@ AND NOT TARGET linkcell::gpu)
     INTERFACE_INCLUDE_DIRECTORIES "${LINKCELL_INCLUDE_DIR}"
     INTERFACE_COMPILE_DEFINITIONS LINKCELL_HAS_GPULITE=1
     INTERFACE_COMPILE_FEATURES cxx_std_17
-    INTERFACE_LINK_LIBRARIES "linkcell::linkcell;@LINKCELL_GPU_SYSTEM_LIBS@")
+    INTERFACE_LINK_LIBRARIES "linkcell::linkcell;linkcell::eh;@LINKCELL_GPU_SYSTEM_LIBS@")
 endif()
 
 check_required_components(linkcell)

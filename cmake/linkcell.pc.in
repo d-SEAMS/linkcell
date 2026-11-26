@@ -7,6 +7,6 @@ Name: linkcell
 Description: Periodic linked-cell k-nearest neighbour search
 Version: @PROJECT_VERSION@
 URL: https://github.com/d-SEAMS/linkcell
-Libs: -L${libdir} -llinkcell
+Libs: -L${libdir} -llinkcell -llinkcell_eh
 Libs.private: @LINKCELL_PKG_LIBS_PRIVATE@
-Cflags: -I${includedir}
+Cflags: -I${includedir}@LINKCELL_EH_PC_CFLAGS@

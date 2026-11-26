@@ -115,7 +115,7 @@ target_link_libraries(device_app PRIVATE linkcell::gpu)
 ```
 
 `LINKCELL_WITH_GPULITE=ON` builds `linkcell::gpu` and is the default.
-`linkcell::cpp` carries the C++17 requirement; `linkcell::linkcell` stays valid in a C-only project.
+`linkcell::cpp` carries the C++17 requirement and links the shared library `linkcell_eh`, which owns `linkcell::Error`'s typeinfo. That library stays shared for a Meson subproject and for `default_library=static`. `eh_shared=false` and `LINKCELL_EH_STATIC=ON` are the fully static link: one copy in each final image. `linkcell::linkcell` stays valid in a C-only project.
 The same target names work in the build tree and from an installed prefix.
 
 ### pkg-config

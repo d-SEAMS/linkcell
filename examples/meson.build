@@ -24,6 +24,8 @@ if host_machine.system() == 'linux'
   _test_env.prepend('LD_LIBRARY_PATH', meson.project_build_root())
 elif host_machine.system() == 'darwin'
   _test_env.prepend('DYLD_LIBRARY_PATH', meson.project_build_root())
+elif host_machine.system() == 'windows'
+  _test_env.prepend('PATH', meson.project_build_root())
 endif
 
 test('two-points-c', two_points_c, env: _test_env)

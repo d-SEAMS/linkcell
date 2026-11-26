@@ -276,6 +276,34 @@ else
   _link_idx = 0
 endif
 
+# linkcell::Error's destructor is the key function. It has to live in one
+# shared library even when this project is a subproject or default_library
+# is static: a parent such as seams-core builds hidden-visibility DSOs and
+# libc++ catches by the typeinfo address. install: true from a subproject
+# so the parent prefix ships that library. eh_shared=false links the object
+# into each final image; that copy is unique only inside one final link.
+_eh_shared = get_option('eh_shared')
+if _eh_shared
+  _eh_cargs = []
+  linkcell_eh = shared_library(
+    'linkcell_eh',
+    'src/error.cpp',
+    include_directories: include_directories('include'),
+    cpp_args: ['-DLINKCELL_EH_BUILDING'],
+    install: true,
+  )
+else
+  _eh_cargs = ['-DLINKCELL_EH_STATIC']
+  linkcell_eh = static_library(
+    'linkcell_eh',
+    'src/error.cpp',
+    include_directories: include_directories('include'),
+    cpp_args: ['-DLINKCELL_EH_STATIC'],
+    pic: true,
+    install: true,
+  )
+endif
+
 _gpu_opt = get_option('with_gpulite')
 gpulite_dep = dependency('gpulite', required: false,
                          fallback: ['gpulite', 'gpulite_dep'])
@@ -310,22 +338,23 @@ if _gpu_on
     )
   endif
   linkcell_gpu_dep = declare_dependency(
-    link_with: linkcell_gpu,
+    link_with: [linkcell_gpu, linkcell_eh],
     link_args: [linkcell_cargo[_link_idx].full_path()] + _sanitize_link,
     sources: linkcell_built_h,
     include_directories: include_directories('include'),
-    compile_args: _gpu_args,
+    compile_args: _gpu_args + _eh_cargs,
     dependencies: [gpulite_dep] + rust_sys)
   meson.override_dependency('linkcell-gpu', linkcell_gpu_dep)
   _gpu_deps += [linkcell_gpu_dep]
 endif
 
 linkcell_dep = declare_dependency(
+  link_with: linkcell_eh,
   link_args: [linkcell_cargo[_link_idx].full_path()] + _sanitize_link,
   sources: linkcell_built_h,
   include_directories: include_directories('include'),
   dependencies: rust_sys + _gpu_deps,
-  compile_args: _gpu_args,
+  compile_args: _gpu_args + _eh_cargs,
   version: meson.project_version(),
 )
 meson.override_dependency('linkcell', linkcell_dep)
@@ -344,7 +373,8 @@ if _install
     url: 'https://github.com/d-SEAMS/linkcell',
     # Raw `-lfoo` does not get `-L${libdir}`; wrap consumers then fail
     # at link with "cannot find -llinkcell".
-    libraries: ['-L${libdir}', '-llinkcell'] + (_sanitized ? [_sanitize_flag] : []),
+    libraries: ['-L${libdir}', '-llinkcell', '-llinkcell_eh'] + (_sanitized ? [_sanitize_flag] : []),
+    extra_cflags: _eh_cargs,
     libraries_private: rust_sys,
     subdirs: '.',
   )
@@ -366,6 +396,7 @@ endif
 summary({
   'OpenMP k-nearest region': _use_openmp,
   'Device k-nearest (gpulite)': _gpu_on,
+  'linkcell::Error typeinfo': _eh_shared ? 'shared linkcell_eh' : 'static, one copy per final link',
 }, section: 'Configuration')
 
 if get_option('with_tests')
@@ -380,6 +411,8 @@ if get_option('with_tests')
     _meson_test_env.prepend('LD_LIBRARY_PATH', meson.project_build_root())
   elif host_machine.system() == 'darwin'
     _meson_test_env.prepend('DYLD_LIBRARY_PATH', meson.project_build_root())
+  elif host_machine.system() == 'windows'
+    _meson_test_env.prepend('PATH', meson.project_build_root())
   endif
   test('nd-capi-smoke-c', nd_capi_smoke, env: _meson_test_env)
   # Cargo's test profile compiles unoptimized. The neighbour checks call
@@ -396,6 +429,54 @@ if get_option('with_tests')
     },
     timeout: 300,
   )
+  _cpp = meson.get_compiler('cpp')
+  _eh_static_probe = executable(
+    'exception_typeinfo_static',
+    files(
+      'tests/exception_typeinfo_static.cpp',
+      'tests/exception_typeinfo_static_other.cpp',
+      'src/error.cpp',
+    ),
+    include_directories: include_directories('include'),
+    cpp_args: ['-DLINKCELL_EH_STATIC'],
+    install: false,
+  )
+  test('exception-typeinfo-static', _eh_static_probe)
+  if _eh_shared
+    # The owner is the installed linkcell_eh target, not a second copy.
+    # MSVC has no -fvisibility; dllimport keeps the typeinfo in the DLL.
+    _hidden_vis = ['-fvisibility=hidden', '-fvisibility-inlines-hidden']
+    _hidden_args = []
+    if _cpp.has_multi_arguments(_hidden_vis)
+      _hidden_args = _hidden_vis
+    endif
+    _eh_dep = declare_dependency(
+      link_with: linkcell_eh,
+      include_directories: include_directories('include'),
+    )
+    _eh_hidden_a = shared_library(
+      'exception_typeinfo_hidden_a',
+      'tests/exception_typeinfo_hidden.cpp',
+      dependencies: _eh_dep,
+      cpp_args: _hidden_args,
+      install: false,
+    )
+    _eh_hidden_b = shared_library(
+      'exception_typeinfo_hidden_b',
+      'tests/exception_typeinfo_hidden.cpp',
+      dependencies: _eh_dep,
+      cpp_args: _hidden_args + ['-DLC_PROBE_B'],
+      install: false,
+    )
+    _eh_probe = executable(
+      'exception_typeinfo',
+      'tests/exception_typeinfo.cpp',
+      dependencies: _eh_dep,
+      link_with: [_eh_hidden_a, _eh_hidden_b],
+      install: false,
+    )
+    test('exception-typeinfo', _eh_probe, env: _meson_test_env)
+  endif
 endif
 
 if get_option('with_examples')
