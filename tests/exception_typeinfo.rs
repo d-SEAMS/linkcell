@@ -1,7 +1,11 @@
-//! A consumer DSO must share `linkcell::Error`'s typeinfo with its caller.
-//! libc++ matches a handler by that address. The owner is one shared library.
-//! Windows uses `dllexport` in that library and `dllimport` in consumers.
-//! A fully static link is a separate test: one copy in the final image.
+//! A throw in one DSO must be caught as `linkcell::Error` in another, and
+//! the status and message must survive. libc++ matches a handler by the
+//! typeinfo address, so Linux and macOS also require one address. MSVC
+//! matches the decorated name and gives each module its own `type_info`,
+//! so address equality is not the invariant there. The owner is one shared
+//! library. Windows uses `dllexport` in that library and `dllimport` in
+//! consumers. A fully static link is a separate test: one copy in the final
+//! image.
 
 use std::ffi::OsString;
 use std::fs;
