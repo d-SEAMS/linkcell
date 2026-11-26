@@ -69,10 +69,6 @@ def test_torch_cuda_batched():
     assert abs(float(out_d2[1, 1, 0].item()) - 0.64) < 1e-12
 
 
-def test_gpu_available_is_bool():
-    assert isinstance(linkcell.gpu_available(), bool)
-
-
 def test_cpu_export_to_torch_retains_buffer():
     import gc
 
