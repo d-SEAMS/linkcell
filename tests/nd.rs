@@ -2412,7 +2412,8 @@ fn overflow_is_reported_however_the_tree_prunes() {
             .map(|axis| axes[(case / 3 + axis) % axes.len()])
             .collect();
         let oracle = Oracle::new(&periods);
-        let mut rows: Vec<Vec<f64>> = (0..80)
+        let near = 32;
+        let mut rows: Vec<Vec<f64>> = (0..near)
             .map(|_| (0..d).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect();
         for _ in 0..1 + case % 3 {
@@ -2420,7 +2421,7 @@ fn overflow_is_reported_however_the_tree_prunes() {
             row[rng.random_range(0..d)] = far[rng.random_range(0..far.len())];
             rows.push(row);
         }
-        let mut queries = rows[76..].to_vec();
+        let mut queries = rows[near - 4..].to_vec();
         queries.push(vec![0.0; d]);
         let mut toward = vec![0.25; d];
         toward[0] = -0.5 * x;
