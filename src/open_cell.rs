@@ -2213,13 +2213,17 @@ mod tests {
 
     /// Cells whose partner box is past 2^24 slots and that the previous
     /// revision searched successfully. The stencil cap has to admit them.
+    /// Side 52 at cutoff 1 is reach two: 52^3 * 5^3 = 17_576_000 slots.
+    /// Widths 0.01, 0.01, 2.12 at cutoff 0.2 keep reach 21 on every axis:
+    /// 212 * 43^3 = 16_855_484 slots. Both sit over 2^24 and under the
+    /// image and bin caps. Side 51 and length 2.11 fall under 2^24.
     #[test]
     fn wide_partner_stencils_match_brute_force() {
-        let cell = Cell::ortho(80.0, 80.0, 80.0).unwrap();
+        let cell = Cell::ortho(52.0, 52.0, 52.0).unwrap();
         let xyz = vec![[0.2, 0.2, 0.2], [0.7, 0.2, 0.2]];
         expect_list(&cell, &xyz, 1.0);
 
-        let cell = Cell::ortho(0.01, 0.01, 10.0).unwrap();
+        let cell = Cell::ortho(0.01, 0.01, 2.12).unwrap();
         let xyz = vec![[0.002, 0.003, 1.0], [0.005, 0.007, 1.05]];
         expect_list(&cell, &xyz, 0.2);
     }
