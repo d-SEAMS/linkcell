@@ -385,11 +385,22 @@ fn many_seeds_cover_edge_cases_and_ties() {
             let query_ids = [0usize, n / 3, n - 1];
             for &qi in &query_ids {
                 let q = &data[qi * d..(qi + 1) * d];
+                // One full ranking feeds every k. Each k is still queried on
+                // the index; only the oracle scan is shared.
+                let mut ranked = Vec::with_capacity(n);
+                for i in 0..n {
+                    ranked.push((i, metric.dist2(&data[i * d..(i + 1) * d], q).unwrap()));
+                }
+                metric.rank(&data, d, q, &mut ranked);
                 for &k in &[0usize, 1, 4, n / 2, n + 13] {
                     let got = idx.knn(q, k).unwrap();
-                    let want = brute_knn(&metric, &data, n, d, q, k);
+                    let want: &[(usize, f64)] = if k == 0 {
+                        &[]
+                    } else {
+                        &ranked[..k.min(ranked.len())]
+                    };
                     assert_eq!(got.len(), want.len());
-                    for (g, w) in got.iter().zip(&want) {
+                    for (g, w) in got.iter().zip(want.iter()) {
                         assert_eq!(g.index, w.0);
                         assert_eq!(g.dist2.to_bits(), w.1.to_bits());
                     }

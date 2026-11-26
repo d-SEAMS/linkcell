@@ -1,0 +1,1 @@
+Meson `cargo test` compiles with the unoptimized test profile, so the N-dimensional neighbour checks miss that test's budget on macOS. The Meson run now sets the test profile's opt-level to 3, which keeps debug assertions and does not enable the release profile's link-time optimization. Those checks rank each query once and still query the index at every listed `k`.
