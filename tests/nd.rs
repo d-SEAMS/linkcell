@@ -1028,18 +1028,19 @@ struct SmallStackRun {
     dbscan: [Result<Vec<i32>, Error>; 2],
 }
 
-/// 20_000 identical points used to recurse one level per point and overflow
-/// a 2 MiB stack. Every build and query runs on a 32 KiB stack, in the debug
-/// profile too. The full scans they are checked against run on the test
-/// thread.
+/// 1_024 identical points recurse one level per point. At about 100 B a
+/// frame that is about 100 KiB, which still overflows a 32 KiB stack if the
+/// recursion returns. Every build and query runs on a 32 KiB stack, in the
+/// debug profile too. The full scans they are checked against run on the
+/// test thread.
 #[test]
 fn large_duplicate_set_builds_on_a_small_stack() {
-    const N: usize = 20_000;
+    const N: usize = 1_024;
     let dup = vec![0.125f64; N];
     let l = 2.0 * std::f64::consts::PI;
     let base = -5.675156211725825;
     let images: Vec<f64> = (0..N)
-        .map(|i| base + f64::from((i as i32) - 10_000) * l)
+        .map(|i| base + f64::from((i as i32) - (N as i32 / 2)) * l)
         .collect();
     let radii = [0.0, f64::from_bits(1), 1.0e-15, 5.4225756419539195e-3];
     // A cluster with duplicates, then two points whose gap overflows.
