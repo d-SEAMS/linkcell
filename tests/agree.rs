@@ -497,6 +497,11 @@ fn packed_layout_is_i_times_k_plus_j() {
             }
         }
     }
+
+    let two = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+    let mut row_major = [0; 4];
+    knearest_into(&two, &b, 2, None, None, &mut row_major).unwrap();
+    assert_eq!(row_major, [1, -1, 0, -1]);
 }
 
 #[test]
@@ -547,15 +552,6 @@ fn knearest_into_rejects_short_buffer() {
         knearest_into(&xyz, &b, 1, None, None, &mut out).unwrap_err(),
         Error::BufferSize
     );
-}
-
-#[test]
-fn packed_layout_is_row_major() {
-    let b = Cell::ortho(10.0, 10.0, 10.0).unwrap();
-    let xyz = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
-    let mut out = [0; 4];
-    knearest_into(&xyz, &b, 2, None, None, &mut out).unwrap();
-    assert_eq!(out, [1, -1, 0, -1]);
 }
 
 #[test]
