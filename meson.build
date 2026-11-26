@@ -382,11 +382,18 @@ if get_option('with_tests')
     _meson_test_env.prepend('DYLD_LIBRARY_PATH', meson.project_build_root())
   endif
   test('nd-capi-smoke-c', nd_capi_smoke, env: _meson_test_env)
+  # Cargo's test profile compiles unoptimized. The neighbour checks call
+  # the dyadic metric often enough that an unoptimized run misses the
+  # meson budget on macOS. Opt level 3 keeps debug assertions, and this
+  # run does not use the release profile's LTO or single codegen unit.
   test(
     'cargo-tests',
     cargo_prog,
     args: ['test', '--manifest-path', _msproot / 'Cargo.toml'],
-    env: {'LINKCELL_OPENMP': _use_openmp ? '1' : '0'},
+    env: {
+      'LINKCELL_OPENMP': _use_openmp ? '1' : '0',
+      'CARGO_PROFILE_TEST_OPT_LEVEL': '3',
+    },
     timeout: 300,
   )
 endif
