@@ -16,12 +16,20 @@ pub enum Error {
     /// A size, index, weight, coordinate, or image offset does not fit
     /// its representation.
     Overflow,
+    /// A squared distance or a periodic reduction overflowed binary64.
+    DistanceOverflow,
     /// `mask` is `Some` and its length is not `n`.
     MaskLen,
     /// Linked-cell mesh would overflow or exceed the bin cap.
     TooManyCells,
     /// `cutoff` is not finite and strictly positive.
     BadCutoff,
+    /// N-dimensional query radius is not finite and non-negative.
+    BadNdRadius,
+    /// DBSCAN epsilon is not finite and strictly positive.
+    BadNdEps,
+    /// DBSCAN `min_pts` is zero.
+    BadNdMinPts,
     /// Periodic image stencil exceeds the 2^24 resource cap.
     ///
     /// The partner stencil returns this same error when its reach box
@@ -61,6 +69,14 @@ pub enum Error {
     ScotchDisabled,
     /// The Scotch library rejected the graph.
     ScotchFailed,
+    /// The row-major buffer shape is inconsistent.
+    BadDimensions,
+    /// A periodic length is not finite and strictly positive.
+    BadPeriod,
+    /// Point index is outside the indexed range.
+    IndexOutOfRange,
+    /// `n * d` does not fit in `usize`.
+    NdProduct,
 }
 
 impl fmt::Display for Error {
@@ -71,9 +87,13 @@ impl fmt::Display for Error {
             Error::Empty => write!(f, "no points"),
             Error::BufferSize => write!(f, "out buffer length must be n * k"),
             Error::Overflow => write!(f, "n * k overflows"),
+            Error::DistanceOverflow => write!(f, "distance overflowed"),
             Error::MaskLen => write!(f, "mask length must be n"),
             Error::TooManyCells => write!(f, "linked-cell mesh is too fine"),
-            Error::BadCutoff => write!(f, "cutoff must be finite and positive"),
+            Error::BadCutoff => write!(f, "cutoff must be finite and strictly positive"),
+            Error::BadNdRadius => write!(f, "radius must be finite and non-negative"),
+            Error::BadNdEps => write!(f, "eps must be finite and strictly positive"),
+            Error::BadNdMinPts => write!(f, "min_pts must be at least 1"),
             Error::TooManyImages => write!(f, "periodic image count exceeds 2^24"),
             Error::Degenerate => {
                 write!(
@@ -98,6 +118,10 @@ impl fmt::Display for Error {
             }
             Error::ScotchDisabled => write!(f, "Scotch support is compiled out"),
             Error::ScotchFailed => write!(f, "Scotch returned an error"),
+            Error::BadDimensions => write!(f, "row-major buffer shape is inconsistent"),
+            Error::BadPeriod => write!(f, "period length must be finite and positive"),
+            Error::IndexOutOfRange => write!(f, "point index is out of range"),
+            Error::NdProduct => write!(f, "n * d overflows"),
         }
     }
 }

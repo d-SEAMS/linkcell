@@ -1,0 +1,3 @@
+- Fixed N-dimensional pruning so a squared distance that underflows, or a periodic slack whose square would underflow, still returns the same neighbours as brute force under `dist2`.
+- Periodic pruning keeps a positive slack when `4 * ulp(L)` squares to zero.
+- `axis_min_dist2` and `aabb_min_dist2` are lower bounds on the squared distance. They are zero when the interval may cover half a period or more.

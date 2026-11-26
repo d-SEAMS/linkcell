@@ -1,0 +1,1 @@
+- N-dimensional build and queries sort with `sort_unstable`. Their keys are unique, so results are unchanged, and no stable-sort scratch buffer sits on the stack. The build and every query run on a 32 KiB thread stack in debug and release builds, for a 20 000-point duplicate set and for sets that mix duplicates with huge coordinates.

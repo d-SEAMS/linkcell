@@ -1,0 +1,1 @@
+- The N-dimensional prune slack rounds its products upward from the exact significand product instead of `f64::mul_add`, so the release library links no fused multiply-add routine outside `simd::select()`.

@@ -1,0 +1,1 @@
+- `VpTreeIndex::new` returns `NdProduct` (`n * d overflows`) when `n * d` does not fit in `usize`, before it reads a point. `lc_nd_build` reports that same string. `Error::Overflow` still displays `n * k overflows`. `NdProduct` is a `linkcell::Error` variant; `Error` is not `#[non_exhaustive]`.

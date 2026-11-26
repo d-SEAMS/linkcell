@@ -193,7 +193,7 @@ The documentation is published at [linkcell.dseams.info](https://linkcell.dseams
 | --- | --- |
 | Tutorial | [Two points](docs/tutorials/two-points.md) |
 | How-to | [Embed from C](docs/how-to/embed-c.md), [Embed from C++](docs/how-to/embed-cpp.md), [Embed from Python](docs/how-to/embed-python.md), [pkg-config](docs/how-to/pkg-config.md) |
-| Reference | [C ABI](docs/reference/c-api.md), [Algorithm](docs/reference/algorithm.md), [Features and instruction-set builds](docs/reference/features.md), [Cell partition](docs/reference/partition.md) |
+| Reference | [C ABI](docs/reference/c-api.md), [Algorithm](docs/reference/algorithm.md), [N-dimensional index and DBSCAN](docs/reference/nd.md), [Features and instruction-set builds](docs/reference/features.md), [Cell partition](docs/reference/partition.md) |
 | Explanation | [Minimum image convention (MIC) and cells](docs/explanation/mic-and-cells.md), [SIMD paths and dispatch](docs/explanation/simd-paths.md) |
 
 Rust API: [docs.rs/linkcell](https://docs.rs/linkcell).

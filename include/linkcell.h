@@ -140,6 +140,17 @@ typedef struct lc_cell {
 } lc_cell;
 
 /**
+ * Opaque N-dimensional neighbour index handle.
+ *
+ * Callers only ever hold a pointer returned by `lc_nd_build`. The byte
+ * makes this a complete object type in C99 and C++17. A zero-length array
+ * is not one.
+ */
+typedef struct lc_nd_index {
+    uint8_t _private;
+} lc_nd_index;
+
+/**
  * One cutoff row: source `i`, target `j`, shift `S`, squared distance.
  * The C++ `linkcell::ShiftedPair` has this layout.
  */
@@ -432,6 +443,132 @@ int lc_mesh_cut(const double *xyz,
                 size_t cap_cell,
                 size_t cap_point,
                 size_t *out_ncell);
+
+/**
+ * Build an N-dimensional exact neighbour index from row-major `n * d` data.
+ *
+ * `periods` is null for a fully open space, or length `d` with
+ * `periods[k] > 0` for periodic axis `k`, `periods[k] == 0` for open axis,
+ * and `periods[k] < 0` rejected.
+ * The index owns a copy of `data` and is released by [`lc_nd_free`].
+ * On failure, `*out` is set to null.
+ *
+ * The period table is one optional period per axis, 16 bytes. `d` greater
+ * than what fits in `isize::MAX` bytes fails with `the period table does
+ * not fit in isize::MAX bytes` before any allocation. A `d` that passes
+ * that check still fails with `the period table could not be allocated`
+ * when the allocator refuses the table. `n * d` that does not fit in
+ * `usize` fails with `n * d overflows` before the coordinates are read.
+ *
+ * # Safety
+ *
+ * When `n * d` fits in `usize`, `data` is readable for that many doubles.
+ * `periods`, if non-null, is readable for `d` doubles. `out` is writable
+ * for one pointer.
+ */
+int lc_nd_build(const double *data,
+                size_t n,
+                size_t d,
+                const double *periods,
+                struct lc_nd_index **out);
+
+/**
+ * Deterministic DBSCAN over the indexed points.
+ *
+ * `min_pts` includes the point itself.
+ *
+ * # Safety
+ *
+ * `out_labels` and `out_core` are writable for `lc_nd_len(index)` entries.
+ * `out_clusters`, if non-null, is writable for one count.
+ */
+int lc_nd_dbscan(const struct lc_nd_index *index,
+                 double eps,
+                 size_t min_pts,
+                 int *out_labels,
+                 int *out_core,
+                 size_t *out_clusters);
+
+/**
+ * Point dimensionality of an N-dimensional index.
+ *
+ * # Safety
+ *
+ * `index` is null or a valid pointer returned by [`lc_nd_build`].
+ */
+size_t lc_nd_dims(const struct lc_nd_index *index);
+
+/**
+ * Free an index built by [`lc_nd_build`]. Null is accepted.
+ *
+ * # Safety
+ *
+ * `index` is null or a pointer returned by [`lc_nd_build`] and not already
+ * freed.
+ */
+void lc_nd_free(struct lc_nd_index *index);
+
+/**
+ * k-nearest neighbours for one query point.
+ *
+ * Writes exactly `k` slots: found neighbours first, then `-1` / `NaN`.
+ *
+ * # Safety
+ *
+ * `query` is readable for `lc_nd_dims(index)` doubles. `out_idx` is writable
+ * for `k` ints. `out_d2`, if non-null, is writable for `k` doubles.
+ */
+int lc_nd_knn(const struct lc_nd_index *index,
+              const double *query,
+              size_t k,
+              int *out_idx,
+              double *out_d2);
+
+/**
+ * Number of indexed points in an N-dimensional index.
+ *
+ * # Safety
+ *
+ * `index` is null or a valid pointer returned by [`lc_nd_build`].
+ */
+size_t lc_nd_len(const struct lc_nd_index *index);
+
+/**
+ * All index pairs `i < j` within radius.
+ *
+ * Null `out_i`, `out_j`, and `out_d2` queries `*out_count`.
+ *
+ * # Safety
+ *
+ * `out_count` is writable. On a fill, `out_i`/`out_j` are writable for `cap`
+ * ints and `out_d2`, if non-null, for `cap` doubles.
+ */
+int lc_nd_pairs_within(const struct lc_nd_index *index,
+                       double radius,
+                       int *out_i,
+                       int *out_j,
+                       double *out_d2,
+                       size_t cap,
+                       size_t *out_count);
+
+/**
+ * Radius neighbours for one query point.
+ *
+ * Null `out_idx` (and `out_d2`) queries `*out_count`.
+ *
+ * # Safety
+ *
+ * `query` is readable for `lc_nd_dims(index)` doubles. `out_count` is writable.
+ * On a fill, `out_idx` is writable for `cap` ints and `out_d2`, if non-null,
+ * for `cap` doubles.
+ */
+int lc_nd_within(const struct lc_nd_index *index,
+                 const double *query,
+                 double radius,
+                 int *out_idx,
+                 double *out_d2,
+                 size_t cap,
+                 size_t *out_count);
 
 /**
  * Width selected by [`lc_set_threads`], or the global pool when unset.

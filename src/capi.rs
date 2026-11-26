@@ -7,7 +7,7 @@ use std::ffi::{c_char, c_int, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{Cell, Error};
+use crate::{Cell, Error, NeighbourIndex};
 
 /// How many Rayon threads the next search should use. Zero is unset: the
 /// search runs from the calling thread with rayon's and OpenMP's own
@@ -363,6 +363,370 @@ pub extern "C" fn lc_last_error() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn lc_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
+
+struct NdHandle {
+    tree: crate::VpTreeIndex<crate::OwnedContiguousSpace, crate::PeriodicSpace>,
+}
+
+/// Opaque N-dimensional neighbour index handle.
+///
+/// Callers only ever hold a pointer returned by `lc_nd_build`. The byte
+/// makes this a complete object type in C99 and C++17. A zero-length array
+/// is not one.
+#[repr(C)]
+pub struct lc_nd_index {
+    _private: u8,
+}
+
+unsafe fn nd_ref<'a>(ptr: *const lc_nd_index) -> Result<&'a NdHandle, c_int> {
+    if ptr.is_null() {
+        return Err(fail_msg("null pointer"));
+    }
+    Ok(unsafe { &*(ptr as *const NdHandle) })
+}
+
+/// Build an N-dimensional exact neighbour index from row-major `n * d` data.
+///
+/// `periods` is null for a fully open space, or length `d` with
+/// `periods[k] > 0` for periodic axis `k`, `periods[k] == 0` for open axis,
+/// and `periods[k] < 0` rejected.
+/// The index owns a copy of `data` and is released by [`lc_nd_free`].
+/// On failure, `*out` is set to null.
+///
+/// The period table is one optional period per axis, 16 bytes. `d` greater
+/// than what fits in `isize::MAX` bytes fails with `the period table does
+/// not fit in isize::MAX bytes` before any allocation. A `d` that passes
+/// that check still fails with `the period table could not be allocated`
+/// when the allocator refuses the table. `n * d` that does not fit in
+/// `usize` fails with `n * d overflows` before the coordinates are read.
+///
+/// # Safety
+///
+/// When `n * d` fits in `usize`, `data` is readable for that many doubles.
+/// `periods`, if non-null, is readable for `d` doubles. `out` is writable
+/// for one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_build(
+    data: *const f64,
+    n: usize,
+    d: usize,
+    periods: *const f64,
+    out: *mut *mut lc_nd_index,
+) -> c_int {
+    if out.is_null() {
+        return fail_msg("null pointer");
+    }
+    unsafe {
+        *out = ptr::null_mut();
+    }
+    if data.is_null() || d == 0 {
+        return fail_msg("null pointer");
+    }
+    let max_d = (isize::MAX as usize) / std::mem::size_of::<Option<f64>>();
+    if d > max_d {
+        return fail_msg("the period table does not fit in isize::MAX bytes");
+    }
+    let Some(len) = n.checked_mul(d) else {
+        return fail(Error::NdProduct);
+    };
+    let raw = unsafe { std::slice::from_raw_parts(data, len) };
+    if !raw.iter().all(|v| v.is_finite()) {
+        return fail(Error::NonFinite);
+    }
+    let mut period_vec = Vec::new();
+    if period_vec.try_reserve_exact(d).is_err() {
+        return fail_msg("the period table could not be allocated");
+    }
+    if periods.is_null() {
+        period_vec.resize(d, None);
+    } else {
+        let p = unsafe { std::slice::from_raw_parts(periods, d) };
+        if p.iter().any(|&v| v.is_nan() || v < 0.0) {
+            return fail(Error::BadPeriod);
+        }
+        for &v in p {
+            period_vec.push(if v > 0.0 { Some(v) } else { None });
+        }
+    }
+    let space = match crate::OwnedContiguousSpace::from_row_major(raw, n, d) {
+        Ok(space) => space,
+        Err(err) => return fail(err),
+    };
+    let metric = match crate::PeriodicSpace::new(period_vec) {
+        Ok(metric) => metric,
+        Err(err) => return fail(err),
+    };
+    let tree = match crate::VpTreeIndex::new(space, metric) {
+        Ok(tree) => tree,
+        Err(err) => return fail(err),
+    };
+    let boxed = Box::new(NdHandle { tree });
+    unsafe {
+        *out = Box::into_raw(boxed) as *mut lc_nd_index;
+    }
+    clear_error();
+    0
+}
+
+/// Number of indexed points in an N-dimensional index.
+///
+/// # Safety
+///
+/// `index` is null or a valid pointer returned by [`lc_nd_build`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_len(index: *const lc_nd_index) -> usize {
+    match unsafe { nd_ref(index) } {
+        Ok(h) => h.tree.len(),
+        Err(_) => 0,
+    }
+}
+
+/// Point dimensionality of an N-dimensional index.
+///
+/// # Safety
+///
+/// `index` is null or a valid pointer returned by [`lc_nd_build`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_dims(index: *const lc_nd_index) -> usize {
+    match unsafe { nd_ref(index) } {
+        Ok(h) => h.tree.dims(),
+        Err(_) => 0,
+    }
+}
+
+/// Free an index built by [`lc_nd_build`]. Null is accepted.
+///
+/// # Safety
+///
+/// `index` is null or a pointer returned by [`lc_nd_build`] and not already
+/// freed.
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_free(index: *mut lc_nd_index) {
+    if index.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(index as *mut NdHandle));
+    }
+}
+
+/// k-nearest neighbours for one query point.
+///
+/// Writes exactly `k` slots: found neighbours first, then `-1` / `NaN`.
+///
+/// # Safety
+///
+/// `query` is readable for `lc_nd_dims(index)` doubles. `out_idx` is writable
+/// for `k` ints. `out_d2`, if non-null, is writable for `k` doubles.
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_knn(
+    index: *const lc_nd_index,
+    query: *const f64,
+    k: usize,
+    out_idx: *mut c_int,
+    out_d2: *mut f64,
+) -> c_int {
+    if query.is_null() || out_idx.is_null() {
+        return fail_msg("null pointer");
+    }
+    let h = match unsafe { nd_ref(index) } {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    let d = h.tree.dims();
+    let q = unsafe { std::slice::from_raw_parts(query, d) };
+    let hits = match with_threads(|| h.tree.knn(q, k)) {
+        Ok(hits) => hits,
+        Err(err) => return fail(err),
+    };
+    let out = unsafe { std::slice::from_raw_parts_mut(out_idx, k) };
+    out.fill(-1);
+    let mut d2_out = if out_d2.is_null() {
+        None
+    } else {
+        let s = unsafe { std::slice::from_raw_parts_mut(out_d2, k) };
+        s.fill(f64::NAN);
+        Some(s)
+    };
+    for (slot, hit) in hits.iter().take(k).enumerate() {
+        if hit.index > c_int::MAX as usize {
+            return fail(Error::Overflow);
+        }
+        out[slot] = hit.index as c_int;
+        if let Some(buf) = d2_out.as_deref_mut() {
+            buf[slot] = hit.dist2;
+        }
+    }
+    clear_error();
+    0
+}
+
+/// Radius neighbours for one query point.
+///
+/// Null `out_idx` (and `out_d2`) queries `*out_count`.
+///
+/// # Safety
+///
+/// `query` is readable for `lc_nd_dims(index)` doubles. `out_count` is writable.
+/// On a fill, `out_idx` is writable for `cap` ints and `out_d2`, if non-null,
+/// for `cap` doubles.
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_within(
+    index: *const lc_nd_index,
+    query: *const f64,
+    radius: f64,
+    out_idx: *mut c_int,
+    out_d2: *mut f64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if query.is_null() || out_count.is_null() {
+        return fail_msg("null pointer");
+    }
+    let h = match unsafe { nd_ref(index) } {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    let d = h.tree.dims();
+    let q = unsafe { std::slice::from_raw_parts(query, d) };
+    let hits = match with_threads(|| h.tree.within(q, radius)) {
+        Ok(hits) => hits,
+        Err(err) => return fail(err),
+    };
+    unsafe {
+        *out_count = hits.len();
+    }
+    if out_idx.is_null() {
+        clear_error();
+        return 0;
+    }
+    if cap < hits.len() {
+        return fail_msg("radius buffer is shorter than the neighbour count");
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(out_idx, cap) };
+    for (slot, hit) in hits.iter().enumerate() {
+        if hit.index > c_int::MAX as usize {
+            return fail(Error::Overflow);
+        }
+        out[slot] = hit.index as c_int;
+    }
+    if !out_d2.is_null() {
+        let d2 = unsafe { std::slice::from_raw_parts_mut(out_d2, cap) };
+        for (slot, hit) in hits.iter().enumerate() {
+            d2[slot] = hit.dist2;
+        }
+    }
+    clear_error();
+    0
+}
+
+/// All index pairs `i < j` within radius.
+///
+/// Null `out_i`, `out_j`, and `out_d2` queries `*out_count`.
+///
+/// # Safety
+///
+/// `out_count` is writable. On a fill, `out_i`/`out_j` are writable for `cap`
+/// ints and `out_d2`, if non-null, for `cap` doubles.
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_pairs_within(
+    index: *const lc_nd_index,
+    radius: f64,
+    out_i: *mut c_int,
+    out_j: *mut c_int,
+    out_d2: *mut f64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if out_count.is_null() {
+        return fail_msg("null pointer");
+    }
+    let h = match unsafe { nd_ref(index) } {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    let pairs = match with_threads(|| h.tree.pairs_within(radius)) {
+        Ok(rows) => rows,
+        Err(err) => return fail(err),
+    };
+    unsafe {
+        *out_count = pairs.len();
+    }
+    if out_i.is_null() && out_j.is_null() && out_d2.is_null() {
+        clear_error();
+        return 0;
+    }
+    if out_i.is_null() || out_j.is_null() {
+        return fail_msg("null pointer");
+    }
+    if cap < pairs.len() {
+        return fail_msg("pair buffer is shorter than the pair count");
+    }
+    let i_out = unsafe { std::slice::from_raw_parts_mut(out_i, cap) };
+    let j_out = unsafe { std::slice::from_raw_parts_mut(out_j, cap) };
+    let mut d2_out = if out_d2.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts_mut(out_d2, cap) })
+    };
+    for (slot, row) in pairs.iter().enumerate() {
+        if row.i > c_int::MAX as usize || row.j > c_int::MAX as usize {
+            return fail(Error::Overflow);
+        }
+        i_out[slot] = row.i as c_int;
+        j_out[slot] = row.j as c_int;
+        if let Some(buf) = d2_out.as_deref_mut() {
+            buf[slot] = row.dist2;
+        }
+    }
+    clear_error();
+    0
+}
+
+/// Deterministic DBSCAN over the indexed points.
+///
+/// `min_pts` includes the point itself.
+///
+/// # Safety
+///
+/// `out_labels` and `out_core` are writable for `lc_nd_len(index)` entries.
+/// `out_clusters`, if non-null, is writable for one count.
+#[no_mangle]
+pub unsafe extern "C" fn lc_nd_dbscan(
+    index: *const lc_nd_index,
+    eps: f64,
+    min_pts: usize,
+    out_labels: *mut c_int,
+    out_core: *mut c_int,
+    out_clusters: *mut usize,
+) -> c_int {
+    if out_labels.is_null() || out_core.is_null() {
+        return fail_msg("null pointer");
+    }
+    let h = match unsafe { nd_ref(index) } {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    let res = match with_threads(|| h.tree.dbscan(eps, min_pts)) {
+        Ok(res) => res,
+        Err(err) => return fail(err),
+    };
+    let labels = unsafe { std::slice::from_raw_parts_mut(out_labels, res.labels.len()) };
+    let core = unsafe { std::slice::from_raw_parts_mut(out_core, res.core.len()) };
+    for (i, &v) in res.labels.iter().enumerate() {
+        labels[i] = v;
+    }
+    for (i, &v) in res.core.iter().enumerate() {
+        core[i] = if v { 1 } else { 0 };
+    }
+    if !out_clusters.is_null() {
+        unsafe {
+            *out_clusters = res.clusters;
+        }
+    }
+    clear_error();
+    0
 }
 
 /// k-nearest neighbours for `n` points.

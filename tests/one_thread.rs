@@ -286,6 +286,8 @@ fn one_thread_calls_create_no_thread() {
         })
         .collect();
 
+    nd_calls(&xyz[..600 * 3], &same);
+
     linkcell::lc_set_threads(0);
     assert_eq!(
         grid_fill(&xyz, &cell, cutoff, ncell),
@@ -299,6 +301,76 @@ fn one_thread_calls_create_no_thread() {
             "partition method {method} differs between one thread and the default width"
         );
     }
+}
+
+/// Every N-dimensional call, each checked by `same`. Without the caller
+/// route, `lc_nd_pairs_within` would split its rows over rayon's global pool
+/// at any point count.
+fn nd_calls(xyz: &[f64], same: &dyn Fn(&str)) {
+    let n = xyz.len() / 3;
+    let mut nd = std::ptr::null_mut();
+    let rc = unsafe { linkcell::lc_nd_build(xyz.as_ptr(), n, 3, std::ptr::null(), &mut nd) };
+    assert_eq!(rc, 0, "ND build");
+    same("ND build");
+
+    let q = &xyz[..3];
+    let mut nn = vec![-1 as c_int; 8];
+    let rc =
+        unsafe { linkcell::lc_nd_knn(nd, q.as_ptr(), 8, nn.as_mut_ptr(), std::ptr::null_mut()) };
+    assert_eq!(rc, 0, "ND k-nearest");
+    assert!(nn.iter().all(|&j| j >= 0), "ND k-nearest left a slot empty");
+    same("ND k-nearest");
+
+    let mut count = 0usize;
+    let rc = unsafe {
+        linkcell::lc_nd_within(
+            nd,
+            q.as_ptr(),
+            2.0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0, "ND radius count");
+    assert!(count > 1, "the query has radius neighbours");
+    same("ND radius count");
+
+    let rc = unsafe {
+        linkcell::lc_nd_pairs_within(
+            nd,
+            2.0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    assert_eq!(rc, 0, "ND pair count");
+    assert!(count > 0, "the slice has pairs within the radius");
+    same("ND pair count");
+
+    let mut labels = vec![-2 as c_int; n];
+    let mut core = vec![0 as c_int; n];
+    let mut clusters = 0usize;
+    let rc = unsafe {
+        linkcell::lc_nd_dbscan(
+            nd,
+            2.0,
+            4,
+            labels.as_mut_ptr(),
+            core.as_mut_ptr(),
+            &mut clusters,
+        )
+    };
+    assert_eq!(rc, 0, "ND DBSCAN");
+    assert!(clusters > 0, "DBSCAN found a cluster");
+    same("ND DBSCAN");
+
+    unsafe { linkcell::lc_nd_free(nd) };
+    same("ND free");
 }
 
 fn grid_fill(xyz: &[f64], cell: &lc_cell, cutoff: f64, ncell: usize) -> (Vec<c_int>, Vec<u64>) {

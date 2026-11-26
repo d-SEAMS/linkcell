@@ -56,6 +56,123 @@ A NaN or infinite coordinate, masked or not and in any frame, or a non-finite `s
 A non-finite lattice entry returns nonzero as a singular or non-positive cell.
 The device entries `lc_gpu_knearest*` in `linkcell_gpu.h` do not scan their device coordinates for non-finite values.
 
+## N-dimensional index
+
+```c
+typedef struct lc_nd_index {
+  uint8_t _private;
+} lc_nd_index;
+
+int lc_nd_build(const double *data, size_t n, size_t d,
+                const double *periods, lc_nd_index **out);
+void lc_nd_free(lc_nd_index *index);
+size_t lc_nd_len(const lc_nd_index *index);
+size_t lc_nd_dims(const lc_nd_index *index);
+
+int lc_nd_knn(const lc_nd_index *index, const double *query, size_t k,
+              int *out_idx, double *out_d2);
+
+int lc_nd_within(const lc_nd_index *index, const double *query,
+                 double radius, int *out_idx, double *out_d2,
+                 size_t cap, size_t *out_count);
+
+int lc_nd_pairs_within(const lc_nd_index *index, double radius,
+                       int *out_i, int *out_j, double *out_d2,
+                       size_t cap, size_t *out_count);
+
+int lc_nd_dbscan(const lc_nd_index *index, double eps, size_t min_pts,
+                 int *out_labels, int *out_core, size_t *out_clusters);
+```
+
+The handle is opaque. Callers only hold a pointer returned by `lc_nd_build`.
+The one byte makes it a complete object type in C99 and C++17.
+
+`lc_nd_build` takes row-major `data` of shape `n x d`.
+`periods` is optional (`NULL` means every axis open); with a non-null pointer,
+length is `d`; `periods[k] > 0` marks axis `k` periodic, `periods[k] == 0`
+marks it open, and negative or NaN values are rejected.
+On any `lc_nd_build` failure, `*out` is set to `NULL`.
+
+The period table is one optional period per axis, 16 bytes. `d` such that
+this table would not fit in `isize::MAX` bytes fails with `the period table
+does not fit in isize::MAX bytes` before any allocation. A `d` that passes
+that check can still fail with `the period table could not be allocated`
+when the allocator refuses the table. `n * d` that does not fit in `usize`
+fails with `n * d overflows` before the coordinates are read. Those three
+strings are the C messages for these refusals. `VpTreeIndex::new` returns
+`NdProduct` (`n * d overflows`) for the same product before it reads a
+point. `Error::Overflow` still displays `n * k overflows`.
+
+`lc_nd_knn` writes exactly `k` slots (`-1` and optional `NaN` for unused
+slots when `k > n`).
+`radius` for `lc_nd_within` / `lc_nd_pairs_within` must be finite and
+non-negative. `eps` for `lc_nd_dbscan` must be finite and strictly positive.
+
+`lc_nd_within` and `lc_nd_pairs_within` accept count-query mode:
+
+- for `lc_nd_within`, set `out_idx = NULL` (and `out_d2 = NULL`) to query
+  `*out_count`;
+- for `lc_nd_pairs_within`, set `out_i = out_j = out_d2 = NULL` to query
+  `*out_count`.
+
+For fill calls, if `cap < *out_count`, the call returns nonzero and keeps
+`*out_count` at the required size without writing partial output.
+
+`lc_nd_dbscan` writes one label and one core flag per indexed point.
+Noise has label `-1`.
+`min_pts` includes the point itself.
+Index outputs are `int` to match existing `lc_*` neighbour and pair ABI
+conventions; if an index would not fit in `int`, the call returns nonzero.
+For finite input coordinates, `dist2` is the binary64 nearest to the exact
+sum of the squares of the per-axis distances, ties to even. When that exact
+sum is a binary64 number, the result is that number, including
+`(1 + 2^-27, 2^-27, 2^-27, 2^-27)` against the origin
+(`1 + 2^-26 + 2^-52`) and, for period 10, `dist2(2^55, 0) = 4`,
+`dist2(2^55, 8) = 0`, and `dist2(2^62, 4) = 0`. The call fails with
+`distance overflowed` when that nearest value is not finite. That string is
+not `n * k overflows`. A half-period gap whose square is outside the finite
+range is that error, not a zero distance. `dist2(1, 0)` at period `1e308`
+is `1`. The nearest value is `0` only when zero is a nearest binary64 to the
+exact sum. `min_pts == 0` fails with `min_pts must be at least 1`.
+
+A query fails with `distance overflowed` exactly when a full scan would.
+`lc_nd_knn` with `k > 0` and `lc_nd_within` read the distance from the
+query to every point, and `lc_nd_pairs_within` and `lc_nd_dbscan` read every
+pair. The tree never prunes a subtree that may hold a point `2^510` or
+farther from the query, so the result does not depend on the point order.
+`lc_nd_build` does not fail on such a distance.
+
+`lc_nd_within`, `lc_nd_pairs_within` and `lc_nd_dbscan` accept a point when
+`dist2 <= fl(radius * radius)`, the product rounded to binary64. When that
+product is `0`, only a point that coincides with the query is accepted, not
+one whose square underflowed to `0`. With points `i * 1e-163` and the query
+`0`, radius `27e-163` returns the 28 points `i <= 27`: `fl(radius * radius)`
+is `2^-1074`, and each of their squares rounds to at most that. Hits are
+ordered by exact squared distance, then index. Two `dist2` values that tie
+keep the order of their unrounded squares: for points `1e-170` and `0`,
+`lc_nd_knn` from `0` with `k = 1` returns index 1.
+
+Returned ND results are checked against a full scan under the same `dist2`.
+Each periodic coordinate is reduced with the IEEE remainder, the remainders
+are subtracted, and that difference is folded into `[-L/2, L/2]`. A
+coordinate is not reflected before the subtraction. A signed `rem_euclid` is
+not used, so a small negative delta on a huge period is kept: with period
+`2^53`, `dist2(-0.5, 0)` is `0.25` and `dist2(2^52 - 1, 2^52)` is `1`; with
+period `1e16` or `1e300`, `dist2(-1, 0)` is `1`; with period `1e16`,
+`dist2(-5e15, 4999999999999999)` is `1`. With period 10,
+`dist2(1.7e308, -1.7e308)` is `16`. Pruning widens every triangle test by a
+Higham relative factor, by at least `8 * sqrt(dims) * 2^-537`, and by
+`8 * sqrt(p) * max(4 * ulp(L_i))` where `p` is the number of periodic axes,
+not the point count. The periodic term is not a sum of squares, so a tiny
+period cannot zero it. It is a prune guard, not an error bound on `dist2`.
+`dist2` is rounded once from the exact sum, so each distance in a triangle
+test is within a relative `2^-52` and an absolute `2^-537` of its exact
+value at every dimension. The relative factor grows with the dimension and
+the absolute floor with its square root; neither is a fixed number of ulps.
+`±L` are the same point, including `L = 1e308`. `knn` with `k = 0` does not
+walk the tree. `lc_nd_within` with radius `0` reads a few distances per tree
+level, not one per point.
+
 ```c
 int lc_pairs_within(const double *xyz, size_t n, const lc_cell *simbox,
                     double cutoff, const int *mask, double cell_hint,
@@ -388,7 +505,12 @@ A null function removes the hook, and the device partition then reports that no 
 | `MaskLen` | `mask` is `Some` and `mask.len() != n` |
 | `TooManyCells` | linked-cell mesh overflows the bin cap |
 | `BadCutoff` | `cutoff` is not finite and strictly positive |
-| `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation |
+| `BadNdRadius` | ND query radius is not finite or is negative |
+| `BadNdEps` | ND DBSCAN epsilon is not finite and strictly positive |
+| `BadNdMinPts` | ND DBSCAN `min_pts` is zero |
+| `Overflow` | A size, index, graph weight, open-cell coordinate, or periodic image offset does not fit its representation (`n * k overflows`) |
+| `NdProduct` | `n * d` does not fit in `usize` (`n * d overflows`) |
+| `DistanceOverflow` | An N-dimensional distance overflowed binary64 (`distance overflowed`) |
 | `BadPartition` | The part count is zero, or the balance bound is below 1 |
 | `BadGraph` | The cell graph must be a square compressed sparse row (CSR) of that grid |
 | `NoDevice` | A device curve split was requested and no device is loaded |
@@ -401,6 +523,12 @@ A null function removes the hook, and the device partition then reports that no 
 | `NonFinite` | A coordinate is not finite. `knearest`, `knearest_into`, `knearest_into_d2`, `knearest_into_many`, `knearest_csr`, `knearest_brute` (and through them `lc_knearest`, `lc_knearest_d2`, `lc_knearest_many`, `lc_knearest_csr`), `pairs_within_pbc`, `pairs_within_csr`, `pairs_open`, and the partition entry points return this variant. The k-nearest entries also return it for a non-finite cell origin |
 | `DeviceMismatch` | The device curve split disagreed with the host weights |
 | `ScotchFailed` | The Scotch library rejected the graph |
+| `BadDimensions` | N-dimensional row-major shape is inconsistent |
+| `BadPeriod` | N-dimensional period value is not finite and strictly positive |
+| `IndexOutOfRange` | N-dimensional point index is outside the indexed range |
+
+All status-returning C ABI calls currently return `0` on success and `1` on
+failure; error detail is carried by `lc_last_error()`.
 
 `Error::Empty` is not a wrong-length buffer.
 `knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`. `TooManyCells` is also a box at least 10^7 bin edges across: the walk would not certify the neighbours.

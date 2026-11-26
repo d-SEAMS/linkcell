@@ -1,0 +1,2 @@
+- Fixed N-dimensional periodic search so radius, k-nearest, pair, and DBSCAN results match brute force under the same `dist2`, including coordinates many periods from the origin and subnormal radii on periodic duplicates.
+- Tied vantage-point distances stay balanced, and build and query walk a heap stack, so a duplicate cloud cannot overflow the calling thread.
