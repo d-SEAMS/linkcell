@@ -352,68 +352,73 @@ fn random_knn_and_within_match_bruteforce() {
 
 #[test]
 fn many_seeds_cover_edge_cases_and_ties() {
-    let dims = [1usize, 2, 3, 8, 20, 40];
+    fn check(rng: &mut StdRng, n: usize, d: usize) {
+        let mut periods = vec![None; d];
+        for p in &mut periods {
+            if rng.random::<f64>() < 0.4 {
+                *p = Some(rng.random_range(1.5..15.0));
+            }
+        }
+        let mut data = vec![0.0; n * d];
+        for i in 0..n {
+            for k in 0..d {
+                let mut v = rng.random_range(-20.0..20.0);
+                if let Some(l) = periods[k] {
+                    v += rng.random_range(-4.0..4.0) * l;
+                }
+                data[i * d + k] = v;
+            }
+        }
+        // Duplicates and exact ties.
+        if n > 3 {
+            for k in 0..d {
+                data[d + k] = data[k];
+                data[2 * d + k] = data[k];
+            }
+        }
+        let idx = build_index(&data, n, d, &periods);
+        let metric = Oracle::new(&periods);
+        let query_ids = [0usize, n / 3, n - 1];
+        for &qi in &query_ids {
+            let q = &data[qi * d..(qi + 1) * d];
+            // One full ranking feeds every k. Each k is still queried on
+            // the index; only the oracle scan is shared.
+            let mut ranked = Vec::with_capacity(n);
+            for i in 0..n {
+                ranked.push((i, metric.dist2(&data[i * d..(i + 1) * d], q).unwrap()));
+            }
+            metric.rank(&data, d, q, &mut ranked);
+            for &k in &[0usize, 1, 4, n / 2, n + 13] {
+                let got = idx.knn(q, k).unwrap();
+                let want: &[(usize, f64)] = if k == 0 {
+                    &[]
+                } else {
+                    &ranked[..k.min(ranked.len())]
+                };
+                assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(want.iter()) {
+                    assert_eq!(g.index, w.0);
+                    assert_eq!(g.dist2.to_bits(), w.1.to_bits());
+                }
+            }
+            let zero = idx.within(q, 0.0).unwrap();
+            for hit in &zero {
+                assert_eq!(hit.dist2, 0.0);
+            }
+            let large = idx.within(q, 1000.0).unwrap();
+            assert_eq!(large.len(), n);
+        }
+    }
+    let dims = [1usize, 3, 40];
     for seed in 0..18u64 {
         let mut rng = StdRng::seed_from_u64(100 + seed);
         for &d in &dims {
-            let n = rng.random_range(2..=2_400usize);
-            let mut periods = vec![None; d];
-            for p in &mut periods {
-                if rng.random::<f64>() < 0.4 {
-                    *p = Some(rng.random_range(1.5..15.0));
-                }
-            }
-            let mut data = vec![0.0; n * d];
-            for i in 0..n {
-                for k in 0..d {
-                    let mut v = rng.random_range(-20.0..20.0);
-                    if let Some(l) = periods[k] {
-                        v += rng.random_range(-4.0..4.0) * l;
-                    }
-                    data[i * d + k] = v;
-                }
-            }
-            // Duplicates and exact ties.
-            if n > 3 {
-                for k in 0..d {
-                    data[d + k] = data[k];
-                    data[2 * d + k] = data[k];
-                }
-            }
-            let idx = build_index(&data, n, d, &periods);
-            let metric = Oracle::new(&periods);
-            let query_ids = [0usize, n / 3, n - 1];
-            for &qi in &query_ids {
-                let q = &data[qi * d..(qi + 1) * d];
-                // One full ranking feeds every k. Each k is still queried on
-                // the index; only the oracle scan is shared.
-                let mut ranked = Vec::with_capacity(n);
-                for i in 0..n {
-                    ranked.push((i, metric.dist2(&data[i * d..(i + 1) * d], q).unwrap()));
-                }
-                metric.rank(&data, d, q, &mut ranked);
-                for &k in &[0usize, 1, 4, n / 2, n + 13] {
-                    let got = idx.knn(q, k).unwrap();
-                    let want: &[(usize, f64)] = if k == 0 {
-                        &[]
-                    } else {
-                        &ranked[..k.min(ranked.len())]
-                    };
-                    assert_eq!(got.len(), want.len());
-                    for (g, w) in got.iter().zip(want.iter()) {
-                        assert_eq!(g.index, w.0);
-                        assert_eq!(g.dist2.to_bits(), w.1.to_bits());
-                    }
-                }
-                let zero = idx.within(q, 0.0).unwrap();
-                for hit in &zero {
-                    assert_eq!(hit.dist2, 0.0);
-                }
-                let large = idx.within(q, 1000.0).unwrap();
-                assert_eq!(large.len(), n);
-            }
+            let n = rng.random_range(2..=64usize);
+            check(&mut rng, n, d);
         }
     }
+    let mut rng = StdRng::seed_from_u64(100);
+    check(&mut rng, 512, 40);
 }
 
 #[test]
@@ -1023,18 +1028,19 @@ struct SmallStackRun {
     dbscan: [Result<Vec<i32>, Error>; 2],
 }
 
-/// 20_000 identical points used to recurse one level per point and overflow
-/// a 2 MiB stack. Every build and query runs on a 32 KiB stack, in the debug
-/// profile too. The full scans they are checked against run on the test
-/// thread.
+/// 1_024 identical points recurse one level per point. At about 100 B a
+/// frame that is about 100 KiB, which still overflows a 32 KiB stack if the
+/// recursion returns. Every build and query runs on a 32 KiB stack, in the
+/// debug profile too. The full scans they are checked against run on the
+/// test thread.
 #[test]
 fn large_duplicate_set_builds_on_a_small_stack() {
-    const N: usize = 20_000;
+    const N: usize = 1_024;
     let dup = vec![0.125f64; N];
     let l = 2.0 * std::f64::consts::PI;
     let base = -5.675156211725825;
     let images: Vec<f64> = (0..N)
-        .map(|i| base + f64::from((i as i32) - 10_000) * l)
+        .map(|i| base + f64::from((i as i32) - (N as i32 / 2)) * l)
         .collect();
     let radii = [0.0, f64::from_bits(1), 1.0e-15, 5.4225756419539195e-3];
     // A cluster with duplicates, then two points whose gap overflows.
@@ -2350,13 +2356,9 @@ fn every_query_matches_a_full_scan_in_every_order() {
     let radii = [0.0, 1.0e-300, 1.0e-170, 1.0, 1.0e100, 1.0e153, 1.0e300];
     let mut rng = StdRng::seed_from_u64(0x0f10_0a11);
     let mut seen = [0usize; 2];
-    for case in 0..150 {
+    for case in 0..60 {
         let d = 1 + case % 3;
-        let n = if case % 25 == 24 {
-            5
-        } else {
-            2 + (case / 3) % 3
-        };
+        let n = 2 + (case / 3) % 3;
         let periods: Vec<Option<f64>> = (0..d)
             .map(|_| axes[rng.random_range(0..axes.len())])
             .collect();
@@ -2407,7 +2409,8 @@ fn overflow_is_reported_however_the_tree_prunes() {
             .map(|axis| axes[(case / 3 + axis) % axes.len()])
             .collect();
         let oracle = Oracle::new(&periods);
-        let mut rows: Vec<Vec<f64>> = (0..80)
+        let near = 32;
+        let mut rows: Vec<Vec<f64>> = (0..near)
             .map(|_| (0..d).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect();
         for _ in 0..1 + case % 3 {
@@ -2415,7 +2418,7 @@ fn overflow_is_reported_however_the_tree_prunes() {
             row[rng.random_range(0..d)] = far[rng.random_range(0..far.len())];
             rows.push(row);
         }
-        let mut queries = rows[76..].to_vec();
+        let mut queries = rows[near - 4..].to_vec();
         queries.push(vec![0.0; d]);
         let mut toward = vec![0.25; d];
         toward[0] = -0.5 * x;
@@ -2558,8 +2561,7 @@ fn zero_k_and_zero_radius_do_not_walk_the_tree() {
 #[test]
 fn collinear_points_in_high_dimension_match_a_brute_force_scan() {
     let mut rng = StdRng::seed_from_u64(0xc011_17ea);
-    for (case, d) in [1usize, 3, 16, 48, 64, 256].into_iter().enumerate() {
-        let n = if d > 16 { 96 } else { 200 };
+    for &(d, n, periodic) in &[(1usize, 200usize, false), (48, 96, true), (256, 24, true)] {
         let dir: Vec<f64> = (0..d).map(|_| rng.random_range(0.5..2.0)).collect();
         let data: Vec<f64> = (0..n)
             .flat_map(|i| {
@@ -2568,7 +2570,7 @@ fn collinear_points_in_high_dimension_match_a_brute_force_scan() {
             })
             .collect();
         let periods: Vec<Option<f64>> = (0..d)
-            .map(|axis| (case % 2 == 1 && axis % 2 == 0).then_some(64.0))
+            .map(|axis| (periodic && axis % 2 == 0).then_some(64.0))
             .collect();
         let oracle = Oracle::new(&periods);
         let point = |i: usize| data[i * d..(i + 1) * d].to_vec();

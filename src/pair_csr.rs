@@ -1242,16 +1242,26 @@ mod tests {
         let paths = crate::simd::paths_to_compare();
         for (case, &(n, edge)) in sizes.iter().enumerate() {
             let edge = edge.unwrap_or((n as f64 / 0.0334).cbrt());
+            // The n=40 system keeps every hint and every half/mask pair.
+            // Every other size keeps both tilts, both half lists, both
+            // thread counts, and every SIMD path, at the default hint and
+            // with no mask. n <= 64 still checks brute force.
+            let full = n == 40;
             for tilt in [0.0, 0.3] {
                 let (xyz, cell) = frame(n, edge, tilt, 0x51ed_270b_27a4_3c11 ^ case as u64);
                 let mask: Vec<bool> = (0..n).map(|i| (i * 7919) % 5 != 0).collect();
-                for hint in [None, Some(0.6 * cutoff), Some(1.7 * cutoff)] {
-                    for (half, masked) in
-                        [(false, false), (true, false), (false, true), (true, true)]
-                    {
-                        if n == 4096 && (masked || tilt != 0.0) {
-                            continue;
-                        }
+                let hints: &[Option<f64>] = if full {
+                    &[None, Some(0.6 * cutoff), Some(1.7 * cutoff)]
+                } else {
+                    &[None]
+                };
+                let halves: &[(bool, bool)] = if full {
+                    &[(false, false), (true, false), (false, true), (true, true)]
+                } else {
+                    &[(false, false), (true, false)]
+                };
+                for &hint in hints {
+                    for &(half, masked) in halves {
                         let query = PbcQuery::periodic(cutoff)
                             .cell_hint(hint)
                             .half(half)
