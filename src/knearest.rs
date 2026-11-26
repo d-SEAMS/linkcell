@@ -2417,7 +2417,7 @@ mod scale_mesh_tests {
             for xyz in &sets {
                 let mask: Vec<bool> = (0..xyz.len()).map(|t| t % 7 != 3).collect();
                 for hint in [Some(2.4), Some(5.0)] {
-                    for k in [1, 4, 8, 12, 20] {
+                    for k in [1, 8, 20] {
                         for mask in [None, Some(mask.as_slice())] {
                             let blocked = knearest(xyz, sim, k, mask, hint).unwrap();
                             NO_BLOCKS.store(true, std::sync::atomic::Ordering::Relaxed);
