@@ -148,7 +148,14 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
         .collect()
 }
 
-/// Kernel identifiers of this process's live threads.
+/// Kernel thread ids of this process's live threads.
+///
+/// These are the ids `pthread_threadid_np` returns. `PROC_PIDLISTTHREADS`
+/// (6) lists each thread's user-space cthread handle instead, and a joined
+/// thread still in the task list then compares unequal to the id the probe
+/// recorded. `PROC_PIDLISTTHREADIDS` (28) is the XNU flavor that lists the
+/// stable ids (`thuniqueid` in `proc_pidlistthreads`). It is not in the
+/// public SDK header; `proc_pidinfo` forwards the flavor.
 #[cfg(target_os = "macos")]
 fn thread_ids() -> std::collections::BTreeSet<u64> {
     extern "C" {
@@ -161,20 +168,23 @@ fn thread_ids() -> std::collections::BTreeSet<u64> {
             size: c_int,
         ) -> c_int;
     }
-    const PROC_PIDLISTTHREADS: c_int = 6;
+    const PROC_PIDLISTTHREADIDS: c_int = 28;
     let mut ids = vec![0u64; 64];
     loop {
         let bytes = c_int::try_from(ids.len() * 8).unwrap();
         let got = unsafe {
             proc_pidinfo(
                 getpid(),
-                PROC_PIDLISTTHREADS,
+                PROC_PIDLISTTHREADIDS,
                 0,
                 ids.as_mut_ptr().cast(),
                 bytes,
             )
         };
-        assert!(got > 0, "proc_pidinfo(PROC_PIDLISTTHREADS) returned {got}");
+        assert!(
+            got > 0,
+            "proc_pidinfo(PROC_PIDLISTTHREADIDS) returned {got}"
+        );
         if got < bytes {
             return ids[..got as usize / 8].iter().copied().collect();
         }
@@ -2774,6 +2784,18 @@ fn lc_nd_respects_set_threads_one_without_growing_threads() {
         nd_spawn::arm().unwrap_or_else(|err| panic!("spawn counter: {err}"));
         let spawned = nd_spawn::count();
         let before_ids = thread_ids();
+        // Windows lists only threads this executable created with
+        // `CreateThread`. The caller was not one of those. Linux and macOS
+        // list every live thread, and the caller's id has to be one of them:
+        // that is the same space the joined id is compared in.
+        #[cfg(not(windows))]
+        {
+            let self_id = current_thread_id();
+            assert!(
+                before_ids.contains(&self_id),
+                "this thread's id {self_id} is absent from the live-thread snapshot {before_ids:?}"
+            );
+        }
         let joined = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let slot = std::sync::Arc::clone(&joined);
         std::thread::spawn(move || {

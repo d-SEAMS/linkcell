@@ -27,6 +27,9 @@ find_program(CARGO_EXECUTABLE cargo REQUIRED)
 
 option(LINKCELL_BUILD_EXAMPLES "Build C and C++ example programs" ON)
 option(LINKCELL_INSTALL "Install headers, libraries, pkg-config, and CMake package" ON)
+option(LINKCELL_EH_STATIC
+  "Link linkcell::Error's key function into each final image instead of the shared linkcell_eh library"
+  OFF)
 option(LINKCELL_WITH_GPULITE "Build the device k-nearest C and C++ APIs" ON)
 option(LINKCELL_CARGO_VERBOSE "Show Cargo and build-script commands" OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
@@ -70,6 +73,16 @@ else()
 endif()
 set(LINKCELL_GPU_STATIC_NAME
   "${CMAKE_STATIC_LIBRARY_PREFIX}linkcell_gpu${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(LINKCELL_EH_SHARED_NAME
+  "${CMAKE_SHARED_LIBRARY_PREFIX}linkcell_eh${CMAKE_SHARED_LIBRARY_SUFFIX}")
+set(LINKCELL_EH_STATIC_NAME
+  "${CMAKE_STATIC_LIBRARY_PREFIX}linkcell_eh${CMAKE_STATIC_LIBRARY_SUFFIX}")
+if(WIN32)
+  set(LINKCELL_EH_IMPLIB_NAME
+    "${CMAKE_IMPORT_LIBRARY_PREFIX}linkcell_eh${CMAKE_IMPORT_LIBRARY_SUFFIX}")
+else()
+  set(LINKCELL_EH_IMPLIB_NAME "")
+endif()
 
 set(LINKCELL_CARGO_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargo-target")
 string(TOLOWER "${CMAKE_BUILD_TYPE}" _linkcell_build_type)
@@ -281,9 +294,36 @@ if(LINKCELL_OMP_DIR)
     INTERFACE_LINK_DIRECTORIES "${LINKCELL_OMP_DIR}")
 endif()
 
+# Key function for linkcell::Error. Shared, so two consumer DSOs import one
+# typeinfo. LINKCELL_EH_STATIC keeps the fully static link: one copy in
+# each final image, not across DSOs.
+if(LINKCELL_EH_STATIC)
+  add_library(linkcell_eh STATIC src/error.cpp)
+  target_compile_definitions(linkcell_eh PUBLIC LINKCELL_EH_STATIC)
+else()
+  add_library(linkcell_eh SHARED src/error.cpp)
+  target_compile_definitions(linkcell_eh PRIVATE LINKCELL_EH_BUILDING)
+endif()
+add_library(linkcell::eh ALIAS linkcell_eh)
+target_include_directories(linkcell_eh PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+)
+target_compile_features(linkcell_eh PUBLIC cxx_std_17)
+set_target_properties(linkcell_eh PROPERTIES POSITION_INDEPENDENT_CODE ON)
+foreach(_linkcell_eh_kind RUNTIME LIBRARY ARCHIVE)
+  set_target_properties(linkcell_eh PROPERTIES
+    "${_linkcell_eh_kind}_OUTPUT_DIRECTORY" "${CMAKE_CURRENT_BINARY_DIR}")
+  foreach(_linkcell_eh_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set_target_properties(linkcell_eh PROPERTIES
+      "${_linkcell_eh_kind}_OUTPUT_DIRECTORY_${_linkcell_eh_cfg}"
+      "${CMAKE_CURRENT_BINARY_DIR}")
+  endforeach()
+endforeach()
+
 add_library(linkcell_cpp INTERFACE)
 add_library(linkcell::cpp ALIAS linkcell_cpp)
-target_link_libraries(linkcell_cpp INTERFACE linkcell::linkcell)
+target_link_libraries(linkcell_cpp INTERFACE linkcell::linkcell linkcell::eh)
 target_compile_features(linkcell_cpp INTERFACE cxx_std_17)
 
 set(LINKCELL_GPU_SYSTEM_LIBS Threads::Threads)
@@ -309,6 +349,7 @@ if(LINKCELL_WITH_GPULITE)
   target_compile_features(linkcell_gpu PUBLIC cxx_std_17)
   target_link_libraries(linkcell_gpu PUBLIC
     linkcell::linkcell
+    linkcell::eh
     ${LINKCELL_GPU_SYSTEM_LIBS}
   )
 endif()
@@ -336,12 +377,48 @@ if(LINKCELL_BUILD_EXAMPLES)
   add_test(NAME knearest-non-finite-cpp COMMAND knearest_non_finite_cpp)
   set(_linkcell_example_tests
     two-points-c two-points-cpp knearest-non-finite-c knearest-non-finite-cpp)
+  add_executable(exception_typeinfo_static
+    tests/exception_typeinfo_static.cpp
+    tests/exception_typeinfo_static_other.cpp
+    src/error.cpp)
+  target_include_directories(exception_typeinfo_static PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_compile_features(exception_typeinfo_static PRIVATE cxx_std_17)
+  target_compile_definitions(exception_typeinfo_static PRIVATE LINKCELL_EH_STATIC)
+  add_test(NAME exception-typeinfo-static COMMAND exception_typeinfo_static)
+  list(APPEND _linkcell_example_tests exception-typeinfo-static)
+  if(NOT LINKCELL_EH_STATIC)
+    add_library(exception_typeinfo_hidden_a SHARED tests/exception_typeinfo_hidden.cpp)
+    add_library(exception_typeinfo_hidden_b SHARED tests/exception_typeinfo_hidden.cpp)
+    target_compile_definitions(exception_typeinfo_hidden_b PRIVATE LC_PROBE_B)
+    foreach(_linkcell_hidden exception_typeinfo_hidden_a exception_typeinfo_hidden_b)
+      target_link_libraries(${_linkcell_hidden} PRIVATE linkcell::eh)
+      target_compile_features(${_linkcell_hidden} PRIVATE cxx_std_17)
+      set_target_properties(${_linkcell_hidden} PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+      if(NOT MSVC)
+        target_compile_options(${_linkcell_hidden} PRIVATE
+          -fvisibility=hidden -fvisibility-inlines-hidden)
+      endif()
+    endforeach()
+    add_executable(exception_typeinfo tests/exception_typeinfo.cpp)
+    target_compile_features(exception_typeinfo PRIVATE cxx_std_17)
+    target_link_libraries(exception_typeinfo PRIVATE
+      linkcell::eh exception_typeinfo_hidden_a exception_typeinfo_hidden_b)
+    set_target_properties(exception_typeinfo PROPERTIES
+      BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+    add_test(NAME exception-typeinfo COMMAND exception_typeinfo)
+    list(APPEND _linkcell_example_tests exception-typeinfo)
+  endif()
   if(UNIX AND NOT APPLE)
     set_tests_properties(${_linkcell_example_tests} PROPERTIES
       ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}")
   elseif(APPLE)
     set_tests_properties(${_linkcell_example_tests} PROPERTIES
       ENVIRONMENT "DYLD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}")
+  elseif(WIN32)
+    set_tests_properties(${_linkcell_example_tests} PROPERTIES
+      ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CMAKE_CURRENT_BINARY_DIR}")
   endif()
 endif()
 
@@ -371,6 +448,11 @@ if(LINKCELL_INSTALL)
     set(LINKCELL_GPU_PKG_LIBS "")
   endif()
 
+  if(LINKCELL_EH_STATIC)
+    set(LINKCELL_EH_PC_CFLAGS " -DLINKCELL_EH_STATIC")
+  else()
+    set(LINKCELL_EH_PC_CFLAGS "")
+  endif()
   configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/linkcell.pc.in"
     "${CMAKE_CURRENT_BINARY_DIR}/linkcell.pc"
@@ -401,6 +483,10 @@ if(LINKCELL_INSTALL)
     install(FILES "${LINKCELL_SHARED}" DESTINATION "${CMAKE_INSTALL_LIBDIR}")
   endif()
   install(FILES "${LINKCELL_STATIC}" DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+  install(TARGETS linkcell_eh
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
   if(LINKCELL_WITH_GPULITE)
     install(TARGETS linkcell_gpu ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
   endif()

@@ -1,0 +1,1 @@
+The Python extension compiles `src/error.cpp` into the wheel with `LINKCELL_EH_STATIC`. The GPU sources throw `linkcell::Error`, and the extension is one final image, so the key function lives in `_lib` and the wheel does not need `liblinkcell_eh`.

@@ -3,7 +3,7 @@
 Header: `include/linkcell.h`.
 Prefix `lc_`.
 Caller owns every buffer.
-C++ (`include/linkcell.hpp`) is a header-only wrap of these entry points.
+C++ (`include/linkcell.hpp`) wraps these entry points. `linkcell::Error` has an out-of-line destructor in the shared library `linkcell_eh`, so every shared library sees one typeinfo.
 Device searches are `lc_gpu_*` in `include/linkcell_gpu.h`; link the package's `linkcell-gpu` target.
 
 ## Cell

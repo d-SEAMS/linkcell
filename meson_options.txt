@@ -12,3 +12,5 @@ option('cargo_profile', type: 'combo', choices: ['auto', 'debug', 'release'], va
   description: 'Cargo profile for the crate; auto is release in a subproject and follows buildtype otherwise')
 option('sanitize', type: 'combo', choices: ['none', 'thread'], value: 'none',
   description: 'Rebuild the crate, std and Rayon with this sanitizer, for a host linked with the same one (LINKCELL_SANITIZE)')
+option('eh_shared', type: 'boolean', value: true,
+  description: 'Put linkcell::Error in the shared library linkcell_eh. false links that object into each final image (one typeinfo per final link, not across DSOs).')

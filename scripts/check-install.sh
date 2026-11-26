@@ -87,6 +87,13 @@ check_pkgconfig() {
       exit 1
       ;;
   esac
+  case "$libs" in
+    *-llinkcell_eh*) ;;
+    *)
+      echo "$label Libs must contain -llinkcell_eh: $libs"
+      exit 1
+      ;;
+  esac
   case "$gpu_cflags" in
     *-DLINKCELL_HAS_GPULITE=1*) ;;
     *)
@@ -146,6 +153,13 @@ check_libs() {
   if ! have_lib "$prefix" "liblinkcell_gpu.a" \
     && ! have_lib "$prefix" "linkcell_gpu.lib"; then
     echo "missing installed GPU static library under $prefix"
+    find "$prefix" -name '*linkcell*' | head
+    exit 1
+  fi
+  if ! have_lib "$prefix" "liblinkcell_eh.so" \
+    && ! have_lib "$prefix" "liblinkcell_eh.dylib" \
+    && ! have_lib "$prefix" "linkcell_eh.dll"; then
+    echo "missing installed linkcell_eh shared library under $prefix"
     find "$prefix" -name '*linkcell*' | head
     exit 1
   fi
