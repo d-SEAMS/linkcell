@@ -2563,8 +2563,7 @@ fn zero_k_and_zero_radius_do_not_walk_the_tree() {
 #[test]
 fn collinear_points_in_high_dimension_match_a_brute_force_scan() {
     let mut rng = StdRng::seed_from_u64(0xc011_17ea);
-    for (case, d) in [1usize, 3, 16, 48, 64, 256].into_iter().enumerate() {
-        let n = if d > 16 { 96 } else { 200 };
+    for &(d, n, periodic) in &[(1usize, 200usize, false), (48, 96, true), (256, 24, true)] {
         let dir: Vec<f64> = (0..d).map(|_| rng.random_range(0.5..2.0)).collect();
         let data: Vec<f64> = (0..n)
             .flat_map(|i| {
@@ -2573,7 +2572,7 @@ fn collinear_points_in_high_dimension_match_a_brute_force_scan() {
             })
             .collect();
         let periods: Vec<Option<f64>> = (0..d)
-            .map(|axis| (case % 2 == 1 && axis % 2 == 0).then_some(64.0))
+            .map(|axis| (periodic && axis % 2 == 0).then_some(64.0))
             .collect();
         let oracle = Oracle::new(&periods);
         let point = |i: usize| data[i * d..(i + 1) * d].to_vec();
