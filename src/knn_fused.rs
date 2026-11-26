@@ -10,8 +10,7 @@ use std::os::raw::c_void;
 use std::time::Instant;
 
 use super::{
-    box_diameter, select_one_block, walk_cells, BlockScan, Candidates, Geom, KHeap, Mesh, RowsOut,
-    TEAM,
+    reach_of, select_one_block, walk_cells, BlockScan, Candidates, Geom, KHeap, Mesh, RowsOut, TEAM,
 };
 use crate::bins::{self, Recycled};
 use crate::cell::Cell;
@@ -421,22 +420,14 @@ pub(super) fn run(
         (ncell, [0; 3], -1)
     };
     let n_blocks = i64::try_from(n_select).map_err(|_| Error::Overflow)?;
-    let cell_min = (widths[0] / f64::from(nbin[0]))
-        .min(widths[1] / f64::from(nbin[1]))
-        .min(widths[2] / f64::from(nbin[2]));
-    let need = (box_diameter(simbox) / cell_min).ceil();
     let image = nbin[0].max(nbin[1]).max(nbin[2]) / 2 + 2;
-    let max_reach = if need.is_finite() && need < 1.0e7 {
-        (need as i32).saturating_add(3).max(image)
-    } else {
-        image
-    };
     let geom = Geom {
         cols: [simbox.a(), simbox.b(), simbox.c()],
         lengths: simbox.widths(),
         nbin,
         widths,
     };
+    let max_reach = reach_of(simbox, &geom, image)?;
     let mode = if simbox.is_ortho() {
         0
     } else if simbox.is_restricted() {

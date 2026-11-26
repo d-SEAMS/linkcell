@@ -106,8 +106,20 @@ int lc_pairs_within_pbc(const double *xyz, size_t n, const lc_cell *simbox,
 shift zero, squared distance strictly below `cutoff * cutoff`.
 `lc_pairs_within_pbc` is that list with a periodicity mask.
 `pbc[k]` nonzero keeps axis `k` periodic. A null `pbc` is fully
-periodic and is `lc_pairs_within_rows`. An open axis is binned on the
-occupied Cartesian cells. It is not padded into a periodic box.
+periodic and is `lc_pairs_within_rows`. An open axis is replaced by a
+unit normal of the periodic rows, however long the stored row is, and
+is binned on the occupied Cartesian cells of that lattice. It is not
+padded into a periodic box. A fully periodic cell whose face width
+is zero or non-finite returns nonzero. A positive finite width is not
+rejected by its ratio to the longest edge. A width that needs more
+than 2^24 images, or whose estimated row buffer does not fit, returns
+nonzero with the image-count error. The mesh edge is clamped to the
+shortest width, so a face much shorter than the other edges can exceed
+the bin cap at every cutoff and returns the mesh error. When both caps
+hold, including a short face no shorter than the cutoff, the call
+returns the pairs. The partner stencil is capped at 2^31 slots,
+enough for a reach of two bins on every axis of a mesh at the bin cap.
+A larger reach box returns the image-count error and is not stored.
 `lc_stencil_builds` counts partner stencils that were built. A stencil
 that is reused does not increment it. A fully open stencil is reused
 by every call with the same cutoff and bin edge, wherever the atoms
@@ -382,6 +394,7 @@ A null function removes the hook, and the device partition then reports that no 
 | `NoDevice` | A device curve split was requested and no device is loaded |
 | `ScotchDisabled` | Scotch support was not compiled in |
 | `TooManyImages` | The periodic image count exceeds 2^24 |
+| `Degenerate` | A periodic face width is zero or non-finite (`periodic cell is degenerate: a face width is zero or non-finite`). A positive finite width is cutoff-aware and uses the image and bin caps. An open axis is replaced before this test |
 | `Partial` | An axis is not periodic and `libvesin.so` is not loaded |
 | `Device` | The device is not the CPU and `libvesin.so` is not loaded |
 | `Padded` | A point has more neighbours than the requested pad |
@@ -390,13 +403,13 @@ A null function removes the hook, and the device partition then reports that no 
 | `ScotchFailed` | The Scotch library rejected the graph |
 
 `Error::Empty` is not a wrong-length buffer.
-`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`.
+`knearest` returns `ZeroK`, `Empty`, `MaskLen`, `Overflow`, `NonFinite`, and `TooManyCells`. `TooManyCells` is also a box at least 10^7 bin edges across: the walk would not certify the neighbours.
 `knearest_csr` returns the same variants.
 `knearest_into`, `knearest_into_d2`, and `knearest_into_many` return them and `BufferSize`.
-`knearest_brute` returns `ZeroK`, `Empty`, and `NonFinite`.
+`knearest_brute` returns `ZeroK`, `Empty`, `NonFinite`, and `Degenerate`.
 A non-finite lattice vector is `BadBox` from the `Cell` constructor, before any search.
 `pairs_within` returns `BadCutoff`, `Empty`, `MaskLen`, `Overflow`,
-`TooManyImages`, and `TooManyCells`. Its `Overflow` cases include a
+`TooManyImages`, `TooManyCells`, and `Degenerate`. Its `Overflow` cases include a
 point count above `u32::MAX` and a relative periodic image offset that
 does not fit the stored shift.
 Positions and cell vectors share one length unit.

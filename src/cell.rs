@@ -33,3 +33,20 @@ pub use minimage::Cell;
 pub use minimage::{
     dist2_many, dist2_ortho_diffs, dist2_pairs, reduce_pairs, reduce_pairs_packed, wrap_many,
 };
+
+/// `true` when a selected periodic face has zero or non-finite width.
+///
+/// `periodic[k]` selects axis `k`. The altitude is [`Cell::widths`] on
+/// that axis. A positive finite width is not collapsed. The image count
+/// `ceil(cutoff / width)` depends on the cutoff, and the mesh edge
+/// clamps to the shortest width, so a much shorter face can still
+/// exceed the bin cap. No selected axis is not collapsed.
+pub(crate) fn periodic_face_collapsed(cell: &Cell, periodic: [bool; 3]) -> bool {
+    let widths = cell.widths();
+    for axis in 0..3 {
+        if periodic[axis] && (!widths[axis].is_finite() || widths[axis] <= 0.0) {
+            return true;
+        }
+    }
+    false
+}

@@ -70,6 +70,8 @@ The C, C++, and Python entries are that list (`lc_pairs_within`, `linkcell::pair
 A cutoff neighbour list is this call.
 
 An open axis has no image.
+`cell_for_pbc` replaces each open row with a unit normal to the span of the periodic rows, whatever length the caller stored, and the bins are that periodic sublattice.
+A zero or near-flat open row no longer collapses the periodic face widths.
 `pairs_open` bins the occupied Cartesian cells and returns the half list (`i < j`, shift zero).
 With every axis open the partner stencil is, for each row of bins in y and z, the farthest x offset within reach. It depends on the cutoff and the bin edge alone, so a frame in other bins, such as another image of a band, reuses it, and the walk clips each row to the bins the frame spans.
 A reach past 16 bins stores rows only out to the span a frame needs on y and z and widens them when a later frame spans more.
@@ -111,7 +113,9 @@ The walk reads each target bin's occupancy from the offsets.
 
 The walk splits across threads from an ideal-gas estimate of ten thousand pairs.
 On this 8-core host one thread is faster at 512 atoms in an 18 Å cube at 4 Å, and eight threads from 768.
-A split call reserves the row buffer on the caller's thread from that estimate.
+A split call checks the image count and the bin cap, then reserves the row buffer on the caller's thread from that estimate when the product of the estimate and the row size fits in `isize::MAX` bytes.
+A cell that fails a check returns `TooManyImages` or `TooManyCells` and does not reserve. An allocator that refuses the buffer returns `TooManyImages`.
+The partner stencil is capped at 2^31 slots. That admits a reach of two bins on every axis of a mesh at the bin cap. A larger reach box returns `TooManyImages` and is not stored.
 It then builds the bins, searches, and writes in one pool entry.
 The caller stays off the serial steps while every worker spins, and sleeps between search and output.
 A short estimate grows that buffer for the calling thread. glibc gives a large block allocated on a worker its own heap and unmaps it when the block is freed, so the buffer the caller keeps is allocated where the caller runs.
@@ -286,13 +290,20 @@ The output is `n` rows of length at most `k`.
 Reduction changes which integer offsets are short.
 The bounds and the Cartesian distances stay the same.
 
-`pairs_open`, and a mixed `pairs_within_pbc`, bin the occupied Cartesian extent.
-An open axis stays open.
+`pairs_open`, and a mixed `pairs_within_pbc`, bin the occupied Cartesian extent of the periodic sublattice.
+An open axis is replaced by a unit normal of the periodic rows and stays open.
 The partner stencil stores, for each row of bins, the farthest offset still inside the cutoff.
 That offset depends on the cutoff and the bin edge.
 A fully open stencil is reused by later frames with the same cutoff and edge.
 With a periodic axis the stencil is rebuilt when the bounding bins change.
 The same 2^24 image cap applies.
+A periodic face width that is zero or non-finite is `Error::Degenerate` (`periodic cell is degenerate: a face width is zero or non-finite`).
+A positive finite width is not rejected by its ratio to the longest edge.
+The image count is the product of `2 * ceil(cutoff / width) + 1` and depends on the cutoff; above 2^24 the call returns `TooManyImages`.
+The mesh edge is clamped to the shortest width, so a face much shorter than the other edges can exceed the bin cap at every cutoff, and that refusal is `TooManyCells`.
+When both caps hold, including a short face no shorter than the cutoff, the search returns the pairs.
+The caps and the checked row reservation run before any buffer is reserved.
+minimage can still return a displacement.
 `lc_stencil_builds` counts builds, not reuses.
 
 Threads change the wall time.
