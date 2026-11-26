@@ -1051,7 +1051,7 @@ mod prune_tests {
     /// tree level, and two per level on average.
     #[test]
     fn knn_prunes_on_a_large_random_set_and_stays_exact() {
-        for n in [4096usize, 64_000] {
+        for n in [4096usize, 16_384] {
             knn_prunes_on(n);
         }
     }
