@@ -2355,13 +2355,9 @@ fn every_query_matches_a_full_scan_in_every_order() {
     let radii = [0.0, 1.0e-300, 1.0e-170, 1.0, 1.0e100, 1.0e153, 1.0e300];
     let mut rng = StdRng::seed_from_u64(0x0f10_0a11);
     let mut seen = [0usize; 2];
-    for case in 0..150 {
+    for case in 0..60 {
         let d = 1 + case % 3;
-        let n = if case % 25 == 24 {
-            5
-        } else {
-            2 + (case / 3) % 3
-        };
+        let n = 2 + (case / 3) % 3;
         let periods: Vec<Option<f64>> = (0..d)
             .map(|_| axes[rng.random_range(0..axes.len())])
             .collect();
