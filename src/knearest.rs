@@ -2264,29 +2264,86 @@ fn team_test_lock() -> &'static std::sync::Mutex<()> {
     &LOCK
 }
 
+/// Saved OpenMP controls. Drop restores the thread count, when this guard
+/// changed it, and dyn-var.
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+struct OmpRestore {
+    threads: Option<i32>,
+    dynamic: i32,
+}
+
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+impl Drop for OmpRestore {
+    fn drop(&mut self) {
+        extern "C" {
+            fn omp_set_num_threads(n: i32);
+            fn omp_set_dynamic(dynamic_threads: i32);
+        }
+        unsafe {
+            if let Some(threads) = self.threads {
+                omp_set_num_threads(threads);
+            }
+            omp_set_dynamic(self.dynamic);
+        }
+    }
+}
+
+/// Width `team_size` stores with dyn-var off: `omp_get_max_threads()`,
+/// then a positive `omp_get_thread_limit()`, and at least one.
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+fn capped_team() -> usize {
+    extern "C" {
+        fn omp_get_max_threads() -> i32;
+        fn omp_get_thread_limit() -> i32;
+    }
+    let mut nt = unsafe { omp_get_max_threads() }.max(1);
+    let limit = unsafe { omp_get_thread_limit() };
+    if limit > 0 && limit < nt {
+        nt = limit;
+    }
+    nt as usize
+}
+
+/// Hold dyn-var off until dropped.
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+fn dynamic_off() -> OmpRestore {
+    extern "C" {
+        fn omp_get_dynamic() -> i32;
+        fn omp_set_dynamic(dynamic_threads: i32);
+    }
+    let restore = OmpRestore {
+        threads: None,
+        dynamic: unsafe { omp_get_dynamic() },
+    };
+    unsafe { omp_set_dynamic(0) };
+    restore
+}
+
 /// Run `body` on a k-nearest team of `threads`, then restore the team
 /// size the process had. `threads` is what `omp_set_num_threads` is given.
+/// Dyn-var is cleared for the query and restored by the same guard, so
+/// the team is [`capped_team`].
 #[cfg(all(test, feature = "parallel", linkcell_openmp))]
 fn with_omp_threads<T>(threads: i32, body: impl FnOnce() -> T) -> T {
     extern "C" {
         fn omp_set_num_threads(n: i32);
         fn omp_get_max_threads() -> i32;
-    }
-    struct Restore(i32);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            extern "C" {
-                fn omp_set_num_threads(n: i32);
-            }
-            unsafe { omp_set_num_threads(self.0) };
-        }
+        fn omp_get_dynamic() -> i32;
+        fn omp_set_dynamic(dynamic_threads: i32);
     }
     let _held = team_test_lock()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let saved = unsafe { omp_get_max_threads() }.max(1);
-    let _restore = Restore(saved);
-    unsafe { omp_set_num_threads(threads.max(1)) };
+    let dynamic = unsafe { omp_get_dynamic() };
+    let _restore = OmpRestore {
+        threads: Some(saved),
+        dynamic,
+    };
+    unsafe {
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads.max(1));
+    }
     body()
 }
 
@@ -2656,10 +2713,11 @@ mod scale_mesh_tests {
         pool.install(move || {
             let _guard = crate::simd::force(path);
             let mesh = Mesh::build(xyz, cell, None, 3.0).unwrap();
-            // The fused team follows `omp_get_max_threads()`, not this pool.
-            // Ask for the same width the pool has, then put the ambient
-            // value back, so an outside `OMP_NUM_THREADS` does not pin
-            // every iteration to one size.
+            // The fused team follows the OpenMP width, not this pool.
+            // Ask for the pool's width with dyn-var held off. The region
+            // stores that width after the thread-limit cap, then the
+            // ambient count is restored. Rows stay identical when the
+            // cap trims a wider request.
             let rows = {
                 #[cfg(linkcell_openmp)]
                 {
@@ -2840,8 +2898,30 @@ mod fused_agree {
         }
     }
 
+    /// Child process. The fused query matches the legacy walk, and its
+    /// team is the thread-limit cap with dyn-var held off. The check is
+    /// alone so another query cannot replace the stored width.
     #[test]
     fn large_unmasked_query_uses_the_region_and_matches_legacy() {
+        if std::env::var_os("LC_UNMASKED_PROBE").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(&exe)
+                .arg(
+                    "knearest::fused_agree::large_unmasked_query_uses_the_region_and_matches_legacy",
+                )
+                .args(["--exact", "--test-threads", "1", "--nocapture"])
+                .env("LC_UNMASKED_PROBE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "probe status {:?}\n{}{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         let cell = Cell::ortho(48.0, 47.0, 49.5).unwrap();
         let mut state = 0xabcdu64;
         let xyz: Vec<[f64; 3]> = (0..9_000)
@@ -2850,14 +2930,12 @@ mod fused_agree {
         let _held = super::team_test_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let _dyn = super::dynamic_off();
         let fused = buffers(&xyz, &cell, 4, Some(3.0));
+        let expect = super::capped_team();
+        assert_eq!(super::knearest_team_threads(), expect, "team {expect}");
         let legacy = with_legacy(|| buffers(&xyz, &cell, 4, Some(3.0)));
         assert_same("n=9000", &fused, &legacy);
-        extern "C" {
-            fn omp_get_max_threads() -> i32;
-        }
-        let expect = unsafe { omp_get_max_threads() }.max(1) as usize;
-        assert_eq!(super::knearest_team_threads(), expect, "team {expect}");
     }
 
     /// Every thread of this process as `(id, name)`. Linux reads
@@ -3022,25 +3100,32 @@ mod fused_agree {
             return;
         }
         extern "C" {
-            fn omp_set_num_threads(n: i32);
             fn omp_get_max_threads() -> i32;
         }
         let before = task_count();
         assert_eq!(team_workers(), 0, "linkcell workers before the first query");
         let saved = unsafe { omp_get_max_threads() }.max(1);
         // A team of one is the caller and has no named worker. A wider
-        // team is that many named workers.
+        // team is that many named workers. Dyn-var stays off through the
+        // cdylib query, and the stored width is the thread-limit cap.
+        let _dyn = super::dynamic_off();
         let named = |team: usize| if team > 1 { team } else { 0 };
-        unsafe { omp_set_num_threads(2) };
-        let asked = unsafe { omp_get_max_threads() }.max(1) as usize;
-        assert!(
-            asked > 1,
-            "multi-worker team was not requested: omp_get_max_threads()={asked}"
-        );
         let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
         let xyz = periodic(&cell, 64, 9);
-        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
-        assert_eq!(super::knearest_team_threads(), asked);
+        let asked = super::with_omp_threads(2, || {
+            extern "C" {
+                fn omp_get_max_threads() -> i32;
+            }
+            let requested = unsafe { omp_get_max_threads() }.max(1) as usize;
+            assert!(
+                requested > 1,
+                "multi-worker team was not requested: omp_get_max_threads()={requested}"
+            );
+            let team = super::capped_team();
+            let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+            assert_eq!(super::knearest_team_threads(), team);
+            team
+        });
         let mid = task_count();
         let asked_workers = named(asked);
         assert!(
@@ -3055,10 +3140,12 @@ mod fused_agree {
         );
         super::shutdown_knearest_team();
         assert_threads_back(before, "shutdown");
-        unsafe { omp_set_num_threads(saved) };
-        let restored = unsafe { omp_get_max_threads() }.max(1) as usize;
-        let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
-        assert_eq!(super::knearest_team_threads(), restored);
+        let restored = super::with_omp_threads(saved, || {
+            let team = super::capped_team();
+            let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
+            assert_eq!(super::knearest_team_threads(), team);
+            team
+        });
         let restored_workers = named(restored);
         assert_eq!(
             team_workers(),
