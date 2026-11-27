@@ -648,9 +648,34 @@ jobs:
         if: runner.os == 'Windows'
         run: meson setup build --prefix "$env:GITHUB_WORKSPACE/prefix" --libdir lib
         shell: pwsh
-      - run: meson compile -C build
-      - run: meson test -C build --print-errorlogs
-      - run: meson install -C build
+      # Git Bash prepends C:\Program Files\Git\usr\bin. GNU link.exe then
+      # shadows the MSVC link.exe that setup-msvc.ps1 put first on Path.
+      # meson --vsenv does not repair that: it returns when VSINSTALLDIR
+      # is already set. The Windows steps stay in pwsh, which keeps that order.
+      - name: Meson compile
+        if: runner.os != 'Windows'
+        run: meson compile -C build
+        shell: bash
+      - name: Meson compile
+        if: runner.os == 'Windows'
+        run: meson compile -C build
+        shell: pwsh
+      - name: Meson test
+        if: runner.os != 'Windows'
+        run: meson test -C build --print-errorlogs
+        shell: bash
+      - name: Meson test
+        if: runner.os == 'Windows'
+        run: meson test -C build --print-errorlogs
+        shell: pwsh
+      - name: Meson install
+        if: runner.os != 'Windows'
+        run: meson install -C build
+        shell: bash
+      - name: Meson install
+        if: runner.os == 'Windows'
+        run: meson install -C build
+        shell: pwsh
       - name: Installed headers and libraries
         shell: bash
         run: |
