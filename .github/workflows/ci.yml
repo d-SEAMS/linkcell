@@ -49,7 +49,8 @@ jobs:
           python-version: "3.12"
       - name: Site
         run: |
-          mkdir -p docs/assets && cp -a assets/branding docs/assets/branding
+          mkdir -p docs/assets
+          cp -a assets/branding docs/assets/branding
           python -m pip install "mkdocs==1.6.1" "mkdocs-material==9.5.49"
           mkdocs build --strict --site-dir _site
       - name: Rust API reference
@@ -451,7 +452,10 @@ jobs:
             "$RUNNER_TEMP/omp-prefix/include/"
           lib="$RUNNER_TEMP/omp-prefix/lib"
           inc="$RUNNER_TEMP/omp-prefix/include"
-          test -f "$lib/libomp.so" && test -f "$inc/omp.h"
+          if ! test -f "$lib/libomp.so" || ! test -f "$inc/omp.h"; then
+            echo "::error::unpacked libomp prefix is missing libomp.so or omp.h"
+            exit 1
+          fi
           if [ -f "$(clang -print-file-name=libomp.so)" ]; then
             echo "::error::clang finds a libomp of its own; LIBRARY_PATH would not be exercised"
             exit 1

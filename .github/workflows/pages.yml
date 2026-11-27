@@ -77,7 +77,8 @@ jobs:
           path: artifact
       - name: Page list
         run: |
-          mkdir site && tar -xf artifact/artifact.tar -C site
+          mkdir site
+          tar -xf artifact/artifact.tar -C site
           (cd site && find . -name '*.html' -not -name 404.html \
             | sed 's#^\./#https://linkcell.dseams.info/#') > pages.txt
           wc -l pages.txt
