@@ -773,10 +773,9 @@ fn tilted_dump_matches_euclidean() {
 #[test]
 fn unreduced_grid_matches_lattice_scan() {
     // Shift (-7, 7, 0) is the Euclidean image here. A 27-image check misses it.
-    // The k=4 rows match this lattice scan from reach 16.
     let b = unreduced_skew();
     let xyz = points_in_cell(&b, 24, 99);
-    let oracle = lattice_knearest(&xyz, &b, 4, None, 16);
+    let oracle = lattice_knearest(&xyz, &b, 4, None, 24);
     for hint in [None, Some(0.05), Some(0.2), Some(3.0)] {
         let linked = knearest(&xyz, &b, 4, None, hint).unwrap();
         assert_rows_match(&format!("unreduced hint={hint:?}"), &linked, &oracle);
