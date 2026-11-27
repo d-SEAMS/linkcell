@@ -703,7 +703,14 @@ static int start_team(int want) {
     return 0;
 }
 
-static void ensure_team(int want) {
+void lc_knn_shutdown_impl(void);
+
+/* 1 when a team of exactly `want` workers is up. 0 when it cannot be
+ * started; the caller then runs the query itself. A standing team of a
+ * different width is joined first. Workers capture `g_team.nt` once, and
+ * the caller sized its scratch to `want`, so a wider team would write off
+ * the end of that scratch. */
+static int ensure_team(int want) {
     if (want < 1) {
         want = 1;
     }
@@ -714,15 +721,21 @@ static void ensure_team(int want) {
             continue;
         }
         if (g_team.state == LC_UP && g_team.parked == g_team.nt && g_team.nt > 0) {
-            break;
+            if (g_team.nt == want) {
+                pthread_mutex_unlock(&g_team.mu);
+                return 1;
+            }
+            pthread_mutex_unlock(&g_team.mu);
+            lc_knn_shutdown_impl();
+            pthread_mutex_lock(&g_team.mu);
+            continue;
         }
         if (g_team.state == LC_EMPTY && !start_team(want)) {
             pthread_mutex_unlock(&g_team.mu);
-            return;
+            return 0;
         }
         pthread_cond_wait(&g_team.cv, &g_team.mu);
     }
-    pthread_mutex_unlock(&g_team.mu);
 }
 
 /* Join every worker. Safe to call twice, from a query, and from the
@@ -734,23 +747,27 @@ void lc_knn_shutdown_impl(void) {
     int slot;
     pthread_mutex_lock(&g_team.mu);
     g_team.sized_want = 0;
-    if (g_team.state == LC_EMPTY) {
-        pthread_mutex_unlock(&g_team.mu);
-        return;
-    }
-    if (g_team.state == LC_STOP) {
-        while (g_team.state != LC_EMPTY) {
-            pthread_cond_wait(&g_team.cv, &g_team.mu);
+    for (;;) {
+        if (g_team.state == LC_EMPTY) {
+            pthread_mutex_unlock(&g_team.mu);
+            return;
         }
-        pthread_mutex_unlock(&g_team.mu);
-        return;
-    }
-    while (g_team.busy || g_team.state == LC_START) {
-        pthread_cond_wait(&g_team.cv, &g_team.mu);
-    }
-    if (g_team.state == LC_EMPTY) {
-        pthread_mutex_unlock(&g_team.mu);
-        return;
+        if (g_team.state == LC_STOP) {
+            /* Another caller is joining. Wait only while it still owns
+             * the team. After STOP the joiner sets EMPTY, and a later
+             * query may already have started a new team; waiting for
+             * EMPTY would sleep through that. */
+            while (g_team.state == LC_STOP) {
+                pthread_cond_wait(&g_team.cv, &g_team.mu);
+            }
+            pthread_mutex_unlock(&g_team.mu);
+            return;
+        }
+        if (g_team.busy || g_team.state == LC_START) {
+            pthread_cond_wait(&g_team.cv, &g_team.mu);
+            continue;
+        }
+        break;
     }
     g_team.state = LC_STOP;
     g_team.quit = 1;
@@ -948,10 +965,12 @@ static void run_on_caller(const LcJob *job) {
 
 /* `bin`, `count`, `scan`, `fill`, and `select` run on the standing team.
  * `scan_base` is the single that publishes each slot's prefix. The
- * caller waits on the condition variable for every slot to finish. A
- * change of team size joins the old team first. `width` above zero
- * stands in for `omp_get_max_threads()`, as a num_threads clause does,
- * and is trimmed and capped the same way. */
+ * caller waits on the condition variable for every slot to finish. The
+ * team is claimed only while `g_team.nt` equals this caller's width: that
+ * is the width the scratch was prepared for. A standing team of another
+ * width is joined and the claim retried. `width` above zero stands in
+ * for `omp_get_max_threads()`, as a num_threads clause does, and is
+ * trimmed and capped the same way. */
 void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int64_t n_blocks,
                        lc_knn_phase bin, lc_knn_phase count, lc_knn_phase scan_base,
                        lc_knn_phase scan, lc_knn_phase fill, lc_knn_phase select, int *team,
@@ -959,7 +978,6 @@ void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int
     int want = width > 0 ? width : omp_get_max_threads();
     int dyn = omp_get_dynamic() != 0;
     int nt;
-    int up;
     LcJob job = {
         .ctx = ctx,
         .pin = pin,
@@ -977,43 +995,48 @@ void lc_knn_one_region(void *ctx, int pin, int64_t n_points, int64_t n_bins, int
     if (want < 1) {
         want = 1;
     }
-    pthread_mutex_lock(&g_team.mu);
-    nt = team_size(want, dyn);
-    up = g_team.state == LC_UP && g_team.nt != nt;
-    pthread_mutex_unlock(&g_team.mu);
-    if (up) {
-        lc_knn_shutdown_impl();
+    for (;;) {
+        int ready;
+        int resize;
         pthread_mutex_lock(&g_team.mu);
         nt = team_size(want, dyn);
         pthread_mutex_unlock(&g_team.mu);
-    }
-    if (nt <= 1) {
-        run_on_caller(&job);
-        return;
-    }
-    ensure_team(nt);
-    pthread_mutex_lock(&g_team.mu);
-    while (g_team.busy) {
-        pthread_cond_wait(&g_team.cv, &g_team.mu);
-    }
-    if (g_team.state != LC_UP) {
+        if (nt <= 1) {
+            run_on_caller(&job);
+            return;
+        }
+        if (!ensure_team(nt)) {
+            run_on_caller(&job);
+            return;
+        }
+        pthread_mutex_lock(&g_team.mu);
+        while (g_team.busy) {
+            pthread_cond_wait(&g_team.cv, &g_team.mu);
+        }
+        ready = g_team.state == LC_UP && g_team.nt == nt && g_team.parked == g_team.nt;
+        if (!ready) {
+            resize = g_team.state == LC_UP && g_team.nt != nt;
+            pthread_mutex_unlock(&g_team.mu);
+            if (resize) {
+                lc_knn_shutdown_impl();
+            }
+            continue;
+        }
+        g_team.busy = 1;
+        g_team.bar.count = 0;
+        g_team.bar.phase = 0;
+        g_team.done = 0;
+        job.restore = g_pinned_once;
+        g_team.job = job;
+        g_team.epoch++;
+        pthread_cond_broadcast(&g_team.cv);
+        while (g_team.done < g_team.nt) {
+            pthread_cond_wait(&g_team.cv, &g_team.mu);
+        }
+        g_team.busy = 0;
+        g_pinned_once = pin;
+        pthread_cond_broadcast(&g_team.cv);
         pthread_mutex_unlock(&g_team.mu);
-        run_on_caller(&job);
         return;
     }
-    g_team.busy = 1;
-    g_team.bar.count = 0;
-    g_team.bar.phase = 0;
-    g_team.done = 0;
-    job.restore = g_pinned_once;
-    g_team.job = job;
-    g_team.epoch++;
-    pthread_cond_broadcast(&g_team.cv);
-    while (g_team.done < g_team.nt) {
-        pthread_cond_wait(&g_team.cv, &g_team.mu);
-    }
-    g_team.busy = 0;
-    g_pinned_once = pin;
-    pthread_cond_broadcast(&g_team.cv);
-    pthread_mutex_unlock(&g_team.mu);
 }

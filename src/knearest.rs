@@ -3664,6 +3664,35 @@ mod fused_agree {
         }
         super::shutdown_knearest_team();
     }
+
+    /// Callers with different OpenMP widths share one standing team. Each
+    /// sizes its scratch to its own width. The team has to be that width
+    /// before the query runs: a wider team writes off the end of a shorter
+    /// scratch.
+    #[cfg(all(feature = "parallel", linkcell_openmp))]
+    #[test]
+    fn concurrent_widths_do_not_overflow_the_fused_scratch() {
+        let cell = Cell::ortho(48.0, 47.0, 49.5).unwrap();
+        let xyz = periodic(&cell, 9_000, 0x517c_c1b7_2722_0a95);
+        let want = with_legacy(|| buffers(&xyz, &cell, 4, Some(3.0)));
+        std::thread::scope(|scope| {
+            for &width in &[2i32, 2, 8, 8] {
+                let xyz = &xyz;
+                let cell = &cell;
+                let want = &want;
+                scope.spawn(move || {
+                    extern "C" {
+                        fn omp_set_num_threads(n: i32);
+                    }
+                    unsafe { omp_set_num_threads(width) };
+                    for _ in 0..40 {
+                        let got = with_fused(|| buffers(xyz, cell, 4, Some(3.0)));
+                        assert_same(&format!("width {width}"), &got, want);
+                    }
+                });
+            }
+        });
+    }
 }
 
 #[cfg(test)]
