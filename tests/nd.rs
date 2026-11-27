@@ -409,16 +409,14 @@ fn many_seeds_cover_edge_cases_and_ties() {
             assert_eq!(large.len(), n);
         }
     }
-    let dims = [1usize, 3, 40];
+    let dims = [1usize, 2, 3, 8, 20, 40];
     for seed in 0..18u64 {
         let mut rng = StdRng::seed_from_u64(100 + seed);
         for &d in &dims {
-            let n = rng.random_range(2..=64usize);
+            let n = rng.random_range(2..=2_400usize);
             check(&mut rng, n, d);
         }
     }
-    let mut rng = StdRng::seed_from_u64(100);
-    check(&mut rng, 512, 40);
 }
 
 #[test]
@@ -1028,19 +1026,18 @@ struct SmallStackRun {
     dbscan: [Result<Vec<i32>, Error>; 2],
 }
 
-/// 1_024 identical points recurse one level per point. At about 100 B a
-/// frame that is about 100 KiB, which still overflows a 32 KiB stack if the
-/// recursion returns. Every build and query runs on a 32 KiB stack, in the
-/// debug profile too. The full scans they are checked against run on the
-/// test thread.
+/// 20_000 identical points used to recurse one level per point and overflow
+/// a 2 MiB stack. Every build and query runs on a 32 KiB stack, in the debug
+/// profile too. The full scans they are checked against run on the test
+/// thread.
 #[test]
 fn large_duplicate_set_builds_on_a_small_stack() {
-    const N: usize = 1_024;
+    const N: usize = 20_000;
     let dup = vec![0.125f64; N];
     let l = 2.0 * std::f64::consts::PI;
     let base = -5.675156211725825;
     let images: Vec<f64> = (0..N)
-        .map(|i| base + f64::from((i as i32) - (N as i32 / 2)) * l)
+        .map(|i| base + f64::from((i as i32) - 10_000) * l)
         .collect();
     let radii = [0.0, f64::from_bits(1), 1.0e-15, 5.4225756419539195e-3];
     // A cluster with duplicates, then two points whose gap overflows.
@@ -2356,9 +2353,13 @@ fn every_query_matches_a_full_scan_in_every_order() {
     let radii = [0.0, 1.0e-300, 1.0e-170, 1.0, 1.0e100, 1.0e153, 1.0e300];
     let mut rng = StdRng::seed_from_u64(0x0f10_0a11);
     let mut seen = [0usize; 2];
-    for case in 0..60 {
+    for case in 0..150 {
         let d = 1 + case % 3;
-        let n = 2 + (case / 3) % 3;
+        let n = if case % 25 == 24 {
+            5
+        } else {
+            2 + (case / 3) % 3
+        };
         let periods: Vec<Option<f64>> = (0..d)
             .map(|_| axes[rng.random_range(0..axes.len())])
             .collect();
@@ -2409,8 +2410,7 @@ fn overflow_is_reported_however_the_tree_prunes() {
             .map(|axis| axes[(case / 3 + axis) % axes.len()])
             .collect();
         let oracle = Oracle::new(&periods);
-        let near = 32;
-        let mut rows: Vec<Vec<f64>> = (0..near)
+        let mut rows: Vec<Vec<f64>> = (0..80)
             .map(|_| (0..d).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect();
         for _ in 0..1 + case % 3 {
@@ -2418,7 +2418,7 @@ fn overflow_is_reported_however_the_tree_prunes() {
             row[rng.random_range(0..d)] = far[rng.random_range(0..far.len())];
             rows.push(row);
         }
-        let mut queries = rows[near - 4..].to_vec();
+        let mut queries = rows[76..].to_vec();
         queries.push(vec![0.0; d]);
         let mut toward = vec![0.25; d];
         toward[0] = -0.5 * x;
@@ -2561,7 +2561,8 @@ fn zero_k_and_zero_radius_do_not_walk_the_tree() {
 #[test]
 fn collinear_points_in_high_dimension_match_a_brute_force_scan() {
     let mut rng = StdRng::seed_from_u64(0xc011_17ea);
-    for &(d, n, periodic) in &[(1usize, 200usize, false), (48, 96, true), (256, 24, true)] {
+    for (case, d) in [1usize, 3, 16, 48, 64, 256].into_iter().enumerate() {
+        let n = if d > 16 { 96 } else { 200 };
         let dir: Vec<f64> = (0..d).map(|_| rng.random_range(0.5..2.0)).collect();
         let data: Vec<f64> = (0..n)
             .flat_map(|i| {
@@ -2570,7 +2571,7 @@ fn collinear_points_in_high_dimension_match_a_brute_force_scan() {
             })
             .collect();
         let periods: Vec<Option<f64>> = (0..d)
-            .map(|axis| (periodic && axis % 2 == 0).then_some(64.0))
+            .map(|axis| (case % 2 == 1 && axis % 2 == 0).then_some(64.0))
             .collect();
         let oracle = Oracle::new(&periods);
         let point = |i: usize| data[i * d..(i + 1) * d].to_vec();
