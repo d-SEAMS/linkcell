@@ -11,6 +11,17 @@ vesin = pytest.importorskip("vesin")
 minimage = pytest.importorskip("minimage")
 
 
+def test_knearest_returns_indices_and_dist2():
+    xyz = np.ascontiguousarray([[0.2, 0.0, 0.0], [9.4, 0.0, 0.0]], dtype=np.float64)
+    cell = np.ascontiguousarray([10.0, 10.0, 10.0], dtype=np.float64)
+    raw = linkcell.knearest(xyz, cell, 1)
+    assert isinstance(raw, tuple) and len(raw) == 2
+    nn = np.from_dlpack(raw[0])
+    d2 = np.from_dlpack(raw[1])
+    assert int(nn[0, 0]) == 1
+    assert abs(float(d2[0, 0]) - 0.64) < 1e-12
+
+
 def test_knn_matches_brute_minimage():
     rng = np.random.default_rng(1)
     n, k = 20, 3
