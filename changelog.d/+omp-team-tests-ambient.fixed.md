@@ -1,0 +1,1 @@
+K-nearest tests that check the OpenMP team ask for the width they need and then restore the process value. A team of one is the calling thread and has no named worker, so a check that starts with `OMP_NUM_THREADS=1` still passes.

@@ -2255,6 +2255,41 @@ pub fn knearest_brute(
 #[path = "knn_fused.rs"]
 mod fused;
 
+/// Tests that set the k-nearest team's size take this. The setting is
+/// process-global, so one such test runs at a time, and the previous
+/// value is restored before the lock is released.
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+fn team_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
+/// Run `body` on a k-nearest team of `threads`, then restore the team
+/// size the process had. `threads` is what `omp_set_num_threads` is given.
+#[cfg(all(test, feature = "parallel", linkcell_openmp))]
+fn with_omp_threads<T>(threads: i32, body: impl FnOnce() -> T) -> T {
+    extern "C" {
+        fn omp_set_num_threads(n: i32);
+        fn omp_get_max_threads() -> i32;
+    }
+    struct Restore(i32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            extern "C" {
+                fn omp_set_num_threads(n: i32);
+            }
+            unsafe { omp_set_num_threads(self.0) };
+        }
+    }
+    let _held = team_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let saved = unsafe { omp_get_max_threads() }.max(1);
+    let _restore = Restore(saved);
+    unsafe { omp_set_num_threads(threads.max(1)) };
+    body()
+}
+
 #[cfg(test)]
 mod scale_mesh_tests {
     use super::*;
@@ -2621,7 +2656,22 @@ mod scale_mesh_tests {
         pool.install(move || {
             let _guard = crate::simd::force(path);
             let mesh = Mesh::build(xyz, cell, None, 3.0).unwrap();
-            let rows = knearest(xyz, cell, 4, None, Some(3.0)).unwrap();
+            // The fused team follows `omp_get_max_threads()`, not this pool.
+            // Ask for the same width the pool has, then put the ambient
+            // value back, so an outside `OMP_NUM_THREADS` does not pin
+            // every iteration to one size.
+            let rows = {
+                #[cfg(linkcell_openmp)]
+                {
+                    super::with_omp_threads(i32::try_from(threads).unwrap_or(i32::MAX), || {
+                        knearest(xyz, cell, 4, None, Some(3.0)).unwrap()
+                    })
+                }
+                #[cfg(not(linkcell_openmp))]
+                {
+                    knearest(xyz, cell, 4, None, Some(3.0)).unwrap()
+                }
+            };
             let pairs = crate::pairs_within(xyz, cell, 4.5, None, None, false).unwrap();
             let mut cols = crate::PairColumns::default();
             crate::pairs_within_columns(xyz, cell, 4.5, None, None, false, &mut cols).unwrap();
@@ -2797,14 +2847,17 @@ mod fused_agree {
         let xyz: Vec<[f64; 3]> = (0..9_000)
             .map(|_| cell.cartesian([unit(&mut state), unit(&mut state), unit(&mut state)]))
             .collect();
+        let _held = super::team_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let fused = buffers(&xyz, &cell, 4, Some(3.0));
         let legacy = with_legacy(|| buffers(&xyz, &cell, 4, Some(3.0)));
         assert_same("n=9000", &fused, &legacy);
-        assert!(
-            super::knearest_team_threads() >= 1,
-            "team {}",
-            super::knearest_team_threads()
-        );
+        extern "C" {
+            fn omp_get_max_threads() -> i32;
+        }
+        let expect = unsafe { omp_get_max_threads() }.max(1) as usize;
+        assert_eq!(super::knearest_team_threads(), expect, "team {expect}");
     }
 
     /// Every thread of this process as `(id, name)`. Linux reads
@@ -2975,26 +3028,42 @@ mod fused_agree {
         let before = task_count();
         assert_eq!(team_workers(), 0, "linkcell workers before the first query");
         let saved = unsafe { omp_get_max_threads() }.max(1);
+        // A team of one is the caller and has no named worker. A wider
+        // team is that many named workers.
+        let named = |team: usize| if team > 1 { team } else { 0 };
         unsafe { omp_set_num_threads(2) };
+        let asked = unsafe { omp_get_max_threads() }.max(1) as usize;
+        assert!(
+            asked > 1,
+            "multi-worker team was not requested: omp_get_max_threads()={asked}"
+        );
         let cell = Cell::ortho(30.0, 30.0, 30.0).unwrap();
         let xyz = periodic(&cell, 64, 9);
         let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
-        assert_eq!(super::knearest_team_threads(), 2);
+        assert_eq!(super::knearest_team_threads(), asked);
         let mid = task_count();
+        let asked_workers = named(asked);
         assert!(
-            mid >= before + 2,
+            mid >= before + asked_workers,
             "team not running: before {before} mid {mid}"
         );
-        assert_eq!(team_workers(), 2, "team of two not named\n{}", task_names());
+        assert_eq!(
+            team_workers(),
+            asked_workers,
+            "team of {asked} not named\n{}",
+            task_names()
+        );
         super::shutdown_knearest_team();
         assert_threads_back(before, "shutdown");
         unsafe { omp_set_num_threads(saved) };
+        let restored = unsafe { omp_get_max_threads() }.max(1) as usize;
         let _ = with_fused(|| buffers(&xyz, &cell, 4, Some(3.0)));
-        assert_eq!(super::knearest_team_threads(), saved as usize);
+        assert_eq!(super::knearest_team_threads(), restored);
+        let restored_workers = named(restored);
         assert_eq!(
             team_workers(),
-            saved as usize,
-            "team of {saved} not named\n{}",
+            restored_workers,
+            "team of {restored} not named\n{}",
             task_names()
         );
         super::shutdown_knearest_team();
@@ -3013,7 +3082,7 @@ mod fused_agree {
                 None
             });
             if let Some(so) = so {
-                unload_cdylib(&so, before, saved as usize);
+                unload_cdylib(&so, before, restored_workers);
             }
         }
     }
