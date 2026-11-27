@@ -28,6 +28,10 @@ concurrency:
   group: wheels-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # One abi3 wheel per platform (CPython 3.12+ GIL).
   abi3:
