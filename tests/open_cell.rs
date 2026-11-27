@@ -331,7 +331,7 @@ fn randomized_clusters_match_brute_force_and_a_large_box() {
             let rows = pairs_within_pbc(&xyz, &dummy, &query).unwrap();
             assert_same(&rows, &brute_open(&xyz, cutoff, half));
             if half {
-                let big = Cell::ortho(40.0, 40.0, 40.0).unwrap();
+                let big = Cell::ortho(80.0, 80.0, 80.0).unwrap();
                 let periodic = pairs_within(&xyz, &big, cutoff, None, hint, true).unwrap();
                 let open_pairs: BTreeMap<_, _> = map_of(&rows);
                 let periodic_pairs = map_of(&periodic);

@@ -3793,7 +3793,7 @@ mod graph_tests {
             .unwrap(),
         ];
         for cell in &cells {
-            let xyz = points(4_200, cell, &mut state);
+            let xyz = points(9_000, cell, &mut state);
             let mask: Vec<bool> = (0..xyz.len()).map(|i| i % 7 != 3).collect();
             // k = 4 is the AVX2 four-lane bound. Width 2 is the smallest
             // team past the serial scan (`width <= 1`).

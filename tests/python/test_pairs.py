@@ -367,12 +367,11 @@ def test_flat_and_needle_are_typed_errors():
 
 
 def test_wide_partner_stencils_match_brute_force():
-    # Side 52 at cutoff 1 is a reach-two stencil: 52^3 * 5^3 = 17576000
-    # slots, past 2^24 and inside the 2^31 partner cap. Side 51 falls under.
+    # A cube of side 80 at cutoff 1 builds a reach-two stencil of about
+    # 6e7 slots, past 2^24 and inside the 2^31 partner cap.
     xyz = np.array([[0.2, 0.2, 0.2], [0.7, 0.2, 0.2]], dtype=np.float64)
-    _assert_pairs(xyz, np.array([52.0, 52.0, 52.0]), 1.0)
-    # Widths 0.01, 0.01, 2.12 at cutoff 0.2. Reach stays 21, the long axis
-    # has 212 bins, and 212 * 43^3 = 16855484 slots. The image cap and the
-    # bin cap both hold. Length 2.11 falls under 2^24.
+    _assert_pairs(xyz, np.array([80.0, 80.0, 80.0]), 1.0)
+    # Widths 0.01, 0.01, 10 at cutoff 0.2: the image cap and the bin cap
+    # both hold, and the reach box is about 7e7 slots.
     xyz = np.array([[0.002, 0.003, 1.0], [0.005, 0.007, 1.05]], dtype=np.float64)
-    _assert_pairs(xyz, np.array([0.01, 0.01, 2.12]), 0.2)
+    _assert_pairs(xyz, np.array([0.01, 0.01, 10.0]), 0.2)

@@ -1169,7 +1169,7 @@ mod tests {
         let mut saw_shift_3 = false;
         // Two points in a 3 Å cube at cutoff 8.6. Images with a shift
         // component of 2 and of 3 are inside the cutoff, so the assertion
-        // does not depend on the 40-trial draw.
+        // does not depend on the Monte Carlo draw.
         {
             let forced = Cell::ortho(3.0, 3.0, 3.0).unwrap();
             let pair = [[2.5, 0.1, 0.1], [0.2, 0.1, 0.1]];
@@ -1189,7 +1189,7 @@ mod tests {
                 }
             }
         }
-        for trial in 0..40 {
+        for trial in 0..200 {
             let lx = 1.25 + 0.45 * next();
             let ly = 1.35 + 0.55 * next();
             let lz = 1.45 + 0.55 * next();
