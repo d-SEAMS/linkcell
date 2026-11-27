@@ -1165,6 +1165,30 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (state >> 11) as f64 / (1u64 << 53) as f64
         };
+        let mut saw_shift_2 = false;
+        let mut saw_shift_3 = false;
+        // Two points in a 3 Å cube at cutoff 8.6. Images with a shift
+        // component of 2 and of 3 are inside the cutoff, so the assertion
+        // does not depend on the 40-trial draw.
+        {
+            let forced = Cell::ortho(3.0, 3.0, 3.0).unwrap();
+            let pair = [[2.5, 0.1, 0.1], [0.2, 0.1, 0.1]];
+            let mut forced_cols = PairColumns::default();
+            pairs_within_columns(&pair, &forced, 8.6, None, None, true, &mut forced_cols).unwrap();
+            let mut forced_skin = SkinList::new(forced, 8.6, 0.2, true).unwrap();
+            let forced_skin_cols = forced_skin.update(&pair, false).unwrap();
+            assert_eq!(set_of(forced_skin_cols), set_of(&forced_cols));
+            for s in &forced_cols.shift {
+                for &c in s {
+                    if c.abs() == 2 {
+                        saw_shift_2 = true;
+                    }
+                    if c.abs() == 3 {
+                        saw_shift_3 = true;
+                    }
+                }
+            }
+        }
         for trial in 0..40 {
             let lx = 1.25 + 0.45 * next();
             let ly = 1.35 + 0.55 * next();
@@ -1201,6 +1225,16 @@ mod tests {
 
             let mut fresh0 = PairColumns::default();
             pairs_within_columns(&xyz, &cell, cutoff, None, None, half, &mut fresh0).unwrap();
+            for s in &fresh0.shift {
+                for &c in s {
+                    if c.abs() == 2 {
+                        saw_shift_2 = true;
+                    }
+                    if c.abs() == 3 {
+                        saw_shift_3 = true;
+                    }
+                }
+            }
             let mut want0_keys: Vec<_> = (0..fresh0.len())
                 .map(|k| {
                     if half {
@@ -1288,6 +1322,7 @@ mod tests {
                 }
             }
         }
+        assert!(saw_shift_2 && saw_shift_3);
     }
 
     #[test]

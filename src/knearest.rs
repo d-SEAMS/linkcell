@@ -2450,7 +2450,9 @@ mod scale_mesh_tests {
         // decides), random points, and a sparse box, in an orthorhombic,
         // a restricted, and a general cell; bins of one point and of
         // several, so both block sides run; k up to 20, past the bound
-        // of the two-pass scan.
+        // of the two-pass scan. k = 4 is the last value that takes the
+        // AVX2 four-lane bound. k = 12 is past the AVX-512 eight-lane
+        // bound and still in the inline heap (k <= 16); k = 20 allocates.
         let mut state = 0x853c_49e6_748f_ea9bu64;
         let mut next = || {
             state ^= state << 13;
@@ -2509,7 +2511,7 @@ mod scale_mesh_tests {
             for xyz in &sets {
                 let mask: Vec<bool> = (0..xyz.len()).map(|t| t % 7 != 3).collect();
                 for hint in [Some(2.4), Some(5.0)] {
-                    for k in [1, 8, 20] {
+                    for k in [1, 4, 8, 12, 20] {
                         for mask in [None, Some(mask.as_slice())] {
                             let blocked = knearest(xyz, sim, k, mask, hint).unwrap();
                             NO_BLOCKS.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3764,14 +3766,16 @@ mod graph_tests {
         for cell in &cells {
             let xyz = points(4_200, cell, &mut state);
             let mask: Vec<bool> = (0..xyz.len()).map(|i| i % 7 != 3).collect();
-            for k in [1usize, 12] {
+            // k = 4 is the AVX2 four-lane bound. Width 2 is the smallest
+            // team past the serial scan (`width <= 1`).
+            for k in [1usize, 4, 12] {
                 for masked in [false, true] {
                     let m = masked.then_some(&mask[..]);
                     let mut nom = vec![0i32; xyz.len() * k];
                     knearest_into(&xyz, cell, k, m, Some(3.0), &mut nom).unwrap();
                     for mutual in [false, true] {
                         let want = reference(&nom, xyz.len(), k, mutual);
-                        for width in [1usize, 3, 8] {
+                        for width in [1usize, 2, 3, 8] {
                             let got = in_pool(width, || {
                                 knearest_csr(&xyz, cell, k, m, Some(3.0), mutual).unwrap()
                             });

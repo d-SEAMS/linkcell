@@ -177,9 +177,12 @@ jobs:
       - name: Test
         if: matrix.crate.name != 'parallel'
         run: cargo test --locked ${{ matrix.crate.flags }}
-      - name: Compile parallel without capi
+      - name: Test parallel without capi
         if: matrix.crate.name == 'parallel'
-        run: cargo test --locked --no-run --no-default-features --features parallel
+        run: cargo test --locked --no-default-features --features parallel
+      - name: SIMD paths exercised
+        shell: bash
+        run: cargo test --locked ${{ matrix.crate.flags }} --lib simd_paths_exercised -- --nocapture
       - run: cargo clippy --locked --all-targets ${{ matrix.crate.flags }} -- -D warnings
 
   scalar-lib:
