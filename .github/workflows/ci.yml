@@ -516,7 +516,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - name: Install LLVM libomp
-        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libomp-dev
       - name: Alias libgomp.so.1 to libomp
         run: |
           libomp=$(printf '%s\n' /usr/lib/llvm-*/lib/libomp.so.5 | sort -V | tail -n 1)
@@ -553,7 +555,8 @@ jobs:
             ${{ runner.os }}-clang-distro-cargo-
       - name: Install clang and libomp-dev
         run: |
-          sudo apt-get update && sudo apt-get install -y clang libomp-dev
+          sudo apt-get update
+          sudo apt-get install -y clang libomp-dev
           clang --version
           if [ -f "$(clang -print-file-name=libomp.so)" ]; then
             echo "::error::clang finds libomp on its own search path; the resource-directory lookup would not be exercised"
