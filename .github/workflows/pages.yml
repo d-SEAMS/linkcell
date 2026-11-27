@@ -16,6 +16,10 @@ concurrency:
   group: pages-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,7 +30,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Branding for the theme
-        run: mkdir -p docs/assets && cp -a assets/branding docs/assets/branding
+        run: |
+          mkdir -p docs/assets
+          cp -a assets/branding docs/assets/branding
       - name: Site
         run: |
           python -m pip install "mkdocs==1.6.1" "mkdocs-material==9.5.49"
@@ -77,7 +83,8 @@ jobs:
           path: artifact
       - name: Page list
         run: |
-          mkdir site && tar -xf artifact/artifact.tar -C site
+          mkdir site
+          tar -xf artifact/artifact.tar -C site
           (cd site && find . -name '*.html' -not -name 404.html \
             | sed 's#^\./#https://linkcell.dseams.info/#') > pages.txt
           wc -l pages.txt
