@@ -282,6 +282,69 @@ No hit is buffered and no step sorts the whole list.
 A cell with an open axis is searched on the calling thread, and its rows are then built on the pool.
 `pairs_within_csr` is the Rust entry and fills a `PairCsr`.
 
+## Row grid
+
+```c
+typedef struct lc_row_grid {
+  uint8_t _private;
+} lc_row_grid;
+
+typedef void (*lc_row_visit)(void *user, const lc_pair *row);
+
+int lc_row_grid_build(const double *xyz, size_t n, const lc_cell *simbox,
+                      const int *pbc, double cutoff, const int *mask,
+                      double cell_hint, int closed, int exclude_self_images,
+                      lc_row_grid **out);
+int lc_row_grid_update(lc_row_grid *grid, const double *xyz, size_t n,
+                       const lc_cell *simbox, const int *pbc, double cutoff,
+                       const int *mask, double cell_hint, int closed,
+                       int exclude_self_images);
+size_t lc_row_grid_len(const lc_row_grid *grid);
+void lc_row_grid_free(lc_row_grid *grid);
+
+int lc_row_grid_rows(const lc_row_grid *grid, size_t begin, size_t end,
+                     int half, lc_row_visit visit, void *user);
+int lc_row_grid_point(const lc_row_grid *grid, size_t i, int half,
+                      lc_row_visit visit, void *user);
+```
+
+`lc_row_grid_build` bins the points of one cutoff search and keeps the bins.
+It stores no pair.
+`xyz`, `simbox`, `pbc`, `cutoff`, `mask`, `cell_hint`, `closed`, and `exclude_self_images` are those of `lc_pairs_within_pbc`.
+`simbox` may be null when every axis is open.
+The grid copies the positions it needs, so `xyz` may be released after the call.
+`lc_row_grid_free` releases the grid and accepts null.
+
+`lc_row_grid_rows` visits the rows of points `begin .. end` in ascending point order.
+`visit(user, row)` runs on the calling thread once for every image of `row->j` within the cutoff of `row->i`.
+`row->shift` and `row->dist2` are the shift and squared distance `lc_pairs_within_pbc` writes for that row, with the same bits.
+`row` is valid until the callback returns.
+`half` nonzero keeps the entries the half list has under `i`: `j > i`, and the self images whose first non-zero shift is negative.
+Over `0 .. lc_row_grid_len(grid)` the entries are the rows of `lc_pairs_within_pbc` for the same arguments.
+Entries of one row come in bin order.
+That order depends on the grid alone, so a split into ranges changes neither a row nor the order inside it.
+A masked-out point has an empty row.
+`lc_row_grid_point` visits the row of one point, with the entries and order `lc_row_grid_rows` gives it.
+
+A visit reads the grid and writes nothing in it.
+Several threads may visit one grid at once, and disjoint ranges cover each row once.
+`lc_row_grid_update` and `lc_row_grid_free` need the grid to themselves.
+
+| Call | Result |
+| --- | --- |
+| `lc_row_grid_build` with `n == 0` | Returns nonzero with `no points`; `*out` is null |
+| `lc_row_grid_build` with a bad cutoff, cell, mask, or coordinate | Returns nonzero with the message `lc_pairs_within_pbc` sets; `*out` is null |
+| `lc_row_grid_update` that fails | Returns nonzero; the grid holds no point and stays valid for another update or the free |
+| `lc_row_grid_rows` with `begin >= end` | Visits nothing, returns 0 |
+| `lc_row_grid_rows` with `end` past the length, or `lc_row_grid_point` with `i` at or past it | Returns nonzero with `point index is out of range` before any visit |
+| Null `grid` or null `visit` | Returns nonzero with `null pointer` |
+| `lc_row_grid_len(NULL)` | 0 |
+
+`lc_row_grid_update` bins new points, a new cell, or new arguments into the same handle.
+It releases the previous bins first, so the new ones reuse their buffers.
+The callback must not unwind and must not update or free the grid it is reading.
+`RowGrid` is the Rust entry: `RowGrid::build`, `update`, `clear`, `for_rows`, and `for_point`, which take a closure.
+
 ## Vesin compatibility
 
 `include/linkcell_vesin.h` declares `lc_vesin_neighbors` and

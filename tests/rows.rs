@@ -1,6 +1,6 @@
 //! Rows read from a kept grid: every row against the pair list, on
 //! orthorhombic, triclinic, skewed, open, and mixed cells, over split
-//! ranges, and from several threads.
+//! ranges, from several threads, and through the C ABI.
 
 use linkcell::{pairs_within, pairs_within_pbc, Cell, Error, Pair, PbcQuery, RowGrid};
 
@@ -528,4 +528,245 @@ fn bad_arguments_are_errors() {
     assert!(visited(&masked, false).is_empty());
     let masked = RowGrid::build(&xyz, &cell, &PbcQuery::open(1.5).mask(Some(&off))).unwrap();
     assert!(visited(&masked, false).is_empty());
+}
+
+#[cfg(feature = "capi")]
+mod c_abi {
+    use super::*;
+    use std::ffi::{c_char, c_int, c_void, CStr};
+
+    #[repr(C)]
+    struct LcCell {
+        h: [f64; 9],
+        origin: [f64; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct LcPair {
+        i: c_int,
+        j: c_int,
+        shift: [c_int; 3],
+        dist2: f64,
+    }
+
+    #[repr(C)]
+    struct LcRowGrid {
+        _private: u8,
+    }
+
+    type Visit = Option<unsafe extern "C" fn(*mut c_void, *const LcPair)>;
+
+    extern "C" {
+        fn lc_last_error() -> *const c_char;
+        fn lc_row_grid_build(
+            xyz: *const f64,
+            n: usize,
+            simbox: *const LcCell,
+            pbc: *const c_int,
+            cutoff: f64,
+            mask: *const c_int,
+            cell_hint: f64,
+            closed: c_int,
+            exclude_self_images: c_int,
+            out: *mut *mut LcRowGrid,
+        ) -> c_int;
+        fn lc_row_grid_update(
+            grid: *mut LcRowGrid,
+            xyz: *const f64,
+            n: usize,
+            simbox: *const LcCell,
+            pbc: *const c_int,
+            cutoff: f64,
+            mask: *const c_int,
+            cell_hint: f64,
+            closed: c_int,
+            exclude_self_images: c_int,
+        ) -> c_int;
+        fn lc_row_grid_len(grid: *const LcRowGrid) -> usize;
+        fn lc_row_grid_free(grid: *mut LcRowGrid);
+        fn lc_row_grid_rows(
+            grid: *const LcRowGrid,
+            begin: usize,
+            end: usize,
+            half: c_int,
+            visit: Visit,
+            user: *mut c_void,
+        ) -> c_int;
+        fn lc_row_grid_point(
+            grid: *const LcRowGrid,
+            i: usize,
+            half: c_int,
+            visit: Visit,
+            user: *mut c_void,
+        ) -> c_int;
+    }
+
+    unsafe extern "C" fn collect(user: *mut c_void, row: *const LcPair) {
+        let rows = unsafe { &mut *(user as *mut Vec<Row>) };
+        let row = unsafe { *row };
+        rows.push((
+            row.i as usize,
+            row.j as usize,
+            row.shift,
+            row.dist2.to_bits(),
+        ));
+    }
+
+    fn last_error() -> String {
+        let msg = unsafe { lc_last_error() };
+        assert!(!msg.is_null());
+        unsafe { CStr::from_ptr(msg) }.to_str().unwrap().to_owned()
+    }
+
+    fn raw(h: [[f64; 3]; 3]) -> LcCell {
+        LcCell {
+            h: [
+                h[0][0], h[0][1], h[0][2], h[1][0], h[1][1], h[1][2], h[2][0], h[2][1], h[2][2],
+            ],
+            origin: [0.0; 3],
+        }
+    }
+
+    #[test]
+    fn c_rows_are_the_rust_rows() {
+        let h = tilted(16.0, [0.25, -0.15, 0.2]);
+        let cell = cell_of(h);
+        let c_cell = raw(h);
+        let xyz = points(h, 400, -0.6, 1.6, 77);
+        let n = xyz.len();
+        for periodic in [PPP, [true, false, true], [false; 3]] {
+            let pbc = periodic.map(c_int::from);
+            let mut grid = std::ptr::null_mut();
+            let code = unsafe {
+                lc_row_grid_build(
+                    xyz.as_ptr().cast(),
+                    n,
+                    &c_cell,
+                    pbc.as_ptr(),
+                    3.5,
+                    std::ptr::null(),
+                    0.0,
+                    0,
+                    0,
+                    &mut grid,
+                )
+            };
+            assert_eq!(code, 0, "{}", last_error());
+            assert_eq!(unsafe { lc_row_grid_len(grid) }, n);
+            let rust = RowGrid::build(&xyz, &cell, &PbcQuery::new(periodic, 3.5)).unwrap();
+            for half in [false, true] {
+                let want = visited(&rust, half);
+                assert!(!want.is_empty());
+                let mut got: Vec<Row> = Vec::new();
+                let user = (&mut got as *mut Vec<Row>).cast();
+                let mid = n / 3;
+                assert_eq!(
+                    unsafe {
+                        lc_row_grid_rows(grid, 0, mid, c_int::from(half), Some(collect), user)
+                    },
+                    0
+                );
+                for i in mid..n {
+                    assert_eq!(
+                        unsafe {
+                            lc_row_grid_point(grid, i, c_int::from(half), Some(collect), user)
+                        },
+                        0
+                    );
+                }
+                assert_eq!(got, want, "{periodic:?} half={half}");
+            }
+            // Out of range, a null callback, and a null grid are errors.
+            let mut got: Vec<Row> = Vec::new();
+            let user = (&mut got as *mut Vec<Row>).cast();
+            assert_ne!(
+                unsafe { lc_row_grid_rows(grid, 0, n + 1, 0, Some(collect), user) },
+                0
+            );
+            assert_eq!(last_error(), "point index is out of range");
+            assert_ne!(
+                unsafe { lc_row_grid_point(grid, n, 0, Some(collect), user) },
+                0
+            );
+            assert_ne!(unsafe { lc_row_grid_rows(grid, 0, n, 0, None, user) }, 0);
+            assert_eq!(last_error(), "null pointer");
+            assert_ne!(
+                unsafe { lc_row_grid_rows(std::ptr::null(), 0, 0, 0, Some(collect), user) },
+                0
+            );
+            assert!(got.is_empty());
+            // Update in place with fewer points and a mask.
+            let fewer = &xyz[..150];
+            let mask: Vec<c_int> = (0..150).map(|i| c_int::from(i % 5 != 0)).collect();
+            let code = unsafe {
+                lc_row_grid_update(
+                    grid,
+                    fewer.as_ptr().cast(),
+                    fewer.len(),
+                    &c_cell,
+                    pbc.as_ptr(),
+                    4.0,
+                    mask.as_ptr(),
+                    2.0,
+                    0,
+                    1,
+                )
+            };
+            assert_eq!(code, 0, "{}", last_error());
+            assert_eq!(unsafe { lc_row_grid_len(grid) }, 150);
+            let keep: Vec<bool> = mask.iter().map(|&v| v != 0).collect();
+            let query = PbcQuery::new(periodic, 4.0)
+                .mask(Some(&keep))
+                .cell_hint(Some(2.0))
+                .exclude_self_images(true);
+            let want = visited(&RowGrid::build(fewer, &cell, &query).unwrap(), false);
+            let mut got: Vec<Row> = Vec::new();
+            let user = (&mut got as *mut Vec<Row>).cast();
+            assert_eq!(
+                unsafe { lc_row_grid_rows(grid, 0, 150, 0, Some(collect), user) },
+                0
+            );
+            assert_eq!(got, want);
+            // A failed update empties the grid and keeps the handle.
+            let code = unsafe {
+                lc_row_grid_update(
+                    grid,
+                    fewer.as_ptr().cast(),
+                    fewer.len(),
+                    &c_cell,
+                    pbc.as_ptr(),
+                    -1.0,
+                    std::ptr::null(),
+                    0.0,
+                    0,
+                    0,
+                )
+            };
+            assert_ne!(code, 0);
+            assert_eq!(last_error(), "cutoff must be finite and strictly positive");
+            assert_eq!(unsafe { lc_row_grid_len(grid) }, 0);
+            unsafe { lc_row_grid_free(grid) };
+        }
+        unsafe { lc_row_grid_free(std::ptr::null_mut()) };
+        assert_eq!(unsafe { lc_row_grid_len(std::ptr::null()) }, 0);
+        let mut grid = std::ptr::null_mut();
+        let code = unsafe {
+            lc_row_grid_build(
+                xyz.as_ptr().cast(),
+                0,
+                &c_cell,
+                std::ptr::null(),
+                3.5,
+                std::ptr::null(),
+                0.0,
+                0,
+                0,
+                &mut grid,
+            )
+        };
+        assert_ne!(code, 0);
+        assert!(grid.is_null());
+        assert_eq!(last_error(), "no points");
+    }
 }

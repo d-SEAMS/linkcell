@@ -174,6 +174,23 @@ typedef struct lc_pair {
 } lc_pair;
 
 /**
+ * Opaque handle of the bins of one cutoff search.
+ *
+ * Callers only ever hold a pointer returned by `lc_row_grid_build`. The
+ * byte makes this a complete object type in C99 and C++17.
+ */
+typedef struct lc_row_grid {
+    uint8_t _private;
+} lc_row_grid;
+
+/**
+ * Receives one row entry from [`lc_row_grid_rows`] or
+ * [`lc_row_grid_point`]. `user` is the pointer given to that call.
+ * `row` is valid until the callback returns.
+ */
+typedef void (*lc_row_visit)(void *user, const struct lc_pair *row);
+
+/**
  * Default method.
  *
  * The panel sums edge cuts over the five systems. The default is the
@@ -851,6 +868,131 @@ extern int32_t lc_ptscotch_part(int32_t n,
                                 double imbalance,
                                 int32_t *part,
                                 double *seconds_max);
+
+/**
+ * Bin `n` points for the rows of one cutoff search and keep the bins.
+ *
+ * The arguments are those of [`lc_pairs_within_pbc`], less `half` and
+ * the row buffer: `pbc` is null for a fully periodic cell or three
+ * ints, nonzero for a periodic axis; `mask` is null or `n` ints;
+ * `cell_hint <= 0` selects the default bin edge; `closed` nonzero keeps
+ * `dist2 <= cutoff²` on an open or mixed cell; `exclude_self_images`
+ * nonzero drops `i == j`. The grid copies what it needs from `xyz` and
+ * is released by [`lc_row_grid_free`]. It holds the bins and no pair.
+ *
+ * Returns 0 and writes the handle to `*out`. On failure `*out` is null,
+ * the return is nonzero, and `lc_last_error` holds the message.
+ * `n == 0` fails with "no points".
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
+ * periodic, points at one `lc_cell`. `pbc`, if non-null, is three
+ * ints. `mask`, if non-null, is `n` ints. `out` is writable for one
+ * pointer.
+ */
+int lc_row_grid_build(const double *xyz,
+                      size_t n,
+                      const struct lc_cell *simbox,
+                      const int *pbc,
+                      double cutoff,
+                      const int *mask,
+                      double cell_hint,
+                      int closed,
+                      int exclude_self_images,
+                      struct lc_row_grid **out);
+
+/**
+ * Free a grid built by [`lc_row_grid_build`]. Null is accepted.
+ *
+ * # Safety
+ *
+ * `grid` is null or a pointer returned by [`lc_row_grid_build`] and not
+ * already freed.
+ */
+void lc_row_grid_free(struct lc_row_grid *grid);
+
+/**
+ * Number of points a grid holds, masked ones included. Rows are
+ * numbered from zero up to this. Null gives zero.
+ *
+ * # Safety
+ *
+ * `grid` is null or a valid pointer returned by [`lc_row_grid_build`].
+ */
+size_t lc_row_grid_len(const struct lc_row_grid *grid);
+
+/**
+ * Visit the row of point `i` of a grid: [`lc_row_grid_rows`] on
+ * `i .. i + 1`, for a caller that reads one point at a time.
+ *
+ * # Safety
+ *
+ * As [`lc_row_grid_rows`].
+ */
+int lc_row_grid_point(const struct lc_row_grid *grid,
+                      size_t i,
+                      int half,
+                      lc_row_visit visit,
+                      void *user);
+
+/**
+ * Visit the rows of points `begin .. end` of a grid, in ascending point
+ * order, without storing them.
+ *
+ * `visit(user, row)` is called on the calling thread once for every
+ * image of `row->j` within the cutoff of `row->i`, with the shift and
+ * squared distance [`lc_pairs_within_pbc`] writes for that row. `half`
+ * nonzero keeps the entries the half list has under `i`. Over every
+ * point the entries are the rows of [`lc_pairs_within_pbc`] for the
+ * grid's arguments. Entries of one row come in bin order, which does
+ * not depend on how the points are split into ranges.
+ *
+ * The call reads the grid and writes nothing in it, so several threads
+ * may visit one grid at once, on disjoint or overlapping ranges.
+ *
+ * Returns nonzero before any visit when `visit` is null or `end` is
+ * past [`lc_row_grid_len`] ("point index is out of range"). `begin >=
+ * end` visits nothing and returns 0.
+ *
+ * # Safety
+ *
+ * `grid` is a valid pointer returned by [`lc_row_grid_build`], and no
+ * thread updates or frees it during the call. `visit` may be called
+ * with `user` any number of times and must not unwind.
+ */
+int lc_row_grid_rows(const struct lc_row_grid *grid,
+                     size_t begin,
+                     size_t end,
+                     int half,
+                     lc_row_visit visit,
+                     void *user);
+
+/**
+ * Bin new points, a new cell, or a new query into a grid from
+ * [`lc_row_grid_build`], reusing its buffers.
+ *
+ * The arguments after `grid` are those of [`lc_row_grid_build`]. On
+ * failure the grid holds no point, every row is out of range, and the
+ * handle is still valid for another update or for
+ * [`lc_row_grid_free`].
+ *
+ * # Safety
+ *
+ * `grid` is a pointer returned by [`lc_row_grid_build`], not freed, and
+ * no other thread is reading it. The other pointers are as in
+ * [`lc_row_grid_build`].
+ */
+int lc_row_grid_update(struct lc_row_grid *grid,
+                       const double *xyz,
+                       size_t n,
+                       const struct lc_cell *simbox,
+                       const int *pbc,
+                       double cutoff,
+                       const int *mask,
+                       double cell_hint,
+                       int closed,
+                       int exclude_self_images);
 
 extern int32_t lc_scotch_part(int32_t n,
                               const int32_t *offsets,

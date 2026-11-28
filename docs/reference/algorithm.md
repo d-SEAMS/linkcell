@@ -161,6 +161,16 @@ Buffers a caller passes in are left alone.
 The bindings write their own layout from the same hits: Python and `pairs_within_columns` get the `ijS` columns without a `Pair` vector, `lc_pairs_within` writes the caller's columns, and a count query keeps its search for the matching fill on the same thread.
 `lc_pairs_within_rows` writes `lc_pair` rows, which the C++ `ShiftedPair` vector uses directly.
 
+`RowGrid` / `lc_row_grid_build` keeps the bins of that search and stores no pair.
+`for_rows` / `lc_row_grid_rows` then hands the rows of a range of points to a callback, and `for_point` / `lc_row_grid_point` the row of one point.
+A row holds the entries the pair list has for that source: every image of every target, with its shift and the same bits in its distance.
+On a periodic cell a row is read from the bins around the bin of its point, with the runs, roles, and shifts of the CSR gather below, in one scalar pass that also reports the shift of each run.
+On an open or mixed cell it is read from the occupied bins and the partner stencil of the open-cell walk.
+That walk tests a pair from its lower point, so a row read from the higher point computes the expression of the lower one.
+The grid holds the folded positions, the bin offsets, and the slot and bin of each point, which is memory in the number of points and bins.
+A visit writes nothing in the grid, so threads can read disjoint ranges of one grid at once.
+Entries of a row come in bin order, which the grid fixes.
+
 `pairs_within_csr` / `lc_pairs_within_csr` groups the same pairs by source, with no shift.
 On a periodic cell each point gathers its own row from the bins around its bin, so no hit is buffered, and no pass counts, places, or fills another thread's hits.
 The bins, the folded positions, and the reach are those of the pair walk, and so is every distance.

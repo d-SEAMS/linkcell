@@ -3,7 +3,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1161,6 +1161,352 @@ pub unsafe extern "C" fn lc_pairs_within_rows(
     });
     clear_error();
     0
+}
+
+struct RowHandle {
+    grid: crate::RowGrid,
+}
+
+/// Opaque handle of the bins of one cutoff search.
+///
+/// Callers only ever hold a pointer returned by `lc_row_grid_build`. The
+/// byte makes this a complete object type in C99 and C++17.
+#[repr(C)]
+pub struct lc_row_grid {
+    _private: u8,
+}
+
+/// Receives one row entry from [`lc_row_grid_rows`] or
+/// [`lc_row_grid_point`]. `user` is the pointer given to that call.
+/// `row` is valid until the callback returns.
+#[allow(non_camel_case_types)]
+pub type lc_row_visit = Option<unsafe extern "C" fn(user: *mut c_void, row: *const lc_pair)>;
+
+unsafe fn row_ref<'a>(ptr: *const lc_row_grid) -> Result<&'a RowHandle, c_int> {
+    if ptr.is_null() {
+        return Err(fail_msg("null pointer"));
+    }
+    Ok(unsafe { &*(ptr as *const RowHandle) })
+}
+
+/// Checks the arguments [`lc_row_grid_build`] and [`lc_row_grid_update`]
+/// share, then runs `bin` with the points, the cell, and the query.
+#[allow(clippy::too_many_arguments)]
+unsafe fn row_grid_bin(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    pbc: *const c_int,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    closed: c_int,
+    exclude_self_images: c_int,
+    bin: impl FnOnce(&[[f64; 3]], &Cell, &crate::PbcQuery<'_>) -> Result<(), Error> + Send,
+) -> c_int {
+    let periodic = if pbc.is_null() {
+        [true, true, true]
+    } else {
+        let flags = unsafe { [*pbc, *pbc.add(1), *pbc.add(2)] };
+        [flags[0] != 0, flags[1] != 0, flags[2] != 0]
+    };
+    if n == 0 {
+        return fail(Error::Empty);
+    }
+    if xyz.is_null() || (periodic != [false, false, false] && simbox.is_null()) {
+        return fail_msg("null pointer");
+    }
+    if n > c_int::MAX as usize || n > (isize::MAX as usize) / 3 {
+        return fail(Error::Overflow);
+    }
+    let cell = if periodic == [false, false, false] {
+        match Cell::ortho(1.0, 1.0, 1.0) {
+            Ok(cell) => cell,
+            Err(err) => return fail(err.into()),
+        }
+    } else {
+        let raw = unsafe { *simbox };
+        match crate::cell_for_pbc(
+            [
+                [raw.ax, raw.ay, raw.az],
+                [raw.bx, raw.by, raw.bz],
+                [raw.cx, raw.cy, raw.cz],
+            ],
+            [raw.ox, raw.oy, raw.oz],
+            periodic,
+        ) {
+            Ok(cell) => cell,
+            Err(err) => return fail(err),
+        }
+    };
+    let pts = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let mask_vec: Option<Vec<bool>> = if mask.is_null() {
+        None
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(mask, n) };
+        Some(raw.iter().map(|&v| v != 0).collect())
+    };
+    let hint = if cell_hint > 0.0 {
+        Some(cell_hint)
+    } else {
+        None
+    };
+    let mut query = crate::PbcQuery::new(periodic, cutoff)
+        .cell_hint(hint)
+        .closed(closed != 0)
+        .exclude_self_images(exclude_self_images != 0);
+    query.mask = mask_vec.as_deref();
+    match with_threads(|| bin(pts, &cell, &query)) {
+        Ok(()) => {
+            clear_error();
+            0
+        }
+        Err(err) => fail(err),
+    }
+}
+
+/// Bin `n` points for the rows of one cutoff search and keep the bins.
+///
+/// The arguments are those of [`lc_pairs_within_pbc`], less `half` and
+/// the row buffer: `pbc` is null for a fully periodic cell or three
+/// ints, nonzero for a periodic axis; `mask` is null or `n` ints;
+/// `cell_hint <= 0` selects the default bin edge; `closed` nonzero keeps
+/// `dist2 <= cutoff²` on an open or mixed cell; `exclude_self_images`
+/// nonzero drops `i == j`. The grid copies what it needs from `xyz` and
+/// is released by [`lc_row_grid_free`]. It holds the bins and no pair.
+///
+/// Returns 0 and writes the handle to `*out`. On failure `*out` is null,
+/// the return is nonzero, and `lc_last_error` holds the message.
+/// `n == 0` fails with "no points".
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `simbox`, if any axis is
+/// periodic, points at one `lc_cell`. `pbc`, if non-null, is three
+/// ints. `mask`, if non-null, is `n` ints. `out` is writable for one
+/// pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_build(
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    pbc: *const c_int,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    closed: c_int,
+    exclude_self_images: c_int,
+    out: *mut *mut lc_row_grid,
+) -> c_int {
+    if out.is_null() {
+        return fail_msg("null pointer");
+    }
+    unsafe {
+        *out = ptr::null_mut();
+    }
+    let mut built = None;
+    let slot = &mut built;
+    let code = unsafe {
+        row_grid_bin(
+            xyz,
+            n,
+            simbox,
+            pbc,
+            cutoff,
+            mask,
+            cell_hint,
+            closed,
+            exclude_self_images,
+            move |pts, cell, query| {
+                *slot = Some(crate::RowGrid::build(pts, cell, query)?);
+                Ok(())
+            },
+        )
+    };
+    if let Some(grid) = built {
+        unsafe {
+            *out = Box::into_raw(Box::new(RowHandle { grid })) as *mut lc_row_grid;
+        }
+    }
+    code
+}
+
+/// Bin new points, a new cell, or a new query into a grid from
+/// [`lc_row_grid_build`], reusing its buffers.
+///
+/// The arguments after `grid` are those of [`lc_row_grid_build`]. On
+/// failure the grid holds no point, every row is out of range, and the
+/// handle is still valid for another update or for
+/// [`lc_row_grid_free`].
+///
+/// # Safety
+///
+/// `grid` is a pointer returned by [`lc_row_grid_build`], not freed, and
+/// no other thread is reading it. The other pointers are as in
+/// [`lc_row_grid_build`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_update(
+    grid: *mut lc_row_grid,
+    xyz: *const f64,
+    n: usize,
+    simbox: *const lc_cell,
+    pbc: *const c_int,
+    cutoff: f64,
+    mask: *const c_int,
+    cell_hint: f64,
+    closed: c_int,
+    exclude_self_images: c_int,
+) -> c_int {
+    if grid.is_null() {
+        return fail_msg("null pointer");
+    }
+    let handle = unsafe { &mut *(grid as *mut RowHandle) };
+    // A call that fails on its arguments never reaches the update, and
+    // still leaves the grid without rows.
+    handle.grid.clear();
+    let target = &mut handle.grid;
+    unsafe {
+        row_grid_bin(
+            xyz,
+            n,
+            simbox,
+            pbc,
+            cutoff,
+            mask,
+            cell_hint,
+            closed,
+            exclude_self_images,
+            move |pts, cell, query| target.update(pts, cell, query),
+        )
+    }
+}
+
+/// Number of points a grid holds, masked ones included. Rows are
+/// numbered from zero up to this. Null gives zero.
+///
+/// # Safety
+///
+/// `grid` is null or a valid pointer returned by [`lc_row_grid_build`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_len(grid: *const lc_row_grid) -> usize {
+    match unsafe { row_ref(grid) } {
+        Ok(handle) => handle.grid.points(),
+        Err(_) => 0,
+    }
+}
+
+/// Free a grid built by [`lc_row_grid_build`]. Null is accepted.
+///
+/// # Safety
+///
+/// `grid` is null or a pointer returned by [`lc_row_grid_build`] and not
+/// already freed.
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_free(grid: *mut lc_row_grid) {
+    if grid.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(grid as *mut RowHandle));
+    }
+}
+
+/// Visit the rows of points `begin .. end` of a grid, in ascending point
+/// order, without storing them.
+///
+/// `visit(user, row)` is called on the calling thread once for every
+/// image of `row->j` within the cutoff of `row->i`, with the shift and
+/// squared distance [`lc_pairs_within_pbc`] writes for that row. `half`
+/// nonzero keeps the entries the half list has under `i`. Over every
+/// point the entries are the rows of [`lc_pairs_within_pbc`] for the
+/// grid's arguments. Entries of one row come in bin order, which does
+/// not depend on how the points are split into ranges.
+///
+/// The call reads the grid and writes nothing in it, so several threads
+/// may visit one grid at once, on disjoint or overlapping ranges.
+///
+/// Returns nonzero before any visit when `visit` is null or `end` is
+/// past [`lc_row_grid_len`] ("point index is out of range"). `begin >=
+/// end` visits nothing and returns 0.
+///
+/// # Safety
+///
+/// `grid` is a valid pointer returned by [`lc_row_grid_build`], and no
+/// thread updates or frees it during the call. `visit` may be called
+/// with `user` any number of times and must not unwind.
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_rows(
+    grid: *const lc_row_grid,
+    begin: usize,
+    end: usize,
+    half: c_int,
+    visit: lc_row_visit,
+    user: *mut c_void,
+) -> c_int {
+    let handle = match unsafe { row_ref(grid) } {
+        Ok(handle) => handle,
+        Err(code) => return code,
+    };
+    let Some(visit) = visit else {
+        return fail_msg("null pointer");
+    };
+    let walked = handle
+        .grid
+        .for_rows(begin..end, half != 0, |i, j, shift, dist2| {
+            let row = lc_pair {
+                i: i as c_int,
+                j: j as c_int,
+                shift,
+                dist2,
+            };
+            unsafe { visit(user, &row) };
+        });
+    match walked {
+        Ok(()) => {
+            clear_error();
+            0
+        }
+        Err(err) => fail(err),
+    }
+}
+
+/// Visit the row of point `i` of a grid: [`lc_row_grid_rows`] on
+/// `i .. i + 1`, for a caller that reads one point at a time.
+///
+/// # Safety
+///
+/// As [`lc_row_grid_rows`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_point(
+    grid: *const lc_row_grid,
+    i: usize,
+    half: c_int,
+    visit: lc_row_visit,
+    user: *mut c_void,
+) -> c_int {
+    let handle = match unsafe { row_ref(grid) } {
+        Ok(handle) => handle,
+        Err(code) => return code,
+    };
+    let Some(visit) = visit else {
+        return fail_msg("null pointer");
+    };
+    let walked = handle.grid.for_point(i, half != 0, |j, shift, dist2| {
+        let row = lc_pair {
+            i: i as c_int,
+            j: j as c_int,
+            shift,
+            dist2,
+        };
+        unsafe { visit(user, &row) };
+    });
+    match walked {
+        Ok(()) => {
+            clear_error();
+            0
+        }
+        Err(err) => fail(err),
+    }
 }
 
 /// How many partner stencils have been built in this process.

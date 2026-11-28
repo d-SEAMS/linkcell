@@ -226,6 +226,9 @@ Map: [docs/index.md](docs/index.md).
 - A cutoff pair list is `pairs_within` / `lc_pairs_within` / `linkcell.pairs_within`: atom-image rows with the caller's shift `S`.
   `knearest` is the k-nearest list.
   `pairs_within_columns`, `lc_pairs_within_rows`, and the Python call write the `ijS` columns or `lc_pair` rows straight from the search, and a C count query keeps its search for the fill that follows on the same thread.
+- `RowGrid` / `lc_row_grid_build` keeps the bins of a cutoff search and stores no pair.
+  `for_rows` / `lc_row_grid_rows` visits the rows of a range of points through a callback, and `for_point` / `lc_row_grid_point` the row of one point, with the shifts and distances of `pairs_within_pbc`.
+  Threads can visit disjoint ranges of one grid at once.
 - `pairs_within_csr` / `lc_pairs_within_csr` writes one sorted row of neighbour indices per point, with optional nearest-image squared distances.
   It handles full or half lists and periodic, triclinic, open, or mixed cells.
   The rows are built on the pool with no global sort and are the same bits at every thread count.
