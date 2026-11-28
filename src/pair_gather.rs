@@ -92,7 +92,7 @@ struct Run {
 
 /// How a row reads a run.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     /// No shift: `q - p`, which squares to the same bits in either role.
     Plain,
     /// The row's atom is the walk's source: `q - (p - shift)`.
@@ -103,13 +103,13 @@ enum Kind {
 
 /// A run of bins at a fixed flat offset from the bin being walked.
 #[derive(Clone, Copy)]
-struct Step {
-    rel: isize,
-    bins: usize,
-    kind: Kind,
+pub(super) struct Step {
+    pub(super) rel: isize,
+    pub(super) bins: usize,
+    pub(super) kind: Kind,
     /// The shift, in cells.
-    s: [i32; 3],
-    shift: [f64; 3],
+    pub(super) s: [i32; 3],
+    pub(super) shift: [f64; 3],
 }
 
 /// A buffer several jobs write at disjoint slots.
@@ -131,7 +131,7 @@ impl<T> Shared<T> {
 }
 
 /// Lattice shifts of the bin offsets a walk can take, by shift index.
-struct Shifts {
+pub(super) struct Shifts {
     lo: [i32; 3],
     len: [i32; 3],
     table: Vec<[f64; 3]>,
@@ -173,6 +173,101 @@ impl Shifts {
             + (s[0] - self.lo[0])) as usize;
         self.table[k]
     }
+}
+
+/// What the runs of a bin depend on besides the bin: the bin counts, the
+/// reach, and the cell.
+pub(super) struct Reach<'a> {
+    pub(super) n: [i32; 3],
+    pub(super) reach: [i32; 3],
+    pub(super) ortho: bool,
+    /// Bin widths, as the stencil takes them.
+    pub(super) width: [f64; 3],
+    pub(super) cut2: f64,
+    pub(super) shifts: &'a Shifts,
+    pub(super) cell: &'a Cell,
+}
+
+/// Runs of bin `c` at `b`, as flat offsets: every bin offset in reach,
+/// the walk's roles and shifts, less the bins the stencil drops. Runs of
+/// neighbouring bins read the same way merge. `axes` is scratch.
+pub(super) fn bin_steps(
+    at: &Reach<'_>,
+    c: usize,
+    b: [i32; 3],
+    axes: &mut [Vec<(i32, i32)>; 3],
+    steps: &mut Vec<Step>,
+) -> Result<(), Error> {
+    let n = at.n;
+    let r = at.reach;
+    // Per axis and offset `d`: the bin `b + d` folds into and its
+    // shift. The walk sees an offset `keep_dir` drops from that bin,
+    // at `-d`, with the opposite shift.
+    for a in 0..3 {
+        let axis = &mut axes[a];
+        axis.clear();
+        axis.extend((-r[a]..=r[a]).map(|d| fold(b[a] + d, n[a])));
+    }
+    steps.clear();
+    for dz in -r[2]..=r[2] {
+        let (wz, sz) = axes[2][(dz + r[2]) as usize];
+        for dy in -r[1]..=r[1] {
+            let (wy, sy) = axes[1][(dy + r[1]) as usize];
+            for dx in -r[0]..=r[0] {
+                let (wx, sx) = axes[0][(dx + r[0]) as usize];
+                let d = [dx, dy, dz];
+                let other = [wx, wy, wz];
+                let source = d == [0, 0, 0] || keep_dir(dx, dy, dz);
+                // Neighbouring bins touch, so only a farther one can be
+                // out of reach.
+                if dx.abs() > 1 || dy.abs() > 1 || dz.abs() > 1 {
+                    let (src, dst) = if source {
+                        (b, [b[0] + dx, b[1] + dy, b[2] + dz])
+                    } else {
+                        (other, [wx - dx, wy - dy, wz - dz])
+                    };
+                    if bins_too_far(at.ortho, src, dst, at.width, at.cut2) {
+                        continue;
+                    }
+                }
+                let rel = bins::flat_cell(other, n) as isize - c as isize;
+                let s = if source {
+                    [sx, sy, sz]
+                } else {
+                    [-sx, -sy, -sz]
+                };
+                let kind = if s == [0, 0, 0] {
+                    Kind::Plain
+                } else if source {
+                    Kind::Source
+                } else {
+                    Kind::Target
+                };
+                if let Some(last) = steps.last_mut() {
+                    if last.rel + last.bins as isize == rel && last.kind == kind && last.s == s {
+                        last.bins += 1;
+                        continue;
+                    }
+                }
+                if steps.len() == steps.capacity() {
+                    let extra = steps.capacity().max(64);
+                    super::try_hold(steps, extra)?;
+                }
+                steps.push(Step {
+                    rel,
+                    bins: 1,
+                    kind,
+                    s,
+                    shift: if kind == Kind::Plain {
+                        [0.0; 3]
+                    } else {
+                        at.shifts.get(at.cell, s)
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The rows of one gather, staged, before they are laid out.
@@ -272,7 +367,23 @@ struct RowOut {
     stage: u64,
 }
 
-struct Walker<'a> {
+/// Where bin `b` of an `n` mesh sits on each axis (first, inner, last),
+/// as an index into the 27 tabulated runs.
+#[inline(always)]
+pub(super) fn bin_class(b: [i32; 3], n: [i32; 3]) -> usize {
+    let at = |v: i32, n: i32| {
+        if v == 0 {
+            0
+        } else if v == n - 1 {
+            2
+        } else {
+            1
+        }
+    };
+    (at(b[0], n[0]) + 3 * at(b[1], n[1]) + 9 * at(b[2], n[2])) as usize
+}
+
+pub(super) struct Walker<'a> {
     grid: &'a Grid,
     cell: &'a Cell,
     cut2: f64,
@@ -291,7 +402,7 @@ struct Walker<'a> {
 }
 
 impl<'a> Walker<'a> {
-    fn new(binned: &'a Binned, cell: &'a Cell) -> Result<Self, Error> {
+    pub(super) fn new(binned: &'a Binned, cell: &'a Cell) -> Result<Self, Error> {
         let grid = &binned.grid;
         let [nx, ny, nz] = grid.n;
         let width = [
@@ -327,95 +438,27 @@ impl<'a> Walker<'a> {
     /// Where bin `b` sits on each axis, as an index into `steps`.
     #[inline(always)]
     fn class(&self, b: [i32; 3]) -> usize {
-        let n = self.grid.n;
-        let at = |v: i32, n: i32| {
-            if v == 0 {
-                0
-            } else if v == n - 1 {
-                2
-            } else {
-                1
-            }
-        };
-        (at(b[0], n[0]) + 3 * at(b[1], n[1]) + 9 * at(b[2], n[2])) as usize
+        bin_class(b, self.grid.n)
     }
 
-    /// Runs of bin `c` at `b`, as flat offsets: every bin offset in
-    /// reach, the walk's roles and shifts, less the bins the stencil
-    /// drops. Runs of neighbouring bins read the same way merge.
+    /// The bin widths, the shift table, and the tabulated runs, for a
+    /// caller that keeps them beside the grid.
+    pub(super) fn into_tables(self) -> ([f64; 3], Shifts, Vec<Vec<Step>>) {
+        (self.width, self.shifts, self.steps)
+    }
+
+    /// [`bin_steps`] of bin `c` at `b`, into `stage.steps`.
     fn steps_of(&self, c: usize, b: [i32; 3], stage: &mut Stage) -> Result<(), Error> {
-        let n = self.grid.n;
-        let r = self.reach;
-        // Per axis and offset `d`: the bin `b + d` folds into and its
-        // shift. The walk sees an offset `keep_dir` drops from that bin,
-        // at `-d`, with the opposite shift.
-        for a in 0..3 {
-            let axis = &mut stage.axes[a];
-            axis.clear();
-            axis.extend((-r[a]..=r[a]).map(|d| fold(b[a] + d, n[a])));
-        }
-        let steps = &mut stage.steps;
-        steps.clear();
-        for dz in -r[2]..=r[2] {
-            let (wz, sz) = stage.axes[2][(dz + r[2]) as usize];
-            for dy in -r[1]..=r[1] {
-                let (wy, sy) = stage.axes[1][(dy + r[1]) as usize];
-                for dx in -r[0]..=r[0] {
-                    let (wx, sx) = stage.axes[0][(dx + r[0]) as usize];
-                    let d = [dx, dy, dz];
-                    let other = [wx, wy, wz];
-                    let source = d == [0, 0, 0] || keep_dir(dx, dy, dz);
-                    // Neighbouring bins touch, so only a farther one can be
-                    // out of reach.
-                    if dx.abs() > 1 || dy.abs() > 1 || dz.abs() > 1 {
-                        let (src, dst) = if source {
-                            (b, [b[0] + dx, b[1] + dy, b[2] + dz])
-                        } else {
-                            (other, [wx - dx, wy - dy, wz - dz])
-                        };
-                        if bins_too_far(self.ortho, src, dst, self.width, self.cut2) {
-                            continue;
-                        }
-                    }
-                    let rel = bins::flat_cell(other, n) as isize - c as isize;
-                    let s = if source {
-                        [sx, sy, sz]
-                    } else {
-                        [-sx, -sy, -sz]
-                    };
-                    let kind = if s == [0, 0, 0] {
-                        Kind::Plain
-                    } else if source {
-                        Kind::Source
-                    } else {
-                        Kind::Target
-                    };
-                    if let Some(last) = steps.last_mut() {
-                        if last.rel + last.bins as isize == rel && last.kind == kind && last.s == s
-                        {
-                            last.bins += 1;
-                            continue;
-                        }
-                    }
-                    if steps.len() == steps.capacity() {
-                        let extra = steps.capacity().max(64);
-                        super::try_hold(steps, extra)?;
-                    }
-                    steps.push(Step {
-                        rel,
-                        bins: 1,
-                        kind,
-                        s,
-                        shift: if kind == Kind::Plain {
-                            [0.0; 3]
-                        } else {
-                            self.shifts.get(self.cell, s)
-                        },
-                    });
-                }
-            }
-        }
-        Ok(())
+        let reach = Reach {
+            n: self.grid.n,
+            reach: self.reach,
+            ortho: self.ortho,
+            width: self.width,
+            cut2: self.cut2,
+            shifts: &self.shifts,
+            cell: self.cell,
+        };
+        bin_steps(&reach, c, b, &mut stage.axes, &mut stage.steps)
     }
 
     /// Gather the rows of the atoms in bins `lo..hi` into `stage`, `W`
