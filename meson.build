@@ -359,6 +359,15 @@ linkcell_dep = declare_dependency(
 )
 meson.override_dependency('linkcell', linkcell_dep)
 
+# The headers alone, for a host that loads the library at run time and
+# links nothing. packaging/linkcell-headers/meson.build declares the same
+# dependency without cargo, for a host that builds no Rust.
+linkcell_headers_dep = declare_dependency(
+  include_directories: include_directories('include'),
+  version: meson.project_version(),
+)
+meson.override_dependency('linkcell-headers', linkcell_headers_dep)
+
 if _install
   install_headers('include/linkcell.h', 'include/linkcell.hpp')
   if _gpu_on
@@ -430,6 +439,33 @@ if get_option('with_tests')
     timeout: 300,
   )
   _cpp = meson.get_compiler('cpp')
+  # The row grid from C++, through the wrapper of linkcell.hpp.
+  _row_grid_cpp = executable(
+    'row_grid_cpp',
+    'tests/row_grid.cpp',
+    dependencies: [linkcell_dep, dependency('threads')],
+    build_rpath: meson.project_build_root(),
+    install: false,
+  )
+  test('row-grid-cpp', _row_grid_cpp, env: _meson_test_env, timeout: 120)
+  # The row grid from a C host that has the headers and no library on its
+  # link line, and loads the shared library by path.
+  if host_machine.system() == 'linux'
+    _row_grid_c = executable(
+      'row_grid_c',
+      'tests/row_grid.c',
+      c_args: ['-D_DEFAULT_SOURCE'],
+      dependencies: [linkcell_headers_dep, cc.find_library('dl', required: false)],
+      install: false,
+    )
+    test(
+      'row-grid-c-headers-only',
+      _row_grid_c,
+      args: [linkcell_cargo[0].full_path()],
+      depends: linkcell_cargo,
+      timeout: 120,
+    )
+  endif
   _eh_static_probe = executable(
     'exception_typeinfo_static',
     files(

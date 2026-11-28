@@ -1,0 +1,9 @@
+[wrap-git]
+directory = linkcell-headers
+url = https://github.com/d-SEAMS/linkcell.git
+revision = v0.6.0
+depth = 1
+patch_directory = linkcell-headers
+
+[provide]
+dependency_names = linkcell-headers

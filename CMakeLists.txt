@@ -321,6 +321,12 @@ foreach(_linkcell_eh_kind RUNTIME LIBRARY ARCHIVE)
   endforeach()
 endforeach()
 
+# The headers alone, for a host that loads the library at run time.
+add_library(linkcell_headers INTERFACE)
+add_library(linkcell::headers ALIAS linkcell_headers)
+target_include_directories(linkcell_headers INTERFACE
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
+
 add_library(linkcell_cpp INTERFACE)
 add_library(linkcell::cpp ALIAS linkcell_cpp)
 target_link_libraries(linkcell_cpp INTERFACE linkcell::linkcell linkcell::eh)
@@ -370,13 +376,18 @@ if(LINKCELL_BUILD_EXAMPLES)
   add_executable(knearest_non_finite_cpp tests/knearest_non_finite.cpp)
   target_link_libraries(knearest_non_finite_cpp PRIVATE linkcell::cpp)
   set_target_properties(knearest_non_finite_cpp PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  add_executable(row_grid_cpp tests/row_grid.cpp)
+  target_link_libraries(row_grid_cpp PRIVATE linkcell::cpp Threads::Threads)
+  set_target_properties(row_grid_cpp PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
   enable_testing()
+  add_test(NAME row-grid-cpp COMMAND row_grid_cpp)
   add_test(NAME two-points-c COMMAND two_points)
   add_test(NAME two-points-cpp COMMAND two_points_cpp)
   add_test(NAME knearest-non-finite-c COMMAND knearest_non_finite)
   add_test(NAME knearest-non-finite-cpp COMMAND knearest_non_finite_cpp)
   set(_linkcell_example_tests
-    two-points-c two-points-cpp knearest-non-finite-c knearest-non-finite-cpp)
+    two-points-c two-points-cpp knearest-non-finite-c knearest-non-finite-cpp
+    row-grid-cpp)
   add_executable(exception_typeinfo_static
     tests/exception_typeinfo_static.cpp
     tests/exception_typeinfo_static_other.cpp

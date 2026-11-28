@@ -55,6 +55,12 @@ if(NOT TARGET linkcell::eh)
   endif()
 endif()
 
+if(NOT TARGET linkcell::headers)
+  add_library(linkcell::headers INTERFACE IMPORTED)
+  set_target_properties(linkcell::headers PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${LINKCELL_INCLUDE_DIR}")
+endif()
+
 if(NOT TARGET linkcell::cpp)
   add_library(linkcell::cpp INTERFACE IMPORTED)
   set_target_properties(linkcell::cpp PROPERTIES
