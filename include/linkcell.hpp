@@ -13,9 +13,11 @@ extern "C" {
 #include "linkcell.h"
 }
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -414,7 +416,7 @@ pairs_open(const double *xyz, std::size_t n, double cutoff,
 /// [`pairs_within`] with a periodicity mask.
 ///
 /// `periodic[k]` false is an open axis. `closed` keeps the cutoff
-/// boundary on an open or mixed cell. `exclude_self_images` drops
+/// boundary, on a periodic cell too. `exclude_self_images` drops
 /// `i == j`.
 [[nodiscard]] inline std::vector<ShiftedPair>
 pairs_within_pbc(const double *xyz, std::size_t n, const Cell &cell,
@@ -518,6 +520,336 @@ inline void pairs_within_csr(const double *xyz, std::size_t n,
     out.dist2.resize(need_cols);
   }
 }
+
+/// The C ABI a header or a library was built for; see `lc_abi`.
+struct AbiStamp {
+  std::uint16_t major = 0;
+  std::uint16_t minor = 0;
+  std::uint16_t layout_revision = 0;
+
+  friend bool operator==(const AbiStamp &a, const AbiStamp &b) noexcept {
+    return a.major == b.major && a.minor == b.minor &&
+           a.layout_revision == b.layout_revision;
+  }
+  friend bool operator!=(const AbiStamp &a, const AbiStamp &b) noexcept {
+    return !(a == b);
+  }
+};
+
+/// The ABI of the header this translation unit compiled against.
+[[nodiscard]] constexpr AbiStamp header_abi() noexcept {
+  return AbiStamp{LC_ABI_MAJOR, LC_ABI_MINOR, LC_ABI_LAYOUT_REVISION};
+}
+
+/// The ABI of the library in this process; see `lc_abi_stamp`.
+[[nodiscard]] inline AbiStamp library_abi() noexcept {
+  const lc_abi raw = lc_abi_stamp();
+  return AbiStamp{raw.major, raw.minor, raw.layout_revision};
+}
+
+/// True when the library serves this header; see `lc_abi_compatible`.
+[[nodiscard]] inline bool abi_compatible() noexcept {
+  const lc_abi host{LC_ABI_MAJOR, LC_ABI_MINOR, LC_ABI_LAYOUT_REVISION};
+  return lc_abi_compatible(&host) != 0;
+}
+
+/// What the library can do; see `lc_caps`. A member the library does not
+/// know is false.
+struct Capabilities {
+  bool row_grid = false;
+  bool row_vector = false;
+  bool row_stop = false;
+  bool row_request = false;
+  bool open_axes = false;
+  bool threads = false;
+  bool row_fill = false;
+  bool closed_periodic = false;
+  bool row_bound = false;
+};
+
+/// `lc_capabilities` of the library in this process.
+[[nodiscard]] inline Capabilities capabilities() {
+  lc_caps raw{};
+  raw.size = static_cast<std::uint32_t>(sizeof(lc_caps));
+  const int status = lc_capabilities(&raw);
+  if (status != 0) {
+    const char *msg = lc_last_error();
+    throw Error(status, msg ? std::string(msg)
+                            : std::string("linkcell: capabilities failed"));
+  }
+  Capabilities caps;
+  caps.row_grid = raw.row_grid != 0;
+  caps.row_vector = raw.row_vector != 0;
+  caps.row_stop = raw.row_stop != 0;
+  caps.row_request = raw.row_request != 0;
+  caps.open_axes = raw.open_axes != 0;
+  caps.threads = raw.threads != 0;
+  caps.row_fill = raw.row_fill != 0;
+  caps.closed_periodic = raw.closed_periodic != 0;
+  caps.row_bound = raw.row_bound != 0;
+  return caps;
+}
+
+/// One entry of a row: an image of point `j` within the cutoff of point
+/// `i`. `vector` is `r_j - r_i` with `shift` applied, and `dist2` its
+/// squared length.
+struct Row {
+  std::size_t i = 0;
+  std::size_t j = 0;
+  std::array<int, 3> shift{};
+  std::array<double, 3> vector{};
+  double dist2 = 0.0;
+};
+
+/// Where a buffered read of rows stands: the next entry is entry `entry`
+/// of the row of point `point`.
+struct RowCursor {
+  std::size_t point = 0;
+  std::size_t entry = 0;
+};
+
+/// What a row grid is built for; the arguments of `lc_row_grid_build`.
+struct RowQuery {
+  double cutoff = 0.0;
+  std::array<bool, 3> periodic{true, true, true};
+  /// Bin edge. Zero or less selects the default.
+  double cell_hint = 0.0;
+  /// Keep `dist2 == cutoff * cutoff`.
+  bool closed = false;
+  /// Drop the periodic images of a point itself.
+  bool exclude_self_images = false;
+};
+
+/// The bins of one cutoff search, kept so its rows can be read without a
+/// stored pair list; see `lc_row_grid_build`.
+///
+/// The grid owns its handle and releases it when destroyed. It moves and
+/// does not copy. `for_rows` and `for_point` are const and write nothing
+/// in the grid, so several threads may call them on one grid at once.
+/// `update` needs the grid to itself.
+class RowGrid {
+public:
+  /// Bin `n` points, `xyz` being `n` packed `x y z` triples. `mask` is
+  /// nullptr or `n` ints, nonzero to keep the point. Throws `Error` with
+  /// the `lc_last_error` text.
+  RowGrid(const double *xyz, std::size_t n, const Cell &cell,
+          const RowQuery &query, const int *mask = nullptr) {
+    const lc_cell raw = cell.raw();
+    const int pbc[3] = {query.periodic[0] ? 1 : 0, query.periodic[1] ? 1 : 0,
+                        query.periodic[2] ? 1 : 0};
+    check(lc_row_grid_build(xyz, n, &raw, pbc, query.cutoff, mask,
+                            query.cell_hint, query.closed ? 1 : 0,
+                            query.exclude_self_images ? 1 : 0, &grid_),
+          "row grid build failed");
+  }
+
+  /// The same for points held as triples.
+  RowGrid(const std::vector<std::array<double, 3>> &xyz, const Cell &cell,
+          const RowQuery &query, const int *mask = nullptr)
+      : RowGrid(xyz.empty() ? nullptr : xyz.front().data(), xyz.size(), cell,
+                query, mask) {}
+
+  /// Bin `n` points for a serialized `NeighborRequest`; see
+  /// `lc_row_grid_build_request`. `mask` is nullptr or `n` ints. `half`,
+  /// if not nullptr, receives the shell the request declares, for the
+  /// caller to pass to each visit. Throws `Error` when the library was
+  /// built without that support (`capabilities().row_request`).
+  [[nodiscard]] static RowGrid from_request(const double *xyz, std::size_t n,
+                                            const std::uint8_t *request,
+                                            std::size_t request_len,
+                                            const int *mask = nullptr,
+                                            bool *half = nullptr) {
+    RowGrid grid;
+    int declared_half = 0;
+    check(lc_row_grid_build_request(xyz, n, mask, request, request_len,
+                                    &declared_half, &grid.grid_),
+          "row grid build from a request failed");
+    if (half != nullptr) {
+      *half = declared_half != 0;
+    }
+    return grid;
+  }
+
+  ~RowGrid() { lc_row_grid_free(grid_); }
+
+  RowGrid(const RowGrid &) = delete;
+  RowGrid &operator=(const RowGrid &) = delete;
+
+  RowGrid(RowGrid &&other) noexcept
+      : grid_(std::exchange(other.grid_, nullptr)) {}
+
+  RowGrid &operator=(RowGrid &&other) noexcept {
+    if (this != &other) {
+      lc_row_grid_free(grid_);
+      grid_ = std::exchange(other.grid_, nullptr);
+    }
+    return *this;
+  }
+
+  /// Bin new points, a new cell, or a new query in place, reusing the
+  /// buffers. After a throw the grid holds no point.
+  void update(const double *xyz, std::size_t n, const Cell &cell,
+              const RowQuery &query, const int *mask = nullptr) {
+    const lc_cell raw = cell.raw();
+    const int pbc[3] = {query.periodic[0] ? 1 : 0, query.periodic[1] ? 1 : 0,
+                        query.periodic[2] ? 1 : 0};
+    check(lc_row_grid_update(grid_, xyz, n, &raw, pbc, query.cutoff, mask,
+                             query.cell_hint, query.closed ? 1 : 0,
+                             query.exclude_self_images ? 1 : 0),
+          "row grid update failed");
+  }
+
+  /// The same for points held as triples.
+  void update(const std::vector<std::array<double, 3>> &xyz, const Cell &cell,
+              const RowQuery &query, const int *mask = nullptr) {
+    update(xyz.empty() ? nullptr : xyz.front().data(), xyz.size(), cell, query,
+           mask);
+  }
+
+  /// Number of points, masked ones included. Rows are `0 .. size()`.
+  [[nodiscard]] std::size_t size() const noexcept {
+    return lc_row_grid_len(grid_);
+  }
+
+  /// Number of bins the grid holds.
+  [[nodiscard]] std::size_t bins() const noexcept {
+    return lc_row_grid_bins(grid_);
+  }
+
+  /// An upper bound on the entries of every full row together, from the
+  /// bin occupancy alone; see `lc_row_grid_bound`. A caller that must
+  /// decide whether a stored list fits in memory reads this.
+  [[nodiscard]] std::uint64_t candidate_bound() const {
+    std::uint64_t bound = 0;
+    check(lc_row_grid_bound(grid_, &bound), "row grid bound failed");
+    return bound;
+  }
+
+  /// Visit the rows of points `begin .. end` in ascending point order.
+  ///
+  /// `visit` takes a `const Row &`. It may return void, or a bool that is
+  /// false to stop the walk. Entries of one row come in bin order, not
+  /// sorted by `j`; that order does not depend on how a range is split.
+  /// `half` keeps the entries the half list has under `i`. Returns true
+  /// when every entry was visited and false when `visit` stopped the
+  /// walk. An exception thrown by `visit` stops the walk and is rethrown
+  /// here. Throws `Error` for a range past `size()`.
+  template <typename F>
+  bool for_rows(std::size_t begin, std::size_t end, bool half,
+                F &&visit) const {
+    Visit<F> state{visit, nullptr};
+    return finish(lc_row_grid_rows(grid_, begin, end, half ? 1 : 0,
+                                   &RowGrid::trampoline<F>, &state),
+                  state.thrown);
+  }
+
+  /// Visit the row of point `i`, as `for_rows(i, i + 1, half, visit)`.
+  template <typename F>
+  bool for_point(std::size_t i, bool half, F &&visit) const {
+    Visit<F> state{visit, nullptr};
+    return finish(lc_row_grid_point(grid_, i, half ? 1 : 0,
+                                    &RowGrid::trampoline<F>, &state),
+                  state.thrown);
+  }
+
+  /// Append row entries to `out`, from `cursor` up to the row of point
+  /// `end`, at most `most` of them, and move `cursor` past them. Returns
+  /// how many were appended. The entries and their order are those of
+  /// `for_rows`. The read is done when `cursor.point == end`. A caller
+  /// that handles many rows reads a buffer at a time this way, with one
+  /// call into the library per block of rows and none per entry.
+  std::size_t fill_rows(RowCursor &cursor, std::size_t end, bool half,
+                        std::vector<Row> &out, std::size_t most) const {
+    lc_row block[64];
+    lc_row_cursor at{cursor.point, cursor.entry};
+    std::size_t appended = 0;
+    while (appended < most && at.point < end) {
+      const std::size_t want = std::min<std::size_t>(64, most - appended);
+      std::size_t got = 0;
+      check(lc_row_grid_fill(grid_, &at, end, half ? 1 : 0, block, want, &got),
+            "row grid fill failed");
+      for (std::size_t k = 0; k < got; ++k) {
+        out.push_back(to_row(block[k]));
+      }
+      appended += got;
+      cursor.point = at.point;
+      cursor.entry = at.entry;
+    }
+    if (appended == 0) {
+      // Nothing was read: the range is still checked.
+      std::size_t got = 0;
+      check(lc_row_grid_fill(grid_, &at, end, half ? 1 : 0, nullptr, 0, &got),
+            "row grid fill failed");
+    }
+    return appended;
+  }
+
+private:
+  RowGrid() = default;
+
+  static Row to_row(const lc_row &raw) noexcept {
+    Row row;
+    row.i = static_cast<std::size_t>(raw.i);
+    row.j = static_cast<std::size_t>(raw.j);
+    row.shift = {raw.shift[0], raw.shift[1], raw.shift[2]};
+    row.vector = {raw.vector[0], raw.vector[1], raw.vector[2]};
+    row.dist2 = raw.dist2;
+    return row;
+  }
+
+  // What the trampoline returns to stop a walk. A failure of the call
+  // itself returns 1 with `lc_last_error` set.
+  static constexpr int kStopped = 2;
+
+  template <typename F> struct Visit {
+    F &visit;
+    std::exception_ptr thrown;
+  };
+
+  // The C callback of a walk. The closure is called through `user`, so
+  // the compiler sees its body here. An exception must not cross the C
+  // frames of the walk, so it is kept and rethrown by `finish`.
+  template <typename F>
+  static int trampoline(void *user, const lc_row *raw) noexcept {
+    auto *state = static_cast<Visit<F> *>(user);
+    try {
+      const Row row = to_row(*raw);
+      if constexpr (std::is_void_v<std::invoke_result_t<F &, const Row &>>) {
+        state->visit(row);
+        return 0;
+      } else {
+        return state->visit(row) ? 0 : kStopped;
+      }
+    } catch (...) {
+      state->thrown = std::current_exception();
+      return kStopped;
+    }
+  }
+
+  static bool finish(int status, const std::exception_ptr &thrown) {
+    if (thrown) {
+      std::rethrow_exception(thrown);
+    }
+    if (status == 0) {
+      return true;
+    }
+    const char *msg = lc_last_error();
+    if (msg == nullptr) {
+      return false;
+    }
+    throw Error(status, std::string(msg));
+  }
+
+  static void check(int status, const char *what) {
+    if (status != 0) {
+      const char *msg = lc_last_error();
+      throw Error(status, msg ? std::string(msg)
+                              : std::string("linkcell: ") + what);
+    }
+  }
+
+  lc_row_grid *grid_ = nullptr;
+};
 
 [[nodiscard]] inline const char *version() noexcept { return lc_version(); }
 
