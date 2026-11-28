@@ -30,7 +30,7 @@ mod rows;
 #[cfg(feature = "capi")]
 pub(crate) use csr::{check as csr_check, csr_rows, CsrDest, CsrWrite};
 pub use csr::{pairs_within_csr, PairCsr};
-pub use rows::RowGrid;
+pub use rows::{Row, RowCursor, RowGrid};
 
 const MAX_IMAGES: i64 = 1 << 24;
 

@@ -184,6 +184,12 @@ mod partition;
 mod place;
 mod pop;
 mod replica;
+#[cfg(feature = "request")]
+#[allow(missing_docs, dead_code, clippy::all)]
+#[rustfmt::skip]
+mod neighbor_capnp;
+#[cfg(feature = "request")]
+mod request;
 mod simd;
 mod skin;
 mod skin_simd;
@@ -208,7 +214,7 @@ pub use nd::{
 pub use open_cell::{cell_for_pbc, pairs_open, pairs_within_pbc, stencil_builds, PbcQuery};
 pub use pairs::{
     pairs_within, pairs_within_columns, pairs_within_count, pairs_within_csr, pairs_within_into,
-    Pair, PairColumns, PairCsr, RowGrid,
+    Pair, PairColumns, PairCsr, Row, RowCursor, RowGrid,
 };
 pub use partition::{
     cell_graph, cell_grid, curve_split_device, derived_balance, derived_balance_f64, edge_cut,

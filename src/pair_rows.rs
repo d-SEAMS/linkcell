@@ -15,16 +15,54 @@
 //! the entries the pair list has for that source: the same targets, the
 //! same shifts, and the same bits in every distance.
 
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 use super::gather::{bin_class, bin_steps, Kind, Reach, Shifts, Step, Walker};
 use super::{bin_atoms, hit_estimate, in_pool, keep_half, try_hold, Binned, ImageOffsets};
 use crate::cell::{periodic_face_collapsed, Cell};
-use crate::open_cell::{MixedRows, PbcQuery};
+use crate::open_cell::{next_up, MixedRows, PbcQuery};
 use crate::Error;
 
 /// Marks a point the mask dropped.
 const MASKED: u32 = u32::MAX;
+
+/// One entry of a row: an image of point `j` within the cutoff of point `i`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Row {
+    /// Source index: the point the row belongs to.
+    pub i: usize,
+    /// Target index.
+    pub j: usize,
+    /// Integer cell shift applied to the target, as in
+    /// [`Pair`](crate::Pair).
+    pub shift: [i32; 3],
+    /// `r_j - r_i` with the shift applied. Its squared length is `dist2`.
+    /// On a fully periodic cell it is taken from the positions folded
+    /// into the cell, so it equals `r_j + shift H - r_i` of the positions
+    /// as given up to the rounding of that fold. With an open axis it is
+    /// that expression itself.
+    pub vector: [f64; 3],
+    /// Squared distance after the shift, the bits
+    /// [`pairs_within_pbc`](crate::pairs_within_pbc) stores.
+    pub dist2: f64,
+}
+
+/// Where a buffered read of rows stands: the next entry is entry
+/// `entry` of the row of point `point`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowCursor {
+    /// Point whose row is read next.
+    pub point: usize,
+    /// Entries of that row already read.
+    pub entry: usize,
+}
+
+impl RowCursor {
+    /// The first entry of the row of `point`.
+    pub fn at(point: usize) -> Self {
+        RowCursor { point, entry: 0 }
+    }
+}
 
 /// The bins of one cutoff search, kept so its rows can be read on demand.
 ///
@@ -46,11 +84,12 @@ const MASKED: u32 = u32::MAX;
 /// let xyz = [[0.2, 0.0, 0.0], [9.4, 0.0, 0.0], [5.0, 5.0, 5.0]];
 /// let grid = RowGrid::build(&xyz, &sim, &PbcQuery::periodic(1.0))?;
 /// let mut rows = Vec::new();
-/// grid.for_rows(0..3, false, |i, j, shift, dist2| rows.push((i, j, shift, dist2)))?;
+/// grid.for_rows(0..3, false, |row| rows.push(*row))?;
 /// assert_eq!(rows.len(), 2);
-/// assert_eq!((rows[0].0, rows[0].1, rows[0].2), (0, 1, [-1, 0, 0]));
-/// assert_eq!((rows[1].0, rows[1].1, rows[1].2), (1, 0, [1, 0, 0]));
-/// assert!((rows[0].3 - 0.64).abs() < 1e-12);
+/// assert_eq!((rows[0].i, rows[0].j, rows[0].shift), (0, 1, [-1, 0, 0]));
+/// assert_eq!((rows[1].i, rows[1].j, rows[1].shift), (1, 0, [1, 0, 0]));
+/// assert!((rows[0].vector[0] + 0.8).abs() < 1e-12);
+/// assert!((rows[0].dist2 - 0.64).abs() < 1e-12);
 /// # Ok(())
 /// # }
 /// ```
@@ -154,6 +193,23 @@ impl RowGrid {
         }
     }
 
+    /// An upper bound on the entries of every full row together, from the
+    /// bin occupancy alone: for each point, the points in the bins its
+    /// row reads, less itself. No distance is computed. A caller that
+    /// must decide whether a stored list fits in memory reads this
+    /// instead of counting the pairs. A half list holds at most half of
+    /// it, rounded up. The sum saturates at `u64::MAX`.
+    ///
+    /// Returns [`Error::TooManyImages`] when a bin's partner runs cannot
+    /// be held.
+    pub fn candidate_bound(&self) -> Result<u64, Error> {
+        match &self.kind {
+            Rows::Empty => Ok(0),
+            Rows::Periodic(rows) => rows.candidates(),
+            Rows::Mixed(rows) => Ok(rows.candidates()),
+        }
+    }
+
     /// Cutoff the rows are tested against.
     pub fn cutoff(&self) -> f64 {
         self.cutoff
@@ -166,13 +222,11 @@ impl RowGrid {
 
     /// Visit the rows of the points in `rows`, in ascending point order.
     ///
-    /// `visit(i, j, shift, dist2)` is called once for every image of `j`
-    /// within the cutoff of `i`: `shift` is the integer cell shift applied
-    /// to `j` and `dist2` the squared distance after it, as in
-    /// [`Pair`](crate::Pair). With `half` unset a row holds every such
-    /// entry, so a pair is visited from both of its points, with opposite
-    /// shifts and the same `dist2`. With `half` set a row keeps the
-    /// entries the half list of
+    /// `visit` is called once for every image of `j` within the cutoff of
+    /// `i`, with that entry as a [`Row`]. With `half` unset a row holds
+    /// every such entry, so a pair is visited from both of its points,
+    /// with opposite shifts and vectors and the same `dist2`. With `half`
+    /// set a row keeps the entries the half list of
     /// [`pairs_within_pbc`](crate::pairs_within_pbc) lists under `i`:
     /// `j > i`, and the self images whose first non-zero shift is
     /// negative.
@@ -180,10 +234,11 @@ impl RowGrid {
     /// The entries visited over `0..points()` are the rows of
     /// [`pairs_within_pbc`](crate::pairs_within_pbc) for the query the
     /// grid was built with, with the same shifts and the same bits in
-    /// every `dist2`. Inside one row the entries come in bin order, which
-    /// depends on the grid alone, so splitting a range does not change
-    /// what any row holds or the order inside it. A masked point has an
-    /// empty row.
+    /// every `dist2`. Inside one row the entries come in bin order: the
+    /// order of the bins around the point and of the points inside each
+    /// bin. It is not sorted by `j`. It depends on the grid alone, so
+    /// splitting a range does not change what any row holds or the order
+    /// inside it. A masked point has an empty row.
     ///
     /// Returns [`Error::IndexOutOfRange`] before any visit when `rows`
     /// runs past [`RowGrid::points`], [`Error::Overflow`] when a shift
@@ -194,36 +249,45 @@ impl RowGrid {
         &self,
         rows: Range<usize>,
         half: bool,
-        mut visit: impl FnMut(usize, usize, [i32; 3], f64),
+        mut visit: impl FnMut(&Row),
     ) -> Result<(), Error> {
+        let walked = self.try_for_rows(rows, half, |row| {
+            visit(row);
+            ControlFlow::<()>::Continue(())
+        })?;
+        debug_assert!(walked.is_continue());
+        Ok(())
+    }
+
+    /// [`RowGrid::for_rows`] with a visit that can stop the walk.
+    ///
+    /// `visit` returns [`ControlFlow::Break`] to stop. No entry is
+    /// visited after that, and the value comes back as
+    /// `Ok(ControlFlow::Break(value))`. A walk that visits every entry
+    /// returns `Ok(ControlFlow::Continue(()))`.
+    pub fn try_for_rows<B>(
+        &self,
+        rows: Range<usize>,
+        half: bool,
+        mut visit: impl FnMut(&Row) -> ControlFlow<B>,
+    ) -> Result<ControlFlow<B>, Error> {
         if rows.start >= rows.end {
-            return Ok(());
+            return Ok(ControlFlow::Continue(()));
         }
         if rows.end > self.points {
             return Err(Error::IndexOutOfRange);
         }
-        match &self.kind {
-            Rows::Empty => Ok(()),
-            Rows::Periodic(grid) => {
-                let mut scratch = Scratch::default();
-                for i in rows {
-                    grid.row(i, half, &mut scratch, &mut |j, shift, dist2| {
-                        visit(i, j, shift, dist2)
-                    })?;
-                }
-                Ok(())
-            }
-            Rows::Mixed(grid) => {
-                for i in rows {
-                    grid.row(i, half, &mut |j, shift, dist2| visit(i, j, shift, dist2))?;
-                }
-                Ok(())
+        let mut scratch = Scratch::default();
+        for i in rows {
+            if let ControlFlow::Break(stop) = self.row(i, half, &mut scratch, &mut visit)? {
+                return Ok(ControlFlow::Break(stop));
             }
         }
+        Ok(ControlFlow::Continue(()))
     }
 
-    /// Visit the row of point `i`: `visit(j, shift, dist2)` for every
-    /// entry [`RowGrid::for_rows`] gives that point, in the same order.
+    /// Visit the row of point `i`: every entry [`RowGrid::for_rows`]
+    /// gives that point, in the same order.
     ///
     /// Returns [`Error::IndexOutOfRange`] when `i` is not below
     /// [`RowGrid::points`], and otherwise the errors of
@@ -232,16 +296,125 @@ impl RowGrid {
         &self,
         i: usize,
         half: bool,
-        mut visit: impl FnMut(usize, [i32; 3], f64),
+        mut visit: impl FnMut(&Row),
     ) -> Result<(), Error> {
+        let walked = self.try_for_point(i, half, |row| {
+            visit(row);
+            ControlFlow::<()>::Continue(())
+        })?;
+        debug_assert!(walked.is_continue());
+        Ok(())
+    }
+
+    /// [`RowGrid::for_point`] with a visit that can stop the walk, as in
+    /// [`RowGrid::try_for_rows`].
+    pub fn try_for_point<B>(
+        &self,
+        i: usize,
+        half: bool,
+        mut visit: impl FnMut(&Row) -> ControlFlow<B>,
+    ) -> Result<ControlFlow<B>, Error> {
         if i >= self.points {
             return Err(Error::IndexOutOfRange);
         }
-        match &self.kind {
-            Rows::Empty => Ok(()),
-            Rows::Periodic(grid) => grid.row(i, half, &mut Scratch::default(), &mut visit),
-            Rows::Mixed(grid) => grid.row(i, half, &mut visit),
+        self.row(i, half, &mut Scratch::default(), &mut visit)
+    }
+
+    /// Copy row entries into `out`, from `cursor` up to the row of point
+    /// `end`, and move `cursor` past them. Returns how many were written.
+    ///
+    /// The entries are those of [`RowGrid::for_rows`] over
+    /// `cursor.point..end`, less the first `cursor.entry` of the first
+    /// row, in the same order. The read stops when `out` is full or the
+    /// rows are exhausted; it is done when `cursor.point == end`. A
+    /// caller that walks many rows calls this in a loop and handles a
+    /// whole buffer at a time, with one call per buffer instead of one
+    /// per entry. A read that resumes inside a row walks that row again
+    /// to its place, so a buffer shorter than a row costs that row once
+    /// per call.
+    ///
+    /// Returns [`Error::IndexOutOfRange`] when `end` is past
+    /// [`RowGrid::points`] or `cursor.point` is past `end`, and otherwise
+    /// the errors of [`RowGrid::for_rows`]. An empty `out` reads nothing.
+    pub fn fill_rows(
+        &self,
+        cursor: &mut RowCursor,
+        end: usize,
+        half: bool,
+        out: &mut [Row],
+    ) -> Result<usize, Error> {
+        if end > self.points || cursor.point > end {
+            return Err(Error::IndexOutOfRange);
         }
+        let mut written = 0;
+        let mut scratch = Scratch::default();
+        while cursor.point < end && written < out.len() {
+            let skip = cursor.entry;
+            let mut seen = 0usize;
+            let room = &mut out[written..];
+            let mut taken = 0usize;
+            let walked = self.row(cursor.point, half, &mut scratch, &mut |row: &Row| {
+                if seen < skip {
+                    seen += 1;
+                    return ControlFlow::Continue(());
+                }
+                if taken == room.len() {
+                    return ControlFlow::Break(());
+                }
+                room[taken] = *row;
+                taken += 1;
+                seen += 1;
+                ControlFlow::Continue(())
+            })?;
+            written += taken;
+            if walked.is_break() {
+                cursor.entry = seen;
+                break;
+            }
+            cursor.point += 1;
+            cursor.entry = 0;
+        }
+        Ok(written)
+    }
+
+    /// The row of point `i`, which is in range.
+    fn row<B>(
+        &self,
+        i: usize,
+        half: bool,
+        scratch: &mut Scratch,
+        visit: &mut impl FnMut(&Row) -> ControlFlow<B>,
+    ) -> Result<ControlFlow<B>, Error> {
+        let mut stop = None;
+        let mut entry = |j: usize, shift: [i32; 3], vector: [f64; 3], dist2: f64| {
+            let row = Row {
+                i,
+                j,
+                shift,
+                vector,
+                dist2,
+            };
+            match visit(&row) {
+                ControlFlow::Continue(()) => true,
+                ControlFlow::Break(value) => {
+                    stop = Some(value);
+                    false
+                }
+            }
+        };
+        match &self.kind {
+            Rows::Empty => {}
+            Rows::Periodic(grid) => {
+                grid.row(i, half, scratch, &mut entry)?;
+            }
+            Rows::Mixed(grid) => {
+                grid.row(i, half, &mut entry)?;
+            }
+        }
+        Ok(match stop {
+            Some(value) => ControlFlow::Break(value),
+            None => ControlFlow::Continue(()),
+        })
     }
 }
 
@@ -305,13 +478,24 @@ impl PeriodicRows {
         mut bin_of: Vec<u32>,
     ) -> Result<Option<Self>, Error> {
         let n = xyz.len();
-        let est = hit_estimate(n, cell, query.cutoff);
+        // A closed cutoff is binned one double wider, so the reach and
+        // the runs cover the boundary, and its rows are tested against
+        // the next double above `cutoff²`; see `next_up`.
+        let cutoff = if query.closed {
+            next_up(query.cutoff)
+        } else {
+            query.cutoff
+        };
+        let est = hit_estimate(n, cell, cutoff);
         let binned = in_pool(est, || {
-            bin_atoms(xyz, cell, query.cutoff, query.mask, query.cell_hint, true)
+            bin_atoms(xyz, cell, cutoff, query.mask, query.cell_hint, true)
         })?;
-        let Some(binned) = binned else {
+        let Some(mut binned) = binned else {
             return Ok(None);
         };
+        if query.closed {
+            binned.cut2 = next_up(query.cutoff * query.cutoff);
+        }
         let images = ImageOffsets::new(xyz, cell, binned.active.as_deref(), binned.repeats)?;
         let (width, shifts, steps) = Walker::new(&binned, cell)?.into_tables();
         slot_of.clear();
@@ -341,23 +525,81 @@ impl PeriodicRows {
         }))
     }
 
+    /// Candidates every row tests, summed over the points: for each
+    /// point, the slots of the runs of its bin less the point itself.
+    fn candidates(&self) -> Result<u64, Error> {
+        let grid = &self.binned.grid;
+        let off = &grid.offsets;
+        let [nx, ny, _] = grid.n;
+        let mut scratch = Scratch::default();
+        let mut total = 0u64;
+        for c in 0..off.len() - 1 {
+            let here = (off[c + 1] - off[c]) as u64;
+            if here == 0 {
+                continue;
+            }
+            let b = [
+                (c % nx as usize) as i32,
+                ((c / nx as usize) % ny as usize) as i32,
+                (c / (nx as usize * ny as usize)) as i32,
+            ];
+            let mut around = 0u64;
+            for step in self.steps_of(c, b, &mut scratch)? {
+                let first = (c as isize + step.rel) as usize;
+                around += (off[first + step.bins] - off[first]) as u64;
+            }
+            total = total.saturating_add(here.saturating_mul(around.saturating_sub(1)));
+        }
+        Ok(total)
+    }
+
+    /// The runs of bin `c` at `b`: tabulated, or built into `scratch`.
+    fn steps_of<'s>(
+        &'s self,
+        c: usize,
+        b: [i32; 3],
+        scratch: &'s mut Scratch,
+    ) -> Result<&'s [Step], Error> {
+        let grid = &self.binned.grid;
+        if !self.steps.is_empty() {
+            return Ok(&self.steps[bin_class(b, grid.n)]);
+        }
+        if scratch.bin != Some(c) {
+            scratch.bin = None;
+            let reach = Reach {
+                n: grid.n,
+                reach: self.binned.reach,
+                ortho: self.cell.is_ortho(),
+                width: self.width,
+                cut2: self.binned.cut2,
+                shifts: &self.shifts,
+                cell: &self.cell,
+            };
+            bin_steps(&reach, c, b, &mut scratch.axes, &mut scratch.steps)?;
+            scratch.bin = Some(c);
+        }
+        Ok(&scratch.steps)
+    }
+
     /// The row of point `i`, which is in range.
     ///
     /// Each run is read with the expression the CSR gather reads it
     /// with, which is the pair walk's for that pair or its negation, so
     /// `dist2` is the walk's bits. A source run reports its own shift. A
     /// target run holds the walk's shift for the reversed pair, so the
-    /// row reports the opposite one.
+    /// row reports the opposite one. In both the difference the row
+    /// forms is `r_j - r_i` with the reported shift applied. `visit`
+    /// returns `false` to stop; the result is `false` when it did.
     fn row(
         &self,
         i: usize,
         half: bool,
         scratch: &mut Scratch,
-        visit: &mut impl FnMut(usize, [i32; 3], f64),
-    ) -> Result<(), Error> {
+        visit: &mut impl FnMut(usize, [i32; 3], [f64; 3], f64) -> bool,
+    ) -> Result<bool, Error> {
         let s = self.slot_of[i];
         if s == MASKED {
-            return Ok(());
+            return Ok(true);
         }
         let s = s as usize;
         let grid = &self.binned.grid;
@@ -369,25 +611,7 @@ impl PeriodicRows {
             ((c / nx as usize) % ny as usize) as i32,
             (c / (nx as usize * ny as usize)) as i32,
         ];
-        let steps: &[Step] = if self.steps.is_empty() {
-            if scratch.bin != Some(c) {
-                scratch.bin = None;
-                let reach = Reach {
-                    n: grid.n,
-                    reach: self.binned.reach,
-                    ortho: self.cell.is_ortho(),
-                    width: self.width,
-                    cut2: self.binned.cut2,
-                    shifts: &self.shifts,
-                    cell: &self.cell,
-                };
-                bin_steps(&reach, c, b, &mut scratch.axes, &mut scratch.steps)?;
-                scratch.bin = Some(c);
-            }
-            &scratch.steps
-        } else {
-            &self.steps[bin_class(b, grid.n)]
-        };
+        let steps = self.steps_of(c, b, scratch)?;
         let cut2 = self.binned.cut2;
         let co = &grid.coords;
         let p = [co.x[s], co.y[s], co.z[s]];
@@ -434,10 +658,12 @@ impl PeriodicRows {
                 if half && j == i && !keep_half(i, j, shift) {
                     continue;
                 }
-                visit(j, shift, dist2);
+                if !visit(j, shift, [dx, dy, dz], dist2) {
+                    return Ok(false);
+                }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 

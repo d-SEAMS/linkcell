@@ -1163,6 +1163,149 @@ pub unsafe extern "C" fn lc_pairs_within_rows(
     0
 }
 
+/// Major version of the C ABI. A library serves a host compiled against
+/// the same major.
+pub const LC_ABI_MAJOR: u16 = 1;
+/// Minor version of the C ABI. It grows when an entry point or a
+/// capability is added. A library serves a host compiled against the
+/// same or a lower minor.
+pub const LC_ABI_MINOR: u16 = 0;
+/// Revision of the struct layouts the row-grid calls pass (`lc_row`,
+/// `lc_caps`, `lc_abi`). A library serves a host compiled against the
+/// same revision.
+pub const LC_ABI_LAYOUT_REVISION: u16 = 1;
+
+/// The C ABI a header or a library was built for.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct lc_abi {
+    /// `LC_ABI_MAJOR`.
+    pub major: u16,
+    /// `LC_ABI_MINOR`.
+    pub minor: u16,
+    /// `LC_ABI_LAYOUT_REVISION`.
+    pub layout_revision: u16,
+}
+
+/// The ABI this library was built for. A host compares it with the
+/// `LC_ABI_*` constants of the header it compiled against, or passes
+/// those to [`lc_abi_compatible`]. Does not touch `lc_last_error`.
+#[no_mangle]
+pub extern "C" fn lc_abi_stamp() -> lc_abi {
+    lc_abi {
+        major: LC_ABI_MAJOR,
+        minor: LC_ABI_MINOR,
+        layout_revision: LC_ABI_LAYOUT_REVISION,
+    }
+}
+
+/// 1 when this library serves a host compiled against `host`: the same
+/// major and layout revision, and a host minor no higher than the
+/// library's. 0 otherwise, and for a null `host`. Does not touch
+/// `lc_last_error`.
+///
+/// # Safety
+///
+/// `host` is null or points at one `lc_abi`.
+#[no_mangle]
+pub unsafe extern "C" fn lc_abi_compatible(host: *const lc_abi) -> c_int {
+    if host.is_null() {
+        return 0;
+    }
+    let host = unsafe { *host };
+    // The minor is 0 today, which makes the last comparison an equality.
+    #[allow(clippy::absurd_extreme_comparisons)]
+    let serves = host.major == LC_ABI_MAJOR
+        && host.layout_revision == LC_ABI_LAYOUT_REVISION
+        && host.minor <= LC_ABI_MINOR;
+    c_int::from(serves)
+}
+
+/// What this library can do, for a host to read before it calls.
+///
+/// The host sets `size` to `sizeof(lc_caps)` as it compiled it. The
+/// library writes the members that fit in that size and sets `size` to
+/// the bytes it wrote, so a member a host knows and the library does not
+/// stays as the host initialised it (zero it first). Each flag is 1 when
+/// supported and 0 when not.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct lc_caps {
+    /// Bytes of this struct: in, the host's; out, those written.
+    pub size: u32,
+    /// The row grid: `lc_row_grid_build`, `lc_row_grid_update`,
+    /// `lc_row_grid_len`, `lc_row_grid_free`, `lc_row_grid_rows`, and
+    /// `lc_row_grid_point`.
+    pub row_grid: c_int,
+    /// `lc_row.vector` is filled.
+    pub row_vector: c_int,
+    /// A nonzero return of the visitor stops the walk.
+    pub row_stop: c_int,
+    /// `lc_row_grid_build_request` decodes a `NeighborRequest`.
+    pub row_request: c_int,
+    /// Open and mixed-periodic cells are accepted.
+    pub open_axes: c_int,
+    /// Binning may run on the pool `lc_set_threads` sets.
+    pub threads: c_int,
+    /// `lc_row_grid_fill` reads rows into a buffer.
+    pub row_fill: c_int,
+    /// `closed` keeps `dist2 == cutoff²` on a fully periodic cell too.
+    pub closed_periodic: c_int,
+    /// `lc_row_grid_bound` and `lc_row_grid_bins` exist.
+    pub row_bound: c_int,
+}
+
+/// Fill `out` with the capabilities of this library. Returns 0, or
+/// nonzero with `lc_last_error` set when `out` is null or `out->size`
+/// is smaller than the `size` member itself.
+///
+/// # Safety
+///
+/// `out` is null or writable for `out->size` bytes, which the host set.
+#[no_mangle]
+pub unsafe extern "C" fn lc_capabilities(out: *mut lc_caps) -> c_int {
+    if out.is_null() {
+        return fail_msg("null pointer");
+    }
+    let host = unsafe { std::ptr::addr_of!((*out).size).read_unaligned() } as usize;
+    if host < std::mem::size_of::<u32>() {
+        return fail_msg("capability struct is smaller than its size member");
+    }
+    let mut caps = lc_caps {
+        size: 0,
+        row_grid: 1,
+        row_vector: 1,
+        row_stop: 1,
+        row_request: c_int::from(cfg!(feature = "request")),
+        open_axes: 1,
+        threads: c_int::from(cfg!(feature = "parallel")),
+        row_fill: 1,
+        closed_periodic: 1,
+        row_bound: 1,
+    };
+    let wrote = host.min(std::mem::size_of::<lc_caps>());
+    caps.size = wrote as u32;
+    // Safety: `out` is writable for the `host >= wrote` bytes it declared.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(caps).cast::<u8>(),
+            out.cast::<u8>(),
+            wrote,
+        );
+    }
+    clear_error();
+    0
+}
+
+/// Runs an entry point's body. A panic does not cross into C: it becomes
+/// a nonzero return with `lc_last_error` set.
+fn no_unwind(body: impl FnOnce() -> c_int) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(code) => code,
+        Err(_) => fail_msg("internal error: a panic was caught at the C boundary"),
+    }
+}
+
 struct RowHandle {
     grid: crate::RowGrid,
 }
@@ -1176,17 +1319,72 @@ pub struct lc_row_grid {
     _private: u8,
 }
 
+/// One entry of a row: an image of point `j` within the cutoff of point
+/// `i`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct lc_row {
+    /// Source index: the point the row belongs to.
+    pub i: c_int,
+    /// Target index.
+    pub j: c_int,
+    /// Integer cell shift `(na, nb, nc)` applied to the target.
+    pub shift: [c_int; 3],
+    /// `r_j - r_i` with the shift applied. Its squared length is `dist2`.
+    pub vector: [f64; 3],
+    /// Squared distance after the shift.
+    pub dist2: f64,
+}
+
 /// Receives one row entry from [`lc_row_grid_rows`] or
 /// [`lc_row_grid_point`]. `user` is the pointer given to that call.
-/// `row` is valid until the callback returns.
+/// `row` is valid until the callback returns. Return 0 to go on. Any
+/// other value stops the walk, and the call returns that value.
 #[allow(non_camel_case_types)]
-pub type lc_row_visit = Option<unsafe extern "C" fn(user: *mut c_void, row: *const lc_pair)>;
+pub type lc_row_visit =
+    Option<unsafe extern "C" fn(user: *mut c_void, row: *const lc_row) -> c_int>;
 
 unsafe fn row_ref<'a>(ptr: *const lc_row_grid) -> Result<&'a RowHandle, c_int> {
     if ptr.is_null() {
         return Err(fail_msg("null pointer"));
     }
     Ok(unsafe { &*(ptr as *const RowHandle) })
+}
+
+/// Checks the points both builds share and views them as triples.
+unsafe fn row_points<'a>(xyz: *const f64, n: usize) -> Result<&'a [[f64; 3]], c_int> {
+    if n == 0 {
+        return Err(fail(Error::Empty));
+    }
+    if xyz.is_null() {
+        return Err(fail_msg("null pointer"));
+    }
+    if n > c_int::MAX as usize || n > (isize::MAX as usize) / 3 {
+        return Err(fail(Error::Overflow));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) })
+}
+
+/// The lattice of `simbox` for `periodic`, or a unit cube when every
+/// axis is open.
+unsafe fn row_cell(simbox: *const lc_cell, periodic: [bool; 3]) -> Result<Cell, c_int> {
+    if periodic == [false, false, false] {
+        return Cell::ortho(1.0, 1.0, 1.0).map_err(|err| fail(err.into()));
+    }
+    if simbox.is_null() {
+        return Err(fail_msg("null pointer"));
+    }
+    let raw = unsafe { *simbox };
+    crate::cell_for_pbc(
+        [
+            [raw.ax, raw.ay, raw.az],
+            [raw.bx, raw.by, raw.bz],
+            [raw.cx, raw.cy, raw.cz],
+        ],
+        [raw.ox, raw.oy, raw.oz],
+        periodic,
+    )
+    .map_err(fail)
 }
 
 /// Checks the arguments [`lc_row_grid_build`] and [`lc_row_grid_update`]
@@ -1210,36 +1408,14 @@ unsafe fn row_grid_bin(
         let flags = unsafe { [*pbc, *pbc.add(1), *pbc.add(2)] };
         [flags[0] != 0, flags[1] != 0, flags[2] != 0]
     };
-    if n == 0 {
-        return fail(Error::Empty);
-    }
-    if xyz.is_null() || (periodic != [false, false, false] && simbox.is_null()) {
-        return fail_msg("null pointer");
-    }
-    if n > c_int::MAX as usize || n > (isize::MAX as usize) / 3 {
-        return fail(Error::Overflow);
-    }
-    let cell = if periodic == [false, false, false] {
-        match Cell::ortho(1.0, 1.0, 1.0) {
-            Ok(cell) => cell,
-            Err(err) => return fail(err.into()),
-        }
-    } else {
-        let raw = unsafe { *simbox };
-        match crate::cell_for_pbc(
-            [
-                [raw.ax, raw.ay, raw.az],
-                [raw.bx, raw.by, raw.bz],
-                [raw.cx, raw.cy, raw.cz],
-            ],
-            [raw.ox, raw.oy, raw.oz],
-            periodic,
-        ) {
-            Ok(cell) => cell,
-            Err(err) => return fail(err),
-        }
+    let pts = match unsafe { row_points(xyz, n) } {
+        Ok(pts) => pts,
+        Err(code) => return code,
     };
-    let pts = unsafe { std::slice::from_raw_parts(xyz.cast::<[f64; 3]>(), n) };
+    let cell = match unsafe { row_cell(simbox, periodic) } {
+        Ok(cell) => cell,
+        Err(code) => return code,
+    };
     let mask_vec: Option<Vec<bool>> = if mask.is_null() {
         None
     } else {
@@ -1271,8 +1447,8 @@ unsafe fn row_grid_bin(
 /// the row buffer: `pbc` is null for a fully periodic cell or three
 /// ints, nonzero for a periodic axis; `mask` is null or `n` ints;
 /// `cell_hint <= 0` selects the default bin edge; `closed` nonzero keeps
-/// `dist2 <= cutoff²` on an open or mixed cell; `exclude_self_images`
-/// nonzero drops `i == j`. The grid copies what it needs from `xyz` and
+/// `dist2 <= cutoff²`, on a periodic cell as on an open one;
+/// `exclude_self_images` nonzero drops `i == j`. The grid copies what it needs from `xyz` and
 /// is released by [`lc_row_grid_free`]. It holds the bins and no pair.
 ///
 /// Returns 0 and writes the handle to `*out`. On failure `*out` is null,
@@ -1304,31 +1480,170 @@ pub unsafe extern "C" fn lc_row_grid_build(
     unsafe {
         *out = ptr::null_mut();
     }
-    let mut built = None;
-    let slot = &mut built;
-    let code = unsafe {
-        row_grid_bin(
-            xyz,
-            n,
-            simbox,
-            pbc,
-            cutoff,
-            mask,
-            cell_hint,
-            closed,
-            exclude_self_images,
-            move |pts, cell, query| {
-                *slot = Some(crate::RowGrid::build(pts, cell, query)?);
-                Ok(())
-            },
+    no_unwind(|| {
+        let mut built = None;
+        let slot = &mut built;
+        let code = unsafe {
+            row_grid_bin(
+                xyz,
+                n,
+                simbox,
+                pbc,
+                cutoff,
+                mask,
+                cell_hint,
+                closed,
+                exclude_self_images,
+                move |pts, cell, query| {
+                    *slot = Some(crate::RowGrid::build(pts, cell, query)?);
+                    Ok(())
+                },
+            )
+        };
+        if let Some(grid) = built {
+            unsafe {
+                *out = Box::into_raw(Box::new(RowHandle { grid })) as *mut lc_row_grid;
+            }
+        }
+        code
+    })
+}
+
+/// [`lc_row_grid_build`] from a Cap'n Proto `NeighborRequest`.
+///
+/// `request` holds one message in the standard stream framing (segment
+/// table, then segments, not packed) whose root is the `NeighborRequest`
+/// of the shared potential schema. The request is read as follows.
+///
+/// - `cutoff` and `skin`: with `cut == 0` the rows have `dist2 <
+///   cutoff²` and `skin` must be 0. With `cut == 1` they have `dist2 <
+///   (cutoff + skin)²`; `cut == 1` with a zero `skin` asks for `dist2 <=
+///   cutoff²`, the closed cutoff of [`lc_row_grid_build`].
+/// - `periodic`: empty for a fully periodic cell, or three flags.
+/// - `systems`: exactly one, with `count == n` and `box` the nine
+///   lattice entries, rows a, b, c. The box is not read when every axis
+///   is open and may then be empty.
+/// - `format` must be 0 (pairs) and `mode` must not be 0.
+/// - `shifts`, `vectors`, `distances`, `cursor`, and `limit` describe a
+///   stored reply and are not read: a visit always passes all three and
+///   takes its range from the call.
+///
+/// - `shell`: written to `*out_half` when `out_half` is not null, 1
+///   for a half list and 0 for a full one, for the caller to pass to
+///   each visit. The grid itself serves both.
+/// - `binEdge`: the bin edge; 0 or less selects the default.
+/// - `origin`: empty for a cell at the origin, or three coordinates.
+/// - `excludeSelfImages`: drops `i == j`.
+///
+/// `mask` is null or `n` ints, nonzero to keep the point, as in
+/// [`lc_row_grid_build`]. It is a buffer beside the positions and not a
+/// field of the request.
+///
+/// Returns nonzero with `lc_last_error` set for a message that does not
+/// decode, a request this entry does not serve, and every failure of
+/// [`lc_row_grid_build`]. A library built without request support
+/// returns nonzero with "this library was built without NeighborRequest
+/// support"; `lc_capabilities` reports that as `row_request == 0`.
+///
+/// # Safety
+///
+/// `xyz` is readable for `n * 3` doubles. `mask`, if non-null, is `n`
+/// ints. `request` is readable for `request_len` bytes. `out_half`, if
+/// non-null, is writable for one int. `out` is writable for one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_build_request(
+    xyz: *const f64,
+    n: usize,
+    mask: *const c_int,
+    request: *const u8,
+    request_len: usize,
+    out_half: *mut c_int,
+    out: *mut *mut lc_row_grid,
+) -> c_int {
+    if out.is_null() {
+        return fail_msg("null pointer");
+    }
+    unsafe {
+        *out = ptr::null_mut();
+    }
+    no_unwind(|| unsafe {
+        row_grid_from_request(xyz, n, mask, request, request_len, out_half, out)
+    })
+}
+
+#[cfg(feature = "request")]
+unsafe fn row_grid_from_request(
+    xyz: *const f64,
+    n: usize,
+    mask: *const c_int,
+    request: *const u8,
+    request_len: usize,
+    out_half: *mut c_int,
+    out: *mut *mut lc_row_grid,
+) -> c_int {
+    let pts = match unsafe { row_points(xyz, n) } {
+        Ok(pts) => pts,
+        Err(code) => return code,
+    };
+    if request.is_null() {
+        return fail_msg("null pointer");
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(request, request_len) };
+    let decoded = match crate::request::decode(bytes, n) {
+        Ok(decoded) => decoded,
+        Err(msg) => return fail_msg(&msg),
+    };
+    let cell = if decoded.periodic == [false, false, false] {
+        Cell::ortho(1.0, 1.0, 1.0).map_err(Error::from)
+    } else {
+        let h = decoded.lattice;
+        crate::cell_for_pbc(
+            [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], h[8]]],
+            decoded.origin,
+            decoded.periodic,
         )
     };
-    if let Some(grid) = built {
-        unsafe {
-            *out = Box::into_raw(Box::new(RowHandle { grid })) as *mut lc_row_grid;
+    let cell = match cell {
+        Ok(cell) => cell,
+        Err(err) => return fail(err),
+    };
+    let mask_vec: Option<Vec<bool>> = if mask.is_null() {
+        None
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(mask, n) };
+        Some(raw.iter().map(|&v| v != 0).collect())
+    };
+    let mut query = crate::PbcQuery::new(decoded.periodic, decoded.cutoff)
+        .cell_hint(decoded.cell_hint)
+        .closed(decoded.closed)
+        .exclude_self_images(decoded.exclude_self);
+    query.mask = mask_vec.as_deref();
+    match with_threads(|| crate::RowGrid::build(pts, &cell, &query)) {
+        Ok(grid) => {
+            unsafe {
+                *out = Box::into_raw(Box::new(RowHandle { grid })) as *mut lc_row_grid;
+                if !out_half.is_null() {
+                    *out_half = c_int::from(decoded.half);
+                }
+            }
+            clear_error();
+            0
         }
+        Err(err) => fail(err),
     }
-    code
+}
+
+#[cfg(not(feature = "request"))]
+unsafe fn row_grid_from_request(
+    _xyz: *const f64,
+    _n: usize,
+    _mask: *const c_int,
+    _request: *const u8,
+    _request_len: usize,
+    _out_half: *mut c_int,
+    _out: *mut *mut lc_row_grid,
+) -> c_int {
+    fail_msg("this library was built without NeighborRequest support")
 }
 
 /// Bin new points, a new cell, or a new query into a grid from
@@ -1360,25 +1675,27 @@ pub unsafe extern "C" fn lc_row_grid_update(
     if grid.is_null() {
         return fail_msg("null pointer");
     }
-    let handle = unsafe { &mut *(grid as *mut RowHandle) };
-    // A call that fails on its arguments never reaches the update, and
-    // still leaves the grid without rows.
-    handle.grid.clear();
-    let target = &mut handle.grid;
-    unsafe {
-        row_grid_bin(
-            xyz,
-            n,
-            simbox,
-            pbc,
-            cutoff,
-            mask,
-            cell_hint,
-            closed,
-            exclude_self_images,
-            move |pts, cell, query| target.update(pts, cell, query),
-        )
-    }
+    no_unwind(|| {
+        let handle = unsafe { &mut *(grid as *mut RowHandle) };
+        // A call that fails on its arguments never reaches the update, and
+        // still leaves the grid without rows.
+        handle.grid.clear();
+        let target = &mut handle.grid;
+        unsafe {
+            row_grid_bin(
+                xyz,
+                n,
+                simbox,
+                pbc,
+                cutoff,
+                mask,
+                cell_hint,
+                closed,
+                exclude_self_images,
+                move |pts, cell, query| target.update(pts, cell, query),
+            )
+        }
+    })
 }
 
 /// Number of points a grid holds, masked ones included. Rows are
@@ -1389,10 +1706,55 @@ pub unsafe extern "C" fn lc_row_grid_update(
 /// `grid` is null or a valid pointer returned by [`lc_row_grid_build`].
 #[no_mangle]
 pub unsafe extern "C" fn lc_row_grid_len(grid: *const lc_row_grid) -> usize {
-    match unsafe { row_ref(grid) } {
-        Ok(handle) => handle.grid.points(),
-        Err(_) => 0,
+    if grid.is_null() {
+        return 0;
     }
+    unsafe { &*(grid as *const RowHandle) }.grid.points()
+}
+
+/// Number of bins a grid holds. Null gives zero.
+///
+/// # Safety
+///
+/// `grid` is null or a valid pointer returned by [`lc_row_grid_build`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_bins(grid: *const lc_row_grid) -> usize {
+    if grid.is_null() {
+        return 0;
+    }
+    unsafe { &*(grid as *const RowHandle) }.grid.bins()
+}
+
+/// An upper bound on the entries of every full row of a grid together,
+/// from the bin occupancy alone: for each point, the points in the bins
+/// its row reads, less itself. No distance is computed, so a host that
+/// must decide whether a stored list fits in memory reads this and does
+/// not count the pairs. A half list holds at most half of it, rounded
+/// up. The sum saturates at `UINT64_MAX`.
+///
+/// Returns 0 and writes `*out`, or 1 with `lc_last_error` set.
+///
+/// # Safety
+///
+/// `grid` is a valid pointer returned by [`lc_row_grid_build`], and no
+/// thread updates or frees it during the call. `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_bound(grid: *const lc_row_grid, out: *mut u64) -> c_int {
+    let handle = match unsafe { row_ref(grid) } {
+        Ok(handle) => handle,
+        Err(code) => return code,
+    };
+    if out.is_null() {
+        return fail_msg("null pointer");
+    }
+    no_unwind(|| match handle.grid.candidate_bound() {
+        Ok(bound) => {
+            unsafe { *out = bound };
+            clear_error();
+            0
+        }
+        Err(err) => fail(err),
+    })
 }
 
 /// Free a grid built by [`lc_row_grid_build`]. Null is accepted.
@@ -1406,8 +1768,43 @@ pub unsafe extern "C" fn lc_row_grid_free(grid: *mut lc_row_grid) {
     if grid.is_null() {
         return;
     }
-    unsafe {
+    let _ = std::panic::catch_unwind(|| unsafe {
         drop(Box::from_raw(grid as *mut RowHandle));
+    });
+}
+
+/// The entry a visit passes to C, and what its callback said.
+fn row_call(
+    visit: unsafe extern "C" fn(*mut c_void, *const lc_row) -> c_int,
+    user: *mut c_void,
+    row: &crate::Row,
+) -> std::ops::ControlFlow<c_int> {
+    let entry = lc_row {
+        i: row.i as c_int,
+        j: row.j as c_int,
+        shift: row.shift,
+        vector: row.vector,
+        dist2: row.dist2,
+    };
+    match unsafe { visit(user, &entry) } {
+        0 => std::ops::ControlFlow::Continue(()),
+        stop => std::ops::ControlFlow::Break(stop),
+    }
+}
+
+/// The return of a visit: 0 after a whole walk, the callback's value
+/// after a stop, both with the last error cleared, or a failure.
+fn row_done(walked: Result<std::ops::ControlFlow<c_int>, Error>) -> c_int {
+    match walked {
+        Ok(std::ops::ControlFlow::Continue(())) => {
+            clear_error();
+            0
+        }
+        Ok(std::ops::ControlFlow::Break(stop)) => {
+            clear_error();
+            stop
+        }
+        Err(err) => fail(err),
     }
 }
 
@@ -1416,18 +1813,24 @@ pub unsafe extern "C" fn lc_row_grid_free(grid: *mut lc_row_grid) {
 ///
 /// `visit(user, row)` is called on the calling thread once for every
 /// image of `row->j` within the cutoff of `row->i`, with the shift and
-/// squared distance [`lc_pairs_within_pbc`] writes for that row. `half`
-/// nonzero keeps the entries the half list has under `i`. Over every
-/// point the entries are the rows of [`lc_pairs_within_pbc`] for the
-/// grid's arguments. Entries of one row come in bin order, which does
-/// not depend on how the points are split into ranges.
+/// squared distance [`lc_pairs_within_pbc`] writes for that row and the
+/// vector `r_j - r_i` with that shift applied. `half` nonzero keeps the
+/// entries the half list has under `i`. Over every point the entries are
+/// the rows of [`lc_pairs_within_pbc`] for the grid's arguments. Entries
+/// of one row come in bin order (the bins around the point, then the
+/// points in each bin), not sorted by `j`; that order does not depend on
+/// how the points are split into ranges.
 ///
 /// The call reads the grid and writes nothing in it, so several threads
 /// may visit one grid at once, on disjoint or overlapping ranges.
 ///
-/// Returns nonzero before any visit when `visit` is null or `end` is
-/// past [`lc_row_grid_len`] ("point index is out of range"). `begin >=
-/// end` visits nothing and returns 0.
+/// Returns 0 after every entry was visited. When `visit` returns a
+/// nonzero value the walk stops and the call returns that value with
+/// `lc_last_error` cleared. A failure returns 1 with `lc_last_error`
+/// set, before any visit when `visit` is null or `end` is past
+/// [`lc_row_grid_len`] ("point index is out of range"). A callback that
+/// returns 1 to stop is told apart from a failure by a null
+/// `lc_last_error`. `begin >= end` visits nothing and returns 0.
 ///
 /// # Safety
 ///
@@ -1450,24 +1853,13 @@ pub unsafe extern "C" fn lc_row_grid_rows(
     let Some(visit) = visit else {
         return fail_msg("null pointer");
     };
-    let walked = handle
-        .grid
-        .for_rows(begin..end, half != 0, |i, j, shift, dist2| {
-            let row = lc_pair {
-                i: i as c_int,
-                j: j as c_int,
-                shift,
-                dist2,
-            };
-            unsafe { visit(user, &row) };
-        });
-    match walked {
-        Ok(()) => {
-            clear_error();
-            0
-        }
-        Err(err) => fail(err),
-    }
+    no_unwind(|| {
+        row_done(
+            handle
+                .grid
+                .try_for_rows(begin..end, half != 0, |row| row_call(visit, user, row)),
+        )
+    })
 }
 
 /// Visit the row of point `i` of a grid: [`lc_row_grid_rows`] on
@@ -1491,22 +1883,265 @@ pub unsafe extern "C" fn lc_row_grid_point(
     let Some(visit) = visit else {
         return fail_msg("null pointer");
     };
-    let walked = handle.grid.for_point(i, half != 0, |j, shift, dist2| {
-        let row = lc_pair {
-            i: i as c_int,
-            j: j as c_int,
-            shift,
-            dist2,
-        };
-        unsafe { visit(user, &row) };
-    });
-    match walked {
-        Ok(()) => {
-            clear_error();
-            0
-        }
-        Err(err) => fail(err),
+    no_unwind(|| {
+        row_done(
+            handle
+                .grid
+                .try_for_point(i, half != 0, |row| row_call(visit, user, row)),
+        )
+    })
+}
+
+/// Where a buffered read of rows stands: the next entry is entry
+/// `entry` of the row of point `point`. Start a read with `{begin, 0}`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct lc_row_cursor {
+    /// Point whose row is read next.
+    pub point: usize,
+    /// Entries of that row already read.
+    pub entry: usize,
+}
+
+/// Copy row entries into `out`, from `*cursor` up to the row of point
+/// `end`, and move `*cursor` past them.
+///
+/// The entries are those [`lc_row_grid_rows`] visits over
+/// `cursor->point .. end`, less the first `cursor->entry` of the first
+/// row, in the same order. `*count` receives how many were written, at
+/// most `cap`. The read is done when `cursor->point == end`. A host
+/// calls this in a loop and handles a buffer of rows at a time, with one
+/// call per buffer and none per entry.
+///
+/// Returns 0, or 1 with `lc_last_error` set: a null pointer, or `end`
+/// past [`lc_row_grid_len`] or `cursor->point` past `end` ("point index
+/// is out of range"). `cap == 0` writes nothing and returns 0.
+///
+/// # Safety
+///
+/// `grid` is a valid pointer returned by [`lc_row_grid_build`], and no
+/// thread updates or frees it during the call. `cursor` and `count` are
+/// writable. `out` is writable for `cap` rows.
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_grid_fill(
+    grid: *const lc_row_grid,
+    cursor: *mut lc_row_cursor,
+    end: usize,
+    half: c_int,
+    out: *mut lc_row,
+    cap: usize,
+    count: *mut usize,
+) -> c_int {
+    let handle = match unsafe { row_ref(grid) } {
+        Ok(handle) => handle,
+        Err(code) => return code,
+    };
+    if cursor.is_null() || count.is_null() || (cap > 0 && out.is_null()) {
+        return fail_msg("null pointer");
     }
+    no_unwind(|| {
+        unsafe { *count = 0 };
+        let mut at = unsafe {
+            crate::RowCursor {
+                point: (*cursor).point,
+                entry: (*cursor).entry,
+            }
+        };
+        // The rows are read in blocks on the stack and copied out, so
+        // the caller's buffer needs no initial value.
+        let mut block = [crate::Row {
+            i: 0,
+            j: 0,
+            shift: [0; 3],
+            vector: [0.0; 3],
+            dist2: 0.0,
+        }; 64];
+        let mut written = 0usize;
+        while written < cap && at.point < end {
+            let want = block.len().min(cap - written);
+            let got = match handle
+                .grid
+                .fill_rows(&mut at, end, half != 0, &mut block[..want])
+            {
+                Ok(got) => got,
+                Err(err) => return fail(err),
+            };
+            for (k, row) in block[..got].iter().enumerate() {
+                let entry = lc_row {
+                    i: row.i as c_int,
+                    j: row.j as c_int,
+                    shift: row.shift,
+                    vector: row.vector,
+                    dist2: row.dist2,
+                };
+                unsafe { out.add(written + k).write(entry) };
+            }
+            written += got;
+            unsafe {
+                *cursor = lc_row_cursor {
+                    point: at.point,
+                    entry: at.entry,
+                };
+                *count = written;
+            }
+        }
+        if cap == 0 || at.point >= end {
+            // Nothing was read: the range is still checked.
+            if let Err(err) = handle.grid.fill_rows(&mut at, end, half != 0, &mut []) {
+                return fail(err);
+            }
+        }
+        clear_error();
+        0
+    })
+}
+
+/// The row-grid operations of this library, as function pointers.
+///
+/// A host that loads the library at run time resolves `lc_abi_stamp`,
+/// `lc_abi_compatible`, and [`lc_row_ops_get`] by name, and takes every
+/// row-grid entry from this table. The host sets `size` to
+/// `sizeof(lc_row_ops)` as it compiled it and zeroes the rest; the
+/// library writes the members that fit and sets `size` to the bytes it
+/// wrote. A null member is an operation this library does not have: one
+/// the host's header knows and an older library lacks, or
+/// `build_request` in a library built without request support. Each
+/// member is the entry point of the same name with the `lc_row_grid_`
+/// prefix, and `last_error` is `lc_last_error`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct lc_row_ops {
+    /// Bytes of this struct: in, the host's; out, those written.
+    pub size: u32,
+    /// [`lc_row_grid_build`].
+    pub build: Option<
+        unsafe extern "C" fn(
+            *const f64,
+            usize,
+            *const lc_cell,
+            *const c_int,
+            f64,
+            *const c_int,
+            f64,
+            c_int,
+            c_int,
+            *mut *mut lc_row_grid,
+        ) -> c_int,
+    >,
+    /// [`lc_row_grid_build_request`], or null without request support.
+    pub build_request: Option<
+        unsafe extern "C" fn(
+            *const f64,
+            usize,
+            *const c_int,
+            *const u8,
+            usize,
+            *mut c_int,
+            *mut *mut lc_row_grid,
+        ) -> c_int,
+    >,
+    /// [`lc_row_grid_update`].
+    pub update: Option<
+        unsafe extern "C" fn(
+            *mut lc_row_grid,
+            *const f64,
+            usize,
+            *const lc_cell,
+            *const c_int,
+            f64,
+            *const c_int,
+            f64,
+            c_int,
+            c_int,
+        ) -> c_int,
+    >,
+    /// [`lc_row_grid_len`].
+    pub len: Option<unsafe extern "C" fn(*const lc_row_grid) -> usize>,
+    /// [`lc_row_grid_free`].
+    pub free: Option<unsafe extern "C" fn(*mut lc_row_grid)>,
+    /// [`lc_row_grid_rows`].
+    pub rows: Option<
+        unsafe extern "C" fn(
+            *const lc_row_grid,
+            usize,
+            usize,
+            c_int,
+            lc_row_visit,
+            *mut c_void,
+        ) -> c_int,
+    >,
+    /// [`lc_row_grid_point`].
+    pub point: Option<
+        unsafe extern "C" fn(*const lc_row_grid, usize, c_int, lc_row_visit, *mut c_void) -> c_int,
+    >,
+    /// [`lc_row_grid_fill`].
+    pub fill: Option<
+        unsafe extern "C" fn(
+            *const lc_row_grid,
+            *mut lc_row_cursor,
+            usize,
+            c_int,
+            *mut lc_row,
+            usize,
+            *mut usize,
+        ) -> c_int,
+    >,
+    /// [`lc_last_error`].
+    pub last_error: Option<extern "C" fn() -> *const c_char>,
+    /// [`lc_capabilities`].
+    pub capabilities: Option<unsafe extern "C" fn(*mut lc_caps) -> c_int>,
+    /// [`lc_row_grid_bins`].
+    pub bins: Option<unsafe extern "C" fn(*const lc_row_grid) -> usize>,
+    /// [`lc_row_grid_bound`].
+    pub bound: Option<unsafe extern "C" fn(*const lc_row_grid, *mut u64) -> c_int>,
+}
+
+/// Fill `out` with the row-grid operations of this library; see
+/// [`lc_row_ops`]. Returns 0, or nonzero with `lc_last_error` set when
+/// `out` is null or `out->size` is smaller than the `size` member.
+///
+/// # Safety
+///
+/// `out` is null or writable for `out->size` bytes, which the host set.
+#[no_mangle]
+pub unsafe extern "C" fn lc_row_ops_get(out: *mut lc_row_ops) -> c_int {
+    if out.is_null() {
+        return fail_msg("null pointer");
+    }
+    let host = unsafe { std::ptr::addr_of!((*out).size).read_unaligned() } as usize;
+    if host < std::mem::size_of::<u32>() {
+        return fail_msg("operations struct is smaller than its size member");
+    }
+    let wrote = host.min(std::mem::size_of::<lc_row_ops>());
+    let ops = lc_row_ops {
+        size: wrote as u32,
+        build: Some(lc_row_grid_build),
+        build_request: if cfg!(feature = "request") {
+            Some(lc_row_grid_build_request)
+        } else {
+            None
+        },
+        update: Some(lc_row_grid_update),
+        len: Some(lc_row_grid_len),
+        free: Some(lc_row_grid_free),
+        rows: Some(lc_row_grid_rows),
+        point: Some(lc_row_grid_point),
+        fill: Some(lc_row_grid_fill),
+        last_error: Some(lc_last_error),
+        capabilities: Some(lc_capabilities),
+        bins: Some(lc_row_grid_bins),
+        bound: Some(lc_row_grid_bound),
+    };
+    // Safety: `out` is writable for the `host >= wrote` bytes it declared.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(ops).cast::<u8>(),
+            out.cast::<u8>(),
+            wrote,
+        );
+    }
+    clear_error();
+    0
 }
 
 /// How many partner stencils have been built in this process.
@@ -1575,7 +2210,7 @@ pub unsafe extern "C" fn lc_pairs_open(
 /// fit, returns nonzero with
 /// "periodic image count exceeds 2^24". A mesh past the bin cap returns
 /// "linked-cell mesh is too fine". `closed`
-/// nonzero keeps `dist2 <= cutoff²` on an open or mixed cell.
+/// nonzero keeps `dist2 <= cutoff²`, on a periodic cell too.
 /// `exclude_self_images` nonzero drops `i == j`.
 ///
 /// Null `out` is a count query. Otherwise `out` holds `cap` rows.

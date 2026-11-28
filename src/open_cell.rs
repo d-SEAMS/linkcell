@@ -50,7 +50,7 @@ pub struct PbcQuery<'a> {
     pub cell_hint: Option<f64>,
     /// Keep one side of `(i, j, S)`.
     pub half: bool,
-    /// Also keep `dist2 == cutoff²` on an open or mixed cell.
+    /// Also keep `dist2 == cutoff²`.
     pub closed: bool,
     /// Drop rows with `i == j`, including a periodic image of the source.
     pub exclude_self_images: bool,
@@ -174,14 +174,19 @@ pub fn pairs_within_pbc(
         if periodic_face_collapsed(cell, query.periodic) {
             return Err(Error::Degenerate);
         }
-        let mut rows = crate::pairs::pairs_within(
-            xyz,
-            cell,
-            query.cutoff,
-            query.mask,
-            query.cell_hint,
-            query.half,
-        )?;
+        // A closed cutoff is searched one double wider and its rows are
+        // then held to the boundary; see `next_up`.
+        let cutoff = if query.closed {
+            next_up(query.cutoff)
+        } else {
+            query.cutoff
+        };
+        let mut rows =
+            crate::pairs::pairs_within(xyz, cell, cutoff, query.mask, query.cell_hint, query.half)?;
+        if query.closed {
+            let cut2 = query.cutoff * query.cutoff;
+            rows.retain(|pair| pair.dist2 <= cut2);
+        }
         if query.exclude_self_images {
             rows.retain(|pair| pair.i != pair.j);
         }
@@ -887,6 +892,18 @@ fn neg_shift(shift: [i32; 3]) -> Option<[i32; 3]> {
     ])
 }
 
+/// The next double above a positive finite `x`.
+///
+/// `dist2 <= c` is `dist2 < next_up(c)`, so a strict walk serves a
+/// closed cutoff with that bound. The square of `next_up(cutoff)` is at
+/// least `next_up(cutoff²)`: it exceeds `cutoff²` by more than one unit
+/// in its last place before it is rounded. Bins and stencils sized for
+/// `next_up(cutoff)` therefore reach every pair on the boundary.
+pub(crate) fn next_up(x: f64) -> f64 {
+    debug_assert!(x > 0.0 && x.is_finite());
+    f64::from_bits(x.to_bits() + 1)
+}
+
 fn accept(dist2: f64, cut2: f64, closed: bool) -> bool {
     if closed {
         dist2 <= cut2
@@ -1164,29 +1181,63 @@ impl MixedRows {
         self.frame.off.len() - 1
     }
 
-    /// `visit(j, shift, dist2)` for every entry of the row of point `i`,
-    /// which is in range: the rows [`walk`] writes under `i` on a full
-    /// list, or on a half list with `half`.
+    /// Candidates every row tests, summed over the points: for each
+    /// point, the occupants of its partner bins less the point itself.
+    pub(crate) fn candidates(&self) -> u64 {
+        let frame = &self.frame;
+        let count = |bin: usize| u64::from(frame.off[bin + 1] - frame.off[bin]);
+        let mut total = 0u64;
+        for src in 0..self.bins() {
+            let here = count(src);
+            if here == 0 {
+                continue;
+            }
+            let mut around = 0u64;
+            if let Some(open) = &self.stencil.open {
+                open_partners(frame.dims, open, local_of(src, frame.dims), |dst| {
+                    around += count(dst);
+                });
+            } else {
+                let links = &self.stencil.links
+                    [self.stencil.off[src] as usize..self.stencil.off[src + 1] as usize];
+                for link in links {
+                    around += count(link.dst as usize);
+                }
+            }
+            total = total.saturating_add(here.saturating_mul(around.saturating_sub(1)));
+        }
+        total
+    }
+
+    /// `visit(j, shift, vector, dist2)` for every entry of the row of point
+    /// `i`, which is in range: the rows [`walk`] writes under `i` on a full
+    /// list, or on a half list with `half`. `vector` is `r_j - r_i` with
+    /// the shift applied, from the positions as given. `visit` returns
+    /// `false` to stop; the result is `false` when it did.
     ///
     /// [`walk`] tests a pair from its lower point and a self image from
     /// the side [`keep_half`] keeps, and writes the other row with the
     /// same `dist2`. A row read here from the other side computes that
-    /// same expression, so the bits agree.
+    /// same expression and negates the vector, so the bits agree.
     pub(crate) fn row(
         &self,
         i: usize,
         half: bool,
-        visit: &mut impl FnMut(usize, [i32; 3], f64),
-    ) -> Result<(), Error> {
+        visit: &mut impl FnMut(usize, [i32; 3], [f64; 3], f64) -> bool,
+    ) -> Result<bool, Error> {
         let src = self.bin_of[i];
         if src == MASKED {
-            return Ok(());
+            return Ok(true);
         }
         let src = src as usize;
         let frame = &self.frame;
         let pi = frame.pos[i];
         if let Some(open) = &self.stencil.open {
+            let mut go = true;
             open_partners(frame.dims, open, local_of(src, frame.dims), |dst| {
+                if !go {
+                    return;
+                }
                 for &ja in &frame.occ[frame.off[dst] as usize..frame.off[dst + 1] as usize] {
                     let j = ja as usize;
                     if j == i || (half && j < i) {
@@ -1195,16 +1246,15 @@ impl MixedRows {
                     let pj = frame.pos[j];
                     // The walk has `pj - pi` or its negation, which
                     // squares to the same bits.
-                    let dx = pj[0] - pi[0];
-                    let dy = pj[1] - pi[1];
-                    let dz = pj[2] - pi[2];
-                    let dist2 = dx * dx + dy * dy + dz * dz;
-                    if accept(dist2, self.cut2, self.closed) {
-                        visit(j, [0; 3], dist2);
+                    let d = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+                    let dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    if accept(dist2, self.cut2, self.closed) && !visit(j, [0; 3], d, dist2) {
+                        go = false;
+                        return;
                     }
                 }
             });
-            return Ok(());
+            return Ok(go);
         }
         let links =
             &self.stencil.links[self.stencil.off[src] as usize..self.stencil.off[src + 1] as usize];
@@ -1219,46 +1269,51 @@ impl MixedRows {
                     continue;
                 }
                 let pj = frame.pos[j];
-                // `from + lattice_shift(by) - to`, squared: the walk's
-                // expression for the pair it tests.
-                let dist2_of = |from: [f64; 3], by: [i32; 3], to: [f64; 3]| {
+                // `from + lattice_shift(by) - to`: the walk's expression
+                // for the pair it tests.
+                let image = |from: [f64; 3], by: [i32; 3], to: [f64; 3]| {
                     let delta = if by == [0, 0, 0] {
                         [0.0; 3]
                     } else {
                         self.cell.lattice_shift(by[0], by[1], by[2])
                     };
-                    let dx = from[0] + delta[0] - to[0];
-                    let dy = from[1] + delta[1] - to[1];
-                    let dz = from[2] + delta[2] - to[2];
-                    dx * dx + dy * dy + dz * dz
+                    [
+                        from[0] + delta[0] - to[0],
+                        from[1] + delta[1] - to[1],
+                        from[2] + delta[2] - to[2],
+                    ]
                 };
-                let (shift, dist2) = if i < j {
+                let flip = |d: [f64; 3]| [-d[0], -d[1], -d[2]];
+                let (shift, d) = if i < j {
                     let shift = reported_shift(frame, i, j, link.shift)?;
-                    (shift, dist2_of(pj, shift, pi))
+                    (shift, image(pj, shift, pi))
                 } else if j < i {
                     let back = neg_shift(link.shift).ok_or(Error::Overflow)?;
                     let walked = reported_shift(frame, j, i, back)?;
                     let shift = neg_shift(walked).ok_or(Error::Overflow)?;
-                    (shift, dist2_of(pi, walked, pj))
+                    (shift, flip(image(pi, walked, pj)))
                 } else {
                     let shift = link.shift;
-                    let walked = if keep_half(i, i, shift) {
-                        shift
+                    if keep_half(i, i, shift) {
+                        (shift, image(pi, shift, pi))
                     } else {
-                        neg_shift(shift).ok_or(Error::Overflow)?
-                    };
-                    (shift, dist2_of(pi, walked, pi))
+                        let walked = neg_shift(shift).ok_or(Error::Overflow)?;
+                        (shift, flip(image(pi, walked, pi)))
+                    }
                 };
+                let dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                 if !accept(dist2, self.cut2, self.closed) {
                     continue;
                 }
                 if half && j == i && !keep_half(i, i, shift) {
                     continue;
                 }
-                visit(j, shift, dist2);
+                if !visit(j, shift, d, dist2) {
+                    return Ok(false);
+                }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 

@@ -37,6 +37,26 @@
 #include <stdlib.h>
 
 /**
+ * Revision of the struct layouts the row-grid calls pass (`lc_row`,
+ * `lc_caps`, `lc_abi`). A library serves a host compiled against the
+ * same revision.
+ */
+#define LC_ABI_LAYOUT_REVISION 1
+
+/**
+ * Major version of the C ABI. A library serves a host compiled against
+ * the same major.
+ */
+#define LC_ABI_MAJOR 1
+
+/**
+ * Minor version of the C ABI. It grows when an entry point or a
+ * capability is added. A library serves a host compiled against the
+ * same or a lower minor.
+ */
+#define LC_ABI_MINOR 0
+
+/**
  * How [`partition_graph`] cuts the cell graph.
  */
 enum Method
@@ -84,6 +104,78 @@ typedef enum Method Method;
 typedef uint8_t Method;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
+
+/**
+ * The C ABI a header or a library was built for.
+ */
+typedef struct lc_abi {
+    /**
+     * `LC_ABI_MAJOR`.
+     */
+    uint16_t major;
+    /**
+     * `LC_ABI_MINOR`.
+     */
+    uint16_t minor;
+    /**
+     * `LC_ABI_LAYOUT_REVISION`.
+     */
+    uint16_t layout_revision;
+} lc_abi;
+
+/**
+ * What this library can do, for a host to read before it calls.
+ *
+ * The host sets `size` to `sizeof(lc_caps)` as it compiled it. The
+ * library writes the members that fit in that size and sets `size` to
+ * the bytes it wrote, so a member a host knows and the library does not
+ * stays as the host initialised it (zero it first). Each flag is 1 when
+ * supported and 0 when not.
+ */
+typedef struct lc_caps {
+    /**
+     * Bytes of this struct: in, the host's; out, those written.
+     */
+    uint32_t size;
+    /**
+     * The row grid: `lc_row_grid_build`, `lc_row_grid_update`,
+     * `lc_row_grid_len`, `lc_row_grid_free`, `lc_row_grid_rows`, and
+     * `lc_row_grid_point`.
+     */
+    int row_grid;
+    /**
+     * `lc_row.vector` is filled.
+     */
+    int row_vector;
+    /**
+     * A nonzero return of the visitor stops the walk.
+     */
+    int row_stop;
+    /**
+     * `lc_row_grid_build_request` decodes a `NeighborRequest`.
+     */
+    int row_request;
+    /**
+     * Open and mixed-periodic cells are accepted.
+     */
+    int open_axes;
+    /**
+     * Binning may run on the pool `lc_set_threads` sets.
+     */
+    int threads;
+    /**
+     * `lc_row_grid_fill` reads rows into a buffer.
+     */
+    int row_fill;
+    /**
+     * `closed` keeps `dist2 == cutoff²` on a fully periodic cell too.
+     */
+    int closed_periodic;
+    /**
+     * `lc_row_grid_bound` and `lc_row_grid_bins` exist.
+     */
+    int row_bound;
+} lc_caps;
 
 /**
  * Periodic parallelepiped. Lattice vectors are a, b, c (same as vesin rows).
@@ -184,11 +276,158 @@ typedef struct lc_row_grid {
 } lc_row_grid;
 
 /**
+ * Where a buffered read of rows stands: the next entry is entry
+ * `entry` of the row of point `point`. Start a read with `{begin, 0}`.
+ */
+typedef struct lc_row_cursor {
+    /**
+     * Point whose row is read next.
+     */
+    size_t point;
+    /**
+     * Entries of that row already read.
+     */
+    size_t entry;
+} lc_row_cursor;
+
+/**
+ * One entry of a row: an image of point `j` within the cutoff of point
+ * `i`.
+ */
+typedef struct lc_row {
+    /**
+     * Source index: the point the row belongs to.
+     */
+    int i;
+    /**
+     * Target index.
+     */
+    int j;
+    /**
+     * Integer cell shift `(na, nb, nc)` applied to the target.
+     */
+    int shift[3];
+    /**
+     * `r_j - r_i` with the shift applied. Its squared length is `dist2`.
+     */
+    double vector[3];
+    /**
+     * Squared distance after the shift.
+     */
+    double dist2;
+} lc_row;
+
+/**
  * Receives one row entry from [`lc_row_grid_rows`] or
  * [`lc_row_grid_point`]. `user` is the pointer given to that call.
- * `row` is valid until the callback returns.
+ * `row` is valid until the callback returns. Return 0 to go on. Any
+ * other value stops the walk, and the call returns that value.
  */
-typedef void (*lc_row_visit)(void *user, const struct lc_pair *row);
+typedef int (*lc_row_visit)(void *user, const struct lc_row *row);
+
+/**
+ * The row-grid operations of this library, as function pointers.
+ *
+ * A host that loads the library at run time resolves `lc_abi_stamp`,
+ * `lc_abi_compatible`, and [`lc_row_ops_get`] by name, and takes every
+ * row-grid entry from this table. The host sets `size` to
+ * `sizeof(lc_row_ops)` as it compiled it and zeroes the rest; the
+ * library writes the members that fit and sets `size` to the bytes it
+ * wrote. A null member is an operation this library does not have: one
+ * the host's header knows and an older library lacks, or
+ * `build_request` in a library built without request support. Each
+ * member is the entry point of the same name with the `lc_row_grid_`
+ * prefix, and `last_error` is `lc_last_error`.
+ */
+typedef struct lc_row_ops {
+    /**
+     * Bytes of this struct: in, the host's; out, those written.
+     */
+    uint32_t size;
+    /**
+     * [`lc_row_grid_build`].
+     */
+    int (*build)(const double*,
+                 size_t,
+                 const struct lc_cell*,
+                 const int*,
+                 double,
+                 const int*,
+                 double,
+                 int,
+                 int,
+                 struct lc_row_grid**);
+    /**
+     * [`lc_row_grid_build_request`], or null without request support.
+     */
+    int (*build_request)(const double*,
+                         size_t,
+                         const int*,
+                         const uint8_t*,
+                         size_t,
+                         int*,
+                         struct lc_row_grid**);
+    /**
+     * [`lc_row_grid_update`].
+     */
+    int (*update)(struct lc_row_grid*,
+                  const double*,
+                  size_t,
+                  const struct lc_cell*,
+                  const int*,
+                  double,
+                  const int*,
+                  double,
+                  int,
+                  int);
+    /**
+     * [`lc_row_grid_len`].
+     */
+    size_t (*len)(const struct lc_row_grid*);
+    /**
+     * [`lc_row_grid_free`].
+     */
+    void (*free)(struct lc_row_grid*);
+    /**
+     * [`lc_row_grid_rows`].
+     */
+    int (*rows)(const struct lc_row_grid*,
+                size_t,
+                size_t,
+                int,
+                lc_row_visit,
+                void*);
+    /**
+     * [`lc_row_grid_point`].
+     */
+    int (*point)(const struct lc_row_grid*, size_t, int, lc_row_visit, void*);
+    /**
+     * [`lc_row_grid_fill`].
+     */
+    int (*fill)(const struct lc_row_grid*,
+                struct lc_row_cursor*,
+                size_t,
+                int,
+                struct lc_row*,
+                size_t,
+                size_t*);
+    /**
+     * [`lc_last_error`].
+     */
+    const char *(*last_error)(void);
+    /**
+     * [`lc_capabilities`].
+     */
+    int (*capabilities)(struct lc_caps*);
+    /**
+     * [`lc_row_grid_bins`].
+     */
+    size_t (*bins)(const struct lc_row_grid*);
+    /**
+     * [`lc_row_grid_bound`].
+     */
+    int (*bound)(const struct lc_row_grid*, uint64_t*);
+} lc_row_ops;
 
 /**
  * Default method.
@@ -203,6 +442,36 @@ typedef void (*lc_row_visit)(void *user, const struct lc_pair *row);
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * 1 when this library serves a host compiled against `host`: the same
+ * major and layout revision, and a host minor no higher than the
+ * library's. 0 otherwise, and for a null `host`. Does not touch
+ * `lc_last_error`.
+ *
+ * # Safety
+ *
+ * `host` is null or points at one `lc_abi`.
+ */
+int lc_abi_compatible(const struct lc_abi *host);
+
+/**
+ * The ABI this library was built for. A host compares it with the
+ * `LC_ABI_*` constants of the header it compiled against, or passes
+ * those to [`lc_abi_compatible`]. Does not touch `lc_last_error`.
+ */
+struct lc_abi lc_abi_stamp(void);
+
+/**
+ * Fill `out` with the capabilities of this library. Returns 0, or
+ * nonzero with `lc_last_error` set when `out` is null or `out->size`
+ * is smaller than the `size` member itself.
+ *
+ * # Safety
+ *
+ * `out` is null or writable for `out->size` bytes, which the host set.
+ */
+int lc_capabilities(struct lc_caps *out);
 
 /**
  * Periodic cell adjacency. Edge weights are pair counts from
@@ -752,7 +1021,7 @@ int lc_pairs_within_csr(const double *xyz,
  * fit, returns nonzero with
  * "periodic image count exceeds 2^24". A mesh past the bin cap returns
  * "linked-cell mesh is too fine". `closed`
- * nonzero keeps `dist2 <= cutoff²` on an open or mixed cell.
+ * nonzero keeps `dist2 <= cutoff²`, on a periodic cell too.
  * `exclude_self_images` nonzero drops `i == j`.
  *
  * Null `out` is a count query. Otherwise `out` holds `cap` rows.
@@ -870,14 +1139,40 @@ extern int32_t lc_ptscotch_part(int32_t n,
                                 double *seconds_max);
 
 /**
+ * Number of bins a grid holds. Null gives zero.
+ *
+ * # Safety
+ *
+ * `grid` is null or a valid pointer returned by [`lc_row_grid_build`].
+ */
+size_t lc_row_grid_bins(const struct lc_row_grid *grid);
+
+/**
+ * An upper bound on the entries of every full row of a grid together,
+ * from the bin occupancy alone: for each point, the points in the bins
+ * its row reads, less itself. No distance is computed, so a host that
+ * must decide whether a stored list fits in memory reads this and does
+ * not count the pairs. A half list holds at most half of it, rounded
+ * up. The sum saturates at `UINT64_MAX`.
+ *
+ * Returns 0 and writes `*out`, or 1 with `lc_last_error` set.
+ *
+ * # Safety
+ *
+ * `grid` is a valid pointer returned by [`lc_row_grid_build`], and no
+ * thread updates or frees it during the call. `out` is writable.
+ */
+int lc_row_grid_bound(const struct lc_row_grid *grid, uint64_t *out);
+
+/**
  * Bin `n` points for the rows of one cutoff search and keep the bins.
  *
  * The arguments are those of [`lc_pairs_within_pbc`], less `half` and
  * the row buffer: `pbc` is null for a fully periodic cell or three
  * ints, nonzero for a periodic axis; `mask` is null or `n` ints;
  * `cell_hint <= 0` selects the default bin edge; `closed` nonzero keeps
- * `dist2 <= cutoff²` on an open or mixed cell; `exclude_self_images`
- * nonzero drops `i == j`. The grid copies what it needs from `xyz` and
+ * `dist2 <= cutoff²`, on a periodic cell as on an open one;
+ * `exclude_self_images` nonzero drops `i == j`. The grid copies what it needs from `xyz` and
  * is released by [`lc_row_grid_free`]. It holds the bins and no pair.
  *
  * Returns 0 and writes the handle to `*out`. On failure `*out` is null,
@@ -901,6 +1196,86 @@ int lc_row_grid_build(const double *xyz,
                       int closed,
                       int exclude_self_images,
                       struct lc_row_grid **out);
+
+/**
+ * [`lc_row_grid_build`] from a Cap'n Proto `NeighborRequest`.
+ *
+ * `request` holds one message in the standard stream framing (segment
+ * table, then segments, not packed) whose root is the `NeighborRequest`
+ * of the shared potential schema. The request is read as follows.
+ *
+ * - `cutoff` and `skin`: with `cut == 0` the rows have `dist2 <
+ *   cutoff²` and `skin` must be 0. With `cut == 1` they have `dist2 <
+ *   (cutoff + skin)²`; `cut == 1` with a zero `skin` asks for `dist2 <=
+ *   cutoff²`, the closed cutoff of [`lc_row_grid_build`].
+ * - `periodic`: empty for a fully periodic cell, or three flags.
+ * - `systems`: exactly one, with `count == n` and `box` the nine
+ *   lattice entries, rows a, b, c. The box is not read when every axis
+ *   is open and may then be empty.
+ * - `format` must be 0 (pairs) and `mode` must not be 0.
+ * - `shifts`, `vectors`, `distances`, `cursor`, and `limit` describe a
+ *   stored reply and are not read: a visit always passes all three and
+ *   takes its range from the call.
+ *
+ * - `shell`: written to `*out_half` when `out_half` is not null, 1
+ *   for a half list and 0 for a full one, for the caller to pass to
+ *   each visit. The grid itself serves both.
+ * - `binEdge`: the bin edge; 0 or less selects the default.
+ * - `origin`: empty for a cell at the origin, or three coordinates.
+ * - `excludeSelfImages`: drops `i == j`.
+ *
+ * `mask` is null or `n` ints, nonzero to keep the point, as in
+ * [`lc_row_grid_build`]. It is a buffer beside the positions and not a
+ * field of the request.
+ *
+ * Returns nonzero with `lc_last_error` set for a message that does not
+ * decode, a request this entry does not serve, and every failure of
+ * [`lc_row_grid_build`]. A library built without request support
+ * returns nonzero with "this library was built without NeighborRequest
+ * support"; `lc_capabilities` reports that as `row_request == 0`.
+ *
+ * # Safety
+ *
+ * `xyz` is readable for `n * 3` doubles. `mask`, if non-null, is `n`
+ * ints. `request` is readable for `request_len` bytes. `out_half`, if
+ * non-null, is writable for one int. `out` is writable for one pointer.
+ */
+int lc_row_grid_build_request(const double *xyz,
+                              size_t n,
+                              const int *mask,
+                              const uint8_t *request,
+                              size_t request_len,
+                              int *out_half,
+                              struct lc_row_grid **out);
+
+/**
+ * Copy row entries into `out`, from `*cursor` up to the row of point
+ * `end`, and move `*cursor` past them.
+ *
+ * The entries are those [`lc_row_grid_rows`] visits over
+ * `cursor->point .. end`, less the first `cursor->entry` of the first
+ * row, in the same order. `*count` receives how many were written, at
+ * most `cap`. The read is done when `cursor->point == end`. A host
+ * calls this in a loop and handles a buffer of rows at a time, with one
+ * call per buffer and none per entry.
+ *
+ * Returns 0, or 1 with `lc_last_error` set: a null pointer, or `end`
+ * past [`lc_row_grid_len`] or `cursor->point` past `end` ("point index
+ * is out of range"). `cap == 0` writes nothing and returns 0.
+ *
+ * # Safety
+ *
+ * `grid` is a valid pointer returned by [`lc_row_grid_build`], and no
+ * thread updates or frees it during the call. `cursor` and `count` are
+ * writable. `out` is writable for `cap` rows.
+ */
+int lc_row_grid_fill(const struct lc_row_grid *grid,
+                     struct lc_row_cursor *cursor,
+                     size_t end,
+                     int half,
+                     struct lc_row *out,
+                     size_t cap,
+                     size_t *count);
 
 /**
  * Free a grid built by [`lc_row_grid_build`]. Null is accepted.
@@ -942,18 +1317,24 @@ int lc_row_grid_point(const struct lc_row_grid *grid,
  *
  * `visit(user, row)` is called on the calling thread once for every
  * image of `row->j` within the cutoff of `row->i`, with the shift and
- * squared distance [`lc_pairs_within_pbc`] writes for that row. `half`
- * nonzero keeps the entries the half list has under `i`. Over every
- * point the entries are the rows of [`lc_pairs_within_pbc`] for the
- * grid's arguments. Entries of one row come in bin order, which does
- * not depend on how the points are split into ranges.
+ * squared distance [`lc_pairs_within_pbc`] writes for that row and the
+ * vector `r_j - r_i` with that shift applied. `half` nonzero keeps the
+ * entries the half list has under `i`. Over every point the entries are
+ * the rows of [`lc_pairs_within_pbc`] for the grid's arguments. Entries
+ * of one row come in bin order (the bins around the point, then the
+ * points in each bin), not sorted by `j`; that order does not depend on
+ * how the points are split into ranges.
  *
  * The call reads the grid and writes nothing in it, so several threads
  * may visit one grid at once, on disjoint or overlapping ranges.
  *
- * Returns nonzero before any visit when `visit` is null or `end` is
- * past [`lc_row_grid_len`] ("point index is out of range"). `begin >=
- * end` visits nothing and returns 0.
+ * Returns 0 after every entry was visited. When `visit` returns a
+ * nonzero value the walk stops and the call returns that value with
+ * `lc_last_error` cleared. A failure returns 1 with `lc_last_error`
+ * set, before any visit when `visit` is null or `end` is past
+ * [`lc_row_grid_len`] ("point index is out of range"). A callback that
+ * returns 1 to stop is told apart from a failure by a null
+ * `lc_last_error`. `begin >= end` visits nothing and returns 0.
  *
  * # Safety
  *
@@ -993,6 +1374,17 @@ int lc_row_grid_update(struct lc_row_grid *grid,
                        double cell_hint,
                        int closed,
                        int exclude_self_images);
+
+/**
+ * Fill `out` with the row-grid operations of this library; see
+ * [`lc_row_ops`]. Returns 0, or nonzero with `lc_last_error` set when
+ * `out` is null or `out->size` is smaller than the `size` member.
+ *
+ * # Safety
+ *
+ * `out` is null or writable for `out->size` bytes, which the host set.
+ */
+int lc_row_ops_get(struct lc_row_ops *out);
 
 extern int32_t lc_scotch_part(int32_t n,
                               const int32_t *offsets,

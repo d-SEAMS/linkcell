@@ -2,7 +2,7 @@
 name = "linkcell"
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.81"
 description = "Periodic linked-cell cutoff pairs and k-nearest neighbour search"
 license = "MIT"
 repository = "https://github.com/d-SEAMS/linkcell"
@@ -21,7 +21,7 @@ name = "linkcell"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
-default = ["capi", "parallel"]
+default = ["capi", "parallel", "request"]
 capi = []
 # minimage's C ABI (minimage_*). Off by default so static consumers can
 # link minimage separately without duplicate symbols (for example
@@ -32,6 +32,9 @@ parallel = ["dep:rayon"]
 tune = ["capi"]
 # Benchmark counters (`SimdTiming`). Off by default.
 timing = []
+# `lc_row_grid_build_request`: the neighbour declaration as a Cap'n Proto
+# `NeighborRequest`. A build without it reports `row_request = 0`.
+request = ["capi", "dep:capnp"]
 # Serial Scotch (`SCOTCH_graphPart`). Off by default. Not vendored.
 scotch = []
 # PT-Scotch (`SCOTCH_dgraphPart`). Off by default. Not vendored.
@@ -41,6 +44,7 @@ ptscotch = []
 
 [dependencies]
 minimage = { version = "0.2.3", default-features = false }
+capnp = { version = "0.21", optional = true }
 rayon = { version = "1.10", optional = true }
 
 [build-dependencies]

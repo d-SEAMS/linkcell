@@ -134,6 +134,15 @@ exclude = [
     "lc_knn_shutdown",
     "lc_knn_shutdown_impl",
     "lc_omp_max_threads",
+    # src/neighbor_capnp.rs is generated Cap'n Proto reader code, not C ABI.
+    "TYPE_ID",
+    "NEIGHBOR_FORMAT_PAIRS",
+    "NEIGHBOR_FORMAT_CLUSTER4",
+    "NEIGHBOR_CUT_STRICT",
+    "NEIGHBOR_CUT_LOOSE",
+    "NEIGHBOR_MODE_INVALID",
+    "NEIGHBOR_MODE_DEFAULT",
+    "NeighborShell",
 ]
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
 
