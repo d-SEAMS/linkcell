@@ -24,9 +24,13 @@ mod gather;
 
 #[path = "pair_csr.rs"]
 mod csr;
+
+#[path = "pair_rows.rs"]
+mod rows;
 #[cfg(feature = "capi")]
 pub(crate) use csr::{check as csr_check, csr_rows, CsrDest, CsrWrite};
 pub use csr::{pairs_within_csr, PairCsr};
+pub use rows::RowGrid;
 
 const MAX_IMAGES: i64 = 1 << 24;
 

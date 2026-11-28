@@ -929,8 +929,37 @@ fn walk(
     Ok(rows)
 }
 
-/// Each source bin visits its partner rows clipped to the frame, in
-/// ascending flat order, which is the order of a per-bin link list.
+/// The partner bins of the bin at `[x, y, z]`: its partner rows clipped
+/// to the frame, in ascending flat order, which is the order of a
+/// per-bin link list.
+#[inline(always)]
+fn open_partners(dims: [i32; 3], open: &OpenRows, at: [i32; 3], mut visit: impl FnMut(usize)) {
+    let [x, y, z] = at;
+    let [ey, ez] = open.ext;
+    let stride = (2 * ey + 1) as usize;
+    let dz_lo = (-z).max(-ez);
+    let dz_hi = (dims[2] - 1 - z).min(ez);
+    let dy_lo = (-y).max(-ey);
+    let dy_hi = (dims[1] - 1 - y).min(ey);
+    for dz in dz_lo..=dz_hi {
+        let plane = (dz + ez) as usize * stride;
+        let row_z = (z + dz) as usize * dims[1] as usize;
+        for dy in dy_lo..=dy_hi {
+            let width = open.width[plane + (dy + ey) as usize];
+            if width < 0 {
+                continue;
+            }
+            let row = (row_z + (y + dy) as usize) * dims[0] as usize;
+            let first = row + (x - width.min(x)) as usize;
+            let last = row + (x + width.min(dims[0] - 1 - x)) as usize;
+            for dst in first..=last {
+                visit(dst);
+            }
+        }
+    }
+}
+
+/// Each source bin visits its [`open_partners`].
 fn walk_open(
     frame: &Frame,
     open: &OpenRows,
@@ -939,39 +968,20 @@ fn walk_open(
     rows: &mut Vec<Pair>,
 ) {
     let dims = frame.dims;
-    let [ey, ez] = open.ext;
-    let stride = (2 * ey + 1) as usize;
     let mut src = 0usize;
     for z in 0..dims[2] {
-        let dz_lo = (-z).max(-ez);
-        let dz_hi = (dims[2] - 1 - z).min(ez);
         for y in 0..dims[1] {
-            let dy_lo = (-y).max(-ey);
-            let dy_hi = (dims[1] - 1 - y).min(ey);
             for x in 0..dims[0] {
                 let src_atoms = &frame.occ[frame.off[src] as usize..frame.off[src + 1] as usize];
                 src += 1;
                 if src_atoms.is_empty() {
                     continue;
                 }
-                for dz in dz_lo..=dz_hi {
-                    let plane = (dz + ez) as usize * stride;
-                    let row_z = (z + dz) as usize * dims[1] as usize;
-                    for dy in dy_lo..=dy_hi {
-                        let width = open.width[plane + (dy + ey) as usize];
-                        if width < 0 {
-                            continue;
-                        }
-                        let row = (row_z + (y + dy) as usize) * dims[0] as usize;
-                        let first = row + (x - width.min(x)) as usize;
-                        let last = row + (x + width.min(dims[0] - 1 - x)) as usize;
-                        for dst in first..=last {
-                            let dst_atoms =
-                                &frame.occ[frame.off[dst] as usize..frame.off[dst + 1] as usize];
-                            pair_open_bins(frame, query, cut2, src_atoms, dst_atoms, rows);
-                        }
-                    }
-                }
+                open_partners(dims, open, [x, y, z], |dst| {
+                    let dst_atoms =
+                        &frame.occ[frame.off[dst] as usize..frame.off[dst + 1] as usize];
+                    pair_open_bins(frame, query, cut2, src_atoms, dst_atoms, rows);
+                });
             }
         }
     }
@@ -1100,6 +1110,156 @@ fn pair_bins(
         }
     }
     Ok(())
+}
+
+/// Marks a point the mask dropped.
+const MASKED: u32 = u32::MAX;
+
+/// The occupied bins and partner stencil of an open or mixed cell, kept
+/// so the row of one point can be read without a pair list.
+pub(crate) struct MixedRows {
+    frame: Frame,
+    cell: Cell,
+    stencil: Arc<Stencil>,
+    /// Bin of each point, or [`MASKED`].
+    bin_of: Vec<u32>,
+    cut2: f64,
+    closed: bool,
+    exclude_self: bool,
+}
+
+impl MixedRows {
+    /// The frame and stencil [`pairs_within_pbc`] walks for `query`, which
+    /// has an open axis. `None` when no point is active.
+    pub(crate) fn build(
+        xyz: &[[f64; 3]],
+        cell: &Cell,
+        query: &PbcQuery<'_>,
+    ) -> Result<Option<Self>, Error> {
+        let cell = cell_for_pbc(cell.h(), cell.origin(), query.periodic)?;
+        let frame = place(xyz, &cell, query)?;
+        if frame.n_active == 0 {
+            return Ok(None);
+        }
+        let stencil = stencil_for(&frame, &cell, query)?;
+        let mut bin_of = vec![MASKED; xyz.len()];
+        for bin in 0..frame.off.len() - 1 {
+            for &atom in &frame.occ[frame.off[bin] as usize..frame.off[bin + 1] as usize] {
+                bin_of[atom as usize] = bin as u32;
+            }
+        }
+        Ok(Some(MixedRows {
+            frame,
+            cell,
+            stencil,
+            bin_of,
+            cut2: query.cutoff * query.cutoff,
+            closed: query.closed,
+            exclude_self: query.exclude_self_images,
+        }))
+    }
+
+    /// Number of bins in the frame.
+    pub(crate) fn bins(&self) -> usize {
+        self.frame.off.len() - 1
+    }
+
+    /// `visit(j, shift, dist2)` for every entry of the row of point `i`,
+    /// which is in range: the rows [`walk`] writes under `i` on a full
+    /// list, or on a half list with `half`.
+    ///
+    /// [`walk`] tests a pair from its lower point and a self image from
+    /// the side [`keep_half`] keeps, and writes the other row with the
+    /// same `dist2`. A row read here from the other side computes that
+    /// same expression, so the bits agree.
+    pub(crate) fn row(
+        &self,
+        i: usize,
+        half: bool,
+        visit: &mut impl FnMut(usize, [i32; 3], f64),
+    ) -> Result<(), Error> {
+        let src = self.bin_of[i];
+        if src == MASKED {
+            return Ok(());
+        }
+        let src = src as usize;
+        let frame = &self.frame;
+        let pi = frame.pos[i];
+        if let Some(open) = &self.stencil.open {
+            open_partners(frame.dims, open, local_of(src, frame.dims), |dst| {
+                for &ja in &frame.occ[frame.off[dst] as usize..frame.off[dst + 1] as usize] {
+                    let j = ja as usize;
+                    if j == i || (half && j < i) {
+                        continue;
+                    }
+                    let pj = frame.pos[j];
+                    // The walk has `pj - pi` or its negation, which
+                    // squares to the same bits.
+                    let dx = pj[0] - pi[0];
+                    let dy = pj[1] - pi[1];
+                    let dz = pj[2] - pi[2];
+                    let dist2 = dx * dx + dy * dy + dz * dz;
+                    if accept(dist2, self.cut2, self.closed) {
+                        visit(j, [0; 3], dist2);
+                    }
+                }
+            });
+            return Ok(());
+        }
+        let links =
+            &self.stencil.links[self.stencil.off[src] as usize..self.stencil.off[src + 1] as usize];
+        for link in links {
+            let dst = link.dst as usize;
+            for &ja in &frame.occ[frame.off[dst] as usize..frame.off[dst + 1] as usize] {
+                let j = ja as usize;
+                if j == i && (link.shift == [0, 0, 0] || self.exclude_self) {
+                    continue;
+                }
+                if half && j < i {
+                    continue;
+                }
+                let pj = frame.pos[j];
+                // `from + lattice_shift(by) - to`, squared: the walk's
+                // expression for the pair it tests.
+                let dist2_of = |from: [f64; 3], by: [i32; 3], to: [f64; 3]| {
+                    let delta = if by == [0, 0, 0] {
+                        [0.0; 3]
+                    } else {
+                        self.cell.lattice_shift(by[0], by[1], by[2])
+                    };
+                    let dx = from[0] + delta[0] - to[0];
+                    let dy = from[1] + delta[1] - to[1];
+                    let dz = from[2] + delta[2] - to[2];
+                    dx * dx + dy * dy + dz * dz
+                };
+                let (shift, dist2) = if i < j {
+                    let shift = reported_shift(frame, i, j, link.shift)?;
+                    (shift, dist2_of(pj, shift, pi))
+                } else if j < i {
+                    let back = neg_shift(link.shift).ok_or(Error::Overflow)?;
+                    let walked = reported_shift(frame, j, i, back)?;
+                    let shift = neg_shift(walked).ok_or(Error::Overflow)?;
+                    (shift, dist2_of(pi, walked, pj))
+                } else {
+                    let shift = link.shift;
+                    let walked = if keep_half(i, i, shift) {
+                        shift
+                    } else {
+                        neg_shift(shift).ok_or(Error::Overflow)?
+                    };
+                    (shift, dist2_of(pi, walked, pi))
+                };
+                if !accept(dist2, self.cut2, self.closed) {
+                    continue;
+                }
+                if half && j == i && !keep_half(i, i, shift) {
+                    continue;
+                }
+                visit(j, shift, dist2);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
