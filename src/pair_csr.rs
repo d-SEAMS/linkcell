@@ -832,10 +832,9 @@ impl<'a> Rows<'a> {
         debug_assert!(dist2.is_null() || with_d2 || staged.cols.is_empty());
         each_index(blocks, |b| {
             let (lo, hi) = span(n, blocks, b);
-            for i in lo..hi {
+            for (i, &from) in raw.iter().enumerate().take(hi).skip(lo) {
                 let at = staged.start[i];
                 let len = staged.start[i + 1] - at;
-                let from = raw[i];
                 // Block `b` writes the packed rows `lo..hi` alone.
                 unsafe {
                     std::ptr::copy_nonoverlapping(staged.cols.as_ptr().add(from), cols.at(at), len);
