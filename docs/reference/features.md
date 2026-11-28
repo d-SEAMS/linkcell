@@ -28,8 +28,13 @@ A static consumer that links minimage itself leaves the feature off, so the two 
 `ptscotch` compiles `src/ptscotch_part.c` and exports `lc_ptscotch_part`.
 Without the feature, `Method::Scotch` and `Method::PtScotch` return `ScotchDisabled`.
 
-The crate `rust-version` is 1.80.
-That is the oldest toolchain that builds the default features: the locked rayon 1.12 requires it.
+`request` compiles `lc_row_grid_build_request`, which reads the neighbour declaration as a Cap'n Proto `NeighborRequest`, and adds the `capnp` crate.
+It is on by default.
+Without it that entry returns an error, `lc_capabilities` reports `row_request == 0`, and the operations table has a null `build_request`.
+`src/neighbor_capnp.rs` is generated from `schema/neighbor.capnp` by `scripts/regen-neighbor-capnp.sh` and shipped, so a build needs no Cap'n Proto compiler.
+
+The crate `rust-version` is 1.81.
+That is the oldest toolchain that builds the default features: the `capnp` crate of the `request` feature requires it, and the locked rayon 1.12 requires 1.80.
 The Python module in `python/Cargo.toml` has `rust-version` 1.88.
 Its features are `scotch` (passes through to the crate), `abi3` (CPython 3.12+ stable ABI), and `abi3t` (CPython 3.15+ free-threaded ABI).
 
@@ -50,7 +55,7 @@ Accepted names are `scalar`, `avx2`, `avx512`, and `neon`.
 
 AVX-512 is selected only when AVX-512F, AVX-512VL, POPCNT, and fused multiply-add (FMA) are all present.
 The build compiles those kernels only when rustc is 1.89 or newer (`linkcell_avx512` in `build.rs`).
-On 1.80 through 1.88 the same source builds the scalar and AVX2 paths, and NEON on aarch64.
+On 1.81 through 1.88 the same source builds the scalar and AVX2 paths, and NEON on aarch64.
 A CPU with AVX-512F and without AVX-512VL uses AVX2.
 AVX2 is selected only when FMA is present, so Sandy Bridge stays on `scalar`.
 NEON is the aarch64 baseline.

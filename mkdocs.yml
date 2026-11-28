@@ -61,6 +61,7 @@ nav:
       - Embed from C: how-to/embed-c.md
       - Embed from C++: how-to/embed-cpp.md
       - Embed from Python: how-to/embed-python.md
+      - Load at run time: how-to/load-at-run-time.md
       - pkg-config, Meson and CMake: how-to/pkg-config.md
   - Reference:
       - C API: reference/c-api.md

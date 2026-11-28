@@ -164,6 +164,8 @@ The bindings write their own layout from the same hits: Python and `pairs_within
 `RowGrid` / `lc_row_grid_build` keeps the bins of that search and stores no pair.
 `for_rows` / `lc_row_grid_rows` then hands the rows of a range of points to a callback, and `for_point` / `lc_row_grid_point` the row of one point.
 A row holds the entries the pair list has for that source: every image of every target, with its shift and the same bits in its distance.
+Each entry also carries the difference that distance was squared from, `r_j - r_i` with the shift applied, at no further cost.
+A callback can stop the walk.
 On a periodic cell a row is read from the bins around the bin of its point, with the runs, roles, and shifts of the CSR gather below, in one scalar pass that also reports the shift of each run.
 On an open or mixed cell it is read from the occupied bins and the partner stencil of the open-cell walk.
 That walk tests a pair from its lower point, so a row read from the higher point computes the expression of the lower one.

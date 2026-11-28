@@ -47,6 +47,27 @@ int j = nn.neighbour(0, 0);
 double r2 = nn.dist2(0, 0);
 ```
 
+Rows of a cutoff search without a stored list:
+
+```cpp
+#include "linkcell.hpp"
+
+const linkcell::Cell box = linkcell::Cell::ortho(10.0, 10.0, 10.0);
+const std::vector<std::array<double, 3>> xyz = {
+    {0.2, 0.0, 0.0}, {9.4, 0.0, 0.0}, {5.0, 5.0, 5.0}};
+linkcell::RowQuery query;
+query.cutoff = 1.0;
+const linkcell::RowGrid grid(xyz, box, query);
+double energy = 0.0;
+grid.for_rows(0, grid.size(), /* half */ true, [&](const linkcell::Row &row) {
+  energy += pair_energy(row.dist2); // row.vector is r_j - r_i
+});
+```
+
+The grid holds the bins and no pair.
+Threads may call `for_rows` on disjoint ranges of one grid at once.
+A visit that returns `false` stops the walk.
+
 Device k-nearest (`linkcell_gpu.hpp`) takes device pointers and writes the same packed buffer.
 Link `linkcell_gpu_dep` in Meson, `linkcell::gpu` in CMake, or `linkcell-gpu` with pkg-config.
 A device-packed cell (3 / 9 / 12 doubles) is inverted on device:
